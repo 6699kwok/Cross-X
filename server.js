@@ -3589,6 +3589,16 @@ function extractAgentConstraints(message, constraints) {
     if (re.test(message)) result.service_types.push(svc);
   }
   if (!result.service_types.length) result.service_types = ["hotel", "food", "transport"];
+  // Pace hints — inferred from special group keywords in message
+  const paceHintMap = [
+    { pattern: /老人|长辈|年迈|爷爷|奶奶|外公|外婆/, hint: "slow_pace" },
+    { pattern: /儿童|小孩|宝宝|孩子|小朋友|baby|kid/i, hint: "child_friendly" },
+    { pattern: /孕妇|孕期|怀孕/, hint: "gentle_pace" },
+    { pattern: /轮椅|行动不便|残疾|无障碍/, hint: "wheelchair" },
+  ];
+  result.pace_hints = paceHintMap
+    .filter(({ pattern }) => pattern.test(message))
+    .map(({ hint }) => hint);
   return result;
 }
 

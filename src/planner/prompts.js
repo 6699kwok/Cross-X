@@ -241,6 +241,10 @@ ${BUSINESS_BOUNDARY_BLOCK}
 7. 三个方案的 total_price 必须有明显差异（budget最低，premium最高）
 8. real_vibes 和 insider_tips 仅在亮点活动中填写（每天至多2个），其余 activity 可省略
 9. 酒店 name/price/hero_image/rating/review_count/guest_review 必须严格从 Real_API_Data 中原样复制，禁止自行编造
+10. 若 prompt 中存在【实时资源池】区块：餐厅等位时间和门票状态必须体现在对应 activity 的 note 字段中（如"当前等位约N分钟，建议提前预约"或"门票有余票可代订"）；如资源池提示人群特殊需求，必须在行程节奏安排上落实
+11. plans[].highlights[] 中的亮点名称必须与 days[].activities[].name 中出现的景点/餐厅名称保持字面一致，禁止在 highlights 中出现 days 中未提及的地点名
+12. 地理锁定（CRITICAL）：若 prompt 包含"地理锁定"指令，则所有 hotel.name、activity.name、day.label、transport_plan、arrival_note 中必须只出现目标城市的地名和设施——出发城市的任何酒店/景点/餐厅名称一律禁止出现，即使 Real_API_Data 中有该城市条目
+13. 人数感知服务（CRITICAL）：若 prompt 包含"大家庭出行"（pax≥5）指令，则每个方案的 transport_plan 必须注明商务车/包车接送，且每天有餐饮的 activity.note 必须包含包间预订建议；若包含"家庭出行"（pax 3-4），transport_plan 须包含拼车/商务车建议
 
 # 【多城市/国际行程处理规则】
 当用户行程涉及多个城市或国际出发地时（如"巴黎飞深圳→西安→新疆"）：

@@ -12,7 +12,7 @@
 const { openAIRequest } = require("../ai/openai");
 const { DETAIL_SYSTEM_PROMPT_TEMPLATE } = require("../planner/prompts");
 const { safeParseJson } = require("../planner/mock");
-const { isComplexItinerary, buildPrePlan, generateCrossXResponse } = require("../planner/pipeline");
+const { isComplexItinerary, buildPrePlan, generateCrossXResponse, buildResourceContext } = require("../planner/pipeline");
 
 // ── P1 session + security modules ─────────────────────────────────────────────
 const {
@@ -355,24 +355,27 @@ function createPlanRouter({
 
       const prePlan = complex ? null : buildPrePlan({ message, city, constraints });
 
-      // Run Coze workflow in parallel with OpenAI for enrichment (hero_image, queue, availability).
-      // callCozeWorkflow ALWAYS resolves (synthetic fallback on failure) — cozeEnrichment is never null.
-      const [result, cozeEnrichment] = await Promise.all([
-        generateCrossXResponse({
-          message, language, city,
-          constraints: { ...constraints, _clientIp: clientIp },
-          conversationHistory,
-          apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
-          prePlan,
-          skipSpeaker:  true,
-          cardTimeoutMs: complex ? 55000 : 50000,
-          cardMaxTokens: complex ? 1400  : 2200,
-          summaryOnly:   complex,
-        }),
-        callCozeWorkflow({ query: message, city, lang: language, budget: budgetVal }),
-      ]);
-
+      // P8.4 Serial scheduling: Coze first → buildResourceContext → OpenAI grounded in real-time data.
+      // Step 1: Coze enrichment (always resolves — synthetic fallback on failure).
+      const cozeEnrichment = await callCozeWorkflow({ query: message, city, lang: language, budget: budgetVal });
       console.log(`[plan/coze] Coze enrichment: ${cozeEnrichment?._synthetic ? "synthetic" : "live"} — queue=${cozeEnrichment?.restaurant_queue}min ticket=${cozeEnrichment?.ticket_availability}`);
+
+      // Step 2: Convert Coze data → structured resource context string for prompt injection.
+      const resourceContext = buildResourceContext(cozeEnrichment, city, message, constraints);
+
+      // Step 3: OpenAI Card Generator, grounded in Coze resource pool.
+      const result = await generateCrossXResponse({
+        message, language, city,
+        constraints: { ...constraints, _clientIp: clientIp },
+        conversationHistory,
+        apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+        prePlan,
+        resourceContext,
+        skipSpeaker:  true,
+        cardTimeoutMs: complex ? 55000 : 50000,
+        cardMaxTokens: complex ? 1400  : 2200,
+        summaryOnly:   complex,
+      });
 
       planDone = true;
 
