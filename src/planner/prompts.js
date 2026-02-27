@@ -246,6 +246,8 @@ ${BUSINESS_BOUNDARY_BLOCK}
 11. plans[].highlights[] 中的亮点名称必须与 days[].activities[].name 中出现的景点/餐厅名称保持字面一致，禁止在 highlights 中出现 days 中未提及的地点名
 12. 地理锁定（CRITICAL）：若 prompt 包含"地理锁定"指令，则所有 hotel.name、activity.name、day.label、transport_plan、arrival_note 中必须只出现目标城市的地名和设施——出发城市的任何酒店/景点/餐厅名称一律禁止出现，即使 Real_API_Data 中有该城市条目
 13. 人数感知服务（CRITICAL）：若 prompt 包含"大家庭出行"（pax≥5）指令，则每个方案的 transport_plan 必须注明商务车/包车接送，且每天有餐饮的 activity.note 必须包含包间预订建议；若包含"家庭出行"（pax 3-4），transport_plan 须包含拼车/商务车建议
+14. 真实店名强制（CRITICAL）：若 prompt 包含【真实餐厅名录】或【真实景点名录】区块，则每个饮食/活动类 activity.name 必须使用该名录中的真实店名，格式为"在【店名】享用XX"或"游览【景点名】"——严禁仅写"吃午餐"、"参观景点"等模糊占位描述
+15. 真实图片强制（CRITICAL）：若名录条目含"photo:URL"字段，则对应 activity 必须新增 "image_url" 键并将该 URL 原样复制填入（不得截断或修改 URL）；若条目无 photo 字段则 image_url 省略即可
 
 # 【多城市/国际行程处理规则】
 当用户行程涉及多个城市或国际出发地时（如"巴黎飞深圳→西安→新疆"）：

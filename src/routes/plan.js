@@ -375,7 +375,8 @@ function createPlanRouter({
       console.log(`[plan/coze] Coze enrichment: ${cozeEnrichment?._synthetic ? "synthetic" : "live"} — queue=${cozeEnrichment?.restaurant_queue}min ticket=${cozeEnrichment?.ticket_availability}`);
 
       // Step 2: Convert Coze data → structured resource context string for prompt injection.
-      const resourceContext = buildResourceContext(cozeEnrichment, city, message, constraints);
+      // P8.7: intentAxis passed so buildResourceContext can include item_list inventory block.
+      const resourceContext = buildResourceContext(cozeEnrichment, city, message, constraints, intentAxis);
 
       // Step 3: OpenAI Card Generator, grounded in Coze resource pool.
       const result = await generateCrossXResponse({

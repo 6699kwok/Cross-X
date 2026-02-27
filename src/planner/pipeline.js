@@ -103,6 +103,57 @@ function buildPrePlan({ message, city, constraints }) {
   };
 }
 
+// ── buildInventoryContext — Coze item_list → named shop/attraction inventory ──
+/**
+ * Converts Coze item_list (real restaurant/attraction arrays) into a structured
+ * named inventory block. Forces LLM to use real shop names in activities[].name
+ * and real photo URLs in image_url fields.
+ *
+ * @param {object} cozeData   Coze enrichment result
+ * @param {string} dest       Destination city
+ * @param {string} intentAxis "food"|"activity"|"stay"|"travel"
+ * @returns {string}          Formatted inventory block or ""
+ */
+function buildInventoryContext(cozeData, dest, intentAxis) {
+  if (!cozeData || cozeData._synthetic) return "";
+  const itemList = cozeData.item_list || cozeData.items || [];
+  if (!itemList.length) return "";
+
+  const destLabel = dest || "目的地";
+
+  if (intentAxis === "food") {
+    const lines = [`【真实餐厅名录·${destLabel}】（来自实时数据，必须在 activity.name 中使用以下店名）`];
+    itemList.slice(0, 8).forEach((item, i) => {
+      const name  = item.name || item.shop_name || `餐厅${i + 1}`;
+      const addr  = item.address || item.addr || "";
+      const price = item.avg_price != null ? `人均¥${item.avg_price}` : "";
+      const queue = item.queue_min  != null ? `等位${item.queue_min}min` : "";
+      const photo = item.real_photo_url || item.photo_url || item.image_url || "";
+      const parts = [addr, price, queue].filter(Boolean).join(" ");
+      lines.push(`${i + 1}. 【${name}】${parts ? `（${parts}）` : ""}${photo ? ` photo:${photo}` : ""}`);
+    });
+    lines.push('\u26a0\ufe0f activity.name \u5fc5\u987b\u5199\u6210\u201c\u5728\u3010\u5e97\u540d\u3011\u4eab\u7528XX\u201d\uff0c\u7981\u6b62\u4ec5\u5199\u201c\u5403\u5348\u9910\u201d\u7b49\u6a21\u7cca\u63cf\u8ff0\u3002');
+    lines.push('\u26a0\ufe0f \u82e5 item \u542b photo:URL\uff0c\u5fc5\u987b\u5c06\u5176\u539f\u6837\u590d\u5236\u5230\u5bf9\u5e94 activity.image_url \u5b57\u6bb5\u3002');
+    return lines.join("\n");
+  }
+
+  if (intentAxis === "activity") {
+    const lines = [`【真实景点名录·${destLabel}】（必须在 activity.name 中使用以下景点名）`];
+    itemList.slice(0, 8).forEach((item, i) => {
+      const name   = item.name || `景点${i + 1}`;
+      const ticket = item.ticket_price != null ? `门票¥${item.ticket_price}` : "";
+      const hours  = item.open_hours || "";
+      const photo  = item.real_photo_url || item.photo_url || "";
+      const parts  = [ticket, hours].filter(Boolean).join(" ");
+      lines.push(`${i + 1}. 【${name}】${parts ? `（${parts}）` : ""}${photo ? ` photo:${photo}` : ""}`);
+    });
+    lines.push('\u26a0\ufe0f activity.name \u5fc5\u987b\u5199\u6210\u201c\u6e38\u89c8\u3010\u666f\u70b9\u540d\u3011\u201d\u683c\u5f0f\uff0c\u7981\u6b62\u4ec5\u5199\u201c\u9017\u666f\u70b9\u201d\u7b49\u6a21\u7cca\u63cf\u8ff0\u3002');
+    return lines.join("\n");
+  }
+
+  return "";
+}
+
 // ── buildResourceContext — Coze → structured injection string ────────────────
 /**
  * Converts Coze enrichment data into a structured Chinese resource context string.
@@ -112,9 +163,10 @@ function buildPrePlan({ message, city, constraints }) {
  * @param {string} city        Destination city name
  * @param {string} message     Original user message (for pace hint detection)
  * @param {object} constraints Extracted constraints (unused, reserved for future)
+ * @param {string} intentAxis  "food"|"activity"|"stay"|"travel" (P8.7)
  * @returns {string}           Formatted resource context block
  */
-function buildResourceContext(cozeData, city, message, constraints) {
+function buildResourceContext(cozeData, city, message, constraints, intentAxis) {
   if (!cozeData) return "";
   const dest = city || "目的地";
   const lines = [`【实时资源池·${dest}】`];
@@ -148,6 +200,13 @@ function buildResourceContext(cozeData, city, message, constraints) {
     lines.push(`• 人群特殊需求：${paceHints.join("；")}`);
   if (cozeData._synthetic)
     lines.push("（以上数据为智能模拟，实时数据将在正式接入后替换）");
+
+  // P8.7: Real item inventory — real shop/attraction names + photo URLs
+  const inventoryBlock = buildInventoryContext(cozeData, dest, intentAxis);
+  if (inventoryBlock) {
+    lines.push("");
+    lines.push(inventoryBlock);
+  }
 
   return lines.join("\n");
 }
@@ -471,6 +530,7 @@ module.exports = {
   configure,
   isComplexItinerary,
   buildPrePlan,
+  buildInventoryContext,
   buildResourceContext,
   generateCrossXResponse,
 };

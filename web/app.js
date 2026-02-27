@@ -6826,10 +6826,15 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
   const statusBarId = `cx-sb-${cardId}-${idx}`;
   const cardCls = `cx-list-card${isRec ? " cx-list-card--rec" : ""}`;
 
-  // Image: prefer hero → city photo → styled cover with intent-aware icon
-  const heroUrl    = p.hotel?.hero_image || "";
-  const fallbackUrl = _getCityHeroUrl(dest);
-  const coverLabel  = escapeHtml(isFoodCard ? (p.name || dest || "") : (dest || p.hotel?.name || ""));
+  // Image: food_only → real dish photo (real_photo_url / food_image) → curated food fallback
+  //        others  → hotel hero → city Unsplash photo → styled cover
+  // "深圳酒店大图" can NEVER leak into a food card because heroUrl skips hotel fields.
+  const FOOD_FALLBACK_URL = "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=800&q=80"; // street food
+  const heroUrl = isFoodCard
+    ? (p.real_photo_url || p.food_image || p.item_image || "")   // real Coze photo first
+    : (p.hotel?.hero_image || "");                                 // hotel image only for non-food
+  const fallbackUrl = isFoodCard ? FOOD_FALLBACK_URL : _getCityHeroUrl(dest);
+  const coverLabel  = escapeHtml(isFoodCard ? (p.name || p.restaurant_name || dest || "") : (dest || p.hotel?.name || ""));
   const coverHtml  = `<div class="cx-lc-img-cover">
        <span class="cx-cover-city">${coverLabel}</span>
        <span style="font-size:20px">${coverIcon}</span>
@@ -8065,22 +8070,14 @@ async function createTaskFromText(text) {
         signal: _planStreamSignal,
         onStatusUpdate: (code, label) => {
           appendThinkingStep(_thinkingStream, code, label);
-          // P8.6: tool_call signal → TOOL_SIGNAL_MAP (intent-aware, never shows wrong tool text)
-          if (code.startsWith("TOOL:")) {
-            const fn = TOOL_SIGNAL_MAP[code.slice(5)];
-            applyThinkingIndicatorState(true, fn ? fn() : label || pickText("AI 处理中...", "AI processing...", "AI 処理中...", "AI 처리 중..."));
-            return;
-          }
-          const auraLabels = {
-            INIT:     pickText("正在理解需求...", "Analyzing request...", "リクエスト解析中...", "요청 분석 중..."),
-            H_SEARCH: pickText("正在查询酒店...", "Searching hotels...", "ホテルを検索中...", "호텔 검색 중..."),
-            T_CALC:   pickText("正在核算交通费用...", "Calculating transport...", "交通費を計算中...", "교통비 계산 중..."),
-            B_CHECK:  pickText("正在锁定最优预算...", "Locking best budget...", "最適予算を確定中...", "최적 예산 확정 중..."),
-            FX_FETCH: pickText("正在调取实时汇率...", "Fetching real-time FX rates...", "為替レートを取得中...", "환율 조회 중..."),
-            COUPON:   pickText("正在匹配专属优惠券...", "Matching exclusive vouchers...", "クーポンを検索中...", "쿠폰 검색 중..."),
-            XHS_SCAN: pickText("正在匹配真实旅行评价...", "Scanning authentic reviews...", "口コミを取得中...", "리뷰 스캔 중..."),
-          };
-          applyThinkingIndicatorState(true, auraLabels[code] || label || "");
+          // P8.7: Unified REALTIME_THINKING_MAP — no fixed hotel/generic text ever.
+          // Context extracted once from the user's message (closure over `text`).
+          const _dest   = _extractDestFromText(text);
+          const _foodKw = _extractFoodKw(text);
+          const _toolName = code.startsWith("TOOL:") ? code.slice(5) : code;
+          const fn = REALTIME_THINKING_MAP[_toolName];
+          applyThinkingIndicatorState(true,
+            fn ? fn(_dest, _foodKw) : label || pickText("AI 处理中...", "AI processing...", "AI 処理中...", "AI 처리 중..."));
         },
         onThinking: (chunk) => {
           if (!_thinkingPanel) _thinkingPanel = createThinkingPanel();
@@ -12864,19 +12861,50 @@ const PLAN_STEPS = [
   { id: "B_CHECK",  icon: "💰" },
 ];
 
-// P8.6 Tool signal map — maps Coze/backend tool_name to intent-aware aura text.
-// Each value is a thunk (function) so pickText() runs at call time (after i18n ready).
-const TOOL_SIGNAL_MAP = {
-  search_hotels:      () => pickText("正在搜罗特色住宿...",    "Scouting unique stays...",          "ユニークな宿を探索中...",      "숙소 탐색 중..."),
-  search_restaurants: () => pickText("正在探索本地美食...",    "Discovering local cuisine...",      "地元グルメを探索中...",         "로컬 맛집 탐색 중..."),
-  check_queue:        () => pickText("正在探测实时等位...",    "Checking live wait times...",       "リアルタイム待ち時間確認中...",  "실시간 대기 시간 확인 중..."),
-  check_tickets:      () => pickText("正在查询景点余票...",    "Checking ticket availability...",   "チケット在庫を確認中...",       "티켓 재고 확인 중..."),
-  fetch_fx_rates:     () => pickText("正在调取实时汇率...",    "Fetching live FX rates...",         "為替レートを取得中...",         "환율 조회 중..."),
-  search_attractions: () => pickText("正在挖掘隐藏景点...",    "Unearthing hidden gems...",         "隠れた名所を発見中...",         "숨겨진 명소 발굴 중..."),
-  match_coupons:      () => pickText("正在匹配专属优惠...",    "Matching exclusive deals...",       "限定クーポンを取得中...",       "전용 혜택 검색 중..."),
-  plan_transport:     () => pickText("正在规划交通路线...",    "Plotting the best route...",        "最適ルートを計算中...",         "최적 경로 계획 중..."),
-  verify_budget:      () => pickText("正在精算最优预算...",    "Optimizing your budget...",         "予算を最適化中...",             "예산 최적화 중..."),
+// P8.7 Unified real-time thinking map — handles BOTH SSE tool_call events AND
+// backend status codes. Values are thunks: (dest, foodKw) => string.
+// Rules: (1) No hardcoded hotel/generic text when user asks about food.
+//        (2) dest + foodKw injected at call-time for city-specific copy.
+const REALTIME_THINKING_MAP = {
+  // ── Backend status codes ─────────────────────────────────────────────────
+  INIT:     (d, f) => f
+    ? pickText(`正在解析${d}${f}偏好...`,      `Parsing ${d} food preferences...`,          `${d}の${f}好みを解析中...`,       `${d} ${f} 취향 분석 중...`)
+    : pickText("正在理解需求...",              "Analyzing request...",                      "リクエスト解析中...",             "요청 분석 중..."),
+  H_SEARCH: (d, f) => f
+    ? pickText(`搜寻${d}${f}`,                 `Hunting ${d} ${f}`,                         `${d}の${f}を探索中`,              `${d} ${f} 탐색 중`)
+    : pickText(`搜罗${d}特色住宿`,             `Scouting ${d} stays`,                       `${d}の宿を探索中`,                `${d} 숙소 탐색 중`),
+  T_CALC:   (d, f) => f
+    ? pickText(`规划${d}美食打卡路线`,         `Mapping ${d} food trail`,                   `${d}グルメルートを計画中`,        `${d} 맛집 경로 계획 중`)
+    : pickText("正在核算交通费用...",          "Calculating transport...",                  "交通費を計算中...",               "교통비 계산 중..."),
+  B_CHECK:  (d, f) => f
+    ? pickText(`精算${d}人均餐饮消费`,         `Budgeting ${d} per-person dining`,          `${d}の一人あたり飲食費を計算中`,  `${d} 1인 식비 계산 중`)
+    : pickText("正在锁定最优预算...",          "Locking best budget...",                    "最適予算を確定中...",             "최적 예산 확정 ���..."),
+  // ── Coze tool_call names ─────────────────────────────────────────────────
+  search_restaurants:          (d) => pickText(`搜寻${d}本地必吃老字号`,    `Hunting ${d} must-eat spots`,       `${d}の必食店を探索中`,     `${d} 필수 맛집 탐색 중`),
+  check_restaurant_queue:      (d) => pickText(`实时探测${d}餐厅排队强度`, `Checking ${d} restaurant queues`,   `${d}の待ち時間を確認中`,   `${d} 대기 시간 확인 중`),
+  search_attractions:          (d) => pickText(`挖掘${d}符合你口味的景点`, `Finding ${d} gems for you`,         `${d}のあなた向け名所を発見中`, `${d} 맞춤 명소 발굴 중`),
+  generate_creative_itinerary: (d) => pickText(`规划${d}避开人流专属动线`, `Plotting ${d} crowd-free route`,    `${d}の穴場ルートを計画中`, `${d} 한산한 경로 계획 중`),
+  search_hotels:               (d) => pickText(`搜罗${d}特色住宿`,         `Scouting ${d} unique stays`,        `${d}のユニークな宿を探索中`, `${d} 특색 숙소 탐색 중`),
+  check_tickets:               (d) => pickText(`查询${d}景点余票`,         `Checking ${d} ticket availability`, `${d}のチケット在庫を確認中`, `${d} 티켓 재고 확인 중`),
+  fetch_fx_rates:              ()  => pickText("调取实时汇率...",           "Fetching live FX rates...",         "為替レートを取得中...",    "환율 조회 중..."),
+  match_coupons:               (d) => pickText(`匹配${d}专属优惠`,         `Matching ${d} exclusive deals`,     `${d}の限定特典を取得中`,   `${d} 전용 혜택 검색 중`),
+  plan_transport:              (d) => pickText(`规划${d}交通路线`,          `Plotting ${d} best route`,          `${d}のルートを最適化中`,   `${d} 경로 계획 중`),
+  verify_budget:               ()  => pickText("精算最优预算...",           "Optimizing budget...",              "予算を最適化中...",        "예산 최적화 중..."),
 };
+
+// Helper: extract destination city from user message (inline, no regex import needed)
+function _extractDestFromText(msg) {
+  const CITIES = ["北京","上海","广州","深圳","成都","西安","杭州","南京","武汉","重庆","厦门","三亚","丽江","桂林","拉萨","乌鲁木齐","苏州","青岛","大理","张家界","黄山","敦煌"];
+  return CITIES.find((c) => msg.includes(c)) || getCurrentCity() || "";
+}
+
+// Helper: extract specific food keyword from message (e.g. "肉夹馍" from "想吃肉夹馍")
+function _extractFoodKw(msg) {
+  const m = msg.match(/[^\s，。！？,!?]{2,6}(?:饭|菜|面|馍|泡馍|凉皮|肠粉|火锅|烤肉|串|烧烤|小吃|海鲜|烤鸭|粥|汤|饺子|丸子|炒饭|米粉|螺蛳粉)/);
+  if (m) return m[0];
+  if (/餐厅|美食|好吃|吃遍|推荐.*吃/.test(msg)) return pickText("特色小吃", "local food", "地元グルメ", "현지 음식");
+  return null;
+}
 const STEP_ORDER = PLAN_STEPS.map((s) => s.id);
 
 /** Create the thinking-stream timeline and append to chatFeed. Returns root el. */
