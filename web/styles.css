@@ -1266,8 +1266,8 @@ body.single-dialog-mode #chatTab {
 body.single-dialog-mode #chatFeed {
   margin: 0;
   min-height: 0;
-  max-height: calc(100dvh - 280px);
-  overflow: auto;
+  max-height: none;
+  overflow: visible;
   border-radius: 18px;
   border: 1px solid #c9dceb;
   box-shadow: 0 14px 30px rgba(16, 46, 71, 0.1);
@@ -2274,7 +2274,7 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 /* ── 3-Plan Option Cards (Horizontal Scroll) ─────────────────────────────── */
 .opt-cards-scroll {
   display: flex;
-  gap: 12px;
+  gap: 24px;
   overflow-x: auto;
   padding-bottom: 10px;
   scroll-snap-type: x mandatory;
@@ -2285,7 +2285,7 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 .opt-cards-scroll::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.12); border-radius: 2px; }
 .opt-card {
   flex: none;
-  width: 240px;
+  width: 260px;
   background: #fff;
   border: 1.5px solid var(--color-border);
   border-radius: 16px;
@@ -2294,9 +2294,11 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   display: flex;
   flex-direction: column;
   position: relative;
-  transition: box-shadow 0.2s, transform 0.2s;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+  transition: box-shadow 0.22s, transform 0.22s;
 }
-.opt-card:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,0.08); }
+.opt-card:hover { transform: translateY(-4px); box-shadow: 0 12px 32px rgba(0,0,0,0.14); }
 .opt-card--recommended {
   border-color: #2d87f0;
   box-shadow: 0 0 0 1px #2d87f0;
@@ -2340,11 +2342,11 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   margin-top: 2px;
 }
 .opt-card-body {
-  padding: 12px 14px;
+  padding: 14px 16px 8px;
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
 }
 .opt-section-label {
   font-size: 9px;
@@ -2430,10 +2432,9 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   width: 6px; height: 6px; border-radius: 50%; display: inline-block; flex-shrink: 0;
 }
 .opt-card-footer {
-  padding: 10px 14px 14px;
+  padding: 10px 16px 16px;
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 .opt-detail-btn {
   width: 100%;
@@ -3312,6 +3313,168 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 .step-progress-item.step-active .step-icon  { opacity: 1; }
 .step-progress-item.step-active .step-label { color: #2563eb; font-weight: 700; }
 
+/* ── P2: Thinking Stream ─────────────────────────────────────────────────── */
+.cx-thinking-stream {
+  background: #f8faff;
+  border: 1px solid #dbeafe;
+  border-radius: 16px;
+  padding: 14px 16px 12px;
+  max-width: 340px;
+  margin: 8px 0 4px;
+  animation: fadeInScale 0.22s ease forwards;
+}
+.cx-ts-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #2563eb;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.cx-ts-ping {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #3b82f6;
+  box-shadow: 0 0 0 0 rgba(59,130,246,0.5);
+  animation: cxPing 1.4s ease-in-out infinite;
+  flex-shrink: 0;
+}
+@keyframes cxPing {
+  0%   { box-shadow: 0 0 0 0   rgba(59,130,246,0.5); }
+  70%  { box-shadow: 0 0 0 8px rgba(59,130,246,0); }
+  100% { box-shadow: 0 0 0 0   rgba(59,130,246,0); }
+}
+.cx-ts-list { display: flex; flex-direction: column; gap: 9px; }
+.cx-ts-step {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; transition: opacity 0.2s;
+}
+.cx-ts-step.pending { opacity: 0.38; }
+.cx-ts-step.active  { opacity: 1; }
+.cx-ts-step.done    { opacity: 0.72; }
+.cx-ts-icon { font-size: 13px; flex-shrink: 0; }
+.cx-ts-label {
+  flex: 1;
+  color: #374151;
+  font-weight: 500;
+  transition: color 0.2s;
+}
+.cx-ts-step.active .cx-ts-label { color: #2563eb; }
+.cx-ts-step.done   .cx-ts-label { color: #6b7280; }
+.cx-ts-state {
+  font-size: 11px; min-width: 18px; text-align: right;
+  color: #10b981; font-weight: 700;
+}
+/* pulsing activity dot for active step */
+.cx-ts-pulse {
+  display: inline-block;
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #3b82f6;
+  animation: cxPulse 0.9s ease-in-out infinite;
+}
+@keyframes cxPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.35; transform: scale(0.7); }
+}
+
+/* ── P2: Plan Skeleton ────────────────────────────────────────────────────── */
+.cx-plan-skeleton {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  max-width: 560px;
+  margin: 4px 0 8px;
+  animation: fadeInScale 0.25s ease forwards;
+}
+.cx-skel-col {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 14px 12px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.cx-skel-block {
+  border-radius: 8px;
+  background: linear-gradient(90deg, #f0f0f0 25%, #e0e8ff 50%, #f0f0f0 75%);
+  background-size: 200% 100%;
+  animation: cxShimmer 1.6s infinite linear;
+}
+.cx-skel-h1 { height: 14px; width: 80%; }
+.cx-skel-h2 { height: 20px; width: 55%; }
+.cx-skel-h3 { height: 10px; width: 90%; }
+@keyframes cxShimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ── P2: Fade-out for teardown ──────────────────────────────────────────── */
+.cx-fadeout {
+  animation: cxFadeOut 0.28s ease forwards;
+}
+@keyframes cxFadeOut {
+  to { opacity: 0; transform: translateY(-6px); }
+}
+
+/* ── P2: Session Memory Badge ───────────────────────────────────────────── */
+.cx-session-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px 3px 6px;
+  border-radius: 999px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  font-size: 11px;
+  color: #15803d;
+  font-weight: 600;
+  cursor: default;
+  transition: opacity 0.2s;
+  margin-right: 6px;
+}
+.cx-session-badge.hidden { display: none; }
+.cx-session-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: #22c55e;
+  animation: cxPulse 1.4s ease-in-out infinite;
+}
+
+/* ── P2: Boundary Rejection Card ────────────────────────────────────────── */
+.cx-boundary-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: #fff5f5;
+  border: 1px solid #fca5a5;
+  border-left: 4px solid #ef4444;
+  border-radius: 14px;
+  padding: 14px 16px;
+  max-width: 420px;
+  margin: 8px 0;
+  animation: cxSlideIn 0.2s ease forwards;
+}
+@keyframes cxSlideIn {
+  from { opacity: 0; transform: translateX(-8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.cx-boundary-icon { font-size: 20px; flex-shrink: 0; line-height: 1; }
+.cx-boundary-body { display: flex; flex-direction: column; gap: 10px; }
+.cx-boundary-text { font-size: 13px; color: #7f1d1d; margin: 0; line-height: 1.5; }
+.cx-boundary-reset {
+  align-self: flex-start;
+  font-size: 12px;
+  font-weight: 600;
+  color: #b91c1c;
+  background: #fee2e2;
+  border: 1px solid #fca5a5;
+  border-radius: 8px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.cx-boundary-reset:hover { background: #fecaca; }
+
 .step-check {
   font-size: 12px;
   color: #10b981;
@@ -4031,4 +4194,1315 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 @keyframes cursor-blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
+}
+
+/* ── P3: Rich Hotel Card — hero image, rating, guest review, book CTA ─────── */
+.opt-hero-img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  height: auto;
+  object-fit: cover;
+  display: block;
+  border-radius: 0;
+  flex-shrink: 0;
+}
+/* AI quip on summary card */
+.opt-ai-quip {
+  font-size: 11px;
+  color: #6b7280;
+  font-style: italic;
+  line-height: 1.4;
+  margin-top: 2px;
+}
+.opt-hotel-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 3px 0 4px;
+  font-size: 12px;
+}
+.opt-hotel-stars {
+  color: #f59e0b;
+  font-weight: 700;
+  font-size: 12px;
+}
+.opt-hotel-revcount {
+  color: #9ca3af;
+  font-size: 11px;
+}
+.opt-hotel-guestrev {
+  font-size: 11px;
+  color: #4b5563;
+  font-style: italic;
+  line-height: 1.4;
+  margin: 4px 0 10px;
+  padding: 5px 8px;
+  background: #f9fafb;
+  border-left: 3px solid #d1d5db;
+  border-radius: 0 4px 4px 0;
+}
+/* Book CTA button — replaces opt-select-btn */
+.opt-book-btn {
+  flex: 1;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  cursor: pointer;
+  border: none;
+  background: linear-gradient(135deg, #059669 0%, #10b981 100%);
+  color: #fff;
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+.opt-book-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.45);
+}
+.opt-book-btn--primary {
+  background: linear-gradient(135deg, #1d4ed8 0%, #3b82f6 100%);
+}
+.opt-book-btn--primary:hover {
+  box-shadow: 0 4px 12px rgba(59, 130, 246, 0.45);
+}
+
+/* ── P3: Mobile Carousel + Sticky Input + Bottom Sheet ───────────────────── */
+@media (max-width: 768px) {
+  /* 3-column plan cards → horizontal scroll-snap carousel */
+  .itinerary-options-grid {
+    display: flex;
+    overflow-x: auto;
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    gap: 12px;
+    padding-bottom: 8px;
+  }
+  .itinerary-options-grid::-webkit-scrollbar { display: none; }
+  .itinerary-option-card {
+    min-width: min(82vw, 300px);
+    flex-shrink: 0;
+    scroll-snap-align: start;
+  }
+
+  /* Sticky chat input bar with iOS/鸿蒙 safe-area padding */
+  body.consumer-app #chatForm {
+    position: sticky;
+    bottom: 0;
+    z-index: 10;
+    background: rgba(247, 251, 255, 0.95);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    padding-bottom: max(10px, env(safe-area-inset-bottom, 0px));
+    margin: 0 -10px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+}
+
+/* Bottom Sheet — works on all screen sizes, JS controls open/close */
+.cx-sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 1000;
+  opacity: 0;
+  transition: opacity 0.25s;
+  pointer-events: none;
+}
+.cx-sheet-backdrop.cx-sheet-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+.cx-bottom-sheet {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  max-height: 90dvh;
+  background: #fff;
+  border-radius: 20px 20px 0 0;
+  z-index: 1001;
+  transform: translateY(100%);
+  transition: transform 0.35s cubic-bezier(0.32, 0.72, 0, 1);
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 -8px 40px rgba(0, 0, 0, 0.2);
+}
+.cx-bottom-sheet.cx-sheet-open {
+  transform: translateY(0);
+}
+.cx-sheet-handle {
+  width: 36px;
+  height: 4px;
+  background: #d1d5db;
+  border-radius: 2px;
+  margin: 10px auto 0;
+  flex-shrink: 0;
+}
+.cx-sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px 10px;
+  border-bottom: 1px solid #e5e7eb;
+  flex-shrink: 0;
+}
+.cx-sheet-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+}
+.cx-sheet-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #f3f4f6;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.cx-sheet-close:hover { background: #e5e7eb; }
+.cx-sheet-body {
+  flex: 1;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 16px;
+  padding-bottom: max(20px, env(safe-area-inset-bottom, 0px));
+}
+
+/* ── P4: Desktop Modal ───────────────────────────────────────────────────── */
+.cx-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  z-index: 1000;
+  opacity: 0;
+  transition: opacity 0.25s;
+  pointer-events: none;
+}
+.cx-modal-backdrop.cx-modal-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+.cx-modal {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -48%) scale(0.96);
+  opacity: 0;
+  transition: transform 0.32s cubic-bezier(0.32, 0.72, 0, 1), opacity 0.25s;
+  width: min(560px, 94vw);
+  max-height: 85dvh;
+  background: #fff;
+  border-radius: 20px;
+  z-index: 1001;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.25);
+}
+.cx-modal.cx-modal-open {
+  transform: translate(-50%, -50%) scale(1);
+  opacity: 1;
+}
+.cx-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px 12px;
+  border-bottom: 1px solid #e5e7eb;
+  flex-shrink: 0;
+  gap: 8px;
+}
+.cx-modal-hleft {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+.cx-modal-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #111827;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cx-modal-back {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #f3f4f6;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  flex-shrink: 0;
+  color: #374151;
+  transition: background 0.15s;
+}
+.cx-modal-back:hover { background: #e5e7eb; }
+
+/* ── Two-panel slide system (60FPS, cubic-bezier damping) ─────────────────── */
+.cx-modal-slides {
+  display: flex;
+  width: 200%;
+  flex: 1;
+  min-height: 0;
+  transition: transform 0.38s cubic-bezier(0.32, 0.72, 0, 1);
+  will-change: transform;
+}
+.cx-modal-slides.slide-checkout {
+  transform: translateX(-50%);
+}
+.cx-modal-slide {
+  width: 50%;
+  flex-shrink: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ── P5: Checkout Panel ───────────────────────────────────────────────────── */
+.cx-checkout {
+  display: flex;
+  flex-direction: column;
+  padding: 18px;
+  gap: 14px;
+}
+.cx-co-summary { display: flex; flex-direction: column; gap: 4px; }
+.cx-co-hotel {
+  font-size: 15px;
+  font-weight: 700;
+  color: #111827;
+  line-height: 1.3;
+}
+.cx-co-meta { font-size: 12px; color: #6b7280; }
+.cx-co-divider { height: 1px; background: #f3f4f6; }
+.cx-co-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.cx-co-table thead th {
+  text-align: left;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #9ca3af;
+  padding: 0 0 8px;
+}
+.cx-co-table tbody td {
+  padding: 6px 0;
+  border-bottom: 1px solid #f9fafb;
+  color: #374151;
+}
+.cx-co-table tfoot td {
+  padding: 10px 0 0;
+  font-weight: 700;
+  color: #111827;
+  font-size: 14px;
+}
+.cx-co-label { flex: 1; }
+.cx-co-cny   { text-align: right; padding-right: 12px; white-space: nowrap; }
+.cx-co-fx    { text-align: right; color: #6b7280; white-space: nowrap; }
+.cx-co-total-fx { color: #374151; font-weight: 700; }
+
+/* Apple Pay-style payment button */
+.cx-pay-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  padding: 14px 20px;
+  border-radius: 14px;
+  background: #111827;
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  transition: transform 0.12s, filter 0.12s;
+  margin-top: 4px;
+}
+.cx-pay-btn:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.15);
+}
+.cx-pay-btn:active { transform: translateY(0); filter: brightness(0.92); }
+.cx-pay-lock  { font-size: 16px; }
+.cx-pay-label { flex: 1; text-align: center; }
+.cx-pay-arrow { opacity: 0.6; }
+.cx-pay-trust {
+  font-size: 11px;
+  color: #9ca3af;
+  text-align: center;
+  line-height: 1.4;
+}
+/* Why recommend section */
+.cx-detail-why {
+  background: linear-gradient(135deg, #eff6ff 0%, #f0fdf4 100%);
+  border-radius: 10px;
+  padding: 12px 14px;
+  font-size: 12.5px;
+  color: #1e40af;
+  line-height: 1.6;
+}
+.cx-detail-why-label {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #3b82f6;
+  margin-bottom: 5px;
+}
+
+/* ── P4: Plan Detail Content (shared by Modal + Sheet) ───────────────────── */
+.cx-plan-detail { display: flex; flex-direction: column; }
+.cx-detail-hero {
+  width: 100%;
+  height: 220px;
+  object-fit: cover;
+  display: block;
+  flex-shrink: 0;
+}
+.cx-detail-body {
+  padding: 16px 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cx-detail-hotel-name {
+  font-size: 17px;
+  font-weight: 700;
+  color: #111827;
+  line-height: 1.3;
+}
+.cx-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.cx-detail-divider {
+  height: 1px;
+  background: #f3f4f6;
+  margin: 2px 0;
+}
+.cx-detail-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #9ca3af;
+  margin-top: 4px;
+}
+.cx-detail-transport {
+  font-size: 13px;
+  color: #374151;
+  line-height: 1.6;
+}
+.cx-detail-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+.cx-detail-itin-btn {
+  flex: 1;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  background: transparent;
+  color: #2d87f0;
+  border: 1.5px solid #93c5fd;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.cx-detail-itin-btn:hover { background: #eff6ff; }
+.cx-detail-book-btn {
+  flex: 1;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 700;
+  background: linear-gradient(135deg, #059669, #10b981);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  transition: transform 0.12s, box-shadow 0.12s;
+}
+.cx-detail-book-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.45);
+}
+
+/* ── Language switch smooth fade ─────────────────────────────────────────── */
+@keyframes cx-lang-in {
+  from { opacity: 0.55; }
+  to   { opacity: 1;    }
+}
+.cx-lang-anim {
+  animation: cx-lang-in 0.22s ease forwards;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   P6: Vertical List Cards · Advanced Loading · Multi-step Payment Flow
+   ══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Vertical Plan List Container ────────────────────────────────────────── */
+.cx-plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+/* ── List Card (full-width horizontal layout) ────────────────────────────── */
+.cx-list-card {
+  display: flex;
+  flex-direction: row;
+  background: #fff;
+  border: 1.5px solid var(--color-border);
+  border-radius: 16px;
+  overflow: hidden;
+  cursor: pointer;
+  position: relative;
+  min-height: 164px;
+  transition: box-shadow 0.22s, transform 0.22s;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+}
+.cx-list-card:hover { transform: translateY(-2px); box-shadow: 0 8px 28px rgba(0,0,0,0.13); }
+.cx-list-card--rec      { border-color: #2d87f0; box-shadow: 0 0 0 1.5px #2d87f0; }
+.cx-list-card--selected { border-color: #10b981; box-shadow: 0 0 0 2px #10b981; }
+.cx-list-card--active   { box-shadow: 0 0 0 2px #2d87f0, 0 4px 20px rgba(45,135,240,0.15); }
+
+/* Left: hero image column */
+.cx-lc-img-wrap {
+  position: relative;
+  flex-shrink: 0;
+  width: 40%;
+}
+.cx-lc-img {
+  width: 100%;
+  height: 100%;
+  min-height: 164px;
+  object-fit: cover;
+  display: block;
+}
+.cx-lc-img-placeholder {
+  width: 100%;
+  min-height: 164px;
+  background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 28px;
+}
+.cx-lc-badge {
+  position: absolute;
+  top: 10px; left: 10px;
+  background: #2d87f0;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  padding: 3px 9px;
+  border-radius: 20px;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+/* Right: content body */
+.cx-lc-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 14px 48px;
+  gap: 3px;
+  min-width: 0;
+  overflow: hidden;
+}
+.cx-lc-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cx-lc-tag {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #6b7280;
+  flex-shrink: 0;
+}
+.cx-lc-price {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--color-text-primary);
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.cx-lc-price-sub {
+  font-size: 10px;
+  color: #9ca3af;
+  margin-top: 1px;
+}
+.cx-lc-hotel {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--color-text-primary);
+  line-height: 1.3;
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cx-lc-meta {
+  font-size: 11px;
+  color: #6b7280;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 6px;
+  align-items: center;
+  margin-top: 1px;
+}
+.cx-lc-analysis {
+  font-size: 11.5px;
+  color: #4b5563;
+  font-style: italic;
+  line-height: 1.5;
+  flex: 1;
+  margin-top: 5px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* Coupon / deal status bar */
+.cx-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: linear-gradient(90deg, #f0fdf4 0%, #eff6ff 100%);
+  border-radius: 8px;
+  padding: 5px 10px;
+  margin-top: 6px;
+  font-size: 10.5px;
+  color: #059669;
+  font-weight: 600;
+}
+.cx-sb-icon { font-size: 13px; flex-shrink: 0; line-height: 1; }
+
+/* CTA button — absolute, bottom-right corner */
+.cx-lc-cta {
+  position: absolute;
+  bottom: 12px; right: 12px;
+  padding: 7px 14px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  border: none;
+  background: linear-gradient(135deg, #059669 0%, #10b981 100%);
+  color: #fff;
+  transition: transform 0.12s, box-shadow 0.12s;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
+}
+.cx-list-card--rec .cx-lc-cta {
+  background: linear-gradient(135deg, #1d4ed8 0%, #3b82f6 100%);
+}
+.cx-lc-cta:hover { transform: translateY(-1px); box-shadow: 0 4px 14px rgba(16,185,129,0.4); }
+.cx-list-card--rec .cx-lc-cta:hover { box-shadow: 0 4px 14px rgba(59,130,246,0.4); }
+
+/* Mobile: stack image above body */
+@media (max-width: 600px) {
+  .cx-list-card         { flex-direction: column; min-height: auto; }
+  .cx-lc-img-wrap       { width: 100%; }
+  .cx-lc-img            { min-height: 0; aspect-ratio: 16/9; height: auto; }
+  .cx-lc-img-placeholder{ min-height: 120px; }
+  .cx-lc-body           { padding: 12px 12px 14px; }
+  .cx-lc-cta            { position: static; width: 100%; margin-top: 8px;
+                          border-radius: 10px; padding: 10px; text-align: center; }
+}
+
+/* ── P6: Advanced Loading — Shimmer Flow ─────────────────────────────────── */
+.cx-ai-shimmer {
+  height: 12px;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    var(--color-surface-secondary, #f3f4f6) 0%,
+    rgba(255,255,255,0.85) 40%,
+    var(--color-surface-secondary, #f3f4f6) 80%
+  );
+  background-size: 200% 100%;
+  animation: cx-shimmer 1.5s ease-in-out infinite;
+}
+.cx-ai-shimmer--mid  { width: 82%; animation-delay: 0.15s; }
+.cx-ai-shimmer--short{ width: 60%; animation-delay: 0.3s;  }
+@keyframes cx-shimmer {
+  0%   { background-position: 200% center; }
+  100% { background-position: -200% center; }
+}
+.cx-ai-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: #2d87f0;
+  font-weight: 600;
+  margin-top: 4px;
+}
+.cx-ai-status-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #2d87f0;
+  flex-shrink: 0;
+  animation: cx-dot-pulse 1s ease-in-out infinite;
+}
+@keyframes cx-dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.35; transform: scale(0.65); }
+}
+
+/* ── P6: Multi-step Payment Flow ─────────────────────────────────────────── */
+.cx-pay-step {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Payment method selection */
+.cx-payment-methods {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cx-pm-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border: 1.5px solid var(--color-border);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  -webkit-tap-highlight-color: transparent;
+}
+.cx-pm-row:hover { border-color: #2d87f0; background: #f0f8ff; }
+.cx-pm-row.cx-pm-selected { border-color: #111827; background: #f9fafb; }
+.cx-pm-icon  { font-size: 22px; flex-shrink: 0; line-height: 1; }
+.cx-pm-label { font-size: 13px; font-weight: 600; flex: 1; color: var(--color-text-primary); }
+.cx-pm-radio {
+  width: 18px; height: 18px;
+  border-radius: 50%;
+  border: 2px solid #d1d5db;
+  flex-shrink: 0;
+  transition: border-color 0.15s, background 0.15s;
+  box-sizing: border-box;
+}
+.cx-pm-row.cx-pm-selected .cx-pm-radio {
+  border-color: #111827;
+  background: #111827;
+  box-shadow: inset 0 0 0 3px #fff;
+}
+
+/* Syncing animation (step 3) */
+.cx-pay-syncing {
+  align-items: center;
+  padding: 32px 20px;
+  gap: 14px;
+  text-align: center;
+}
+.cx-pay-spinner {
+  width: 38px; height: 38px;
+  border: 3px solid #e5e7eb;
+  border-top-color: #111827;
+  border-radius: 50%;
+  animation: cx-spin 0.7s linear infinite;
+}
+@keyframes cx-spin { to { transform: rotate(360deg); } }
+.cx-pay-sync-text {
+  font-size: 13px;
+  color: #374151;
+  font-weight: 500;
+  line-height: 1.6;
+}
+.cx-pay-sync-sub {
+  font-size: 11px;
+  color: #9ca3af;
+}
+
+/* ── P6-B: Booking Voucher ─────────────────────────────────────────────── */
+.cx-voucher {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 20px 20px;
+  gap: 12px;
+  text-align: center;
+  animation: cx-voucher-in 0.35s ease;
+}
+@keyframes cx-voucher-in {
+  from { opacity: 0; transform: scale(0.92); }
+  to   { opacity: 1; transform: scale(1);    }
+}
+.cx-voucher-check {
+  width: 48px; height: 48px;
+  border-radius: 50%;
+  background: #d1fae5;
+  color: #059669;
+  font-size: 22px;
+  line-height: 48px;
+  text-align: center;
+  font-weight: 700;
+}
+.cx-voucher-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: #111827;
+}
+.cx-voucher-qr {
+  width: 110px; height: 110px;
+  border: 2px solid #e5e7eb;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f9fafb;
+  position: relative;
+}
+.cx-voucher-qr::before,
+.cx-voucher-qr::after {
+  content: "";
+  position: absolute;
+  border: 3px solid #111827;
+  border-radius: 4px;
+  width: 20px; height: 20px;
+}
+.cx-voucher-qr::before { top: 8px; left: 8px; }
+.cx-voucher-qr::after  { bottom: 8px; right: 8px; }
+.cx-voucher-qr-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+.cx-voucher-qr-logo {
+  font-size: 20px;
+  font-weight: 900;
+  color: #111827;
+  letter-spacing: -1px;
+}
+.cx-voucher-qr-ref {
+  font-size: 8px;
+  font-family: monospace;
+  color: #6b7280;
+  letter-spacing: 0.5px;
+}
+.cx-voucher-rows {
+  width: 100%;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+}
+.cx-voucher-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 12px;
+  border-bottom: 1px solid #f3f4f6;
+}
+.cx-voucher-row:last-child { border-bottom: none; }
+.cx-voucher-row span { color: #6b7280; }
+.cx-voucher-row strong { color: #111827; font-weight: 600; }
+.cx-voucher-note {
+  font-size: 11px;
+  color: #6b7280;
+  text-align: center;
+  line-height: 1.5;
+  padding: 0 4px;
+}
+
+/* ── P6.3: Language-switch smooth refresh ────────────────────────────────── */
+.cx-plan-list {
+  transition: filter 0.28s ease, opacity 0.28s ease;
+}
+.cx-smooth-refresh {
+  filter: blur(4px);
+  opacity: 0.6;
+}
+
+/* ── P6.4: Mini-itinerary timeline inside list card ─────────────────────── */
+.cx-mini-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid #f3f4f6;
+}
+.cx-mt-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #6b7280;
+  position: relative;
+}
+.cx-mt-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: #d1d5db;
+  margin-top: 3px;
+  flex-shrink: 0;
+  transition: background 0.3s ease, transform 0.3s ease;
+}
+.cx-list-card--rec .cx-mt-dot {
+  background: #111827;
+}
+/* Breathing animation synced to rec card glow */
+@keyframes cx-dot-breathe {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50%       { transform: scale(1.4); opacity: 0.7; }
+}
+.cx-list-card--rec .cx-mt-dot {
+  animation: cx-dot-breathe 2.5s ease-in-out infinite;
+}
+.cx-mt-line {
+  position: absolute;
+  left: 3px;
+  top: 12px;
+  bottom: -6px;
+  width: 1px;
+  background: #e5e7eb;
+}
+.cx-mt-row:last-child .cx-mt-line { display: none; }
+.cx-mt-label {
+  font-weight: 600;
+  color: #9ca3af;
+  font-size: 10px;
+  min-width: 28px;
+  flex-shrink: 0;
+}
+.cx-mt-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  max-width: 130px;
+}
+
+/* ── P6.4: Image fallback cover ─────────────────────────────────────────── */
+.cx-lc-img-cover {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 4px;
+  background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+  color: #94a3b8;
+  font-size: 11px;
+  text-align: center;
+  padding: 8px;
+  box-sizing: border-box;
+}
+.cx-lc-img-cover .cx-cover-city {
+  font-size: 13px;
+  font-weight: 700;
+  color: #f1f5f9;
+  letter-spacing: 0.5px;
+}
+
+/* ── P7-Step3: Apple Intelligence Aurora — rotating multi-color conic glow ── */
+
+/* Animatable custom property for the conic-gradient angle                    */
+@property --cx-aura-a {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+
+/* Spin the gradient angle                                                     */
+@keyframes cx-aurora-spin {
+  to { --cx-aura-a: 360deg; }
+}
+/* Breathe the intensity — subtle opacity pulse layered on top of spin         */
+@keyframes cx-aurora-pulse {
+  0%, 100% { opacity: 0.72; }
+  50%       { opacity: 1; }
+}
+/* Dot still breathes in sync                                                  */
+@keyframes cx-dot-breathe-v2 {
+  0%, 100% { transform: scale(1);   opacity: 1; }
+  50%       { transform: scale(1.5); opacity: 0.65; }
+}
+
+/* Card positioning shell                                                       */
+.cx-list-card--rec {
+  position: relative;
+  isolation: isolate;
+  overflow: visible !important;
+  /* Remove old single-color box-shadow animation */
+  animation: none !important;
+  box-shadow: none !important;
+}
+
+/* Layer 1 — rotating aurora ring                                               */
+.cx-list-card--rec::before {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 20px;
+  z-index: -1;
+  background: conic-gradient(
+    from var(--cx-aura-a),
+    #a855f7 0%,
+    #ec4899 20%,
+    #f97316 38%,
+    #3b82f6 58%,
+    #06b6d4 76%,
+    #a855f7 100%
+  );
+  animation:
+    cx-aurora-spin  6s linear        infinite,
+    cx-aurora-pulse 3s ease-in-out   infinite;
+  filter: blur(2px);
+}
+
+/* Layer 2 — white mask so the aurora only shows as a border                   */
+.cx-list-card--rec::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 17px;
+  z-index: -1;
+  background: #fff;
+}
+
+/* Dots in the mini-timeline breathe with new animation                        */
+.cx-list-card--rec .cx-mt-dot {
+  animation: cx-dot-breathe-v2 3s ease-in-out infinite;
+}
+
+/* ── P7-Step1: Unified 44×44 input-dock button system ───────────────────────
+   Scope: only inside the .input-dock form so global icon-btn / intercom-btn
+   remain unchanged for any other usage in the page.
+   All three buttons (translate, voice, send) share identical box geometry.
+── */
+.input-dock {
+  align-items: center;        /* vertically center all items as one row */
+}
+
+/* Translate & any future icon-btn inside the dock */
+.input-dock .icon-btn {
+  width:        44px !important;
+  height:       44px !important;
+  min-width:    44px !important;
+  border-radius: 12px !important;   /* pill → rounded-square */
+  flex-shrink: 0;
+}
+
+/* Voice / microphone button */
+.input-dock .intercom-btn {
+  width:        44px !important;
+  height:       44px !important;
+  min-width:    44px !important;
+  border-radius: 12px !important;
+  flex-shrink: 0;
+}
+
+/* Send button — fixed height matches icon buttons; width auto by text */
+.input-dock #chatSendBtn {
+  height:       44px !important;
+  min-width:    44px;
+  padding:      0 18px;
+  flex-shrink:  0;
+  border-radius: 12px !important;
+  font-size:    14px;
+  font-weight:  600;
+  letter-spacing: 0.3px;
+}
+
+/* Equal gap between all dock children */
+.input-dock { gap: 8px !important; }
+
+/* ── P7-Step2: Auto-height + overflow fix for list cards ─────────────────────
+   Root cause: .cx-lc-body had overflow:hidden which clipped mini-timeline,
+   analysis text, and long hotel names. Fix: allow body to grow naturally.
+── */
+
+/* Card: explicit height: auto so content drives height */
+.cx-list-card {
+  height: auto !important;
+  min-height: 180px;
+}
+
+/* Body: let content breathe — overflow:hidden was clipping mini-timeline */
+.cx-lc-body {
+  overflow: visible !important;
+  padding-bottom: 52px;   /* safe clearance for absolute CTA (was 48px) */
+}
+
+/* Image wrap: stretch full card height */
+.cx-lc-img-wrap {
+  align-self: stretch;
+  min-height: 180px;
+}
+
+/* Image: cover the full wrap height regardless of card expansion */
+.cx-lc-img,
+.cx-lc-img-cover,
+.cx-lc-img-placeholder {
+  min-height: 180px;
+  height: 100%;
+}
+
+/* Mini-timeline text: allow wrap so it doesn't overflow */
+.cx-mt-text {
+  max-width: none !important;   /* remove 130px cap that was clipping */
+  white-space: normal;
+  word-break: break-all;
+}
+
+/* Analysis text: allow wrap */
+.cx-lc-analysis {
+  white-space: normal !important;
+  overflow: visible !important;
+  -webkit-line-clamp: unset !important;
+  display: block !important;
+}
+
+/* ── P8: 衣食住行 Detail Itinerary Components ──────────────────────────────── */
+
+/* Intercity transport banner (flight/HSR between cities) */
+.act-intercity {
+  margin: 4px 0 12px;
+  padding: 10px 12px;
+  background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
+  border-left: 3px solid #2d87f0;
+  border-radius: 10px;
+}
+.act-intercity-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #1e40af;
+}
+.act-intercity-icon { font-size: 17px; }
+.act-intercity-route { flex: 1; }
+.act-intercity-cost {
+  font-size: 12px;
+  font-weight: 700;
+  color: #2d87f0;
+  background: rgba(45,135,240,0.12);
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+.act-intercity-detail {
+  margin-top: 5px;
+  font-size: 12px;
+  color: #374151;
+  line-height: 1.4;
+}
+.act-intercity-tip {
+  margin-top: 3px;
+  font-size: 11px;
+  color: #6b7280;
+}
+
+/* Transit strip — how to get from one activity to the next */
+.act-transit {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 4px 5px 16px;
+  font-size: 11px;
+  color: #9ca3af;
+  border-left: 1.5px dashed #d1d5db;
+  margin-left: 20px;
+  margin-bottom: 2px;
+  line-height: 1.3;
+}
+
+/* Time-of-day badge inside activity name row */
+.act-time-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  color: #6b7280;
+  background: #f3f4f6;
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
+/* Duration indicator */
+.act-duration {
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 2px;
+}
+
+/* Free-entry cost label */
+.act-cost--free {
+  color: #10b981 !important;
+  font-size: 11px !important;
+}
+
+/* Hotel stay card at bottom of each day */
+.act-hotel-card {
+  margin: 12px 0 4px;
+  padding: 10px 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+}
+.act-hotel-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1e293b;
+}
+.act-hotel-name { flex: 1; }
+.act-hotel-type {
+  font-size: 11px;
+  color: #6b7280;
+  background: #f1f5f9;
+  padding: 2px 7px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+.act-hotel-cost {
+  font-size: 12px;
+  font-weight: 700;
+  color: #2d87f0;
+  white-space: nowrap;
+}
+.act-hotel-area {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #6b7280;
+}
+.act-hotel-tip {
+  margin-top: 3px;
+  font-size: 11px;
+  color: #6b7280;
+}
+
+/* Day budget strip at very bottom of each day panel */
+.act-day-budget {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 14px;
+  padding: 8px 12px;
+  background: #fff7ed;
+  border-radius: 10px;
+  font-size: 12px;
+}
+.act-day-budget-items {
+  color: #78350f;
+  flex: 1;
+}
+.act-day-budget-total {
+  font-weight: 700;
+  color: #ea580c;
+  margin-left: 8px;
+  white-space: nowrap;
+}
+
+/* ── P8.3 Coze real-time enrichment badges ───────────────────────────────── */
+.act-coze-queue {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+  border-radius: 8px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.act-coze-ticket {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #065f46;
+  background: #d1fae5;
+  border: 1px solid #10b981;
+  border-radius: 8px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+/* ── Plan card hero image (destination city) ─────────────────────────────── */
+.plan-card-hero {
+  position: relative;
+  width: calc(100% + 32px);   /* bleed past card padding */
+  margin: -16px -16px 14px;
+  height: 140px;
+  overflow: hidden;
+  border-radius: 14px 14px 0 0;
+  background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+}
+.plan-card-hero-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: opacity 0.4s ease;
+}
+.plan-card-hero-overlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top, rgba(0,0,0,0.72) 0%, rgba(0,0,0,0.18) 60%, transparent 100%);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 12px 14px;
+}
+.plan-card-hero-overlay .plan-card-title {
+  color: #fff !important;
+  text-shadow: 0 1px 4px rgba(0,0,0,0.5);
+  margin: 0 0 3px;
+  font-size: 15px;
+}
+.plan-card-hero-overlay .plan-card-meta {
+  color: rgba(255,255,255,0.85) !important;
+  font-size: 12px;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.4);
 }

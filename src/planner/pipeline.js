@@ -12,7 +12,7 @@
  */
 
 const { openAIRequest } = require("../ai/openai");
-const { PLANNER_SYSTEM_PROMPT, CROSS_X_SYSTEM_PROMPT, SPEAKER_SYSTEM_PROMPT } = require("./prompts");
+const { PLANNER_SYSTEM_PROMPT, buildCrossXSystemPrompt, SPEAKER_SYSTEM_PROMPT } = require("./prompts");
 const { safeParseJson, CHINA_CITIES_RE, mockAmapRouting, mockCtripHotels } = require("./mock");
 
 // ── Injected dependencies (set once at server startup) ───────────────────────
@@ -122,7 +122,7 @@ function buildPrePlan({ message, city, constraints }) {
  */
 async function generateCrossXResponse({
   message, language, city, constraints, conversationHistory,
-  apiKey, model,
+  apiKey, model, baseUrl,
   prePlan, skipSpeaker,
   cardTimeoutMs, cardMaxTokens,
   summaryOnly,
@@ -151,7 +151,7 @@ async function generateCrossXResponse({
     ].filter(Boolean).join("\n");
 
     const plannerRes = await openAIRequest({
-      apiKey, model: usedModel,
+      apiKey, model: usedModel, baseUrl,
       systemPrompt: PLANNER_SYSTEM_PROMPT,
       userContent: plannerContent,
       temperature: 0.2, maxTokens: 400, jsonMode: true, timeoutMs: 12000,
@@ -247,15 +247,22 @@ ${itineraryNote}- 天数: ${days}天, 人数: ${pax}人
 ${knowledgeContext.slice(0, 800)}
 `.trim();
 
-  const speakerCardRes = await openAIRequest({
-    apiKey, model: usedModel,
-    systemPrompt: CROSS_X_SYSTEM_PROMPT,
+  const _cardOpts = {
+    apiKey, model: usedModel, baseUrl,
+    systemPrompt: buildCrossXSystemPrompt(language),
     userContent: cardUserContent,
     temperature: 0.5,
     maxTokens: cardMaxTokens || 2200,
     jsonMode: true,
-    timeoutMs: cardTimeoutMs || 32000,
-  });
+    timeoutMs: cardTimeoutMs || 50000,   // bumped 32s → 50s
+  };
+  let speakerCardRes = await openAIRequest(_cardOpts);
+
+  // One automatic retry on empty/timeout response
+  if (!speakerCardRes.text) {
+    console.warn("[Card Generator] First attempt failed — retrying once");
+    speakerCardRes = await openAIRequest(_cardOpts);
+  }
 
   let cardData = safeParseJson(speakerCardRes.text);
   if (!cardData) console.warn("[Card Generator] Failed to parse JSON, raw:", speakerCardRes.text?.slice(0, 200));
@@ -277,7 +284,7 @@ ${knowledgeContext.slice(0, 800)}
     const hotelName = recommendedPlan?.hotel?.name || `${dest}精选酒店`;
 
     const speakerRes = await openAIRequest({
-      apiKey, model: usedModel,
+      apiKey, model: usedModel, baseUrl,
       systemPrompt: SPEAKER_SYSTEM_PROMPT,
       userContent: `
 用户需求: ${message}

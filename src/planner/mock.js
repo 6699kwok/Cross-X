@@ -51,34 +51,34 @@ function mockAmapRouting(fromCity, toCity) {
 // ── Mock Ctrip Hotels — 6 cities × 3 tiers ───────────────────────────────────
 const CTRIP_HOTELS = {
   shenzhen: [
-    { tier: "budget",   name: "汉庭酒店（深圳南山科技园店）",     price_per_night: 268,  rating: 4.4, district: "南山区",  image_keyword: "Hanting Hotel Shenzhen budget city view" },
-    { tier: "balanced", name: "深圳招商格兰云天大酒店",           price_per_night: 620,  rating: 4.7, district: "南山区",  image_keyword: "Grand Skylight Hotel Shenzhen bay view" },
-    { tier: "premium",  name: "深圳瑞吉酒店",                    price_per_night: 1980, rating: 4.9, district: "福田区",  image_keyword: "St Regis Shenzhen luxury skyline" },
+    { tier: "budget",   name: "汉庭酒店（深圳南山科技园店）",     price_per_night: 268,  rating: 4.4, review_count: "1,024 reviews", guest_review: "Clean rooms and great value near the tech park!", district: "南山区",  image_keyword: "Hanting Hotel Shenzhen budget city view",       hero_image: "https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=800&q=80" },
+    { tier: "balanced", name: "深圳招商格兰云天大酒店",           price_per_night: 620,  rating: 4.7, review_count: "2,381 reviews", guest_review: "Stunning bay views and excellent service.",        district: "南山区",  image_keyword: "Grand Skylight Hotel Shenzhen bay view",       hero_image: "https://images.unsplash.com/photo-1566073771259-c35e8d22cbee?w=800&q=80" },
+    { tier: "premium",  name: "深圳瑞吉酒店",                    price_per_night: 1980, rating: 4.9, review_count: "986 reviews",   guest_review: "Absolutely world-class luxury — worth every penny.", district: "福田区",  image_keyword: "St Regis Shenzhen luxury skyline",             hero_image: "https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=800&q=80" },
   ],
   xian: [
-    { tier: "budget",   name: "如家酒店（西安钟楼回民街店）",      price_per_night: 198,  rating: 4.3, district: "莲湖区",  image_keyword: "Home Inn Xian Bell Tower budget" },
-    { tier: "balanced", name: "西安君乐宝铂尔曼酒店",             price_per_night: 780,  rating: 4.8, district: "高新区",  image_keyword: "Pullman Xian modern hotel exterior" },
-    { tier: "premium",  name: "西安万达文华酒店",                 price_per_night: 1580, rating: 4.9, district: "曲江新区", image_keyword: "Wanda Vista Xian luxury pool" },
+    { tier: "budget",   name: "如家酒店（西安钟楼回民街店）",      price_per_night: 198,  rating: 4.3, review_count: "827 reviews",   guest_review: "Perfect location steps from the Bell Tower!",    district: "莲湖区",  image_keyword: "Home Inn Xian Bell Tower budget",             hero_image: "https://images.unsplash.com/photo-1455587734955-081b22074882?w=800&q=80" },
+    { tier: "balanced", name: "西安君乐宝铂尔曼酒店",             price_per_night: 780,  rating: 4.8, review_count: "1,645 reviews", guest_review: "Modern hotel with an amazing breakfast buffet.",  district: "高新区",  image_keyword: "Pullman Xian modern hotel exterior",          hero_image: "https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=800&q=80" },
+    { tier: "premium",  name: "西安万达文华酒店",                 price_per_night: 1580, rating: 4.9, review_count: "712 reviews",   guest_review: "Exquisite rooms and breathtaking rooftop views.", district: "曲江新区", image_keyword: "Wanda Vista Xian luxury pool",               hero_image: "https://images.unsplash.com/photo-1564501049412-61e9a8c59b4f?w=800&q=80" },
   ],
   urumqi: [
-    { tier: "budget",   name: "汉庭酒店（乌鲁木齐火车南站店）",   price_per_night: 228,  rating: 4.2, district: "天山区",  image_keyword: "Hanting Hotel Urumqi budget" },
-    { tier: "balanced", name: "乌鲁木齐凯宾斯基大酒店",           price_per_night: 860,  rating: 4.7, district: "天山区",  image_keyword: "Kempinski Hotel Urumqi exterior" },
-    { tier: "premium",  name: "乌鲁木齐喜来登酒店",               price_per_night: 1280, rating: 4.8, district: "水磨沟区", image_keyword: "Sheraton Urumqi luxury hotel lobby" },
+    { tier: "budget",   name: "汉庭酒店（乌鲁木齐火车南站店）",   price_per_night: 228,  rating: 4.2, review_count: "532 reviews",   guest_review: "Comfortable and affordable near the station.",    district: "天山区",  image_keyword: "Hanting Hotel Urumqi budget",                 hero_image: "https://images.unsplash.com/photo-1590490360182-c33d57733427?w=800&q=80" },
+    { tier: "balanced", name: "乌鲁木齐凯宾斯基大酒店",           price_per_night: 860,  rating: 4.7, review_count: "1,283 reviews", guest_review: "Top hotel in the city — staff were so helpful!",  district: "天山区",  image_keyword: "Kempinski Hotel Urumqi exterior",             hero_image: "https://images.unsplash.com/photo-1566073771259-c35e8d22cbee?w=800&q=80" },
+    { tier: "premium",  name: "乌鲁木齐喜来登酒店",               price_per_night: 1280, rating: 4.8, review_count: "948 reviews",   guest_review: "Luxurious rooms with stunning mountain views.",   district: "水磨沟区", image_keyword: "Sheraton Urumqi luxury hotel lobby",          hero_image: "https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=800&q=80" },
   ],
   beijing: [
-    { tier: "budget",   name: "全季酒店（北京王府井步行街店）",    price_per_night: 360,  rating: 4.5, district: "东城区",  image_keyword: "Ji Hotel Beijing Wangfujing" },
-    { tier: "balanced", name: "北京日出东方凯宾斯基酒店",         price_per_night: 1150, rating: 4.7, district: "朝阳区",  image_keyword: "Kempinski Hotel Beijing sunrise" },
-    { tier: "premium",  name: "北京柏悦酒店",                    price_per_night: 2800, rating: 4.9, district: "朝阳区",  image_keyword: "Park Hyatt Beijing luxury skyline" },
+    { tier: "budget",   name: "全季酒店（北京王府井步行街店）",    price_per_night: 360,  rating: 4.5, review_count: "2,104 reviews", guest_review: "Great location on Wangfujing, very clean rooms.", district: "东城区",  image_keyword: "Ji Hotel Beijing Wangfujing",                 hero_image: "https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=800&q=80" },
+    { tier: "balanced", name: "北京日出东方凯宾斯基酒店",         price_per_night: 1150, rating: 4.7, review_count: "1,876 reviews", guest_review: "Stunning sunrise views over the city. Top service.", district: "朝阳区",  image_keyword: "Kempinski Hotel Beijing sunrise",             hero_image: "https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=800&q=80" },
+    { tier: "premium",  name: "北京柏悦酒店",                    price_per_night: 2800, rating: 4.9, review_count: "1,043 reviews", guest_review: "The Park Hyatt experience is simply incomparable.", district: "朝阳区",  image_keyword: "Park Hyatt Beijing luxury skyline",           hero_image: "https://images.unsplash.com/photo-1564501049412-61e9a8c59b4f?w=800&q=80" },
   ],
   shanghai: [
-    { tier: "budget",   name: "锦江都城酒店（上海南京西路店）",    price_per_night: 320,  rating: 4.4, district: "静安区",  image_keyword: "Metropolo Hotel Shanghai Nanjing Road" },
-    { tier: "balanced", name: "上海新天地朗廷酒店",               price_per_night: 1200, rating: 4.8, district: "黄浦区",  image_keyword: "The Langham Shanghai Xintiandi" },
-    { tier: "premium",  name: "上海柏悦酒店（环球金融中心）",     price_per_night: 3200, rating: 4.9, district: "浦东新区", image_keyword: "Park Hyatt Shanghai tower luxury" },
+    { tier: "budget",   name: "锦江都城酒店（上海南京西路店）",    price_per_night: 320,  rating: 4.4, review_count: "1,732 reviews", guest_review: "Modern rooms, steps from Nanjing Road shopping.", district: "静安区",  image_keyword: "Metropolo Hotel Shanghai Nanjing Road",       hero_image: "https://images.unsplash.com/photo-1455587734955-081b22074882?w=800&q=80" },
+    { tier: "balanced", name: "上海新天地朗廷酒店",               price_per_night: 1200, rating: 4.8, review_count: "2,571 reviews", guest_review: "Pure elegance in the heart of Shanghai.",         district: "黄浦区",  image_keyword: "The Langham Shanghai Xintiandi",              hero_image: "https://images.unsplash.com/photo-1566073771259-c35e8d22cbee?w=800&q=80" },
+    { tier: "premium",  name: "上海柏悦酒店（环球金融中心）",     price_per_night: 3200, rating: 4.9, review_count: "1,384 reviews", guest_review: "102nd-floor views are absolutely unreal!",        district: "浦东新区", image_keyword: "Park Hyatt Shanghai tower luxury",           hero_image: "https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=800&q=80" },
   ],
   chengdu: [
-    { tier: "budget",   name: "汉庭酒店（成都春熙路天府广场店）", price_per_night: 198,  rating: 4.3, district: "锦江区",  image_keyword: "Hanting Hotel Chengdu Chunxi Road" },
-    { tier: "balanced", name: "成都博舍酒店（太古里）",           price_per_night: 1380, rating: 4.9, district: "锦江区",  image_keyword: "The Temple House Chengdu Taikoo Li courtyard" },
-    { tier: "premium",  name: "成都瑞吉酒店",                    price_per_night: 2200, rating: 4.9, district: "高新区",  image_keyword: "St Regis Chengdu luxury hotel" },
+    { tier: "budget",   name: "汉庭酒店（成都春熙路天府广场店）", price_per_night: 198,  rating: 4.3, review_count: "968 reviews",   guest_review: "Clean budget option right on Chunxi Road.",      district: "锦江区",  image_keyword: "Hanting Hotel Chengdu Chunxi Road",          hero_image: "https://images.unsplash.com/photo-1590490360182-c33d57733427?w=800&q=80" },
+    { tier: "balanced", name: "成都博舍酒店（太古里）",           price_per_night: 1380, rating: 4.9, review_count: "3,247 reviews", guest_review: "A design masterpiece — the courtyard is magical!", district: "锦江区",  image_keyword: "The Temple House Chengdu Taikoo Li courtyard", hero_image: "https://images.unsplash.com/photo-1564501049412-61e9a8c59b4f?w=800&q=80" },
+    { tier: "premium",  name: "成都瑞吉酒店",                    price_per_night: 2200, rating: 4.9, review_count: "876 reviews",   guest_review: "Impeccable luxury with a beautiful Chengdu vibe.", district: "高新区",  image_keyword: "St Regis Chengdu luxury hotel",              hero_image: "https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=800&q=80" },
   ],
 };
 
@@ -89,9 +89,9 @@ function mockCtripHotels(city, budgetPerNight) {
     .replace(/上海|shanghai/i, "shanghai").replace(/成都|chengdu/i, "chengdu");
   const key = normalize(city || "");
   const hotels = CTRIP_HOTELS[key] || [
-    { tier: "budget",   name: `${city}经济型酒店（推荐如家/汉庭）`, price_per_night: 200,  rating: 4.2, district: "市中心", image_keyword: `${city} budget hotel city center` },
-    { tier: "balanced", name: `${city}商务酒店（推荐万怡/四点）`,  price_per_night: 600,  rating: 4.6, district: "商业区", image_keyword: `${city} business hotel modern` },
-    { tier: "premium",  name: `${city}五星酒店（推荐万豪/希尔顿）`, price_per_night: 1500, rating: 4.8, district: "核心区", image_keyword: `${city} luxury five star hotel` },
+    { tier: "budget",   name: `${city}经济型酒店（推荐如家/汉庭）`, price_per_night: 200,  rating: 4.2, review_count: "500+ reviews",   guest_review: "Convenient location and great value for money.",  district: "市中心", image_keyword: `${city} budget hotel city center`,    hero_image: "https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=800&q=80" },
+    { tier: "balanced", name: `${city}商务酒店（推荐万怡/四点）`,  price_per_night: 600,  rating: 4.6, review_count: "1,000+ reviews",  guest_review: "Solid business hotel with excellent amenities.",   district: "商业区", image_keyword: `${city} business hotel modern`,       hero_image: "https://images.unsplash.com/photo-1566073771259-c35e8d22cbee?w=800&q=80" },
+    { tier: "premium",  name: `${city}五星酒店（推荐万豪/希尔顿）`, price_per_night: 1500, rating: 4.8, review_count: "800+ reviews",   guest_review: "Absolutely superb — luxury at its finest.",       district: "核心区", image_keyword: `${city} luxury five star hotel`,      hero_image: "https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=800&q=80" },
   ];
   if (budgetPerNight) hotels.forEach((h) => { h.fits_budget = h.price_per_night <= budgetPerNight; });
   return hotels;

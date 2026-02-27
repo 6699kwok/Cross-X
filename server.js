@@ -17,10 +17,11 @@ const { buildChinaTravelKnowledge } = require("./lib/knowledge/china-travel");
 const ragEngine = require("./lib/rag/engine");
 
 // ── Extracted planner modules ──────────────────────────────────────────────
-const { openAIRequest, setDefaultModel } = require("./src/ai/openai");
+const { openAIRequest, setDefaultModel, setDefaultBaseUrl } = require("./src/ai/openai");
 const { safeParseJson } = require("./src/planner/mock");
 const { configure: configurePipeline, generateCrossXResponse } = require("./src/planner/pipeline");
 const { createPlanRouter } = require("./src/routes/plan");
+const { fetchFxRates, fetchJutuiRestaurants } = require("./src/services/api_gateway");
 const sessionItinerary = new Map(); // 2h TTL session context, keyed by client IP
 
 // ─── Sichuan Attraction Knowledge Base (1650 records from RAG project CSVs) ───
@@ -106,7 +107,7 @@ function loadLocalEnvFiles() {
       const idx = cleaned.indexOf("=");
       if (idx <= 0) continue;
       const key = cleaned.slice(0, idx).trim();
-      if (!key || process.env[key] !== undefined) continue;
+      if (!key || !!process.env[key]) continue;  // overwrite only if current value is falsy/empty
       let value = cleaned.slice(idx + 1).trim();
       if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
         value = value.slice(1, -1);
@@ -249,13 +250,86 @@ let COZE_API_KEY = "";
 let COZE_API_BASE = "https://api.coze.cn";
 let COZE_BOT_ID = "";
 
+let COZE_WORKFLOW_ID = "7611467642825605161";
+
 function applyCozeConfig() {
   COZE_API_KEY = String(process.env.COZE_API_KEY || "").trim();
   COZE_API_BASE = String(process.env.COZE_API_BASE || "https://api.coze.cn").replace(/\/+$/, "");
   COZE_BOT_ID = String(process.env.COZE_BOT_ID || "").trim();
+  COZE_WORKFLOW_ID = String(process.env.COZE_WORKFLOW_ID || "7611467642825605161").trim();
 }
 
 applyCozeConfig();
+
+/**
+ * Synthetic enrichment — generated from city name when Coze workflow is
+ * unavailable (missing key, workflow 4200, network failure, etc.).
+ * Keeps the rendering pipeline fully active so all Coze UI slots render.
+ */
+function buildSyntheticEnrichment(city) {
+  // Stable pseudo-random per city so hot-reload doesn't flicker
+  const h = String(city || "").split("").reduce((a, c) => (a + c.charCodeAt(0)) & 0xffff, 0);
+  const queueMinutes = [15, 20, 25, 30, 35, 40][(h >> 3) % 6];
+  return {
+    restaurant_queue:    queueMinutes,
+    ticket_availability: true,
+    spoken_text: `${city || "目的地"}旅游热度高，建议提前预订景点门票和特色餐厅。`,
+    _synthetic: true,   // debug flag — not rendered by frontend
+  };
+}
+
+/**
+ * Call the Coze Workflow API for real-time travel intelligence enrichment.
+ * ALWAYS returns an enrichment object — falls back to synthetic data on any
+ * failure (missing key, workflow not found, network error, timeout).
+ * Fields: hero_image?, restaurant_queue, ticket_availability, total_price?, spoken_text
+ */
+async function callCozeWorkflow({ query, city, lang, budget }) {
+  if (!COZE_API_KEY || !COZE_WORKFLOW_ID) {
+    console.log("[coze/workflow] No key/workflow configured — using synthetic enrichment");
+    return buildSyntheticEnrichment(city);
+  }
+  try {
+    const resp = await fetch(`${COZE_API_BASE}/v1/workflow/run`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${COZE_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        workflow_id: COZE_WORKFLOW_ID,
+        parameters: {
+          query: String(query || ""),
+          city: String(city || ""),
+          lang: String(lang || "ZH"),
+          budget: String(budget || ""),
+        },
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+    const json = await resp.json();
+    if (json.code !== 0) {
+      // 4200 = workflow not found; other codes = API error
+      console.warn(`[coze/workflow] API error ${json.code}: ${json.msg} — using synthetic enrichment`);
+      return buildSyntheticEnrichment(city);
+    }
+    // `data` may be a JSON string or already an object
+    let output = json.data;
+    if (typeof output === "string") {
+      try { output = JSON.parse(output); } catch {
+        output = { spoken_text: output };
+      }
+    }
+    if (!output || typeof output !== "object") {
+      return buildSyntheticEnrichment(city);
+    }
+    console.log("[coze/workflow] Real enrichment received:", JSON.stringify(output).slice(0, 200));
+    return output;
+  } catch (e) {
+    console.warn("[coze/workflow] Call failed:", e.message, "— using synthetic enrichment");
+    return buildSyntheticEnrichment(city);
+  }
+}
 
 // ─── Python RAG Service Bridge (Intelligent-Tourism-QA-System) ───────────────
 // When running, forward scenic/attraction questions to the Python FastAPI on port 8005.
@@ -7226,10 +7300,13 @@ function parsePath(pathname) {
 
 // ── Wire up extracted planner modules ───────────────────────────────────────
 setDefaultModel(OPENAI_MODEL);
+setDefaultBaseUrl(OPENAI_BASE_URL);
 configurePipeline({ buildChinaTravelKnowledge, extractAgentConstraints, sessionItinerary });
 const planRouter = createPlanRouter({
   readBody, writeJson, normalizeLang, pickLang, db,
-  getOpenAIConfig: () => ({ apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, keyHealth: OPENAI_KEY_HEALTH }),
+  getOpenAIConfig: () => ({ apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, keyHealth: OPENAI_KEY_HEALTH, baseUrl: OPENAI_BASE_URL }),
+  getCozeConfig: () => ({ apiKey: COZE_API_KEY, workflowId: COZE_WORKFLOW_ID }),
+  callCozeWorkflow,
   detectQuickActionIntent, buildQuickActionResponse,
   detectCasualChatIntent, callCasualChat,
   classifyBookingIntent, callPythonRagService, searchAttractions,
@@ -7687,6 +7764,27 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // ── API Gateway: FX rates ──────────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/api/gateway/fx") {
+      try {
+        const rates = await fetchFxRates();
+        return writeJson(res, 200, { ok: true, rates, source: process.env.JUHE_KEY ? "juhe" : "mock" });
+      } catch (e) {
+        return writeJson(res, 500, { ok: false, error: e.message });
+      }
+    }
+
+    // ── API Gateway: Jutui restaurants (via ele/store_list) ───────────────
+    if (req.method === "GET" && pathname === "/api/gateway/coupons") {
+      const city = String(parsed.query.keyword || "").slice(0, 50);
+      try {
+        const coupons = await fetchJutuiRestaurants(city, "美食", 4);
+        return writeJson(res, 200, { ok: true, coupons, keyword: city });
+      } catch (e) {
+        return writeJson(res, 500, { ok: false, error: e.message });
+      }
+    }
+
     if (req.method === "GET" && pathname === "/api/system/llm-status") {
       const primaryProvider = ANTHROPIC_KEY_HEALTH.looksValid ? "claude" : (OPENAI_KEY_HEALTH.looksValid ? "openai" : "fallback");
       return writeJson(res, 200, {
@@ -7704,6 +7802,12 @@ const server = http.createServer(async (req, res) => {
         envFilesLoaded: LOADED_ENV_FILES,
         // Extended multi-provider fields
         primary: primaryProvider,
+        coze: {
+          configured:   Boolean(COZE_API_KEY),
+          keyPreview:   COZE_API_KEY ? COZE_API_KEY.slice(0, 10) + "..." : "(not set)",
+          workflowId:   COZE_WORKFLOW_ID,
+          workflowReady: Boolean(COZE_API_KEY && COZE_WORKFLOW_ID),
+        },
         providers: {
           claude: {
             configured: Boolean(ANTHROPIC_API_KEY),
@@ -7733,6 +7837,7 @@ const server = http.createServer(async (req, res) => {
       LOADED_ENV_FILES = loadLocalEnvFiles();
       applyOpenAiConfig();
       applyClaudeConfig();
+      applyCozeConfig();
       audit.append({
         kind: "system",
         who: "demo",
@@ -9463,6 +9568,51 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/orders") {
       const orders = Object.values(db.orders).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
       return writeJson(res, 200, { orders });
+    }
+
+    // ── CrossX Consumer Plan Orders (checkout flow) ────────────────────────
+    if (req.method === "POST" && pathname === "/api/order/create") {
+      const body = await readBody(req);
+      const ts  = Date.now();
+      const ref = "CXS-" + ts.toString(36).slice(-5).toUpperCase() + "-" + Math.random().toString(36).slice(2, 6).toUpperCase();
+      if (!db.crossx_orders) db.crossx_orders = {};
+      db.crossx_orders[ref] = {
+        ref,
+        status: "pending",
+        method: String(body.method || "card"),
+        destination: String(body.destination || ""),
+        total: Number(body.total || 0),
+        planId: String(body.plan?.id || ""),
+        planTag: String(body.plan?.tag || ""),
+        createdAt: new Date(ts).toISOString(),
+        ip: req.socket?.remoteAddress || "default",
+      };
+      saveDb();
+      return writeJson(res, 200, { ok: true, ref, status: "pending" });
+    }
+
+    if (req.method === "GET" && pathname === "/api/order/status") {
+      const ref = String(parsed.query.ref || "");
+      if (!ref) return writeJson(res, 400, { error: "missing_ref" });
+      if (!db.crossx_orders) db.crossx_orders = {};
+      const ord = db.crossx_orders[ref];
+      if (!ord) return writeJson(res, 404, { error: "not_found" });
+      // Auto-confirm after 2.5 s (mock payment processing)
+      if (ord.status === "pending") {
+        const age = Date.now() - new Date(ord.createdAt).getTime();
+        if (age >= 2500) {
+          ord.status = "confirmed";
+          ord.confirmedAt = new Date().toISOString();
+          saveDb();
+        }
+      }
+      return writeJson(res, 200, {
+        ok: true, ref,
+        status: ord.status,
+        total: ord.total,
+        destination: ord.destination,
+        planTag: ord.planTag,
+      });
     }
 
     if (req.method === "GET" && /^\/api\/orders\/[^/]+\/detail$/.test(pathname)) {

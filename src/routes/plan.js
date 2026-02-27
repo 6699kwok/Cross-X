@@ -77,6 +77,8 @@ function isInjectionAttack(text) {
 function createPlanRouter({
   readBody, writeJson, normalizeLang, pickLang, db,
   getOpenAIConfig,
+  getCozeConfig,
+  callCozeWorkflow,
   detectQuickActionIntent, buildQuickActionResponse,
   detectCasualChatIntent, callCasualChat,
   classifyBookingIntent, callPythonRagService, searchAttractions,
@@ -114,7 +116,7 @@ function createPlanRouter({
       return;
     }
 
-    const { apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, keyHealth: OPENAI_KEY_HEALTH } = getOpenAIConfig();
+    const { apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, keyHealth: OPENAI_KEY_HEALTH, baseUrl: OPENAI_BASE_URL } = getOpenAIConfig();
     const language        = normalizeLang(body.language || db.users.demo.language || "ZH");
     const cityRaw         = String(body.city || db.users.demo.city || "Shanghai");
     const city            = cityRaw.split("·")[0].trim() || "Shanghai";
@@ -151,7 +153,9 @@ function createPlanRouter({
 
     // ── CASUAL CHAT bypass ──────────────────────────────────────────────────
     if (detectCasualChatIntent(message)) {
-      emit({ type: "status", code: "INIT", label: "正在理解您的问题..." });
+      emit({ type: "status", code: "INIT", label: pickLang(language,
+        "正在理解您的问题...", "Understanding your question...",
+        "ご質問を理解中...", "질문을 이해하는 중...") });
       await delay(150);
       const chatText = await callCasualChat({ message, language, city });
       emit({ type: "final", response_type: "chat", spoken_text: chatText, source: "chat" });
@@ -162,7 +166,9 @@ function createPlanRouter({
     // ── RAG intent → knowledge base path ───────────────────────────────────
     const intent = classifyBookingIntent(message, constraints);
     if (intent === "rag") {
-      emit({ type: "status", code: "INIT", label: "正在查询知识库..." });
+      emit({ type: "status", code: "INIT", label: pickLang(language,
+        "正在查询知识库...", "Querying knowledge base...",
+        "知識ベースを照会中...", "지식 베이스 조회 중...") });
       await delay(300);
 
       let ragAnswer = null;
@@ -305,7 +311,9 @@ function createPlanRouter({
     }
 
     // ── FULL GENERATION PATH — OpenAI only (Coze abolished) ──────────────────
-    emit({ type: "status", code: "INIT", label: "正在生成方案..." });
+    emit({ type: "status", code: "INIT", label: pickLang(language,
+      "正在生成方案...", "Generating your plan...",
+      "プランを生成中...", "플랜을 생성하는 중...") });
 
     let planDone = false;
     const clientIp = req.socket?.remoteAddress || req.connection?.remoteAddress || "default";
@@ -319,17 +327,26 @@ function createPlanRouter({
         }, 300);
       });
       await cd(2500);
-      if (!planDone) emit({ type: "status", code: "H_SEARCH", label: "正在匹配酒店..." });
+      if (!planDone) emit({ type: "status", code: "H_SEARCH", label: pickLang(language,
+        "正在匹配酒店...", "Searching hotels...", "ホテルを検索中...", "호텔 검색 중...") });
       await cd(12000);
-      if (!planDone) emit({ type: "status", code: "H_SEARCH", label: "酒店方案分析中..." });
+      if (!planDone) emit({ type: "status", code: "H_SEARCH", label: pickLang(language,
+        "酒店方案分析中...", "Analyzing hotel options...", "ホテル案を分析中...", "호텔 옵션 분석 중...") });
       await cd(12000);
-      if (!planDone) emit({ type: "status", code: "T_CALC",   label: "正在核算交通费用..." });
+      if (!planDone) emit({ type: "status", code: "T_CALC",   label: pickLang(language,
+        "正在核算交通费用...", "Calculating transport costs...", "交通費を計算中...", "교통비 계산 중...") });
       await cd(10000);
-      if (!planDone) emit({ type: "status", code: "B_CHECK",  label: "正在校验预算..." });
+      if (!planDone) emit({ type: "status", code: "B_CHECK",  label: pickLang(language,
+        "正在校验预算...", "Verifying budget...", "予算を確認中...", "예산 확인 중...") });
     })();
 
     const complex = isComplexItinerary(message);
     if (complex) console.log("[plan/coze] Complex itinerary — using full Planner LLM");
+
+    // Extract budget for Coze parameters
+    const budgetVal = constraints.budget
+      ? String(constraints.budget).replace(/[^0-9]/g, "") || constraints.budget
+      : "";
 
     try {
       if (!(OPENAI_API_KEY && OPENAI_KEY_HEALTH.looksValid)) {
@@ -337,17 +354,25 @@ function createPlanRouter({
       }
 
       const prePlan = complex ? null : buildPrePlan({ message, city, constraints });
-      const result  = await generateCrossXResponse({
-        message, language, city,
-        constraints: { ...constraints, _clientIp: clientIp },
-        conversationHistory,
-        apiKey: OPENAI_API_KEY, model: OPENAI_MODEL,
-        prePlan,
-        skipSpeaker:  true,
-        cardTimeoutMs: complex ? 40000 : 32000,
-        cardMaxTokens: complex ? 1400  : 2200,
-        summaryOnly:   complex,
-      });
+
+      // Run Coze workflow in parallel with OpenAI for enrichment (hero_image, queue, availability).
+      // callCozeWorkflow ALWAYS resolves (synthetic fallback on failure) — cozeEnrichment is never null.
+      const [result, cozeEnrichment] = await Promise.all([
+        generateCrossXResponse({
+          message, language, city,
+          constraints: { ...constraints, _clientIp: clientIp },
+          conversationHistory,
+          apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+          prePlan,
+          skipSpeaker:  true,
+          cardTimeoutMs: complex ? 55000 : 50000,
+          cardMaxTokens: complex ? 1400  : 2200,
+          summaryOnly:   complex,
+        }),
+        callCozeWorkflow({ query: message, city, lang: language, budget: budgetVal }),
+      ]);
+
+      console.log(`[plan/coze] Coze enrichment: ${cozeEnrichment?._synthetic ? "synthetic" : "live"} — queue=${cozeEnrichment?.restaurant_queue}min ticket=${cozeEnrichment?.ticket_availability}`);
 
       planDone = true;
 
@@ -374,9 +399,12 @@ function createPlanRouter({
         }
 
         // Success — emit completion status events
-        emit({ type: "status", code: "H_SEARCH", label: "酒店匹配完成" });
-        emit({ type: "status", code: "T_CALC",   label: "交通核算完成" });
-        emit({ type: "status", code: "B_CHECK",  label: "预算校验完成" });
+        emit({ type: "status", code: "H_SEARCH", label: pickLang(language,
+          "酒店匹配完成", "Hotels matched", "ホテル確定", "호텔 확정") });
+        emit({ type: "status", code: "T_CALC",   label: pickLang(language,
+          "交通核算完成", "Transport calculated", "交通費確定", "교통비 확정") });
+        emit({ type: "status", code: "B_CHECK",  label: pickLang(language,
+          "预算校验完成", "Budget verified", "予算確定", "예산 확정") });
 
         // [P1] Session: save or create session for future UPDATE requests
         let outSessionId = incomingSessionId;
@@ -392,7 +420,12 @@ function createPlanRouter({
           console.log(`[plan/coze] Session ${outSessionId} — plan saved (${s.card_data.title || "untitled"})`);
         }
 
-        emit({ type: "final", ...s, source: "openai", sessionId: outSessionId || null });
+        emit({
+          type: "final", ...s,
+          source: "openai",
+          sessionId: outSessionId || null,
+          coze_data: cozeEnrichment,   // always present (synthetic fallback guaranteed)
+        });
       } else {
         emit({
           type: "final", response_type: "clarify",
@@ -427,7 +460,7 @@ function createPlanRouter({
     const { message, city, constraints, planSummary } = body;
     if (!message || !planSummary) return writeJson(res, 400, { error: "message and planSummary required" });
 
-    const { apiKey, model: OPENAI_MODEL } = getOpenAIConfig();
+    const { apiKey, model: OPENAI_MODEL, baseUrl } = getOpenAIConfig();
     if (!apiKey) return writeJson(res, 503, { error: "OpenAI not configured" });
 
     const dest      = planSummary.destination || city || "中国";
@@ -438,7 +471,7 @@ function createPlanRouter({
     const transport = planSummary.transport_plan || "";
     const hotelNote = planSummary.hotel?.name || "";
 
-    const BATCH    = 5;
+    const BATCH    = 2;   // 2 days/batch — safe for all tiers on gpt-4o-mini (≤45s)
     const startDay = Math.max(1, Number(body.startDay) || 1);
     const endDay   = Math.min(totalDays, startDay + BATCH - 1);
     const hasMore  = endDay < totalDays;
@@ -458,10 +491,10 @@ function createPlanRouter({
     }
 
     const result = await openAIRequest({
-      apiKey, model: OPENAI_MODEL,
+      apiKey, model: OPENAI_MODEL, baseUrl,
       systemPrompt, userContent,
-      temperature: 0.5, maxTokens: 1800,
-      jsonMode: true, timeoutMs: 35000,
+      temperature: 0.5, maxTokens: 2800,
+      jsonMode: true, timeoutMs: 45000,
     });
 
     const parsed = safeParseJson(result.text);

@@ -3,26 +3,28 @@
  * src/ai/openai.js
  * OpenAI HTTP client — extracted from server.js
  * 唯一职责：发 OpenAI chat/completions 请求，返回 {ok, text}
+ *
+ * Uses global fetch (Node 18+) + configurable base URL so OPENAI_BASE_URL
+ * is honoured instead of hard-coding api.openai.com.
  */
 
-const https = require("https");
+// ── Module-level config (set once at startup) ─────────────────────────────
+let _defaultModel   = "gpt-4o-mini";
+let _defaultBaseUrl = "https://api.openai.com/v1";
 
-// ── Module-level config (set by configureOpenAI at startup) ──────────────────
-let _defaultModel = "gpt-4o-mini";
-
-/**
- * Called by applyOpenAiConfig() after env is loaded.
- * @param {string} model  e.g. "gpt-4o-mini"
- */
 function setDefaultModel(model) {
   if (model) _defaultModel = String(model).trim();
+}
+
+function setDefaultBaseUrl(url) {
+  if (url) _defaultBaseUrl = String(url).replace(/\/+$/, "");
 }
 
 /**
  * Single OpenAI chat/completions request.
  * @returns {Promise<{ok: boolean, text: string}>}
  */
-function openAIRequest({
+async function openAIRequest({
   apiKey,
   model,
   systemPrompt,
@@ -31,12 +33,14 @@ function openAIRequest({
   maxTokens = 800,
   jsonMode = false,
   timeoutMs = 25000,
+  baseUrl,
 }) {
+  const endpoint = `${baseUrl || _defaultBaseUrl}/chat/completions`;
   const messages = [
     { role: "system", content: systemPrompt },
-    { role: "user", content: userContent },
+    { role: "user",   content: userContent  },
   ];
-  const requestBody = JSON.stringify({
+  const body = JSON.stringify({
     model: model || _defaultModel,
     messages,
     temperature,
@@ -44,54 +48,40 @@ function openAIRequest({
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
   });
 
-  return new Promise((resolve) => {
-    const req = https.request(
-      {
-        hostname: "api.openai.com",
-        path: "/v1/chat/completions",
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`,
-          "Content-Length": Buffer.byteLength(requestBody),
-        },
+  try {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${apiKey}`,
       },
-      (apiRes) => {
-        let data = "";
-        apiRes.on("data", (chunk) => (data += chunk));
-        apiRes.on("end", () => {
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.error) {
-              console.warn("[openAIRequest] API error:", JSON.stringify(parsed.error).slice(0, 200));
-              resolve({ ok: false, text: "" });
-              return;
-            }
-            const text = parsed.choices?.[0]?.message?.content || "";
-            const finishReason = parsed.choices?.[0]?.finish_reason || "";
-            if (finishReason === "length") {
-              console.warn("[openAIRequest] Response truncated (finish_reason=length), maxTokens:", maxTokens);
-            }
-            resolve({ ok: Boolean(text), text });
-          } catch (e) {
-            console.warn("[openAIRequest] JSON parse error:", e.message, "raw:", data.slice(0, 200));
-            resolve({ ok: false, text: "" });
-          }
-        });
-      },
-    );
-    req.on("error", (e) => {
-      console.warn("[openAIRequest] req error:", e.message);
-      resolve({ ok: false, text: "" });
+      body,
+      signal: AbortSignal.timeout(timeoutMs),
     });
-    req.setTimeout(timeoutMs, () => {
+
+    const data = await resp.text();
+    const parsed = JSON.parse(data);
+
+    if (parsed.error) {
+      console.warn("[openAIRequest] API error:", JSON.stringify(parsed.error).slice(0, 200));
+      return { ok: false, text: "" };
+    }
+
+    const text        = parsed.choices?.[0]?.message?.content || "";
+    const finishReason = parsed.choices?.[0]?.finish_reason  || "";
+    if (finishReason === "length") {
+      console.warn("[openAIRequest] Response truncated (finish_reason=length), maxTokens:", maxTokens);
+    }
+    return { ok: Boolean(text), text };
+
+  } catch (e) {
+    if (e.name === "TimeoutError" || e.name === "AbortError") {
       console.warn("[openAIRequest] timeout after", timeoutMs, "ms");
-      req.destroy();
-      resolve({ ok: false, text: "" });
-    });
-    req.write(requestBody);
-    req.end();
-  });
+    } else {
+      console.warn("[openAIRequest] req error:", e.message);
+    }
+    return { ok: false, text: "" };
+  }
 }
 
-module.exports = { openAIRequest, setDefaultModel };
+module.exports = { openAIRequest, setDefaultModel, setDefaultBaseUrl };
