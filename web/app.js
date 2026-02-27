@@ -6784,50 +6784,83 @@ function _getCityHeroUrl(dest) {
 }
 
 function _buildListCard(p, idx, cardId, dur, pax, dest) {
+  // P8.6: Card layout polymorphism — driven by layout_type from backend
+  const layoutType  = state._layoutType || "travel_full";
+  const isFoodCard  = layoutType === "food_only";
+  const isStayFocus = layoutType === "stay_focus";
+
   const style = _LIST_CARD_TAG_STYLES[p.id] || _LIST_CARD_TAG_STYLES.balanced;
   const isRec = p.is_recommended;
-  // P8.3: for recommended plan, prefer Coze MOR net price + service premium if available
+
+  // P8.3: for recommended plan, prefer Coze MOR net price if available
   const cozePrice = isRec && state.cozeData?.total_price ? Number(state.cozeData.total_price) : 0;
-  const priceTotal = (cozePrice > 0 ? cozePrice : Number(p.total_price || 0)).toLocaleString();
-  const heroUrl = p.hotel?.hero_image || "";
-  const hotelRating = p.hotel?.rating || 0;
-  const hotelRevCount = p.hotel?.review_count || "";
+  const rawPrice  = cozePrice > 0 ? cozePrice : Number(p.total_price || 0);
+
+  // ── Polymorphic field mapping ────────────────────────────────────────────
+  // food_only  → item name / avg_price / queue badge
+  // stay_focus → hotel name + rating focus
+  // travel_full → default hotel + price display
+  const displayTitle = isFoodCard
+    ? escapeHtml(p.name || p.restaurant_name || p.item_name || dest || "")
+    : escapeHtml(p.hotel?.name || "");
+
+  const displayRating = isFoodCard
+    ? (p.rating || p.item_rating || p.score || 0)
+    : (p.hotel?.rating || 0);
+
+  const displayRevCount = isFoodCard ? "" : escapeHtml(p.hotel?.review_count || "");
+
+  const priceDisplay = isFoodCard
+    ? (p.avg_price
+        ? `${pickText("人均","Avg","人均","인당")}¥${p.avg_price}`
+        : `¥${rawPrice.toLocaleString()}`)
+    : `¥${rawPrice.toLocaleString()}`;
+
+  // Queue badge replaces review count on food cards
+  const queueBadge = isFoodCard && state.cozeData?.restaurant_queue > 0
+    ? `<span class="act-coze-queue" style="margin-bottom:6px">⏳ ${pickText("排队约","~","約","대기")}${state.cozeData.restaurant_queue}${pickText("分钟","min","分","분")}</span>`
+    : "";
+
+  const coverIcon = isFoodCard ? "🍜" : isStayFocus ? "🏨" : "✈️";
   const aiAnalysis = escapeHtml((p.highlights || []).slice(0, 2).join(" · ").slice(0, 90));
   const statusBarId = `cx-sb-${cardId}-${idx}`;
   const cardCls = `cx-list-card${isRec ? " cx-list-card--rec" : ""}`;
 
-  // Image: prefer hotel hero → city Unsplash photo → styled cover
-  // All images have the same onerror chain so the next fallback always shows
-  const fallbackUrl  = _getCityHeroUrl(dest);
-  const cityLabel    = escapeHtml(dest || p.hotel?.name || "");
-  const coverHtml    = `<div class="cx-lc-img-cover">
-       <span class="cx-cover-city">${cityLabel}</span>
-       <span style="font-size:20px">🏨</span>
+  // Image: prefer hero → city photo → styled cover with intent-aware icon
+  const heroUrl    = p.hotel?.hero_image || "";
+  const fallbackUrl = _getCityHeroUrl(dest);
+  const coverLabel  = escapeHtml(isFoodCard ? (p.name || dest || "") : (dest || p.hotel?.name || ""));
+  const coverHtml  = `<div class="cx-lc-img-cover">
+       <span class="cx-cover-city">${coverLabel}</span>
+       <span style="font-size:20px">${coverIcon}</span>
      </div>`;
   const imgHtml = heroUrl
-    ? `<img class="cx-lc-img" src="${heroUrl}" alt="${cityLabel}" loading="lazy"
+    ? `<img class="cx-lc-img" src="${heroUrl}" alt="${coverLabel}" loading="lazy"
          onerror="this.src='${fallbackUrl}';this.onerror=function(){this.style.display='none';this.nextElementSibling.style.display='flex'}">`
        + `<div class="cx-lc-img-cover" style="display:none">${coverHtml}</div>`
-    : `<img class="cx-lc-img" src="${fallbackUrl}" alt="${cityLabel}" loading="lazy"
+    : `<img class="cx-lc-img" src="${fallbackUrl}" alt="${coverLabel}" loading="lazy"
          onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
        + `<div class="cx-lc-img-cover" style="display:none">${coverHtml}</div>`;
 
-  // Mini-itinerary timeline — up to 3 highlights mapped to Day N
+  // Mini timeline: food → label as 特色菜 / activity → Day N / default → Day N
   const hlList = (p.highlights || []).slice(0, 3);
+  const timelineLabel = (i) => isFoodCard
+    ? pickText("推荐", "Pick", "推薦", "추천")
+    : `Day ${i + 1}`;
   const miniTimeline = hlList.length > 0
     ? `<div class="cx-mini-timeline">` +
       hlList.map((h, i) => `
         <div class="cx-mt-row">
           <div class="cx-mt-dot"></div>
           <div class="cx-mt-line"></div>
-          <span class="cx-mt-label">Day ${i + 1}</span>
+          <span class="cx-mt-label">${timelineLabel(i)}</span>
           <span class="cx-mt-text">${escapeHtml(h)}</span>
         </div>`).join("") +
       `</div>`
     : "";
 
   return `
-  <div class="${cardCls}" data-plan-id="${escapeHtml(p.id || "")}"
+  <div class="${cardCls}" data-plan-id="${escapeHtml(p.id || "")}" data-layout="${layoutType}"
     onclick="openPlanDetail('${cardId}', ${idx})">
     <div class="cx-lc-img-wrap">
       ${imgHtml}
@@ -6836,13 +6869,14 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
     <div class="cx-lc-body">
       <div class="cx-lc-top">
         <span class="cx-lc-tag" style="color:${style.color}">${escapeHtml(p.tag || "")}</span>
-        <div class="cx-lc-price">¥${escapeHtml(priceTotal)}</div>
+        <div class="cx-lc-price">${priceDisplay}</div>
       </div>
       <div class="cx-lc-price-sub">${pax > 1 ? pax + pickText(" 人 / "," pax · "," 名 / "," 명 · ") : ""}${dur}${pickText("天","d","日","일")}</div>
-      <div class="cx-lc-hotel">${escapeHtml(p.hotel?.name || "")}</div>
+      <div class="cx-lc-hotel">${displayTitle}</div>
       <div class="cx-lc-meta">
-        ${hotelRating   ? `<span>★ ${hotelRating}</span>` : ""}
-        ${hotelRevCount ? `<span style="color:#9ca3af">${escapeHtml(hotelRevCount)}</span>` : ""}
+        ${displayRating   ? `<span>★ ${displayRating}</span>` : ""}
+        ${displayRevCount ? `<span style="color:#9ca3af">${displayRevCount}</span>` : ""}
+        ${queueBadge}
       </div>
       ${miniTimeline}
       ${aiAnalysis ? `<div class="cx-lc-analysis">${aiAnalysis}</div>` : ""}
@@ -8031,6 +8065,12 @@ async function createTaskFromText(text) {
         signal: _planStreamSignal,
         onStatusUpdate: (code, label) => {
           appendThinkingStep(_thinkingStream, code, label);
+          // P8.6: tool_call signal → TOOL_SIGNAL_MAP (intent-aware, never shows wrong tool text)
+          if (code.startsWith("TOOL:")) {
+            const fn = TOOL_SIGNAL_MAP[code.slice(5)];
+            applyThinkingIndicatorState(true, fn ? fn() : label || pickText("AI 处理中...", "AI processing...", "AI 処理中...", "AI 처리 중..."));
+            return;
+          }
           const auraLabels = {
             INIT:     pickText("正在理解需求...", "Analyzing request...", "リクエスト解析中...", "요청 분석 중..."),
             H_SEARCH: pickText("正在查询酒店...", "Searching hotels...", "ホテルを検索中...", "호텔 검색 중..."),
@@ -8067,8 +8107,23 @@ async function createTaskFromText(text) {
   // auto-constraint notification hidden per UX design
   if (skeleton && el.chatSolutionStrip) skeleton.render(el.chatSolutionStrip, { count: 3, lines: 4 });
   setLoading("createTask", true);
-  // Activate thinking indicator with progressive rotating text
-  const thinkingPhases = [
+  // P8.6: Intent-aware thinking phases — align copy to what the user is actually asking
+  const _iFood  = /餐厅|美食|好吃|推荐.*吃|吃什么|小吃|eat|restaurant|food|dining/i.test(text);
+  const _iStay  = /酒店|住宿|宾馆|民宿|hotel|hostel|stay|accommodation/i.test(text);
+  const _iSight = /景点|游览|门票|博物馆|景区|打卡|scenic|attraction|museum/i.test(text);
+  const thinkingPhases = _iFood ? [
+    pickText("正在理解你的美食偏好...", "Parsing your food preferences...", "食の好みを解析中...", "음식 취향 분석 중..."),
+    pickText("搜索本地特色餐厅...", "Searching local eateries...", "地元レストランを検索中...", "현지 맛집 검색 중..."),
+    pickText("核查等位情况与预约渠道...", "Checking wait times & bookings...", "待ち時間と予約を確認中...", "대기 시간 및 예약 확인 중..."),
+  ] : _iStay ? [
+    pickText("正在分析你的住宿需求...", "Analyzing your stay requirements...", "宿泊ニーズを分析中...", "숙박 요구사항 분석 중..."),
+    pickText("匹配最优性价比酒店...", "Matching best-value hotels...", "最適ホテルをマッチング中...", "최적 호텔 매칭 중..."),
+    pickText("核查房型与实时价格...", "Verifying room types & live rates...", "部屋タイプと料金を確認中...", "객실 유형 및 요금 확인 중..."),
+  ] : _iSight ? [
+    pickText("正在解析景点偏好...", "Parsing sightseeing preferences...", "観光の好みを解析中...", "관광 취향 분석 중..."),
+    pickText("核查门票状态与余票...", "Checking ticket availability...", "チケット在庫を確認中...", "티켓 재고 확인 중..."),
+    pickText("生成逐日游览路线...", "Building day-by-day route...", "日程別ルートを生成中...", "일별 루트 생성 중..."),
+  ] : [
     pickText("正在理解你的需求...", "Understanding your request...", "リクエストを解析中...", "요청을 분석 중..."),
     pickText("搜索候选方案...", "Searching candidate options...", "候補を検索中...", "후보를 검색 중..."),
     pickText("生成定制化建议...", "Generating tailored suggestions...", "カスタム提案を生成中...", "맞춤 제안 생성 중..."),
@@ -12775,6 +12830,9 @@ async function consumePlanStream({
           const ev = JSON.parse(line.slice(6));
           if (ev.type === "status" && typeof onStatusUpdate === "function") {
             onStatusUpdate(ev.code, ev.label);
+          } else if (ev.type === "tool_call" && typeof onStatusUpdate === "function") {
+            // P8.6: Coze/backend emits tool_call events → TOOL_SIGNAL_MAP lookup
+            onStatusUpdate("TOOL:" + (ev.tool_name || "unknown"), ev.label || "");
           } else if (ev.type === "thinking" && typeof onThinking === "function") {
             onThinking(ev.text || "");
           } else if (ev.type === "final" || ev.type === "error") {
@@ -12783,6 +12841,8 @@ async function consumePlanStream({
             if (ev.sessionId && typeof onSessionId === "function") onSessionId(ev.sessionId);
             // P8.3: store Coze enrichment for hero_image / queue / ticket slots
             if (ev.coze_data) state.cozeData = ev.coze_data;
+            // P8.6: store layout_type for polymorphic card rendering
+            state._layoutType = ev.card_data?.layout_type || "travel_full";
           }
         } catch { /* ignore malformed line */ }
       }
@@ -12803,6 +12863,20 @@ const PLAN_STEPS = [
   { id: "T_CALC",   icon: "🚗" },
   { id: "B_CHECK",  icon: "💰" },
 ];
+
+// P8.6 Tool signal map — maps Coze/backend tool_name to intent-aware aura text.
+// Each value is a thunk (function) so pickText() runs at call time (after i18n ready).
+const TOOL_SIGNAL_MAP = {
+  search_hotels:      () => pickText("正在搜罗特色住宿...",    "Scouting unique stays...",          "ユニークな宿を探索中...",      "숙소 탐색 중..."),
+  search_restaurants: () => pickText("正在探索本地美食...",    "Discovering local cuisine...",      "地元グルメを探索中...",         "로컬 맛집 탐색 중..."),
+  check_queue:        () => pickText("正在探测实时等位...",    "Checking live wait times...",       "リアルタイム待ち時間確認中...",  "실시간 대기 시간 확인 중..."),
+  check_tickets:      () => pickText("正在查询景点余票...",    "Checking ticket availability...",   "チケット在庫を確認中...",       "티켓 재고 확인 중..."),
+  fetch_fx_rates:     () => pickText("正在调取实时汇率...",    "Fetching live FX rates...",         "為替レートを取得中...",         "환율 조회 중..."),
+  search_attractions: () => pickText("正在挖掘隐藏景点...",    "Unearthing hidden gems...",         "隠れた名所を発見中...",         "숨겨진 명소 발굴 중..."),
+  match_coupons:      () => pickText("正在匹配专属优惠...",    "Matching exclusive deals...",       "限定クーポンを取得中...",       "전용 혜택 검색 중..."),
+  plan_transport:     () => pickText("正在规划交通路线...",    "Plotting the best route...",        "最適ルートを計算中...",         "최적 경로 계획 중..."),
+  verify_budget:      () => pickText("正在精算最优预算...",    "Optimizing your budget...",         "予算を最適化中...",             "예산 최적화 중..."),
+};
 const STEP_ORDER = PLAN_STEPS.map((s) => s.id);
 
 /** Create the thinking-stream timeline and append to chatFeed. Returns root el. */

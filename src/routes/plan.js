@@ -51,6 +51,16 @@ function isInjectionAttack(text) {
   return INJECTION_PATTERNS.some((re) => re.test(text));
 }
 
+// ── P8.6: Intent axis detector ───────────────────────────────────────────────
+// Determines the primary intent of the user message to enable specialty mode.
+// Returns: "food" | "activity" | "stay" | "travel" (default full itinerary)
+function detectIntentAxis(message) {
+  if (/餐厅|美食|好吃|推荐.*吃|吃什么|特色菜|小吃|eat|restaurant|food|dining|meal/i.test(message)) return "food";
+  if (/景点|游览|门票|博物馆|景区|打卡|scenic|attraction|museum|sightseeing/i.test(message)) return "activity";
+  if (/酒店|住宿|宾馆|民宿|hotel|hostel|stay|accommodation/i.test(message)) return "stay";
+  return "travel";
+}
+
 // ── Factory ────────────────────────────────────────────────────────────────────
 /**
  * Inject server.js-level utilities and live config values.
@@ -355,6 +365,10 @@ function createPlanRouter({
 
       const prePlan = complex ? null : buildPrePlan({ message, city, constraints });
 
+      // P8.6: Detect intent axis for specialty mode — affects prompt and layout_type
+      const intentAxis = detectIntentAxis(message);
+      if (intentAxis !== "travel") console.log(`[plan/coze] Intent axis: ${intentAxis} — specialty mode`);
+
       // P8.4 Serial scheduling: Coze first → buildResourceContext → OpenAI grounded in real-time data.
       // Step 1: Coze enrichment (always resolves — synthetic fallback on failure).
       const cozeEnrichment = await callCozeWorkflow({ query: message, city, lang: language, budget: budgetVal });
@@ -371,6 +385,7 @@ function createPlanRouter({
         apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
         prePlan,
         resourceContext,
+        intentAxis,
         skipSpeaker:  true,
         cardTimeoutMs: complex ? 55000 : 50000,
         cardMaxTokens: complex ? 1400  : 2200,

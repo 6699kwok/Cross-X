@@ -168,6 +168,7 @@ function buildResourceContext(cozeData, city, message, constraints) {
  * @param {number}  [opts.cardMaxTokens] Card Generator max tokens
  * @param {boolean} [opts.summaryOnly]   Skip days[] generation (complex itinerary mode)
  * @param {string}  [opts.resourceContext] Pre-built Coze resource context string (P8.4)
+ * @param {string}  [opts.intentAxis]     "food"|"activity"|"stay"|"travel" (P8.6)
  * @returns {Promise<{ok: boolean, structured: object}>}
  */
 async function generateCrossXResponse({
@@ -177,6 +178,7 @@ async function generateCrossXResponse({
   cardTimeoutMs, cardMaxTokens,
   summaryOnly,
   resourceContext,
+  intentAxis,
 }) {
   const usedModel = model;
   let plan;
@@ -286,6 +288,24 @@ async function generateCrossXResponse({
     ? `\n⚠️ SUMMARY MODE: Generate plans[] with all fields EXCEPT days. Set "days": [] (empty array). Day-by-day activities will be generated separately on demand.\n`
     : "";
 
+  // P8.6: Specialty-mode note — suppresses hotel template for non-accommodation queries
+  const _axisToLayout = { food: "food_only", activity: "travel_full", stay: "stay_focus", travel: "travel_full" };
+  const targetLayout = _axisToLayout[intentAxis] || "travel_full";
+  const specialtyNote = intentAxis === "food"
+    ? `\n[专项查询·美食] 当前请求为餐厅/美食专项查询，无需填充通用酒店住宿模板。\n` +
+      `plans[].hotel 字段可填写就餐餐厅名称，plans[].highlights 聚焦特色菜/氛围，\n` +
+      `days[].activities 重点体现餐厅名称、特色菜推荐、人均消费。\n` +
+      `card_data 顶层必须输出 "layout_type": "food_only"。\n`
+    : intentAxis === "activity"
+    ? `\n[专项查询·景点] 当前请求为景点/活动专项查询，无需填充完整酒店住宿模板。\n` +
+      `plans[].highlights 聚焦景点、门票价格、最佳游览时长。\n` +
+      `card_data 顶层必须输出 "layout_type": "travel_full"。\n`
+    : intentAxis === "stay"
+    ? `\n[专项查询·住宿] 当前请求聚焦酒店/住宿对比，无需填充活动行程。\n` +
+      `plans[].highlights 聚焦酒店设施、位置便利性、性价比。\n` +
+      `card_data 顶层必须输出 "layout_type": "stay_focus"。\n`
+    : ``;  // travel: full itinerary, no specialty note
+
   // Geo-lock directive: when origin ≠ destination, explicitly ban origin-city content
   const geoLocked = originCity && dest && originCity !== dest
     && !dest.includes(originCity) && !originCity.includes(dest);
@@ -307,7 +327,7 @@ async function generateCrossXResponse({
     : "";
 
   const cardUserContent = `
-${updateNote}${summaryModeNote}${geoNote}${paxHint}用户原始需求: ${message}
+${updateNote}${summaryModeNote}${specialtyNote}${geoNote}${paxHint}用户原始需求: ${message}
 
 ⚠️ 你是无情的数据组装员。酒店名称/价格/image_keyword 必须且只能使用 <Real_API_Data> 中的数据，绝对禁止编造！
 
@@ -352,6 +372,11 @@ ${resourceContext ? `\n${resourceContext}\n⚠️ 资源池中的餐厅等位时
 
   let cardData = safeParseJson(speakerCardRes.text);
   if (!cardData) console.warn("[Card Generator] Failed to parse JSON, raw:", speakerCardRes.text?.slice(0, 200));
+
+  // P8.6: Safety net — ensure layout_type is always present in card_data
+  if (cardData?.card_data && !cardData.card_data.layout_type) {
+    cardData.card_data.layout_type = targetLayout;
+  }
 
   // Speaker: generate natural spoken_text (skipped on fast path)
   const cdPlans = cardData?.card_data?.plans || [];

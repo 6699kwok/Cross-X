@@ -224,6 +224,7 @@ ${BUSINESS_BOUNDARY_BLOCK}
         ]
       }
     ],
+    "layout_type": "travel_full|food_only|stay_focus（根据请求意图主轴选择）",
     "action_button": {
       "text": "确认行程 · 开始预订",
       "payload": {"action":"initiate_payment"}
