@@ -1,0 +1,53 @@
+<svg width="960" height="300" viewBox="0 0 960 300" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#12B886"/>
+      <stop offset="100%" stop-color="#0F8BFF"/>
+    </linearGradient>
+    <style>
+      .node { fill: #ffffff; stroke: #c8d8e3; stroke-width: 2; rx: 14; }
+      .title { font: 700 16px Avenir Next, Segoe UI, sans-serif; fill: #173148; }
+      .sub { font: 500 12px Avenir Next, Segoe UI, sans-serif; fill: #4d6b80; }
+      .line { stroke: url(#g1); stroke-width: 3; marker-end: url(#arrow); }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#0F8BFF"/>
+    </marker>
+  </defs>
+
+  <rect x="20" y="60" width="170" height="92" class="node"/>
+  <text x="36" y="92" class="title">One-Sentence</text>
+  <text x="36" y="114" class="title">Intent Input</text>
+  <text x="36" y="136" class="sub">Tourist says one goal</text>
+
+  <rect x="220" y="60" width="170" height="92" class="node"/>
+  <text x="236" y="92" class="title">Plan + Confirm</text>
+  <text x="236" y="114" class="sub">Price and risk flags</text>
+  <text x="236" y="134" class="sub">explicitly confirmed</text>
+
+  <rect x="420" y="60" width="170" height="92" class="node"/>
+  <text x="436" y="92" class="title">Execute + Pay</text>
+  <text x="436" y="114" class="sub">Atomic tools + ACT</text>
+  <text x="436" y="134" class="sub">delegation domain</text>
+
+  <rect x="620" y="60" width="170" height="92" class="node"/>
+  <text x="636" y="92" class="title">Deliverable</text>
+  <text x="636" y="114" class="sub">QR, bilingual card,</text>
+  <text x="636" y="134" class="sub">navigation proof</text>
+
+  <rect x="420" y="182" width="170" height="92" class="node"/>
+  <text x="436" y="214" class="title">Handoff Path</text>
+  <text x="436" y="236" class="sub">open → in_progress</text>
+  <text x="436" y="256" class="sub">→ resolved</text>
+
+  <rect x="820" y="60" width="120" height="92" class="node"/>
+  <text x="836" y="96" class="title">KPI</text>
+  <text x="836" y="118" class="sub">Closed-loop</text>
+  <text x="836" y="138" class="sub">Funnel + SLA</text>
+
+  <line x1="190" y1="106" x2="220" y2="106" class="line"/>
+  <line x1="390" y1="106" x2="420" y2="106" class="line"/>
+  <line x1="590" y1="106" x2="620" y2="106" class="line"/>
+  <line x1="790" y1="106" x2="820" y2="106" class="line"/>
+  <line x1="505" y1="152" x2="505" y2="182" class="line"/>
+</svg>

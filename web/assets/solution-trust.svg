@@ -1,0 +1,57 @@
+<svg width="960" height="360" viewBox="0 0 960 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="trustBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#EEFDEB"/>
+      <stop offset="100%" stop-color="#DCF7E3"/>
+    </linearGradient>
+    <linearGradient id="trustLine" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <style>
+      .panel { fill: #ffffff; stroke: #b9e5c5; stroke-width: 2; rx: 14; }
+      .h { font: 700 18px Avenir Next, Segoe UI, sans-serif; fill: #1d5a35; }
+      .t { font: 500 13px Avenir Next, Segoe UI, sans-serif; fill: #366247; }
+      .k { font: 700 12px Menlo, monospace; fill: #2d6d47; }
+      .line { stroke: url(#trustLine); stroke-width: 3; marker-end: url(#arrS); }
+    </style>
+    <marker id="arrS" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="360" fill="url(#trustBg)"/>
+  <text x="36" y="48" class="h">Trust & payment hardening lane</text>
+  <text x="36" y="72" class="t">Compliance gating + operation chain + reconciliation before scale</text>
+
+  <rect x="34" y="102" width="170" height="92" class="panel"/>
+  <text x="50" y="136" class="h">Auth Domain</text>
+  <text x="50" y="158" class="t">Limit + threshold</text>
+
+  <rect x="230" y="102" width="170" height="92" class="panel"/>
+  <text x="246" y="136" class="h">Rail Checks</text>
+  <text x="246" y="158" class="t">KYC + PCI + cert</text>
+
+  <rect x="426" y="102" width="170" height="92" class="panel"/>
+  <text x="442" y="136" class="h">Intent Verify</text>
+  <text x="442" y="158" class="t">High amount MFA</text>
+
+  <rect x="622" y="102" width="170" height="92" class="panel"/>
+  <text x="638" y="136" class="h">Audit Chain</text>
+  <text x="638" y="158" class="t">Explain each step</text>
+
+  <rect x="818" y="102" width="108" height="92" class="panel"/>
+  <text x="832" y="136" class="h">Recon</text>
+  <text x="832" y="158" class="t">Payout guard</text>
+
+  <line x1="204" y1="148" x2="230" y2="148" class="line"/>
+  <line x1="400" y1="148" x2="426" y2="148" class="line"/>
+  <line x1="596" y1="148" x2="622" y2="148" class="line"/>
+  <line x1="792" y1="148" x2="818" y2="148" class="line"/>
+
+  <rect x="34" y="228" width="892" height="94" class="panel"/>
+  <text x="50" y="258" class="k">Comment:</text>
+  <text x="124" y="258" class="t">Use this lane before growth campaigns to avoid payment and settlement incidents.</text>
+  <text x="50" y="286" class="k">Why recommended:</text>
+  <text x="176" y="286" class="t">Reduces operational risk by enforcing certified rails and auditable action history.</text>
+</svg>

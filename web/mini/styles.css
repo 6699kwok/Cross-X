@@ -1,0 +1,166 @@
+:root {
+  --bg: linear-gradient(180deg, #0f2941 0%, #eaf4fb 38%, #f1f8fd 100%);
+  --surface: #ffffff;
+  --line: #d4e4f0;
+  --ink: #13324c;
+  --muted: #5f7a8f;
+  --brand: linear-gradient(135deg, #10b88d 0%, #1f93ff 100%);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Avenir Next", "PingFang SC", "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  min-height: 100vh;
+}
+
+.shell {
+  max-width: 540px;
+  margin: 0 auto;
+  padding: 14px;
+}
+
+.top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.brand {
+  font-size: 18px;
+  font-weight: 800;
+  color: #f5fbff;
+}
+
+.build {
+  color: #d7e9f8;
+  font-size: 11px;
+  border: 1px solid rgba(255, 255, 255, 0.38);
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px;
+  box-shadow: 0 10px 24px rgba(12, 36, 58, 0.1);
+  margin-bottom: 10px;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+  margin-bottom: 6px;
+}
+
+h2 {
+  font-size: 15px;
+  margin-bottom: 8px;
+}
+
+h3 {
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.list {
+  display: grid;
+  gap: 8px;
+}
+
+.item {
+  border: 1px solid #d9e8f3;
+  border-radius: 12px;
+  padding: 10px;
+  background: #f7fbff;
+}
+
+.badge {
+  display: inline-block;
+  border: 1px solid #c4daea;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #1d4f72;
+  background: #eaf4fb;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+button,
+.btn {
+  border: 0;
+  border-radius: 10px;
+  background: var(--brand);
+  color: #fff;
+  padding: 9px 11px;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.btn.secondary,
+button.secondary {
+  background: #eef5fb;
+  border: 1px solid #c7dced;
+  color: #1d4869;
+}
+
+.nav {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.nav a {
+  text-align: center;
+  padding: 8px 4px;
+  border-radius: 10px;
+  border: 1px solid #cadfed;
+  background: #fff;
+  color: #164364;
+  text-decoration: none;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.nav a.active {
+  border-color: transparent;
+  color: #fff;
+  background: var(--brand);
+}
+
+.notice {
+  border: 1px dashed #b9d3e6;
+  border-radius: 12px;
+  padding: 9px;
+  color: #3e6380;
+  font-size: 12px;
+  background: #f4faff;
+}

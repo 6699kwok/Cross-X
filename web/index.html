@@ -1,0 +1,844 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cross X | AI Concierge</title>
+    <link rel="stylesheet" href="/styles/tokens.css?v=20260227-160" />
+    <link rel="stylesheet" href="/styles.css?v=20260227-160" />
+    <link rel="stylesheet" href="/styles/components.css?v=20260227-160" />
+    <link rel="stylesheet" href="/styles/motion.css?v=20260227-160" />
+  </head>
+  <body class="consumer-app single-dialog-mode">
+    <header class="topbar">
+      <div class="brand-wrap">
+        <img src="/assets/logo-crossx.jpg" alt="Cross X logo" class="logo" onerror="this.src='/assets/logo-crossx.png'" />
+        <div class="brand">
+          <h1>Cross X</h1>
+          <p>一句话说需求，自动给出可执行主方案与备选方案</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="pill" id="myOrdersBtn">我的订单</button>
+        <button class="pill" id="workspaceModeBtn">Workspace</button>
+        <a class="pill ops-link" id="openOpsBtn" href="/admin.html" target="_blank" rel="noopener">Ops Board</a>
+        <span class="pill" id="buildTag">build:-</span>
+        <button class="pill locate-btn" id="locateBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14" style="vertical-align:-2px;margin-right:3px" aria-hidden="true"><circle cx="12" cy="10" r="3"/><path d="M12 2a8 8 0 0 1 8 8c0 5.25-8 13-8 13S4 15.25 4 10a8 8 0 0 1 8-8z"/></svg>定位
+        </button>
+        <span class="pill location-pill" id="locationTag">Shanghai</span>
+        <span class="pill" id="languageTag">EN</span>
+        <span class="pill" id="viewModeTag">user</span>
+        <label class="pill lang-pill" for="langSwitch">
+          <span id="langPillLabel">Lang</span>
+          <select id="langSwitch" name="langSwitch">
+            <option value="ZH">中文</option>
+            <option value="EN">EN</option>
+            <option value="ID">Bahasa</option>
+            <option value="JA">日本語</option>
+            <option value="KO">한국어</option>
+          </select>
+          <span class="lang-caret">▾</span>
+        </label>
+        <button class="ghost-danger" id="emergencyBtn">Emergency</button>
+      </div>
+    </header>
+
+    <main class="app-shell">
+      <nav class="tabs">
+        <button class="tab active" data-tab="chat">Chat</button>
+        <button class="tab" data-tab="near">Near Me</button>
+        <button class="tab" data-tab="trips">Trips</button>
+        <button class="tab" data-tab="me">Me</button>
+        <button class="tab" data-tab="trust">Trust</button>
+      </nav>
+
+      <section id="chatTab" class="tab-panel active">
+        <article class="card context-card">
+          <h3 id="contextTitle">Context Chips</h3>
+          <div id="contextSummary" class="status">No constraints selected.</div>
+          <div id="contextGlossary" class="status">Task = 任务 · Plan = 计划 · Lane = 路线 · Proof = 凭证</div>
+        </article>
+        <article class="card quick-goals-card">
+          <h3 id="quickGoalsTitle">One Tap Goals</h3>
+          <div id="quickGoals" class="quick-goals"></div>
+        </article>
+        <article class="card flow-rail-card">
+          <h3 id="flowRailTitle">Closed Loop Progress</h3>
+          <div id="flowRail" class="flow-rail"></div>
+        </article>
+        <article class="card brain-card">
+          <h3 id="brainTitle">Agent Brain</h3>
+          <div id="brainState" class="brain-state"></div>
+        </article>
+        <section id="taskWorkspace" class="task-workspace">
+          <div id="chatFeed" class="chat-feed chat-timeline"></div>
+          <article id="taskStatusMount" class="card task-status-card section-hidden"></article>
+          <section id="planCardsSection" class="card task-panel section-hidden"></section>
+          <section id="confirmCardSection" class="card task-panel section-hidden"></section>
+          <section id="executionStepsSection" class="card task-panel section-hidden"></section>
+          <section id="executionResultSection" class="card task-panel section-hidden"></section>
+        </section>
+        <article class="card human-assist-card" id="humanAssistCard">
+          <div class="human-assist-head">
+            <h3 id="humanAssistTitle">Human Assist Desk</h3>
+            <span id="humanAssistMode" class="status-badge queued">Standby</span>
+          </div>
+          <div id="humanAssistSummary" class="status">No task is currently under human supervision.</div>
+          <div id="humanAssistTicket" class="status"></div>
+          <div id="humanAssistEta" class="status eta-live"></div>
+          <div class="actions">
+            <button class="secondary" id="assistRequestBtn" data-action="assist-request-handoff">Request Human Supervision</button>
+            <button class="secondary" id="assistOpenSupportBtn" data-action="assist-open-support">Open Support Desk</button>
+            <button class="secondary" id="assistLiveCallBtn" data-action="assist-open-live-room">Live Call Room</button>
+            <button class="secondary" id="assistRefreshBtn" data-action="assist-refresh">Refresh Assist Status</button>
+          </div>
+          <ul id="humanAssistRecent" class="steps"></ul>
+        </article>
+        <article class="card spotlight-card">
+          <h3 id="recommendedTitle">Recommended Solution</h3>
+          <p id="recommendedSubtitle" class="status">Images + related comments + why this recommendation</p>
+          <div id="chatSolutionStrip" class="solution-strip"></div>
+        </article>
+
+        <div class="constraints-toolbar">
+          <button class="secondary" id="toggleConstraintsBtn" type="button">Show Constraints</button>
+          <span id="inputAssistHint" class="status">Just say one goal naturally. Cross X will plan and execute.</span>
+          <span id="activeTripHint" class="status"></span>
+        </div>
+        <div class="chips" id="constraintChips">
+          <button class="chip" data-k="budget" data-v="low">Budget Low</button>
+          <button class="chip" data-k="budget" data-v="mid">Budget Mid</button>
+          <button class="chip" data-k="budget" data-v="high">Budget High</button>
+          <button class="chip" data-k="distance" data-v="walk">Walkable</button>
+          <button class="chip" data-k="distance" data-v="ride">Ride OK</button>
+          <button class="chip" data-k="time" data-v="soon">ASAP</button>
+          <button class="chip" data-k="time" data-v="flexible">Flexible</button>
+          <button class="chip" data-k="dietary" data-v="halal">Halal</button>
+          <button class="chip" data-k="dietary" data-v="vegan">Vegan</button>
+          <button class="chip" data-k="family" data-v="true">Family</button>
+          <button class="chip" data-k="accessibility" data-v="yes">Accessible</button>
+        </div>
+
+<div id="thinkingIndicator" class="thinking-indicator hidden" aria-live="polite"></div>
+        <form id="chatForm" class="chat-input input-dock">
+          <textarea id="chatInput" rows="1" placeholder="一句话说出你的酒店预订需求，比如’明天北京住一晚，500以内’" maxlength="500" required></textarea>
+          <button type="button" class="icon-btn translate-btn" id="translateBtn" title="翻译 / Translate" aria-label="翻译">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10"/>
+              <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+            </svg>
+            <span class="sr-only">翻译</span>
+          </button>
+          <button type="button" class="secondary intercom-btn" id="voiceInputBtn" aria-pressed="false" title="语音输入" aria-label="语音输入">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" class="mic-icon">
+              <rect x="9" y="3" width="6" height="11" rx="3"/>
+              <path d="M5 11a7 7 0 0 0 14 0"/>
+              <line x1="12" y1="18" x2="12" y2="22"/>
+              <line x1="8" y1="22" x2="16" y2="22"/>
+            </svg>
+            <span class="sr-only">语音输入</span>
+          </button>
+          <button id="chatSendBtn" type="submit">发送</button>
+        </form>
+      </section>
+
+      <section id="nearTab" class="tab-panel">
+        <h2 id="nearHeading">Near Me</h2>
+        <div class="near-layout">
+          <article class="card">
+            <h3 id="nearFiltersHeading">Filters</h3>
+            <form id="nearFilterForm" class="form-col">
+              <label>
+                Distance
+                <select name="distance">
+                  <option value="any">any</option>
+                  <option value="500m">500m</option>
+                  <option value="1km">1km</option>
+                  <option value="3km">3km</option>
+                </select>
+              </label>
+              <label>
+                Budget
+                <select name="budget">
+                  <option value="any">any</option>
+                  <option value="low">low</option>
+                  <option value="mid">mid</option>
+                  <option value="high">high</option>
+                </select>
+              </label>
+              <label>
+                Queue
+                <select name="queue">
+                  <option value="any">any</option>
+                  <option value="short">short</option>
+                  <option value="normal">normal</option>
+                </select>
+              </label>
+              <label>
+                Dietary
+                <select name="dietary">
+                  <option value="none">none</option>
+                  <option value="halal">halal</option>
+                  <option value="vegan">vegan</option>
+                  <option value="vegetarian">vegetarian</option>
+                </select>
+              </label>
+              <label>
+                Booking
+                <select name="booking">
+                  <option value="all">all</option>
+                  <option value="bookable_only">bookable only</option>
+                </select>
+              </label>
+              <label>
+                Foreign card
+                <select name="foreignCard">
+                  <option value="all">all</option>
+                  <option value="supported_only">supported only</option>
+                </select>
+              </label>
+            </form>
+          </article>
+          <article class="card">
+            <h3 id="nearResultsHeading">Results</h3>
+            <div id="nearList" class="list"></div>
+          </article>
+          <article class="card">
+            <h3 id="nearMapHeading">Map Preview</h3>
+            <div id="nearMapPreview" class="near-map"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="tripsTab" class="tab-panel">
+        <h2 id="tripsHeading">Trips & Orders</h2>
+        <article class="card">
+          <h3 id="tripPlanHeading">Trip Plans</h3>
+          <form id="tripForm" class="form-col">
+            <label>
+              Trip title
+              <input id="tripTitleInput" name="title" type="text" placeholder="e.g. Shanghai Business Day" />
+            </label>
+            <label>
+              City
+              <input id="tripCityInput" name="city" type="text" placeholder="Shanghai" />
+            </label>
+            <label>
+              Note
+              <input id="tripNoteInput" name="note" type="text" placeholder="airport pickup + dinner + hotel" />
+            </label>
+            <div class="actions">
+              <button id="createTripBtn" type="submit">Create Trip Plan</button>
+            </div>
+          </form>
+        </article>
+        <div id="tripList" class="cards-grid"></div>
+        <h3 id="ordersHeading">Orders</h3>
+        <div id="ordersList" class="cards-grid"></div>
+      </section>
+
+      <section id="meTab" class="tab-panel">
+        <div class="split-grid">
+          <article class="card">
+            <h3 id="mePreferencesHeading">My Preferences</h3>
+            <form id="prefForm" class="form-col">
+              <label>
+                Language
+                <select name="language">
+                  <option value="EN">EN</option>
+                  <option value="ZH">ZH</option>
+                  <option value="JA">JA</option>
+                  <option value="KO">KO</option>
+                </select>
+              </label>
+              <label>
+                Budget Preference
+                <select name="budget">
+                  <option value="low">Low</option>
+                  <option value="mid">Mid</option>
+                  <option value="high">High</option>
+                </select>
+              </label>
+              <label>
+                Dietary Preference
+                <input id="prefDietaryInput" name="dietary" type="text" placeholder="halal / vegan / allergy..." />
+              </label>
+              <label>
+                Family Friendly
+                <select name="family">
+                  <option value="false">No</option>
+                  <option value="true">Yes</option>
+                </select>
+              </label>
+              <label>
+                Mobility Preference
+                <select name="transport">
+                  <option value="mixed">Mixed</option>
+                  <option value="walk_first">Walk first</option>
+                  <option value="taxi_first">Taxi first</option>
+                  <option value="metro_first">Metro first</option>
+                </select>
+              </label>
+              <label>
+                Accessibility
+                <select name="accessibility">
+                  <option value="optional">Optional</option>
+                  <option value="yes">Required</option>
+                  <option value="no">No need</option>
+                </select>
+              </label>
+              <label>
+                Hotel
+                <input id="prefHotelInput" name="hotel" type="text" placeholder="Saved place: hotel" />
+              </label>
+              <label>
+                Office
+                <input id="prefOfficeInput" name="office" type="text" placeholder="Saved place: office" />
+              </label>
+              <label>
+                Airport
+                <input id="prefAirportInput" name="airport" type="text" placeholder="PVG / SHA" />
+              </label>
+              <button id="savePrefBtn" type="submit">Save Preferences</button>
+            </form>
+            <form id="viewModeForm" class="form-col">
+              <label>
+                Mode
+                <select name="viewMode">
+                  <option value="user">User</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </label>
+              <button id="switchModeBtn" type="submit">Switch Mode</button>
+            </form>
+          </article>
+
+          <article class="card plus-card">
+            <h3 id="plusHeading">Cross X Plus</h3>
+            <p id="plusDescription">7x24人工接管、更快响应、实时同传、稀缺资源代抢、部分费率优惠。</p>
+            <div id="plusStatus" class="status-text"></div>
+            <div id="providerStatus" class="status-text"></div>
+            <div class="actions">
+              <button id="plusSubscribeBtn" data-action="plus-subscribe">Activate Plus</button>
+              <button id="plusCancelBtn" class="secondary" data-action="plus-cancel">Pause Plus</button>
+            </div>
+          </article>
+
+          <article class="card">
+            <h3 id="llmConnectHeading">Connect OpenAI</h3>
+            <p id="llmConnectDesc" class="status">Sign in to OpenAI, paste API key, then Cross X can use ChatGPT for dynamic replies.</p>
+            <form id="llmRuntimeForm" class="form-col">
+              <label>
+                OpenAI API Key
+                <input id="llmApiKeyInput" name="apiKey" type="password" autocomplete="off" placeholder="sk-..." />
+              </label>
+              <label>
+                Model
+                <select id="llmModelSelect" name="model">
+                  <option value="gpt-4o-mini">gpt-4o-mini</option>
+                  <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                  <option value="gpt-4.1">gpt-4.1</option>
+                </select>
+              </label>
+              <div class="actions">
+                <button id="saveLlmBtn" type="submit">Save & Test</button>
+                <button id="openOpenAiBtn" class="secondary" type="button" data-action="open-openai-login">Open OpenAI Login</button>
+                <button id="clearLlmBtn" class="secondary" type="button" data-action="clear-llm-runtime">Clear Key</button>
+              </div>
+            </form>
+            <div id="llmStatusText" class="status-text"></div>
+            <div id="llmLastErrorText" class="status-text"></div>
+          </article>
+
+          <article class="card">
+            <h3 id="paymentLimitsHeading">Payment & Limits</h3>
+            <form id="railForm" class="form-col">
+              <label>
+                Default Payment Method
+                <select name="railId">
+                  <option value="alipay_cn">Alipay CN</option>
+                  <option value="wechat_cn">WeChat Pay CN</option>
+                  <option value="card_delegate">ACT Delegated Card</option>
+                </select>
+              </label>
+              <button id="saveRailBtn" type="submit">Save Payment Method</button>
+            </form>
+            <div class="status">Merchant of Record = 交易主体（Cross X 代收代付或商家直收，见确认页说明）</div>
+            <div id="railStatus" class="status-text"></div>
+            <div class="actions">
+              <button id="openTrustAdvancedBtn" class="secondary" data-action="open-trust-advanced">Open Trust Advanced</button>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <h3>KPI Dashboard</h3>
+            <div id="kpiSummary" class="list"></div>
+            <h3>Funnel</h3>
+            <div id="funnelSummary" class="list"></div>
+            <h3>Revenue</h3>
+            <div id="revenueSummary" class="list"></div>
+            <div class="actions">
+              <button class="secondary" data-action="run-settlement">Run Settlement Batch</button>
+            </div>
+            <h3>PRD Coverage</h3>
+            <div id="prdCoverageSummary" class="list"></div>
+            <h3>Gray Release Flags</h3>
+            <div id="flagsSummary" class="list"></div>
+            <form id="flagsForm" class="form-col">
+              <label>
+                plusConcierge rollout (%)
+                <input name="plusConciergeRollout" type="number" min="0" max="100" />
+              </label>
+              <label>
+                liveTranslation rollout (%)
+                <input name="liveTranslationRollout" type="number" min="0" max="100" />
+              </label>
+              <label>
+                manualFallback rollout (%)
+                <input name="manualFallbackRollout" type="number" min="0" max="100" />
+              </label>
+              <button type="submit">Update Rollout</button>
+            </form>
+            <form id="mcpPolicyForm" class="form-col">
+              <label>
+                MCP strict SLA enforcement
+                <select name="enforceSla">
+                  <option value="false">Disabled</option>
+                  <option value="true">Enabled</option>
+                </select>
+              </label>
+              <label>
+                Simulate SLA breach rate (%)
+                <input name="simulateBreachRate" type="number" min="0" max="100" />
+              </label>
+              <button type="submit">Update MCP Policy</button>
+            </form>
+          </article>
+
+          <article class="card admin-only">
+            <h3>Solution Board</h3>
+            <p class="status">Image + comments + recommendation analysis</p>
+            <div id="solutionBoard" class="solution-board"></div>
+            <div class="actions">
+              <button class="secondary" data-action="refresh-solution">Refresh Analysis</button>
+            </div>
+          </article>
+
+          <article class="card admin-only">
+            <h3>Mini Program Package</h3>
+            <div id="miniPackageSummary" class="list"></div>
+            <div class="actions">
+              <button class="secondary" data-action="release-alipay">Release Alipay</button>
+              <button class="secondary" data-action="release-wechat">Release WeChat</button>
+              <button class="secondary" data-action="refresh-mini-package">Refresh Package</button>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="trustTab" class="tab-panel">
+        <div class="split-grid trust-grid">
+          <article class="card">
+            <h3 id="trustSummaryHeading">Trust Summary (User View)</h3>
+            <div id="trustSummaryCard" class="list"></div>
+          </article>
+
+          <article class="card">
+            <h3 id="authHeading">Authorization Domain</h3>
+            <form id="authForm" class="form-col">
+              <label>
+                No-PIN Payment
+                <select name="noPinEnabled">
+                  <option value="true">Enabled</option>
+                  <option value="false">Disabled</option>
+                </select>
+              </label>
+              <label>
+                Daily Limit (CNY)
+                <input name="dailyLimit" type="number" min="0" />
+              </label>
+              <label>
+                Single Limit (CNY)
+                <input name="singleLimit" type="number" min="0" />
+              </label>
+              <button id="updateAuthBtn" type="submit">Update Authorization</button>
+            </form>
+          </article>
+
+          <article class="card">
+            <h3 id="operationHeading">Operation Tracking Chain</h3>
+            <div id="auditList" class="list"></div>
+          </article>
+
+          <article class="card">
+            <h3 id="privacyHeading">Privacy & Data</h3>
+            <form id="privacyForm" class="form-col">
+              <label>
+                Location Sharing
+                <select name="locationEnabled">
+                  <option value="true">Enabled</option>
+                  <option value="false">Disabled</option>
+                </select>
+              </label>
+              <button type="submit">Update Privacy</button>
+            </form>
+            <div class="actions trust-actions">
+              <button id="exportDataBtn" class="secondary" data-action="export-data">Export My Data</button>
+              <button id="deleteDataBtn" class="danger" data-action="delete-data">Delete My Data</button>
+            </div>
+            <div id="privacyResult" class="status-text"></div>
+          </article>
+
+          <article class="card">
+            <h3 id="mcpChainHeading">MCP Call Chain</h3>
+            <div id="mcpSlaSummary" class="list"></div>
+            <div id="mcpList" class="list"></div>
+          </article>
+
+          <article class="card">
+            <h3 id="supportHeading">Support Tickets</h3>
+            <div id="supportList" class="list"></div>
+          </article>
+
+          <article class="card admin-only">
+            <h3 id="advancedHeading">Advanced (Admin)</h3>
+            <details class="advanced" open>
+              <summary>Rail Compliance & Reconciliation</summary>
+              <form id="complianceForm" class="form-col">
+                <label>
+                  Rail compliance target
+                  <select name="railId">
+                    <option value="alipay_cn">Alipay CN</option>
+                    <option value="wechat_cn">WeChat Pay CN</option>
+                    <option value="card_delegate">ACT Delegated Card</option>
+                  </select>
+                </label>
+                <label>
+                  Certified
+                  <select name="certified">
+                    <option value="true">Yes</option>
+                    <option value="false">No</option>
+                  </select>
+                </label>
+                <label>
+                  KYC passed
+                  <select name="kycPassed">
+                    <option value="true">Yes</option>
+                    <option value="false">No</option>
+                  </select>
+                </label>
+                <label>
+                  PCI DSS
+                  <select name="pciDss">
+                    <option value="true">Yes</option>
+                    <option value="false">No</option>
+                  </select>
+                </label>
+                <label>
+                  Enabled
+                  <select name="enabled">
+                    <option value="true">Yes</option>
+                    <option value="false">No</option>
+                  </select>
+                </label>
+                <label>
+                  Risk tier
+                  <select name="riskTier">
+                    <option value="low">low</option>
+                    <option value="medium">medium</option>
+                    <option value="high">high</option>
+                  </select>
+                </label>
+                <button type="submit">Save Rail Compliance</button>
+              </form>
+              <form id="compliancePolicyForm" class="form-col">
+                <label>
+                  Block uncertified rails
+                  <select name="blockUncertifiedRails">
+                    <option value="true">Yes</option>
+                    <option value="false">No</option>
+                  </select>
+                </label>
+                <label>
+                  Require fraud screen
+                  <select name="requireFraudScreen">
+                    <option value="true">Yes</option>
+                    <option value="false">No</option>
+                  </select>
+                </label>
+                <button type="submit">Save Compliance Policy</button>
+              </form>
+              <div id="reconSummary" class="status-text"></div>
+              <div id="providerProbeSummary" class="status-text"></div>
+              <div class="actions">
+                <button class="secondary" data-action="run-reconciliation">Run Reconciliation</button>
+                <button id="probeProvidersBtn" class="secondary" data-action="probe-providers">Probe Providers</button>
+              </div>
+            </details>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <section id="taskDrawer" class="drawer hidden" aria-hidden="true">
+      <div class="drawer-panel">
+        <div class="drawer-head">
+          <h3 id="drawerTitle">Task Detail</h3>
+          <button id="closeTaskDrawerBtn" data-action="close-drawer" class="secondary">Close</button>
+        </div>
+        <nav class="subtabs">
+          <button id="subtabOverview" class="subtab active" data-subtab="overview">Overview</button>
+          <button id="subtabSteps" class="subtab" data-subtab="steps">Steps</button>
+          <button id="subtabPayments" class="subtab" data-subtab="payments">Payments</button>
+          <button id="subtabProof" class="subtab" data-subtab="proof">Proof</button>
+        </nav>
+        <div id="drawerBody" class="drawer-body"></div>
+      </div>
+    </section>
+
+    <section id="conditionEditorDrawer" class="drawer hidden" aria-hidden="true">
+      <div class="drawer-panel replan-panel">
+        <div class="drawer-head">
+          <h3 id="conditionEditorTitle">Condition Editor</h3>
+          <button id="closeConditionEditorBtn" class="secondary" data-action="close-condition-editor">Close</button>
+        </div>
+        <form id="conditionEditorForm" class="form-col">
+          <label>
+            Intent
+            <select name="intent" id="conditionIntent">
+              <option value="eat">eat</option>
+              <option value="travel">travel</option>
+              <option value="hotel">hotel</option>
+              <option value="combo_eat_travel">combo_eat_travel</option>
+              <option value="combo_hotel_travel">combo_hotel_travel</option>
+            </select>
+          </label>
+          <label>
+            City
+            <input name="city" id="conditionCity" type="text" placeholder="Shanghai / Shenzhen / Beijing" />
+          </label>
+          <label>
+            Area
+            <input name="area" id="conditionArea" type="text" placeholder="Nanshan / Bund / Jing'an" />
+          </label>
+          <label>
+            Party Size
+            <input name="party_size" id="conditionPartySize" type="number" min="1" max="10" placeholder="2" />
+          </label>
+          <label>
+            Budget
+            <select name="budget" id="conditionBudget">
+              <option value="">-</option>
+              <option value="low">low</option>
+              <option value="mid">mid</option>
+              <option value="high">high</option>
+            </select>
+          </label>
+          <label>
+            Time Constraint
+            <input name="time_constraint" id="conditionTimeConstraint" type="text" placeholder="ASAP / tonight / before 20:00" />
+          </label>
+          <label>
+            Preferences (comma separated)
+            <input name="preferences" id="conditionPreferences" type="text" placeholder="no_queue,walk_first,halal" />
+          </label>
+          <label>
+            Execution Permission
+            <select name="execution_permission" id="conditionExecutionPermission">
+              <option value="false">false</option>
+              <option value="true">true</option>
+            </select>
+          </label>
+          <div class="actions">
+            <button type="submit">Apply Conditions</button>
+            <button type="button" class="secondary" data-action="close-condition-editor">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section id="replanDrawer" class="drawer hidden" aria-hidden="true">
+      <div class="drawer-panel replan-panel">
+        <div class="drawer-head">
+          <h3 id="replanTitle">Edit Plan</h3>
+          <button id="closeReplanBtn" data-action="close-replan" class="secondary">Close</button>
+        </div>
+        <form id="replanForm" class="form-col">
+          <input id="replanTaskId" name="taskId" type="hidden" />
+          <label>
+            Template
+            <select id="replanTemplateId" name="templateId">
+              <option value="">Custom / 自定义</option>
+              <option value="eat_local">Eat Local / 地道美食</option>
+              <option value="airport_rush">Airport Rush / 赶机场优先</option>
+              <option value="family_food">Family Food / 亲子餐饮</option>
+            </select>
+          </label>
+          <label>
+            Intent
+            <input id="replanIntent" name="intent" type="text" required />
+          </label>
+          <label>
+            Budget
+            <select name="budget">
+              <option value="low">low</option>
+              <option value="mid">mid</option>
+              <option value="high">high</option>
+            </select>
+          </label>
+          <label>
+            Distance
+            <select name="distance">
+              <option value="walk">walk</option>
+              <option value="ride">ride</option>
+              <option value="any">any</option>
+            </select>
+          </label>
+          <label>
+            Time
+            <select name="time">
+              <option value="soon">soon</option>
+              <option value="normal">normal</option>
+              <option value="flexible">flexible</option>
+            </select>
+          </label>
+          <label>
+            Dietary
+            <input id="replanDietaryInput" name="dietary" type="text" placeholder="e.g. halal, vegan" />
+          </label>
+          <label>
+            Family
+            <select name="family">
+              <option value="false">false</option>
+              <option value="true">true</option>
+            </select>
+          </label>
+          <label>
+            Accessibility
+            <select name="accessibility">
+              <option value="optional">optional</option>
+              <option value="yes">yes</option>
+              <option value="no">no</option>
+            </select>
+          </label>
+          <label>
+            City
+            <input name="city" type="text" />
+          </label>
+          <label>
+            Origin
+            <input name="origin" type="text" />
+          </label>
+          <label>
+            Destination
+            <input name="destination" type="text" />
+          </label>
+          <div id="replanHint" class="status-text"></div>
+          <div id="replanPreview" class="list"></div>
+          <div class="actions">
+            <button id="previewReplanBtn" type="button" class="secondary" data-action="preview-replan">Preview</button>
+            <button id="saveReplanBtn" type="submit">Save Replan</button>
+            <button id="cancelReplanBtn" type="button" class="secondary" data-action="close-replan">Cancel</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section id="proofDrawer" class="drawer hidden" aria-hidden="true">
+      <div class="drawer-panel">
+        <div class="drawer-head">
+          <h3 id="proofDrawerTitle">Proof & Support</h3>
+          <button id="closeProofDrawerBtn" data-action="close-proof-drawer" class="secondary">Close</button>
+        </div>
+        <div id="proofDrawerBody" class="drawer-body"></div>
+      </div>
+    </section>
+
+    <section id="orderDrawer" class="drawer hidden" aria-hidden="true">
+      <div class="drawer-panel">
+        <div class="drawer-head">
+          <h3 id="orderDrawerTitle">Order Detail</h3>
+          <button id="closeOrderDrawerBtn" data-action="close-order-drawer" class="secondary">Close</button>
+        </div>
+        <div id="orderDrawerBody" class="drawer-body"></div>
+      </div>
+    </section>
+
+    <section id="supportRoomDrawer" class="drawer hidden" aria-hidden="true">
+      <div class="drawer-panel support-room-panel">
+        <div class="drawer-head support-room-head">
+          <h3 id="supportRoomTitle">Live Human Support</h3>
+          <div class="actions">
+            <span id="supportRoomStatus" class="status-badge queued">waiting</span>
+            <button id="closeSupportRoomBtn" data-action="close-support-room" class="secondary">Close</button>
+          </div>
+        </div>
+        <div id="supportRoomMeta" class="status"></div>
+        <div id="supportRoomMessages" class="drawer-body support-room-messages"></div>
+        <form id="supportRoomForm" class="support-room-input">
+          <textarea id="supportRoomInput" rows="2" placeholder="Tell support agent what is urgent..." required></textarea>
+          <div class="actions">
+            <button type="button" class="secondary" id="supportRoomVoiceBtn" data-action="support-voice-toggle" aria-pressed="false">Voice Talk</button>
+            <button type="submit" id="supportRoomSendBtn">Send</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <div id="aiAuraBackground" aria-hidden="true">
+      <div class="aura-orb aura-orb-a"></div>
+      <div class="aura-orb aura-orb-b"></div>
+      <div class="aura-orb aura-orb-c"></div>
+    </div>
+
+    <div id="modalRoot"></div>
+    <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+
+    <!-- Payment Modal -->
+    <div id="paymentModal" class="payment-modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="payModalTitle">
+      <div class="payment-modal">
+        <button class="payment-modal-close" id="payModalClose" aria-label="关闭">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" width="18" height="18"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+        <div class="payment-modal-header">
+          <div class="payment-modal-title" id="payModalTitle">确认订单</div>
+          <div class="payment-modal-subtitle" id="payModalSubtitle">请选择支付方式</div>
+        </div>
+        <div class="payment-order-summary" id="payOrderSummary">
+          <div class="pay-order-row"><span id="payItemName">-</span><span id="payItemPrice" class="pay-price">-</span></div>
+          <div class="pay-order-divider"></div>
+          <div class="pay-order-row pay-total"><span>合计</span><span id="payTotal" class="pay-price pay-total-amount">-</span></div>
+        </div>
+        <div class="payment-methods">
+          <button class="payment-method-btn wechat-btn" id="payWechat">
+            <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22" aria-hidden="true"><path d="M9.5 2C5.36 2 2 5.13 2 9c0 2.04 0.92 3.88 2.39 5.18L3.5 17l3.05-1.53A8.2 8.2 0 0 0 9.5 16c.35 0 .7-.02 1.04-.06C10.19 15.36 10 14.7 10 14c0-3.31 3.13-6 7-6 .17 0 .34 0 .5.01C16.88 4.63 13.5 2 9.5 2zm-1.5 4a1 1 0 1 1 0 2 1 1 0 0 1 0-2zm4 0a1 1 0 1 1 0 2 1 1 0 0 1 0-2zm5 6c-2.76 0-5 1.79-5 4s2.24 4 5 4c.74 0 1.44-.14 2.07-.38L21 21l-.85-2.19A3.84 3.84 0 0 0 22 16c0-2.21-2.24-4-5-4zm-1.5 2a.75.75 0 1 1 0 1.5.75.75 0 0 1 0-1.5zm3 0a.75.75 0 1 1 0 1.5.75.75 0 0 1 0-1.5z"/></svg>
+            <span>微信支付</span>
+          </button>
+          <button class="payment-method-btn alipay-btn" id="payAlipay">
+            <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22" aria-hidden="true"><path d="M21.4 15.59c-1.87-.8-4.75-2.2-6.47-3.09.85-1.24 1.48-2.78 1.72-4.5H19V6.5h-5V5h-2v1.5H7V8h7.47c-.2 1.22-.65 2.29-1.27 3.14C11.9 10.4 10.5 10 9 10c-3.31 0-6 2.24-6 5s2.69 5 6 5c2.43 0 4.52-1.38 5.52-3.38 1.81.96 4.66 2.38 6.48 3.14.28.12.56-.11.5-.41l-.1-.76zM9 18c-1.66 0-3-1.12-3-2.5S7.34 13 9 13s3 1.12 3 2.5S10.66 18 9 18z"/></svg>
+            <span>支付宝</span>
+          </button>
+        </div>
+        <div class="payment-qr-section hidden" id="payQrSection">
+          <div class="payment-qr-label" id="payQrLabel">扫码支付</div>
+          <img class="payment-qr-img" id="payQrImg" src="" alt="支付二维码" />
+          <div class="payment-qr-hint" id="payQrHint">请使用对应App扫码</div>
+          <div class="payment-qr-amount" id="payQrAmount"></div>
+          <button class="payment-done-btn" id="payDoneBtn">我已完成支付</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+    <script src="/state/store.js?v=20260227-160"></script>
+    <script src="/utils/i18n.js?v=20260227-160"></script>
+    <script src="/ui/motion.js?v=20260227-160"></script>
+    <script src="/ui/drawer.js?v=20260227-160"></script>
+    <script src="/ui/modal.js?v=20260227-160"></script>
+    <script src="/ui/toast.js?v=20260227-160"></script>
+    <script src="/ui/skeleton.js?v=20260227-160"></script>
+    <script src="/ui/task-components.js?v=20260227-160"></script>
+    <script src="/app.js?v=20260227-160"></script>
+  </body>
+</html>

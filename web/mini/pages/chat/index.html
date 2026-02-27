@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cross X Mini | Chat</title>
+    <link rel="stylesheet" href="/mini/styles.css" />
+  </head>
+  <body data-page="chat">
+    <main class="shell">
+      <header class="top">
+        <div class="brand">Cross X Mini</div>
+        <div class="build" id="buildTag">build:-</div>
+      </header>
+
+      <article class="card">
+        <h1>Chat (Mini Program)</h1>
+        <p class="muted">One sentence -> plan -> confirm -> execute -> proof.</p>
+        <div class="actions">
+          <button data-action="open-chat-web">Open Full Chat</button>
+          <button class="secondary" data-action="refresh-mini">Refresh</button>
+        </div>
+      </article>
+
+      <article class="card">
+        <h2>Quick Intents</h2>
+        <div class="list">
+          <div class="item">
+            <h3>Local noodles nearby</h3>
+            <p class="muted">Will run: search -> queue -> lock -> pay -> proof</p>
+            <span class="badge">ETA 15-25 min</span>
+          </div>
+          <div class="item">
+            <h3>Bund then airport</h3>
+            <p class="muted">Will run: route -> traffic -> lock ride -> pay -> QR proof</p>
+            <span class="badge">ETA 60-90 min</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="card notice">
+        Last refreshed: <span id="timestamp">-</span>
+      </article>
+
+      <nav class="nav">
+        <a class="active" href="/mini/pages/chat/index.html">Chat</a>
+        <a href="/mini/pages/trips/index.html">Trips</a>
+        <a href="/mini/pages/trust/index.html">Trust</a>
+        <a href="/mini/pages/me/index.html">Me</a>
+      </nav>
+    </main>
+    <script src="/mini/app.js"></script>
+  </body>
+</html>

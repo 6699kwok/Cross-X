@@ -1,0 +1,20 @@
+{
+  "name": "crossx-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "node -e \"console.log('build: static node app, no compile step')\"",
+    "start": "PORT=8787 HOST=127.0.0.1 node server.js",
+    "start:8787": "PORT=8787 HOST=127.0.0.1 node server.js",
+    "start:3001": "PORT=3001 HOST=127.0.0.1 node server.js",
+    "llm:status": "curl -s http://127.0.0.1:8787/api/system/llm-status",
+    "llm:connect-env": "sh -c 'if [ -z \"$OPENAI_API_KEY\" ]; then echo \"OPENAI_API_KEY is empty\"; exit 1; fi; curl -s -X POST http://127.0.0.1:8787/api/system/llm/runtime -H \"Content-Type: application/json\" -d \"{\\\"apiKey\\\":\\\"$OPENAI_API_KEY\\\"}\" && echo && curl -s http://127.0.0.1:8787/api/system/llm-status'",
+    "llm:reload": "curl -s -X POST http://127.0.0.1:8787/api/system/llm/reload -H 'Content-Type: application/json' -d '{}'",
+    "llm:probe": "curl -s -X POST http://127.0.0.1:8787/api/chat/reply -H 'Content-Type: application/json' -d '{\"message\":\"Find halal dinner in Shanghai for 2 under 200\",\"language\":\"EN\",\"city\":\"Shanghai\",\"constraints\":{\"budget\":\"mid\",\"dietary\":\"halal\"}}'",
+    "llm:probe:source": "curl -s -X POST http://127.0.0.1:8787/api/chat/reply -H 'Content-Type: application/json' -d '{\"message\":\"Find halal dinner in Shanghai for 2 under 200\",\"language\":\"EN\",\"city\":\"Shanghai\",\"constraints\":{\"budget\":\"mid\",\"dietary\":\"halal\"}}' | grep -o '\"source\":\"[^\"]*\"'",
+    "llm:diagnose": "curl -s -X POST http://127.0.0.1:8787/api/chat/reply -H 'Content-Type: application/json' -d '{\"message\":\"Find halal dinner in Shanghai for 2 under 200\",\"language\":\"EN\",\"city\":\"Shanghai\",\"constraints\":{\"budget\":\"mid\",\"dietary\":\"halal\"}}' | grep -o '\"source\":\"[^\"]*\"\\|\"fallbackReason\":\"[^\"]*\"\\|\"reason\":\"[^\"]*\"\\|\"keySource\":\"[^\"]*\"\\|\"looksValid\":\\(true\\|false\\)'",
+    "provider:check": "bash scripts/provider-live-check.sh",
+    "launchd:install": "bash scripts/install-launchd.sh",
+    "launchd:uninstall": "bash scripts/uninstall-launchd.sh"
+  }
+}

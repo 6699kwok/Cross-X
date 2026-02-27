@@ -1,0 +1,57 @@
+<svg width="960" height="360" viewBox="0 0 960 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="eatBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#FFF7E8"/>
+      <stop offset="100%" stop-color="#FFE3D3"/>
+    </linearGradient>
+    <linearGradient id="eatLine" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#F97316"/>
+      <stop offset="100%" stop-color="#EF4444"/>
+    </linearGradient>
+    <style>
+      .panel { fill: #ffffff; stroke: #f2c9ad; stroke-width: 2; rx: 14; }
+      .h { font: 700 18px Avenir Next, Segoe UI, sans-serif; fill: #8a2d14; }
+      .t { font: 500 13px Avenir Next, Segoe UI, sans-serif; fill: #7b4a36; }
+      .k { font: 700 12px Menlo, monospace; fill: #a63b22; }
+      .line { stroke: url(#eatLine); stroke-width: 3; marker-end: url(#arr); }
+    </style>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#EF4444"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="360" fill="url(#eatBg)"/>
+  <text x="36" y="48" class="h">Eat locally like a pro</text>
+  <text x="36" y="72" class="t">Intent -> queue intelligence -> booking -> ACT payment -> bilingual proof</text>
+
+  <rect x="34" y="102" width="170" height="92" class="panel"/>
+  <text x="50" y="136" class="h">Intent</text>
+  <text x="50" y="158" class="t">Authentic + walkable</text>
+
+  <rect x="230" y="102" width="170" height="92" class="panel"/>
+  <text x="246" y="136" class="h">LBS + Queue</text>
+  <text x="246" y="158" class="t">Real-time wait</text>
+
+  <rect x="426" y="102" width="170" height="92" class="panel"/>
+  <text x="442" y="136" class="h">Book Lock</text>
+  <text x="442" y="158" class="t">Reserve slot</text>
+
+  <rect x="622" y="102" width="170" height="92" class="panel"/>
+  <text x="638" y="136" class="h">ACT Pay</text>
+  <text x="638" y="158" class="t">Delegated charge</text>
+
+  <rect x="818" y="102" width="108" height="92" class="panel"/>
+  <text x="832" y="136" class="h">Proof</text>
+  <text x="832" y="158" class="t">QR + map</text>
+
+  <line x1="204" y1="148" x2="230" y2="148" class="line"/>
+  <line x1="400" y1="148" x2="426" y2="148" class="line"/>
+  <line x1="596" y1="148" x2="622" y2="148" class="line"/>
+  <line x1="792" y1="148" x2="818" y2="148" class="line"/>
+
+  <rect x="34" y="228" width="892" height="94" class="panel"/>
+  <text x="50" y="258" class="k">Comment:</text>
+  <text x="124" y="258" class="t">Tourists prefer this lane when they need fast, low-risk local dining decisions.</text>
+  <text x="50" y="286" class="k">Why recommended:</text>
+  <text x="176" y="286" class="t">Highest completion lift for first-session inbound users with minimal interaction cost.</text>
+</svg>

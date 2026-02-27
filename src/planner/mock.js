@@ -1,0 +1,107 @@
+"use strict";
+/**
+ * src/planner/mock.js
+ * Mock data layer (AMap routing + Ctrip hotels) — extracted from server.js
+ * Also exports safeParseJson utility used across the planner pipeline.
+ */
+
+// ── safeParseJson — tolerant JSON extractor for LLM output ───────────────────
+function safeParseJson(raw) {
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { /* fall through */ }
+  const stripped = raw.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+  try { return JSON.parse(stripped); } catch { /* fall through */ }
+  const match = stripped.match(/(\{[\s\S]*\}|\[[\s\S]*\])/m);
+  if (match) {
+    try { return JSON.parse(match[1]); } catch { /* fall through */ }
+  }
+  return null;
+}
+
+// ── Known Chinese city names (for reliable destination extraction) ───────────
+const CHINA_CITIES_RE = /北京|上海|广州|深圳|成都|西安|杭州|南京|武汉|重庆|厦门|苏州|青岛|大连|哈尔滨|长沙|郑州|西宁|乌鲁木齐|昆明|贵阳|南宁|海口|三亚|丽江|桂林|张家界|黄山|敦煌|拉萨|香港|澳门|台北|台湾/;
+
+// ── Mock AMap Routing — 8 major inter-city corridors ────────────────────────
+const AMAP_ROUTES = {
+  "shenzhen→xian":     { modes:[{type:"flight",label:"航班",duration_min:165,price_cny:950,freq:"每日8班"},{type:"hsr",label:"高铁（需中转武汉）",duration_min:780,price_cny:720,freq:"每日3班"}], recommended:"flight", note:"宝安机场→咸阳机场，建议提前2小时到达机场" },
+  "xian→shenzhen":     { modes:[{type:"flight",label:"航班",duration_min:165,price_cny:950,freq:"每日8班"}], recommended:"flight", note:"咸阳机场→宝安机场" },
+  "shenzhen→urumqi":   { modes:[{type:"flight",label:"航班",duration_min:270,price_cny:1400,freq:"每日4班"}], recommended:"flight", note:"宝安机场→地窝堡机场，无直达高铁" },
+  "xian→urumqi":       { modes:[{type:"flight",label:"航班",duration_min:190,price_cny:1100,freq:"每日5班"},{type:"train",label:"普速火车",duration_min:1620,price_cny:450,freq:"每日2班"}], recommended:"flight", note:"咸阳机场→地窝堡机场" },
+  "shenzhen→beijing":  { modes:[{type:"flight",label:"航班",duration_min:195,price_cny:1100,freq:"每日20班"},{type:"hsr",label:"G高铁",duration_min:510,price_cny:870,freq:"每日12班"}], recommended:"flight", note:"宝安机场→首都/大兴机场" },
+  "shenzhen→shanghai": { modes:[{type:"flight",label:"航班",duration_min:150,price_cny:800,freq:"每日30班"},{type:"hsr",label:"G高铁",duration_min:330,price_cny:550,freq:"每日18班"}], recommended:"hsr", note:"推荐高铁，市区间点对点省时" },
+  "beijing→xian":      { modes:[{type:"hsr",label:"G高铁",duration_min:330,price_cny:600,freq:"每日15班"},{type:"flight",label:"航班",duration_min:120,price_cny:700,freq:"每日10班"}], recommended:"hsr", note:"北京西→西安北高铁站" },
+  "shanghai→beijing":  { modes:[{type:"hsr",label:"G高铁",duration_min:270,price_cny:550,freq:"每日50班"},{type:"flight",label:"航班",duration_min:135,price_cny:700,freq:"每日30班"}], recommended:"hsr", note:"虹桥→北京南高铁站" },
+};
+
+function mockAmapRouting(fromCity, toCity) {
+  if (!fromCity || !toCity) return null;
+  const normalize = (s) => String(s).toLowerCase()
+    .replace(/深圳|shenzhen/i, "shenzhen").replace(/西安|xian|xi'an/i, "xian")
+    .replace(/新疆|乌鲁木齐|urumqi|xinjiang/i, "urumqi").replace(/北京|beijing/i, "beijing")
+    .replace(/上海|shanghai/i, "shanghai").replace(/成都|chengdu/i, "chengdu");
+  const key = normalize(fromCity) + "→" + normalize(toCity);
+  const rev = normalize(toCity) + "→" + normalize(fromCity);
+  return AMAP_ROUTES[key] || AMAP_ROUTES[rev] || {
+    modes: [{ type: "flight", label: "航班", duration_min: 120, price_cny: 800, freq: "每日多班" }],
+    recommended: "flight",
+    note: `${fromCity}→${toCity}，建议查阅携程获取实时票价`,
+  };
+}
+
+// ── Mock Ctrip Hotels — 6 cities × 3 tiers ───────────────────────────────────
+const CTRIP_HOTELS = {
+  shenzhen: [
+    { tier: "budget",   name: "汉庭酒店（深圳南山科技园店）",     price_per_night: 268,  rating: 4.4, district: "南山区",  image_keyword: "Hanting Hotel Shenzhen budget city view" },
+    { tier: "balanced", name: "深圳招商格兰云天大酒店",           price_per_night: 620,  rating: 4.7, district: "南山区",  image_keyword: "Grand Skylight Hotel Shenzhen bay view" },
+    { tier: "premium",  name: "深圳瑞吉酒店",                    price_per_night: 1980, rating: 4.9, district: "福田区",  image_keyword: "St Regis Shenzhen luxury skyline" },
+  ],
+  xian: [
+    { tier: "budget",   name: "如家酒店（西安钟楼回民街店）",      price_per_night: 198,  rating: 4.3, district: "莲湖区",  image_keyword: "Home Inn Xian Bell Tower budget" },
+    { tier: "balanced", name: "西安君乐宝铂尔曼酒店",             price_per_night: 780,  rating: 4.8, district: "高新区",  image_keyword: "Pullman Xian modern hotel exterior" },
+    { tier: "premium",  name: "西安万达文华酒店",                 price_per_night: 1580, rating: 4.9, district: "曲江新区", image_keyword: "Wanda Vista Xian luxury pool" },
+  ],
+  urumqi: [
+    { tier: "budget",   name: "汉庭酒店（乌鲁木齐火车南站店）",   price_per_night: 228,  rating: 4.2, district: "天山区",  image_keyword: "Hanting Hotel Urumqi budget" },
+    { tier: "balanced", name: "乌鲁木齐凯宾斯基大酒店",           price_per_night: 860,  rating: 4.7, district: "天山区",  image_keyword: "Kempinski Hotel Urumqi exterior" },
+    { tier: "premium",  name: "乌鲁木齐喜来登酒店",               price_per_night: 1280, rating: 4.8, district: "水磨沟区", image_keyword: "Sheraton Urumqi luxury hotel lobby" },
+  ],
+  beijing: [
+    { tier: "budget",   name: "全季酒店（北京王府井步行街店）",    price_per_night: 360,  rating: 4.5, district: "东城区",  image_keyword: "Ji Hotel Beijing Wangfujing" },
+    { tier: "balanced", name: "北京日出东方凯宾斯基酒店",         price_per_night: 1150, rating: 4.7, district: "朝阳区",  image_keyword: "Kempinski Hotel Beijing sunrise" },
+    { tier: "premium",  name: "北京柏悦酒店",                    price_per_night: 2800, rating: 4.9, district: "朝阳区",  image_keyword: "Park Hyatt Beijing luxury skyline" },
+  ],
+  shanghai: [
+    { tier: "budget",   name: "锦江都城酒店（上海南京西路店）",    price_per_night: 320,  rating: 4.4, district: "静安区",  image_keyword: "Metropolo Hotel Shanghai Nanjing Road" },
+    { tier: "balanced", name: "上海新天地朗廷酒店",               price_per_night: 1200, rating: 4.8, district: "黄浦区",  image_keyword: "The Langham Shanghai Xintiandi" },
+    { tier: "premium",  name: "上海柏悦酒店（环球金融中心）",     price_per_night: 3200, rating: 4.9, district: "浦东新区", image_keyword: "Park Hyatt Shanghai tower luxury" },
+  ],
+  chengdu: [
+    { tier: "budget",   name: "汉庭酒店（成都春熙路天府广场店）", price_per_night: 198,  rating: 4.3, district: "锦江区",  image_keyword: "Hanting Hotel Chengdu Chunxi Road" },
+    { tier: "balanced", name: "成都博舍酒店（太古里）",           price_per_night: 1380, rating: 4.9, district: "锦江区",  image_keyword: "The Temple House Chengdu Taikoo Li courtyard" },
+    { tier: "premium",  name: "成都瑞吉酒店",                    price_per_night: 2200, rating: 4.9, district: "高新区",  image_keyword: "St Regis Chengdu luxury hotel" },
+  ],
+};
+
+function mockCtripHotels(city, budgetPerNight) {
+  const normalize = (s) => String(s).toLowerCase()
+    .replace(/深圳|shenzhen/i, "shenzhen").replace(/西安|xian|xi'an/i, "xian")
+    .replace(/新疆|乌鲁木齐|urumqi|xinjiang/i, "urumqi").replace(/北京|beijing/i, "beijing")
+    .replace(/上海|shanghai/i, "shanghai").replace(/成都|chengdu/i, "chengdu");
+  const key = normalize(city || "");
+  const hotels = CTRIP_HOTELS[key] || [
+    { tier: "budget",   name: `${city}经济型酒店（推荐如家/汉庭）`, price_per_night: 200,  rating: 4.2, district: "市中心", image_keyword: `${city} budget hotel city center` },
+    { tier: "balanced", name: `${city}商务酒店（推荐万怡/四点）`,  price_per_night: 600,  rating: 4.6, district: "商业区", image_keyword: `${city} business hotel modern` },
+    { tier: "premium",  name: `${city}五星酒店（推荐万豪/希尔顿）`, price_per_night: 1500, rating: 4.8, district: "核心区", image_keyword: `${city} luxury five star hotel` },
+  ];
+  if (budgetPerNight) hotels.forEach((h) => { h.fits_budget = h.price_per_night <= budgetPerNight; });
+  return hotels;
+}
+
+module.exports = {
+  safeParseJson,
+  CHINA_CITIES_RE,
+  AMAP_ROUTES,
+  mockAmapRouting,
+  CTRIP_HOTELS,
+  mockCtripHotels,
+};

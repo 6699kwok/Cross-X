@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cross X Ops | 人工干预后台</title>
+    <link rel="stylesheet" href="/styles/tokens.css?v=20260224-23" />
+    <link rel="stylesheet" href="/styles.css?v=20260224-23" />
+    <link rel="stylesheet" href="/styles/components.css?v=20260224-23" />
+    <link rel="stylesheet" href="/styles/motion.css?v=20260224-23" />
+    <link rel="stylesheet" href="/admin.css?v=20260224-23" />
+  </head>
+  <body class="ops-body">
+    <header class="topbar">
+      <div class="brand-wrap">
+        <img src="/assets/logo-crossx.svg" alt="Cross X logo" class="logo" />
+        <div class="brand">
+          <h1 id="opsTitle">Cross X Ops Console</h1>
+          <p id="opsSubtitle">人工监督与工单执行中台</p>
+        </div>
+      </div>
+      <div class="top-actions">
+        <a class="pill ops-link" id="openUserAppLink" href="/index.html" target="_blank" rel="noopener">打开用户端</a>
+        <button class="pill locate-btn" id="opsRefreshBtn">刷新</button>
+        <span class="pill" id="opsBuildTag">build:-</span>
+        <label class="pill lang-pill" for="opsLangSwitch">
+          <span id="opsLangLabel">语言</span>
+          <select id="opsLangSwitch" name="opsLangSwitch">
+            <option value="ZH">中文</option>
+            <option value="EN">EN</option>
+            <option value="JA">日本語</option>
+            <option value="KO">한국어</option>
+          </select>
+          <span class="lang-caret">▾</span>
+        </label>
+      </div>
+    </header>
+
+    <main class="app-shell ops-shell">
+      <article class="card">
+        <div class="ops-section-head">
+          <h2 id="overviewHeading">人工干预总览</h2>
+          <span class="status" id="lastUpdatedText">-</span>
+        </div>
+        <div id="opsSummaryGrid" class="ops-summary-grid"></div>
+      </article>
+
+      <article class="card">
+        <div class="ops-section-head">
+          <h3 id="issuesHeading">待转人工问题</h3>
+          <span id="issuesCountBadge" class="status-badge queued">0</span>
+        </div>
+        <div id="issuesList" class="cards-grid"></div>
+      </article>
+
+      <section class="ops-live-grid">
+        <article class="card">
+          <div class="ops-section-head">
+            <h3 id="liveSessionsHeading">实时会话队列</h3>
+            <span id="liveSessionsCountBadge" class="status-badge running">0</span>
+          </div>
+          <div id="liveSessionsList" class="list"></div>
+        </article>
+        <article class="card">
+          <div class="ops-section-head">
+            <h3 id="liveRoomHeading">人工通话空间</h3>
+            <span id="liveRoomStatusBadge" class="status-badge queued">未接入</span>
+          </div>
+          <div id="liveRoomMeta" class="status">请选择会话并接入。</div>
+          <div id="liveRoomMessages" class="ops-live-room"></div>
+          <form id="liveRoomForm" class="form-col">
+            <textarea id="liveRoomInput" rows="3" placeholder="输入回复给前端用户..." required></textarea>
+            <div class="actions">
+              <button type="button" class="secondary" id="liveVoiceBtn" data-action="ops-live-voice">语音回复</button>
+              <button type="button" class="secondary" id="liveClaimBtn" data-action="ops-live-claim">接入会话</button>
+              <button type="button" class="secondary" id="liveCloseBtn" data-action="ops-live-close">关闭会话</button>
+              <button type="submit" id="liveSendBtn">发送</button>
+            </div>
+          </form>
+        </article>
+      </section>
+
+      <section class="ops-board-grid">
+        <article class="card ops-column ops-critical">
+          <div class="ops-column-head">
+            <h3 id="immediateHeading">需立即监督</h3>
+            <span id="immediateCountBadge" class="status-badge failed">0</span>
+          </div>
+          <div id="immediateList" class="list"></div>
+        </article>
+        <article class="card ops-column">
+          <div class="ops-column-head">
+            <h3 id="pendingHeading">待处理工单</h3>
+            <span id="pendingCountBadge" class="status-badge queued">0</span>
+          </div>
+          <div id="pendingList" class="list"></div>
+        </article>
+        <article class="card ops-column">
+          <div class="ops-column-head">
+            <h3 id="activeHeading">处理中</h3>
+            <span id="activeCountBadge" class="status-badge running">0</span>
+          </div>
+          <div id="activeList" class="list"></div>
+        </article>
+        <article class="card ops-column">
+          <div class="ops-column-head">
+            <h3 id="resolvedHeading">已解决</h3>
+            <span id="resolvedCountBadge" class="status-badge success">0</span>
+          </div>
+          <div id="resolvedList" class="list"></div>
+        </article>
+      </section>
+    </main>
+
+    <section id="opsDrawer" class="drawer hidden" aria-hidden="true">
+      <div class="drawer-panel">
+        <div class="drawer-head">
+          <h3 id="opsDrawerTitle">工单详情</h3>
+          <button id="closeOpsDrawerBtn" class="secondary" data-action="close-ops-drawer">关闭</button>
+        </div>
+        <div id="opsDrawerBody" class="drawer-body"></div>
+      </div>
+    </section>
+
+    <div id="modalRoot"></div>
+    <div id="toastRoot" class="toast-root" aria-live="polite"></div>
+
+    <script src="/ui/motion.js?v=20260224-23"></script>
+    <script src="/ui/drawer.js?v=20260224-23"></script>
+    <script src="/ui/modal.js?v=20260224-23"></script>
+    <script src="/ui/toast.js?v=20260224-23"></script>
+    <script src="/ui/skeleton.js?v=20260224-23"></script>
+    <script src="/admin.js?v=20260224-23"></script>
+  </body>
+</html>

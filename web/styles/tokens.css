@@ -1,0 +1,48 @@
+:root {
+  --font-sans: "Avenir Next", "Manrope", "SF Pro Display", "PingFang SC", "Segoe UI", sans-serif;
+  --font-mono: "SF Mono", "Menlo", "Consolas", monospace;
+
+  --color-bg-0: #07131f;
+  --color-bg-1: #0f2538;
+  --color-bg-2: #123954;
+  --color-surface: #ffffff;
+  --color-surface-soft: #f4f9fd;
+  --color-line: #d7e6f2;
+  --color-text: #10283e;
+  --color-text-dim: #5a7489;
+  --color-brand-a: #0cc58f;
+  --color-brand-b: #1593ff;
+  --color-warn: #f2a800;
+  --color-danger: #d53a5a;
+  --color-success: #0d9f71;
+  --color-info: #3688ff;
+
+  --gradient-bg:
+    radial-gradient(1200px 420px at 8% -12%, #2f6079 0%, transparent 58%),
+    radial-gradient(900px 340px at 96% 0%, #186f60 0%, transparent 55%),
+    linear-gradient(180deg, var(--color-bg-2) 0%, #eef6fb 37%, #edf5fb 100%);
+  --gradient-brand: linear-gradient(130deg, var(--color-brand-a) 0%, var(--color-brand-b) 100%);
+
+  --radius-xs: 8px;
+  --radius-sm: 12px;
+  --radius-md: 16px;
+  --radius-lg: 20px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  --shadow-sm: 0 8px 20px rgba(17, 41, 61, 0.08);
+  --shadow-md: 0 16px 34px rgba(17, 41, 61, 0.12);
+  --shadow-lg: 0 24px 46px rgba(17, 41, 61, 0.16);
+
+  /* Apple Intelligence color palette */
+  --apple-ai-1: #B5B9FF; /* blue-violet */
+  --apple-ai-2: #F4B8FF; /* pink-magenta */
+  --apple-ai-3: #FFE5B4; /* warm orange */
+  --apple-ai-4: #B8F0FF; /* cyan */
+  --apple-ai-5: #A8FFDC; /* mint green */
+}
