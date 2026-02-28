@@ -67,12 +67,24 @@ function detectIntentAxis(message) {
 // (they are standalone queries that don't need a day count or trip budget).
 // Returns array of missing slot names, empty = ok to proceed.
 function checkRequirements(message, constraints, intentAxis) {
-  if (intentAxis !== "travel") return [];
   const hasDuration = /\d+\s*天|\d+\s*(?:days?|nights?)/i.test(message)
     || !!(constraints.duration || constraints.days);
   const hasBudget = /\d[\d,]*\s*万|\d[\d,]+\s*(?:元|人民币|RMB|CNY)/i.test(message)
-    || /(?:预算|budget)[^\d]*\d+/i.test(message)
+    || /(?:预算|budget|人均)[^\d]*\d+/i.test(message)
     || !!(constraints.budget);
+
+  if (intentAxis === "food") {
+    // 美食专项：只需人均预算，不需要天数
+    return hasBudget ? [] : ["budget"];
+  }
+  if (intentAxis === "activity" || intentAxis === "stay") {
+    // 景点/住宿：需要天数 + 预算
+    const missing = [];
+    if (!hasDuration) missing.push("duration");
+    if (!hasBudget)   missing.push("budget");
+    return missing;
+  }
+  // travel（默认完整行程）：需要天数 + 总预算
   const missing = [];
   if (!hasDuration) missing.push("duration");
   if (!hasBudget)   missing.push("budget");
@@ -390,11 +402,11 @@ function createPlanRouter({
         console.log(`[plan/coze] Slot-fill merge: "${_pc.originalMessage}" + "${message}" -> "${effectiveMessage}"`);
       }
 
-      const prePlan = complex ? null : buildPrePlan({ message: effectiveMessage, city, constraints });
-
-      // P8.6: Detect intent axis for specialty mode — affects prompt and layout_type
+      // P8.6: Detect intent axis FIRST — affects buildPrePlan defaults + gate
       const intentAxis = detectIntentAxis(effectiveMessage);
       if (intentAxis !== "travel") console.log(`[plan/coze] Intent axis: ${intentAxis} — specialty mode`);
+
+      const prePlan = complex ? null : buildPrePlan({ message: effectiveMessage, city, constraints, intentAxis });
 
       // P8.8: Requirement gate — travel plans need explicit duration + budget.
       // Emits clarify immediately (no Coze call, no LLM call) when slots are missing.
@@ -413,7 +425,9 @@ function createPlanRouter({
         }
         const slotLabels = {
           duration: pickLang(language, "行程天数", "trip duration", "日数", "여행 일수"),
-          budget:   pickLang(language, "总预算",   "total budget",  "予算", "예산"),
+          budget: intentAxis === "food"
+            ? pickLang(language, "人均消费预算", "per-person budget", "一人あたりの予算", "1인 예산")
+            : pickLang(language, "总预算", "total budget", "予算", "예산"),
         };
         const asked = missingSlots.map((s) => slotLabels[s])
           .join(pickLang(language, "和", " and ", "と", "과 "));

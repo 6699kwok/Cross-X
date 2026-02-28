@@ -55,7 +55,7 @@ function isComplexItinerary(message) {
  * Extracts plan parameters locally (~0ms), avoiding the 12s Planner LLM call.
  * Only used for simple single-city messages.
  */
-function buildPrePlan({ message, city, constraints }) {
+function buildPrePlan({ message, city, constraints, intentAxis = "travel" }) {
   const extracted = _extractConstraints(message, constraints);
 
   let dest = extracted.city || extracted.destination || constraints.destination || null;
@@ -71,7 +71,7 @@ function buildPrePlan({ message, city, constraints }) {
   }
   dest = dest || city || "Shanghai";
 
-  const days = Number(extracted.duration || constraints.duration || constraints.days || 3);
+  const days = Number(extracted.duration || constraints.duration || constraints.days || (intentAxis === "food" ? 1 : 3));
   const pax = Number(extracted.party_size || constraints.party_size || constraints.pax || 2);
   let budget = Number(extracted.budget || constraints.budget || 0);
   if (!budget) {
@@ -81,7 +81,8 @@ function buildPrePlan({ message, city, constraints }) {
     if (bm)       budget = parseFloat(bm[1].replace(/,/g, "")) * 10000;
     else if (bm2) budget = parseFloat(bm2[1].replace(/,/g, ""));
     else if (bm3) budget = parseFloat(bm3[1].replace(/,/g, ""));
-    if (!budget)  budget = pax * days * 800;
+    // P8.11: food mode uses per-meal estimate; travel uses per-day estimate
+    if (!budget)  budget = intentAxis === "food" ? pax * 150 : pax * days * 800;
   }
 
   return {
@@ -288,7 +289,7 @@ async function generateCrossXResponse({
   // ── Node 2: Mock Data injection ──────────────────────────────────────────
   const dest      = plan.destination || city;
   const destArea  = plan.destination_area || "";
-  const days      = plan.duration_days || 3;
+  const days      = plan.duration_days || (intentAxis === "food" ? 1 : 3);
   const pax       = plan.pax || 1;
   let budget      = plan.total_budget || constraints.budget || null;
   if (!budget) {
@@ -296,7 +297,8 @@ async function generateCrossXResponse({
     const bm2 = message.match(/(\d[\d,]+)\s*(?:元|人民币|RMB|CNY)/i);
     if (bm)       budget = parseFloat(bm[1].replace(/,/g, "")) * 10000;
     else if (bm2) budget = parseFloat(bm2[1].replace(/,/g, ""));
-    if (!budget)  budget = pax * days * 800;
+    // P8.11: food mode uses per-meal estimate; travel uses per-day estimate
+    if (!budget)  budget = intentAxis === "food" ? pax * 150 : pax * days * 800;
   }
 
   const knowledgeContext = _buildKnowledge();
