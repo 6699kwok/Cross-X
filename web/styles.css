@@ -2624,6 +2624,35 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 .cx-flavor-tag  { background: #fee2e2; color: #991b1b; }
 .cx-origin-tag  { background: #e0f2fe; color: #075985; }
 
+/* P8.16: Restaurant detail — address row + navigation button */
+.cx-rest-addr-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 5px 0;
+}
+.cx-rest-addr { flex: 1; font-size: 0.82rem; color: var(--color-text-muted); }
+.cx-rest-nav-btn {
+  flex-shrink: 0;
+  font-size: 0.75rem;
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: var(--brand, #2563eb);
+  color: #fff;
+  text-decoration: none;
+  white-space: nowrap;
+}
+/* P8.16: Real review label */
+.cx-rest-review-label {
+  display: block;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 3px;
+}
+
 /* ── Booking Guide Card ───────────────────────────────────────────────────── */
 .booking-guide-wrap { margin: 12px 0 0; }
 /* ── CrossX AI-Native Checkout Sheet ────────────────────────────────────────*/
