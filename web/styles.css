@@ -2568,6 +2568,33 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 }
 .clarify-chip:active { transform: scale(0.97); }
 
+/* P8.10: Gate multi-select chip selected state */
+.clarify-chip.cx-chip--selected {
+  background: var(--brand, #2563eb);
+  color: #fff;
+  border-color: var(--brand, #2563eb);
+}
+
+/* P8.10: Gate confirm button */
+.cx-gate-confirm {
+  display: block;
+  width: 100%;
+  margin-top: 12px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: none;
+  background: var(--brand, #2563eb);
+  color: #fff;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.cx-gate-confirm:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
 /* ── Booking Guide Card ───────────────────────────────────────────────────── */
 .booking-guide-wrap { margin: 12px 0 0; }
 /* ── CrossX AI-Native Checkout Sheet ────────────────────────────────────────*/
@@ -4591,6 +4618,49 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   color: #111827;
   line-height: 1.3;
 }
+/* P9: Restaurant detail — food_only mode name + meta atoms */
+.cx-detail-rest-name {
+  font-size: 18px;
+  font-weight: 700;
+  color: #111827;
+  line-height: 1.3;
+}
+.cx-rest-score {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #fef9c3;
+  color: #854d0e;
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.cx-rest-score-label { font-weight: 400; opacity: 0.75; font-size: 11px; }
+.cx-rest-avgprice {
+  color: #f59e0b;
+  font-weight: 700;
+  font-size: 14px;
+}
+.cx-rest-queue {
+  color: #ef4444;
+  font-size: 13px;
+  font-weight: 600;
+}
+.cx-rest-addr {
+  color: #6b7280;
+  font-size: 13px;
+  margin-top: 2px;
+}
+.cx-rest-review {
+  font-size: 13px;
+  color: #374151;
+  font-style: italic;
+  border-left: 3px solid #10b981;
+  padding-left: 10px;
+  margin-top: 4px;
+}
+.cx-rest-dishes li { font-size: 14px; }
 .cx-detail-meta {
   display: flex;
   flex-wrap: wrap;

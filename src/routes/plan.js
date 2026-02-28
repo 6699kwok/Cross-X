@@ -381,17 +381,36 @@ function createPlanRouter({
         throw new Error("OpenAI not configured or key invalid");
       }
 
-      const prePlan = complex ? null : buildPrePlan({ message, city, constraints });
+      // P8.10: Merge slot-fill answer with original message from pendingClarify
+      let effectiveMessage = message;
+      const _pc = existingSession?.pendingClarify;
+      if (_pc?.originalMessage) {
+        effectiveMessage = `${_pc.originalMessage} ${message}`.trim();
+        patchSession(incomingSessionId, { pendingClarify: null });
+        console.log(`[plan/coze] Slot-fill merge: "${_pc.originalMessage}" + "${message}" -> "${effectiveMessage}"`);
+      }
+
+      const prePlan = complex ? null : buildPrePlan({ message: effectiveMessage, city, constraints });
 
       // P8.6: Detect intent axis for specialty mode — affects prompt and layout_type
-      const intentAxis = detectIntentAxis(message);
+      const intentAxis = detectIntentAxis(effectiveMessage);
       if (intentAxis !== "travel") console.log(`[plan/coze] Intent axis: ${intentAxis} — specialty mode`);
 
       // P8.8: Requirement gate — travel plans need explicit duration + budget.
       // Emits clarify immediately (no Coze call, no LLM call) when slots are missing.
-      const missingSlots = checkRequirements(message, constraints, intentAxis);
+      const missingSlots = checkRequirements(effectiveMessage, constraints, intentAxis);
       if (missingSlots.length > 0) {
         planDone = true;
+        // P8.10: persist context so next turn can merge destination + original intent
+        let gateSessionId = incomingSessionId;
+        if (gateSessionId && getSession(gateSessionId)) {
+          patchSession(gateSessionId, { pendingClarify: { originalMessage: message, missingSlots } });
+        } else {
+          gateSessionId = createSession(
+            { pendingClarify: { originalMessage: message, missingSlots }, language, city },
+            DEFAULT_TTL_MS,
+          );
+        }
         const slotLabels = {
           duration: pickLang(language, "行程天数", "trip duration", "日数", "여행 일수"),
           budget:   pickLang(language, "总预算",   "total budget",  "予算", "예산"),
@@ -408,6 +427,7 @@ function createPlanRouter({
             `안녕하세요! ${asked}를 알려주시면 바로 맞춤 플랜을 만들겠습니다.`),
           missing_slots: missingSlots,
           source: "requirement-gate",
+          sessionId: gateSessionId,   // P8.10: client persists, next request carries it
         });
         res.end();
         return;
@@ -415,16 +435,16 @@ function createPlanRouter({
 
       // P8.4 Serial scheduling: Coze first → buildResourceContext → OpenAI grounded in real-time data.
       // Step 1: Coze enrichment (always resolves — synthetic fallback on failure).
-      const cozeEnrichment = await callCozeWorkflow({ query: message, city, lang: language, budget: budgetVal });
+      const cozeEnrichment = await callCozeWorkflow({ query: effectiveMessage, city, lang: language, budget: budgetVal });
       console.log(`[plan/coze] Coze enrichment: ${cozeEnrichment?._synthetic ? "synthetic" : "live"} — queue=${cozeEnrichment?.restaurant_queue}min ticket=${cozeEnrichment?.ticket_availability}`);
 
       // Step 2: Convert Coze data → structured resource context string for prompt injection.
       // P8.7: intentAxis passed so buildResourceContext can include item_list inventory block.
-      const resourceContext = buildResourceContext(cozeEnrichment, city, message, constraints, intentAxis);
+      const resourceContext = buildResourceContext(cozeEnrichment, city, effectiveMessage, constraints, intentAxis);
 
       // Step 3: OpenAI Card Generator, grounded in Coze resource pool.
       const result = await generateCrossXResponse({
-        message, language, city,
+        message: effectiveMessage, language, city,
         constraints: { ...constraints, _clientIp: clientIp },
         conversationHistory,
         apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
@@ -473,10 +493,10 @@ function createPlanRouter({
         let outSessionId = incomingSessionId;
         if (s.response_type === "options_card" && s.card_data) {
           if (outSessionId && getSession(outSessionId)) {
-            patchSession(outSessionId, { plan: s.card_data, message, language, city });
+            patchSession(outSessionId, { plan: s.card_data, message: effectiveMessage, language, city });
           } else {
             outSessionId = createSession(
-              { plan: s.card_data, message, language, city },
+              { plan: s.card_data, message: effectiveMessage, language, city },
               DEFAULT_TTL_MS,
             );
           }

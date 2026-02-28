@@ -580,7 +580,7 @@ function applyThinkingIndicatorState(active, text = "") {
     el.thinkingIndicator.textContent =
       text
       || pickText(
-        "核心方案思考中...",
+        "核心方案精算中...",
         "Building your plan...",
         "プランを構築中...",
         "플랜 구성 중...",
@@ -6691,28 +6691,51 @@ function renderClarifyCard(structured) {
     },
   };
 
+  // P8.10: "duration" from requirement-gate maps to "duration_days" in SLOT_CHIPS
+  const SLOT_ALIAS = { duration: "duration_days" };
   // Determine which slot groups to show (default to budget if nothing specified)
   const slotsToShow = missing.length > 0 ? missing : ["budget"];
   const chipGroups = slotsToShow
-    .map((slot) => SLOT_CHIPS[slot])
-    .filter(Boolean);
+    .map((slot) => ({ slot, group: SLOT_CHIPS[SLOT_ALIAS[slot] || slot] }))
+    .filter(({ group }) => Boolean(group));
 
   if (!chipGroups.length) {
     addMessage(questionText, "agent");
     return;
   }
 
-  const groupsHtml = chipGroups.map((group) => {
-    const chips = group.options.map((opt) =>
-      `<button class="clarify-chip" onclick="sendClarifyChip(${JSON.stringify(opt.value)})">
-        <span class="clarify-chip-label">${escapeHtml(opt.label)}</span>
-      </button>`
-    ).join("");
-    return `<div class="clarify-group">
-      <div class="clarify-group-label"><span class="clarify-group-icon">${group.icon}</span>${escapeHtml(group.label)}</div>
-      <div class="clarify-chips">${chips}</div>
-    </div>`;
-  }).join("");
+  // P8.10: Gate multi-select — when both slots missing, require pick-both-then-confirm
+  const isGate = structured.source === "requirement-gate";
+
+  let groupsHtml;
+  if (isGate && slotsToShow.length >= 2) {
+    // Multi-select: each chip marks selected state; confirm fires only when all groups have a pick
+    groupsHtml = chipGroups.map(({ slot, group }) => {
+      const chips = group.options.map((opt) =>
+        `<button class="clarify-chip" data-value="${escapeHtml(opt.value)}" onclick="_gateChipSelect(this)">
+          <span class="clarify-chip-label">${escapeHtml(opt.label)}</span>
+        </button>`
+      ).join("");
+      return `<div class="clarify-group" data-slot="${escapeHtml(slot)}">
+        <div class="clarify-group-label"><span class="clarify-group-icon">${group.icon}</span>${escapeHtml(group.label)}</div>
+        <div class="clarify-chips">${chips}</div>
+      </div>`;
+    }).join("");
+    groupsHtml += `<button class="cx-gate-confirm" disabled onclick="_gateConfirmSubmit(this.closest('.clarify-card'))">生成我的方案 →</button>`;
+  } else {
+    // Single slot or non-gate: tap-to-send immediately
+    groupsHtml = chipGroups.map(({ group }) => {
+      const chips = group.options.map((opt) =>
+        `<button class="clarify-chip" onclick="sendClarifyChip(${JSON.stringify(opt.value)})">
+          <span class="clarify-chip-label">${escapeHtml(opt.label)}</span>
+        </button>`
+      ).join("");
+      return `<div class="clarify-group">
+        <div class="clarify-group-label"><span class="clarify-group-icon">${group.icon}</span>${escapeHtml(group.label)}</div>
+        <div class="clarify-chips">${chips}</div>
+      </div>`;
+    }).join("");
+  }
 
   addCard(`
     <article class="card smart-reply-card clarify-card">
@@ -6734,6 +6757,27 @@ function sendClarifyChip(value) {
   createTaskFromText(value);
 }
 
+// P8.10: Gate multi-select helpers
+function _gateChipSelect(btn) {
+  btn.closest(".clarify-chips").querySelectorAll(".clarify-chip")
+    .forEach((b) => b.classList.remove("cx-chip--selected"));
+  btn.classList.add("cx-chip--selected");
+  const card = btn.closest(".clarify-card");
+  const groups = [...card.querySelectorAll(".clarify-group[data-slot]")];
+  const allPicked = groups.every((g) => g.querySelector(".cx-chip--selected"));
+  const confirmBtn = card.querySelector(".cx-gate-confirm");
+  if (confirmBtn) confirmBtn.disabled = !allPicked;
+}
+
+function _gateConfirmSubmit(cardEl) {
+  const groups = [...cardEl.querySelectorAll(".clarify-group[data-slot]")];
+  const parts = groups
+    .map((g) => g.querySelector(".cx-chip--selected")?.dataset?.value)
+    .filter(Boolean);
+  if (!parts.length) return;
+  createTaskFromText(parts.join(" "));
+}
+
 // ── Shared list-card builder (called by renderCardData + refreshPlanCardLanguage) ──
 const _LIST_CARD_TAG_STYLES = {
   budget:   { bg: "#ecfdf5", color: "#065f46", border: "#6ee7b7" },
@@ -6747,7 +6791,7 @@ const _LIST_CARD_TAG_STYLES = {
 const GLOBAL_CITY_HERO_MAP = {
   "北京":   "https://images.unsplash.com/photo-1547981609-4b6bfe67ca0b?w=800&q=80", // Great Wall
   "上海":   "https://images.unsplash.com/photo-1538428494232-9c0d8a3ab403?w=800&q=80", // The Bund
-  "深圳":   "https://images.unsplash.com/photo-1575979275447-4c6b6c72ac26?w=800&q=80", // Skyline
+  "深圳":   "https://images.unsplash.com/photo-dfUNbRA3r2I?w=800&q=80", // Talent Park 人才公园
   "广州":   "https://images.unsplash.com/photo-1598887141926-d0a1fc2bb862?w=800&q=80", // Canton Tower
   "成都":   "https://images.unsplash.com/photo-1548393594-d73d12babb3e?w=800&q=80", // Chengdu
   "重庆":   "https://images.unsplash.com/photo-1518060350020-07882a01fca6?w=800&q=80", // Night view
@@ -7119,9 +7163,9 @@ function renderCardData(cd, spokenText) {
     cd.arrival_date ? `${escapeHtml(cd.arrival_date)}抵达` : "",
   ].filter(Boolean).join("  ·  ");
 
-  // ── Hotel strip ───────────────────────────────────────────────────────
+  // ── Hotel strip (suppressed in food_only mode) ────────────────────────
   let hotelHtml = "";
-  if (cd.hotel && cd.hotel.name) {
+  if ((state._layoutType || "travel_full") !== "food_only" && cd.hotel && cd.hotel.name) {
     const h = cd.hotel;
     const hotelTotalFmt = Number(h.total || 0).toLocaleString();
     hotelHtml = `
@@ -12216,65 +12260,96 @@ function _applyCouponBar(barEl, coupon) {
   }
 }
 
-function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
-  // P8.8: Polymorphic template — food_only shows restaurant UI, travel shows hotel UI
-  const layoutType = state._layoutType || "travel_full";
-  const isFoodDetail = layoutType === "food_only";
+// ── P9: Restaurant detail — food_only mode only ───────────────────────────
+// HARD RULE: zero references to p.hotel.xxx — no hotel star class, no bed type,
+// no price-per-night. Only real food data from Coze item_list + plan fields.
+function buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, cozeData) {
+  const FOOD_FALLBACK = "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=800&q=80"; // street food
+
+  // Real photo priority: Coze item photo > plan photo > street-food fallback
+  // NEVER fall back to p.hotel?.hero_image in food mode.
+  const heroUrl  = p.real_photo_url || p.food_image || p.item_image || FOOD_FALLBACK;
+  const restName = escapeHtml(p.name || p.restaurant_name || p.item_name || "");
+  const rating   = p.rating || p.score || 0;
+  const avgPrice = p.avg_price || (p.budget_breakdown?.meals
+    ? Math.round(p.budget_breakdown.meals / 3) : 0);
+  // Review: plan field first, never touch p.hotel.guest_review
+  const review   = escapeHtml(p.review || p.user_review || p.review_snippet || "");
+  // Address from plan data only
+  let addr       = escapeHtml(p.address || p.addr || "");
+  // Queue: real-time from Coze root; plan-level override allowed
+  let queueMin   = cozeData?.restaurant_queue;
+
+  // Enrich from Coze item_list when the plan option matches a known restaurant
+  if (Array.isArray(cozeData?.item_list) && restName) {
+    const match = cozeData.item_list.find((item) =>
+      item.name && restName.includes(escapeHtml(item.name).slice(0, 4))
+    );
+    if (match) {
+      if (match.photo && /^https?:\/\//i.test(match.photo))
+        p._enrichedPhoto = match.photo;
+      if (match.address) addr = escapeHtml(match.address);
+      if (match.avg_price) p._enrichedPrice = match.avg_price;
+      if (match.queue_min) queueMin = match.queue_min;
+    }
+  }
+  const finalHero  = p._enrichedPhoto || heroUrl;
+  const finalPrice = p._enrichedPrice || avgPrice;
+  // Signature dishes: dedicated fields first, highlights as last resort
+  const dishes = (p.dishes || p.signature_dishes || p.menu_highlights || p.highlights || []).slice(0, 3);
 
   const el = document.createElement("div");
   el.className = "cx-plan-detail";
+  el.innerHTML = `
+    <img class="cx-detail-hero" src="${finalHero}" alt="${restName}" loading="lazy"
+      onerror="this.src='${FOOD_FALLBACK}';this.onerror=null">
+    <div class="cx-detail-body">
+      <div class="cx-detail-rest-name">${restName}</div>
+      <div class="cx-detail-meta" style="gap:10px;flex-wrap:wrap">
+        ${rating     ? `<span class="cx-rest-score">★ ${rating} <span class="cx-rest-score-label">${pickText("大众评分","Rating","評点","평점")}</span></span>` : ""}
+        ${finalPrice ? `<span class="cx-rest-avgprice">${pickText("人均","Avg","人均","인당")} ¥${finalPrice}</span>` : ""}
+        ${queueMin   ? `<span class="cx-rest-queue">⏳ ${pickText("排队约","Wait ~","待ち約","대기 약")}${queueMin}${pickText("分钟","min","分","분")}</span>` : ""}
+      </div>
+      ${addr   ? `<div class="cx-rest-addr">📍 ${addr}</div>` : ""}
+      ${review ? `<div class="cx-rest-review">"${review}"</div>` : ""}
+      ${dishes.length ? `
+      <div class="cx-detail-divider"></div>
+      <div class="cx-detail-section-label">${pickText("招牌菜 Top 3","Signature Dishes","看板メニュー Top 3","시그니처 메뉴 Top 3")}</div>
+      <ul class="opt-highlights cx-rest-dishes">
+        ${dishes.map((d) => `<li><span class="opt-check">🍽️</span>${escapeHtml(d)}</li>`).join("")}
+      </ul>` : ""}
+      ${spokenText ? `
+      <div class="cx-detail-why">
+        <div class="cx-detail-why-label">${pickText("为何推荐","Why We Recommend","おすすめ理由","추천 이유")}</div>
+        ${escapeHtml(spokenText)}
+      </div>` : ""}
+      <div class="cx-detail-actions">
+        <button class="cx-detail-itin-btn"
+          data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
+          onclick="cxDetailOpenItinerary(this)">
+          ${pickText("查看完整美食路线 ↓","View Full Food Trail ↓","グルメルートを見る ↓","맛집 코스 보기 ↓")}
+        </button>
+        <button class="cx-detail-book-btn"
+          data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
+          onclick="cxGoToCheckout(this)">
+          ${pickText("预订此方案 →","Book This Plan →","このプランを予約 →","이 플랜 예약 →")}
+        </button>
+      </div>
+    </div>`;
+  return el;
+}
+
+function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
+  // P9: Polymorphic template — food_only → buildRestaurantDetailHTML, travel → hotel UI
+  const layoutType = state._layoutType || "travel_full";
+  const isFoodDetail = layoutType === "food_only";
 
   if (isFoodDetail) {
-    // ── Food mode: restaurant detail (no hotel fields) ──────────────────────
-    const heroUrl    = p.real_photo_url || p.food_image || p.hotel?.hero_image || "";
-    const restName   = escapeHtml(p.name || p.restaurant_name || p.hotel?.name || "");
-    const restAddr   = escapeHtml(p.address || p.addr || "");
-    const restRating = p.rating || p.score || p.hotel?.rating || 0;
-    const restReview = escapeHtml(p.hotel?.guest_review || p.review || "");
-    const avgPrice   = p.avg_price || (p.budget_breakdown?.meals
-      ? Math.round((p.budget_breakdown.meals) / 3)
-      : 0);
-    const queueMin   = state.cozeData?.restaurant_queue;
-    const dishes     = (p.highlights || []).slice(0, 3);
-
-    el.innerHTML = `
-      ${heroUrl ? `<img class="cx-detail-hero" src="${heroUrl}" alt="${restName}" loading="lazy"
-        onerror="this.src='https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=800&q=80';this.onerror=null">` : ""}
-      <div class="cx-detail-body">
-        <div class="cx-detail-hotel-name" style="font-size:17px">${restName}</div>
-        <div class="cx-detail-meta" style="gap:10px;flex-wrap:wrap">
-          ${restRating ? `<span class="opt-hotel-stars">★ ${restRating}</span>` : ""}
-          ${avgPrice   ? `<span style="color:#f59e0b;font-weight:600">${pickText("人均","Avg","人均","인당")} ¥${avgPrice}</span>` : ""}
-          ${queueMin   ? `<span style="color:#ef4444">⏳ ${pickText("排队约","Wait ~","待ち約","대기 약")}${queueMin}${pickText("分钟","min","分","분")}</span>` : ""}
-        </div>
-        ${restAddr ? `<div style="color:#6b7280;font-size:13px;margin:4px 0 0">📍 ${restAddr}</div>` : ""}
-        ${restReview ? `<div class="opt-hotel-guestrev" style="margin-top:10px">"${restReview}"</div>` : ""}
-        ${dishes.length ? `
-        <div class="cx-detail-divider"></div>
-        <div class="cx-detail-section-label">${pickText("招牌菜 Top 3","Signature Dishes","看板メニュー","시그니처 메뉴")}</div>
-        <ul class="opt-highlights">
-          ${dishes.map((d) => `<li><span class="opt-check">🍽</span>${escapeHtml(d)}</li>`).join("")}
-        </ul>` : ""}
-        ${spokenText ? `
-        <div class="cx-detail-why">
-          <div class="cx-detail-why-label">${pickText("为何推荐","Why We Recommend","おすすめ理由","추천 이유")}</div>
-          ${escapeHtml(spokenText)}
-        </div>` : ""}
-        <div class="cx-detail-actions">
-          <button class="cx-detail-itin-btn"
-            data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
-            onclick="cxDetailOpenItinerary(this)">
-            ${pickText("查看完整美食路线 ↓","View Full Food Trail ↓","グルメルートを見る ↓","맛집 코스 보기 ↓")}
-          </button>
-          <button class="cx-detail-book-btn"
-            data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
-            onclick="cxGoToCheckout(this)">
-            ${pickText("预订此方案 →","Book This Plan →","このプランを予約 →","이 플랜 예약 →")}
-          </button>
-        </div>
-      </div>`;
-    return el;
+    return buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, state.cozeData);
   }
+
+  const el = document.createElement("div");
+  el.className = "cx-plan-detail";
 
   // ── Travel / stay mode: hotel detail (original template) ───────────────────
   const heroUrl       = p.hotel?.hero_image || "";
