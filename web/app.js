@@ -6791,7 +6791,7 @@ const _LIST_CARD_TAG_STYLES = {
 const GLOBAL_CITY_HERO_MAP = {
   "北京":   "https://images.unsplash.com/photo-1547981609-4b6bfe67ca0b?w=800&q=80", // Great Wall
   "上海":   "https://images.unsplash.com/photo-1538428494232-9c0d8a3ab403?w=800&q=80", // The Bund
-  "深圳":   "https://images.unsplash.com/photo-dfUNbRA3r2I?w=800&q=80", // Talent Park 人才公园
+  "深圳":   "https://images.unsplash.com/photo-1596464716127-f2a82984de30?w=800&q=80", // Talent Park 人才公园
   "广州":   "https://images.unsplash.com/photo-1598887141926-d0a1fc2bb862?w=800&q=80", // Canton Tower
   "成都":   "https://images.unsplash.com/photo-1548393594-d73d12babb3e?w=800&q=80", // Chengdu
   "重庆":   "https://images.unsplash.com/photo-1518060350020-07882a01fca6?w=800&q=80", // Night view
