@@ -473,6 +473,11 @@ async function callCozeWorkflow({ query, city, lang, budget }) {
     // `data` may be a JSON string or already an object
     let output = json.data;
     if (typeof output === "string") {
+      // Detect unresolved Coze template (End node misconfigured — variable not bound)
+      if (output.includes("{{") && output.includes("}}")) {
+        console.warn("[coze/workflow] End node returned unresolved template — using synthetic enrichment");
+        return buildSyntheticEnrichment(city);
+      }
       try { output = JSON.parse(output); } catch {
         output = { spoken_text: output };
       }
