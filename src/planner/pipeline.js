@@ -357,6 +357,11 @@ async function generateCrossXResponse({
       `plans[].hotel 字段可填写就餐餐厅名称，plans[].highlights 聚焦特色菜/氛围，\n` +
       `days[].activities 重点体现餐厅名称、特色菜推荐、人均消费。\n` +
       `card_data 顶层必须输出 "layout_type": "food_only"。\n` +
+      `P8.12 食物卡片必填字段：每个 plan 必须包含：\n` +
+      `  plans[].cuisine_type: 菜系（如"陕西菜"、"川菜"、"粤菜"、"江浙菜"、"清真菜"）\n` +
+      `  plans[].flavor: 口味特征（如"咸鲜微辣"、"酸爽开胃"、"浓郁醇厚"、"清淡爽口"）\n` +
+      `  plans[].origin: 发源地/代表区域（如"西安回民街"、"成都宽窄巷子"、"广州西关"）\n` +
+      `  plans[].real_photo_url: 从 Real_API_Data 的 item_list[].photo 原样复制真实照片URL；若无则省略此字段\n` +
       `\u26a0\ufe0f \u300c\u5e97\u540d\u683c\u5f0f\u300d\u5f3a\u5236\u8981\u6c42\uff1a\u6bcf\u4e2a\u9910\u996e\u7c7b activity.name \u5fc5\u987b\u5199\u6210\u201c\u5728\u3010\u5177\u4f53\u9910\u5385\u540d\u3011\u4eab\u7528XX\u201d\u683c\u5f0f\uff0c\n` +
       `\u4f8b\u5982\uff1a\u201c\u5728\u3010\u8001\u5b59\u5bb6\u7f8a\u8089\u6ce1\u9988\u00b7\u4e1c\u5927\u8857\u5e97\u3011\u4eab\u7528\u5348\u9910\u201d\u3001\u201c\u5728\u3010\u8d3e\u4e09\u704c\u6c64\u5305\u3011\u54c1\u5c1d\u8089\u5939\u9988\u201d\u3002\n` +
       `\u8d27\u771f\u4ef7\u5b9e\uff1a\u4e25\u7981\u4ec5\u5199\u201c\u5403\u5348\u9910\u201d\u3001\u201c\u54c1\u5c1d\u5c0f\u5403\u201d\u7b49\u6a21\u7cca\u5360\u4f4d\u8bcd\u3002\n`

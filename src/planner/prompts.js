@@ -164,7 +164,11 @@ ${BUSINESS_BOUNDARY_BLOCK}
         "transport_plan": "主要交通策略一句话，含费用（如：全程地铁+共享单车，交通总费用约¥120）",
         "total_price": 数字（在用户预算70%以内）,
         "highlights": ["特色亮点1(≤12字)","特色亮点2(≤12字)","特色亮点3(≤12字)"],
-        "budget_breakdown": {"accommodation":数字,"transport":数字,"meals":数字,"activities":数字,"misc":数字}
+        "budget_breakdown": {"accommodation":数字,"transport":数字,"meals":数字,"activities":数字,"misc":数字},
+        "cuisine_type": "菜系（仅food_only时填写，如：陕西菜）",
+        "flavor": "口味特征（仅food_only时填写，如：咸鲜微辣）",
+        "origin": "发源地/代表区域（仅food_only时填写，如：西安回民街）",
+        "real_photo_url": "餐厅真实照片URL（仅food_only时，从Real_API_Data item_list[].photo复制；无则省略）"
       },
       {
         "id": "balanced",

@@ -62,11 +62,21 @@ function detectIntentAxis(message) {
 }
 
 // ── P8.8: Requirement completeness gate ──────────────────────────────────────
-// For full-itinerary travel intent: require BOTH explicit duration AND explicit budget
-// from the user message or pre-filled constraints. Food/stay/activity are exempt
-// (they are standalone queries that don't need a day count or trip budget).
-// Returns array of missing slot names, empty = ok to proceed.
+// Explicit city/destination detection regex (covers mainland China + common international)
+const CITY_MENTION_RE = /北京|上海|深圳|广州|成都|重庆|杭州|苏州|西安|南京|三亚|丽江|大理|桂林|张家界|黄山|青岛|厦门|拉萨|哈尔滨|新疆|乌鲁木齐|武汉|长沙|贵阳|昆明|天津|福州|宁波|济南|郑州|大连|沈阳|长春|合肥|南昌|石家庄|呼和浩特|银川|兰州|西宁|香港|澳门|台北|东京|大阪|首尔|曼谷|巴黎|伦敦|纽约|新加坡|吐鲁番|敦煌|西双版纳/;
+
+// Conversational gate — always ask questions first, then generate.
+// Returns array of missing slot names; empty = ok to proceed.
 function checkRequirements(message, constraints, intentAxis) {
+  // P8.12: Step 0 — Destination first.
+  // If the message has no explicit city AND it's not a local/nearby query
+  // (e.g. "附近餐厅" where GPS city is intentional), ask for destination first.
+  const isLocalQuery = /附近|周边|本地|就在这|本城|这里/.test(message);
+  const hasCityInMessage = CITY_MENTION_RE.test(message) || !!(constraints.destination);
+  if (!hasCityInMessage && !isLocalQuery) {
+    return ["destination"];
+  }
+
   const hasDuration = /\d+\s*天|\d+\s*(?:days?|nights?)/i.test(message)
     || !!(constraints.duration || constraints.days);
   const hasBudget = /\d[\d,]*\s*万|\d[\d,]+\s*(?:元|人民币|RMB|CNY)/i.test(message)
@@ -424,6 +434,7 @@ function createPlanRouter({
           );
         }
         const slotLabels = {
+          destination: pickLang(language, "目的地城市", "destination city", "目的地", "목적지"),
           duration: pickLang(language, "行程天数", "trip duration", "日数", "여행 일수"),
           budget: intentAxis === "food"
             ? pickLang(language, "人均消费预算", "per-person budget", "一人あたりの予算", "1인 예산")

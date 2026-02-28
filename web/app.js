@@ -6963,26 +6963,41 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
   const statusBarId = `cx-sb-${cardId}-${idx}`;
   const cardCls = `cx-list-card${isRec ? " cx-list-card--rec" : ""}`;
 
-  // Image: food_only → real dish photo (real_photo_url / food_image) → curated food fallback
-  //        others  → hotel hero → city Unsplash photo → styled cover
-  // "深圳酒店大图" can NEVER leak into a food card because heroUrl skips hotel fields.
-  const FOOD_FALLBACK_URL = "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=800&q=80"; // street food
-  const heroUrl = isFoodCard
-    ? (p.real_photo_url || p.food_image || p.item_image || "")   // real Coze photo first
-    : (p.hotel?.hero_image || "");                                 // hotel image only for non-food
-  const fallbackUrl = isFoodCard ? FOOD_FALLBACK_URL : _getCityHeroUrl(dest);
-  const coverLabel  = escapeHtml(isFoodCard ? (p.name || p.restaurant_name || dest || "") : (dest || p.hotel?.name || ""));
+  // P8.12: Hero image is ALWAYS the destination city landmark photo.
+  // This gives every card a recognisable city skyline/landmark at the top.
+  // The restaurant's actual photo appears inside the card body (restPhotoHtml below).
+  const heroUrl    = _getCityHeroUrl(dest);
+  const fallbackUrl = heroUrl; // already resolved — onerror uses same
+
+  // Restaurant-specific photo (shown inside card body for food_only)
+  const restPhotoUrl = isFoodCard
+    ? (p.real_photo_url || p.food_image || p.item_image || null)
+    : null;
+  // Hero always shows city name overlay (landmark photo of the destination)
+  const coverLabel = escapeHtml(dest || "");
   const coverHtml  = `<div class="cx-lc-img-cover">
        <span class="cx-cover-city">${coverLabel}</span>
        <span style="font-size:20px">${coverIcon}</span>
      </div>`;
-  const imgHtml = heroUrl
-    ? `<img class="cx-lc-img" src="${heroUrl}" alt="${coverLabel}" loading="lazy"
-         onerror="this.src='${fallbackUrl}';this.onerror=function(){this.style.display='none';this.nextElementSibling.style.display='flex'}">`
-       + `<div class="cx-lc-img-cover" style="display:none">${coverHtml}</div>`
-    : `<img class="cx-lc-img" src="${fallbackUrl}" alt="${coverLabel}" loading="lazy"
-         onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
-       + `<div class="cx-lc-img-cover" style="display:none">${coverHtml}</div>`;
+  const imgHtml = `<img class="cx-lc-img" src="${heroUrl}" alt="${coverLabel}" loading="lazy"
+       onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+     + `<div class="cx-lc-img-cover" style="display:none">${coverHtml}</div>`;
+
+  // P8.12: Restaurant-specific photo inside card body (for food_only cards only)
+  const restPhotoHtml = restPhotoUrl
+    ? `<img class="cx-rest-card-photo" src="${escapeHtml(restPhotoUrl)}"
+         alt="${escapeHtml(p.name || p.restaurant_name || "")}" loading="lazy"
+         onerror="this.style.display='none'">`
+    : "";
+
+  // P8.12: Cuisine / flavor / origin tags for food cards
+  const cuisineTagsHtml = isFoodCard && (p.cuisine_type || p.flavor || p.origin)
+    ? `<div class="cx-food-tags">
+        ${p.cuisine_type ? `<span class="cx-cuisine-tag">\uD83C\uDF74 ${escapeHtml(p.cuisine_type)}</span>` : ""}
+        ${p.flavor       ? `<span class="cx-flavor-tag">\u2726 ${escapeHtml(p.flavor)}</span>` : ""}
+        ${p.origin       ? `<span class="cx-origin-tag">\uD83D\uDCCD ${escapeHtml(p.origin)}</span>` : ""}
+      </div>`
+    : "";
 
   // Mini timeline: food → label as 特色菜 / activity → Day N / default → Day N
   const hlList = (p.highlights || []).slice(0, 3);
@@ -7015,11 +7030,13 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
       </div>
       <div class="cx-lc-price-sub">${pax > 1 ? pax + pickText(" 人 / "," pax · "," 名 / "," 명 · ") : ""}${dur}${pickText("天","d","日","일")}</div>
       <div class="cx-lc-hotel">${displayTitle}</div>
+      ${restPhotoHtml}
       <div class="cx-lc-meta">
         ${displayRating   ? `<span>★ ${displayRating}</span>` : ""}
         ${displayRevCount ? `<span style="color:#9ca3af">${displayRevCount}</span>` : ""}
         ${queueBadge}
       </div>
+      ${cuisineTagsHtml}
       ${miniTimeline}
       ${aiAnalysis ? `<div class="cx-lc-analysis">${aiAnalysis}</div>` : ""}
       <div class="cx-status-bar" id="${statusBarId}">
