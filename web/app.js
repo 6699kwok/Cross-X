@@ -6831,6 +6831,95 @@ function _getCityHeroUrl(dest) {
   return GLOBAL_CITY_HERO_MAP[key] || _CITY_HERO_FALLBACK;
 }
 
+// ── Activity thumbnail: keyword → curated Unsplash photo ID ─────────────────
+// Priority: act.image_url → act.real_photo_url → keyword lookup → type lookup → picsum
+const _ACT_THUMB = {
+  // 餐饮类
+  "烤鸭":       "photo-1563245372-f21724e3856d",
+  "peking duck":"photo-1563245372-f21724e3856d",
+  "火锅":        "photo-1555396273-367ea4eb4db5",
+  "hotpot":     "photo-1555396273-367ea4eb4db5",
+  "面条":        "photo-1569050467447-ce54b3bbc37d",
+  "noodle":     "photo-1569050467447-ce54b3bbc37d",
+  "泡馍":        "photo-1547592166-23ac45744acd",
+  "肉夹馍":      "photo-1547592166-23ac45744acd",
+  "凉皮":        "photo-1547592166-23ac45744acd",
+  "饺子":        "photo-1541696432-82c6da8ce7bf",
+  "dumpling":   "photo-1541696432-82c6da8ce7bf",
+  "包子":        "photo-1541696432-82c6da8ce7bf",
+  "烧烤":        "photo-1529193591184-b1d58069ecdd",
+  "bbq":        "photo-1529193591184-b1d58069ecdd",
+  "海鲜":        "photo-1565680018434-b513d5e5fd47",
+  "seafood":    "photo-1565680018434-b513d5e5fd47",
+  "粤菜":        "photo-1563245372-f21724e3856d",
+  "早餐":        "photo-1504754524776-8f4f37790ca0",
+  "breakfast":  "photo-1504754524776-8f4f37790ca0",
+  "午餐":        "photo-1546069901-ba9599a7e63c",
+  "lunch":      "photo-1546069901-ba9599a7e63c",
+  "晚餐":        "photo-1414235077428-338989a2e8c0",
+  "dinner":     "photo-1414235077428-338989a2e8c0",
+  "咖啡":        "photo-1509042239860-f550ce710b93",
+  "coffee":     "photo-1509042239860-f550ce710b93",
+  "小吃":        "photo-1563379091339-03246963b7b0",
+  "snack":      "photo-1563379091339-03246963b7b0",
+  "米线":        "photo-1569050467447-ce54b3bbc37d",
+  // 景点类
+  "故宫":        "photo-1508804185872-d7badad00f7d",
+  "forbidden":  "photo-1508804185872-d7badad00f7d",
+  "长城":        "photo-1547981609-4b6bfe67ca0b",
+  "great wall": "photo-1547981609-4b6bfe67ca0b",
+  "兵马俑":      "photo-1547036967-23d11aacaee0",
+  "terracotta": "photo-1547036967-23d11aacaee0",
+  "西湖":        "photo-1605979257913-1704eb7b6246",
+  "west lake":  "photo-1605979257913-1704eb7b6246",
+  "钟楼":        "photo-1548013146-72479768bada",
+  "bell tower": "photo-1548013146-72479768bada",
+  "大雁塔":      "photo-1548013146-72479768bada",
+  "博物馆":      "photo-1575223970966-76ae61ee7838",
+  "museum":     "photo-1575223970966-76ae61ee7838",
+  "公园":        "photo-1441974231531-c6227db76b6e",
+  "park":       "photo-1441974231531-c6227db76b6e",
+  "寺庙":        "photo-1537996194471-e657df975ab4",
+  "temple":     "photo-1537996194471-e657df975ab4",
+  "古镇":        "photo-1512453979798-5ea266f8880c",
+  "古街":        "photo-1512453979798-5ea266f8880c",
+  "海滩":        "photo-1507525428034-b723cf961d3e",
+  "beach":      "photo-1507525428034-b723cf961d3e",
+  "山":          "photo-1464822759023-fed622ff2c3b",
+  "mountain":   "photo-1464822759023-fed622ff2c3b",
+  "购物":        "photo-1483985988355-763728e1935b",
+  "shopping":   "photo-1483985988355-763728e1935b",
+  // 交通类
+  "flight":     "photo-1436491865332-7a61a109cc05",
+  "航班":        "photo-1436491865332-7a61a109cc05",
+  "高铁":        "photo-1540555700478-4be289fbecef",
+  "hsr":        "photo-1540555700478-4be289fbecef",
+  "地铁":        "photo-1569400877844-9272b13c9727",
+  "metro":      "photo-1569400877844-9272b13c9727",
+  "打车":        "photo-1449965408869-eaa3f722e40d",
+  "taxi":       "photo-1449965408869-eaa3f722e40d",
+  // 通用
+  "酒店":        "photo-1455587734955-081b22074882",
+  "hotel":      "photo-1455587734955-081b22074882",
+  "餐厅":        "photo-1517248135467-4c7edcad34c4",
+  "restaurant": "photo-1517248135467-4c7edcad34c4",
+};
+// act.type fallback map
+const _ACT_THUMB_TYPE = {
+  meal:      "photo-1546069901-ba9599a7e63c",
+  transport: "photo-1436491865332-7a61a109cc05",
+  activity:  "photo-1469854523086-cc02fe5d8800",
+  hotel:     "photo-1455587734955-081b22074882",
+};
+function _actThumbUrl(keyword, type, w, h) {
+  const kw = String(keyword || "").toLowerCase();
+  const match = Object.keys(_ACT_THUMB).find((k) => kw.includes(k));
+  const photoId = match
+    ? _ACT_THUMB[match]
+    : (_ACT_THUMB_TYPE[type] || "photo-1469854523086-cc02fe5d8800");
+  return `https://images.unsplash.com/${photoId}?w=${w || 120}&h=${h || 80}&fit=crop&q=75`;
+}
+
 function _buildListCard(p, idx, cardId, dur, pax, dest) {
   // P8.6: Card layout polymorphism — driven by layout_type from backend
   const layoutType  = state._layoutType || "travel_full";
@@ -7030,7 +7119,7 @@ function renderCardData(cd, spokenText) {
           const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
           const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
           // P8.9: real_photo_url (from Coze via Rule 15) takes priority; picsum as last resort
-          const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
+          const actImgSrc = act.image_url || act.real_photo_url || _actThumbUrl(act.image_keyword || act.name, act.type);
           const costRaw = act.cost_cny || act.cost || 0;
           const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` :"免费";
           const costCls  = costRaw === 0 ? " act-cost--free" : "";
@@ -7208,8 +7297,8 @@ function renderCardData(cd, spokenText) {
       const activities = (d.activities || []).map((act) => {
         const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
         const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
-        // P8.9: real photo first; picsum as last resort
-        const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
+        // P8.9: real photo first; keyword-mapped Unsplash as last resort
+        const actImgSrc = act.image_url || act.real_photo_url || _actThumbUrl(act.image_keyword || act.name, act.type);
         const costRaw = act.cost_cny || act.cost || 0;
         const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` : "免费";
         const costCls  = costRaw === 0 ? " act-cost--free" : "";
@@ -7260,7 +7349,7 @@ function renderCardData(cd, spokenText) {
     dayPanelsHtml = `<div class="plan-items">` + cd.items.map((item) => {
       const imgKw = encodeURIComponent(item.image_keyword || item.name || "");
       // P8.9: real photo first; picsum as last resort
-      const itemImgSrc = item.image_url || item.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
+      const itemImgSrc = item.image_url || item.real_photo_url || _actThumbUrl(item.image_keyword || item.name, item.type);
       const priceFmt = Number(item.price || 0).toLocaleString();
       return `<div class="cd-item-row">
         <img class="cd-item-img" src="${itemImgSrc}" alt="${escapeHtml(item.name || "")}" loading="lazy" onerror="this.style.display='none'">
@@ -7467,7 +7556,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
           const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
           const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
           // P8.9: real photo first; picsum as last resort
-          const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
+          const actImgSrc = act.image_url || act.real_photo_url || _actThumbUrl(act.image_keyword || act.name, act.type);
           const costRaw = act.cost_cny || act.cost || 0;
           const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` :"免费";
           const costCls  = costRaw === 0 ? " act-cost--free" : "";
