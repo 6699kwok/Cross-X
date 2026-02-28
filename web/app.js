@@ -580,10 +580,10 @@ function applyThinkingIndicatorState(active, text = "") {
     el.thinkingIndicator.textContent =
       text
       || pickText(
-        "核心方案精算中...",
-        "Building your plan...",
-        "プランを構築中...",
-        "플랜 구성 중...",
+        "核心资源精算中...",
+        "Calculating resources...",
+        "リソースを精算中...",
+        "리소스 정산 중...",
       );
     if (el.conversationAura) {
       el.conversationAura.dataset.mode = "planning";
@@ -12260,15 +12260,14 @@ function _applyCouponBar(barEl, coupon) {
   }
 }
 
-// ── P9: Restaurant detail — food_only mode only ───────────────────────────
+// ── P9/P10: Restaurant detail — food_only mode only ──────────────────────────
 // HARD RULE: zero references to p.hotel.xxx — no hotel star class, no bed type,
 // no price-per-night. Only real food data from Coze item_list + plan fields.
+// P10: If Coze returns no real photo, show "暂无实拍图" placeholder — NEVER use
+//      a generic stock photo to mask missing data ("宁可报错也不许用假图").
 function buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, cozeData) {
-  const FOOD_FALLBACK = "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=800&q=80"; // street food
-
-  // Real photo priority: Coze item photo > plan photo > street-food fallback
-  // NEVER fall back to p.hotel?.hero_image in food mode.
-  const heroUrl  = p.real_photo_url || p.food_image || p.item_image || FOOD_FALLBACK;
+  // Real photo priority: Coze item photo > plan photo > null (no fake fallback)
+  const heroUrl  = p.real_photo_url || p.food_image || p.item_image || null;
   const restName = escapeHtml(p.name || p.restaurant_name || p.item_name || "");
   const rating   = p.rating || p.score || 0;
   const avgPrice = p.avg_price || (p.budget_breakdown?.meals
@@ -12293,16 +12292,22 @@ function buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, cozeData) {
       if (match.queue_min) queueMin = match.queue_min;
     }
   }
-  const finalHero  = p._enrichedPhoto || heroUrl;
+  const finalHero  = p._enrichedPhoto || heroUrl;   // null = no real photo
   const finalPrice = p._enrichedPrice || avgPrice;
   // Signature dishes: dedicated fields first, highlights as last resort
   const dishes = (p.dishes || p.signature_dishes || p.menu_highlights || p.highlights || []).slice(0, 3);
 
+  // P10: real photo or explicit "暂无实拍图" placeholder — zero fake stock images
+  const heroHtml = finalHero
+    ? `<img class="cx-detail-hero" src="${finalHero}" alt="${restName}" loading="lazy"
+         onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
+      + `<div class="cx-rest-no-photo" style="display:none">📷 ${pickText("暂无实拍图","No photo yet","実写なし","실사 없음")}</div>`
+    : `<div class="cx-rest-no-photo">📷 ${pickText("暂无实拍图","No photo yet","実写なし","실사 없음")}</div>`;
+
   const el = document.createElement("div");
   el.className = "cx-plan-detail";
   el.innerHTML = `
-    <img class="cx-detail-hero" src="${finalHero}" alt="${restName}" loading="lazy"
-      onerror="this.src='${FOOD_FALLBACK}';this.onerror=null">
+    ${heroHtml}
     <div class="cx-detail-body">
       <div class="cx-detail-rest-name">${restName}</div>
       <div class="cx-detail-meta" style="gap:10px;flex-wrap:wrap">
@@ -13008,8 +13013,8 @@ const REALTIME_THINKING_MAP = {
     ? pickText(`正在解析${d}${f}偏好...`,      `Parsing ${d} food preferences...`,          `${d}の${f}好みを解析中...`,       `${d} ${f} 취향 분석 중...`)
     : pickText("正在理解需求...",              "Analyzing request...",                      "リクエスト解析中...",             "요청 분석 중..."),
   H_SEARCH: (d, f) => f
-    ? pickText(`搜寻${d}${f}`,                 `Hunting ${d} ${f}`,                         `${d}の${f}を探索中`,              `${d} ${f} 탐색 중`)
-    : pickText(`搜罗${d}特色住宿`,             `Scouting ${d} stays`,                       `${d}の宿を探索中`,                `${d} 숙소 탐색 중`),
+    ? pickText(`搜寻${d}${f}`,       `Hunting ${d} ${f}`,           `${d}の${f}を探索中`,  `${d} ${f} 탐색 중`)
+    : pickText("核心资源精算中...", "Calculating resources...", "リソースを精算中...", "리소스 정산 중..."),
   T_CALC:   (d, f) => f
     ? pickText(`规划${d}美食打卡路线`,         `Mapping ${d} food trail`,                   `${d}グルメルートを計画中`,        `${d} 맛집 경로 계획 중`)
     : pickText("正在核算交通费用...",          "Calculating transport...",                  "交通費を計算中...",               "교통비 계산 중..."),
@@ -13021,7 +13026,7 @@ const REALTIME_THINKING_MAP = {
   check_restaurant_queue:      (d) => pickText(`实时探测${d}餐厅排队强度`, `Checking ${d} restaurant queues`,   `${d}の待ち時間を確認中`,   `${d} 대기 시간 확인 중`),
   search_attractions:          (d) => pickText(`挖掘${d}符合你口味的景点`, `Finding ${d} gems for you`,         `${d}のあなた向け名所を発見中`, `${d} 맞춤 명소 발굴 중`),
   generate_creative_itinerary: (d) => pickText(`规划${d}避开人流专属动线`, `Plotting ${d} crowd-free route`,    `${d}の穴場ルートを計画中`, `${d} 한산한 경로 계획 중`),
-  search_hotels:               (d) => pickText(`搜罗${d}特色住宿`,         `Scouting ${d} unique stays`,        `${d}のユニークな宿を探索中`, `${d} 특색 숙소 탐색 중`),
+  search_hotels:               ()  => pickText("核心资源精算中...", "Calculating resources...", "リソースを精算中...", "리소스 정산 중..."),
   check_tickets:               (d) => pickText(`查询${d}景点余票`,         `Checking ${d} ticket availability`, `${d}のチケット在庫を確認中`, `${d} 티켓 재고 확인 중`),
   fetch_fx_rates:              ()  => pickText("调取实时汇率...",           "Fetching live FX rates...",         "為替レートを取得中...",    "환율 조회 중..."),
   match_coupons:               (d) => pickText(`匹配${d}专属优惠`,         `Matching ${d} exclusive deals`,     `${d}の限定特典を取得中`,   `${d} 전용 혜택 검색 중`),
@@ -13054,12 +13059,20 @@ function renderThinkingStream() {
 
   const title = document.createElement("div");
   title.className = "cx-ts-title";
-  title.innerHTML = `<span class="cx-ts-ping"></span>${pickText("CrossX AI 正在思考...", "CrossX AI is thinking...", "CrossX AI が思考中...", "CrossX AI 생각 중...")}`;
+  title.innerHTML = `<span class="cx-ts-ping"></span>${pickText("CrossX AI 精算中...", "CrossX AI calculating...", "CrossX AI 精算中...", "CrossX AI 정산 중...")}`;
   wrap.appendChild(title);
 
   const list = document.createElement("div");
   list.className = "cx-ts-list";
-  PLAN_STEPS.forEach((s, i) => {
+  // P10: swap 🏨→🍜 for food_only so no hotel icon leaks into food thinking stream
+  const _foodLayout = (state._layoutType || "") === "food_only";
+  const _stepsRendered = PLAN_STEPS.map((s) => ({
+    ...s,
+    icon: s.id === "H_SEARCH" ? (_foodLayout ? "🍜" : "🏨")
+        : s.id === "T_CALC"   ? (_foodLayout ? "🗺️" : "🚗")
+        : s.icon,
+  }));
+  _stepsRendered.forEach((s, i) => {
     const row = document.createElement("div");
     row.className = "cx-ts-step" + (i === 0 ? " active" : " pending");
     row.dataset.step = s.id;
