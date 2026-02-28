@@ -404,10 +404,10 @@ function createPlanRouter({
         // P8.10: persist context so next turn can merge destination + original intent
         let gateSessionId = incomingSessionId;
         if (gateSessionId && getSession(gateSessionId)) {
-          patchSession(gateSessionId, { pendingClarify: { originalMessage: message, missingSlots } });
+          patchSession(gateSessionId, { pendingClarify: { originalMessage: effectiveMessage, missingSlots } });
         } else {
           gateSessionId = createSession(
-            { pendingClarify: { originalMessage: message, missingSlots }, language, city },
+            { pendingClarify: { originalMessage: effectiveMessage, missingSlots }, language, city },
             DEFAULT_TTL_MS,
           );
         }

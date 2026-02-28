@@ -5067,10 +5067,17 @@ function applyLanguagePack() {
     el.langPillLabel.textContent = lang === "ZH" ? "语言" : lang === "ID" ? "Bahasa" : lang === "JA" ? "言語" : lang === "KO" ? "언어" : "Lang";
   }
   if (el.locateBtn) {
-    el.locateBtn.textContent = pickText("定位", "Use Location","現在地", "현재 위치");
+    // Use lastChild (text node) to avoid wiping the SVG icon
+    const _locateLbl = pickText("定位", "Use Location", "\u73fe\u5728\u5730", "\ud604\uc7ac \uc704\uce58");
+    const _lastNode = el.locateBtn.lastChild;
+    if (_lastNode && _lastNode.nodeType === Node.TEXT_NODE) {
+      _lastNode.textContent = _locateLbl;
+    } else {
+      el.locateBtn.appendChild(document.createTextNode(_locateLbl));
+    }
   }
   if (el.inlineLocateBtn) {
-    el.inlineLocateBtn.textContent = pickText("定位", "Locate","現在地", "위치");
+    el.inlineLocateBtn.textContent = pickText("定位", "Locate", "\u73fe\u5728\u5730", "\uc704\uce58");
   }
   if (el.openOpsBtn) {
     el.openOpsBtn.textContent = pickText("人工后台", "Ops Board","運用ボード", "운영 보드");
@@ -11495,6 +11502,7 @@ function bindInput() {
       // ── Step 1: Update language state + redraw all static labels immediately.
       // This is always safe — it only touches DOM text nodes, never sends requests.
       state.uiLanguage = next;
+      if (el.languageTag) el.languageTag.textContent = i18n.languageName(next);
       applyLanguagePack();
 
       // ── Step 2: Re-translate any rendered plan cards in the new language.
