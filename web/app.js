@@ -580,10 +580,10 @@ function applyThinkingIndicatorState(active, text = "") {
     el.thinkingIndicator.textContent =
       text
       || pickText(
-        "正在思考并生成定制化方案...",
-        "Thinking and building tailored options...",
-        "思考中。カスタム提案を生成しています...",
-        "생각 중입니다. 맞춤 제안을 생성하고 있어요...",
+        "核心方案思考中...",
+        "Building your plan...",
+        "プランを構築中...",
+        "플랜 구성 중...",
       );
     if (el.conversationAura) {
       el.conversationAura.dataset.mode = "planning";
@@ -6741,46 +6741,43 @@ const _LIST_CARD_TAG_STYLES = {
   premium:  { bg: "#fffbeb", color: "#92400e", border: "#fcd34d" },
 };
 
-// ── City hero image — Picsum scenic photos, deterministic by city seed ───────
-// picsum.photos/seed/{seed}/W/H always returns the same high-quality landscape photo
-// for a given seed. We use city-slug seeds so each destination gets its own image.
-// No API key, no rate limit, no 503, never shows food/products.
-const _CITY_IMG_SEEDS = {
-  "北京" :    "beijing-great-wall",
-  "上海" :    "shanghai-bund-night",
-  "深圳" :    "shenzhen-skyline",
-  "广州" :    "guangzhou-canton",
-  "成都" :    "chengdu-sichuan",
-  "重庆" :    "chongqing-mountain",
-  "杭州" :    "hangzhou-west-lake",
-  "苏州" :    "suzhou-garden",
-  "西安" :    "xian-city-wall",
-  "南京" :    "nanjing-scenic",
-  "三亚" :    "sanya-beach-sea",
-  "丽江" :    "lijiang-ancient-town",
-  "大理" :    "dali-erhai-lake",
-  "桂林" :    "guilin-karst-peaks",
-  "张家界" :   "zhangjiajie-pillar",
-  "黄山" :    "huangshan-mist",
-  "新疆" :    "xinjiang-prairie",
-  "拉萨" :    "lhasa-potala",
-  "哈尔滨" :  "harbin-ice-snow",
-  "青岛" :    "qingdao-coastal",
-  "厦门" :    "xiamen-island",
-  "乌鲁木齐" : "urumqi-xinjiang",
+// ── P8.8: Global city hero map — curated real landmark photos (Unsplash) ──────
+// Fixed Unsplash photo IDs for each major Chinese city landmark.
+// Falls back to a scenic travel photo if city not in map.
+const GLOBAL_CITY_HERO_MAP = {
+  "北京":   "https://images.unsplash.com/photo-1547981609-4b6bfe67ca0b?w=800&q=80", // Great Wall
+  "上海":   "https://images.unsplash.com/photo-1538428494232-9c0d8a3ab403?w=800&q=80", // The Bund
+  "深圳":   "https://images.unsplash.com/photo-1575979275447-4c6b6c72ac26?w=800&q=80", // Skyline
+  "广州":   "https://images.unsplash.com/photo-1598887141926-d0a1fc2bb862?w=800&q=80", // Canton Tower
+  "成都":   "https://images.unsplash.com/photo-1548393594-d73d12babb3e?w=800&q=80", // Chengdu
+  "重庆":   "https://images.unsplash.com/photo-1518060350020-07882a01fca6?w=800&q=80", // Night view
+  "杭州":   "https://images.unsplash.com/photo-1541250848046-a1e7ea06bd81?w=800&q=80", // West Lake
+  "苏州":   "https://images.unsplash.com/photo-1587082870498-2e8ace6c3bd6?w=800&q=80", // Garden
+  "西安":   "https://images.unsplash.com/photo-1548080819-6f8d2843e08b?w=800&q=80", // City Wall
+  "南京":   "https://images.unsplash.com/photo-1587595431973-160d0d94add1?w=800&q=80", // Nanjing
+  "三亚":   "https://images.unsplash.com/photo-1562183241-840b8af0721e?w=800&q=80", // Beach
+  "丽江":   "https://images.unsplash.com/photo-1598208040073-c8fd7ef6283a?w=800&q=80", // Ancient town
+  "大理":   "https://images.unsplash.com/photo-1589519673049-72edf5e30ae5?w=800&q=80", // Erhai Lake
+  "桂林":   "https://images.unsplash.com/photo-1537531069765-d34bf5c4a944?w=800&q=80", // Karst peaks
+  "张家界": "https://images.unsplash.com/photo-1578662996442-48f60103fc96?w=800&q=80", // Pillars
+  "黄山":   "https://images.unsplash.com/photo-1519451241324-20b4ea2c4220?w=800&q=80", // Misty peaks
+  "青岛":   "https://images.unsplash.com/photo-1585830438540-3e5edde62c8f?w=800&q=80", // Coastal
+  "厦门":   "https://images.unsplash.com/photo-1559847844-5315695dadae?w=800&q=80", // Gulangyu
+  "拉萨":   "https://images.unsplash.com/photo-1571406252241-db0280bd36cd?w=800&q=80", // Potala Palace
+  "哈尔滨": "https://images.unsplash.com/photo-1548438294-1ad5d5f4f063?w=800&q=80", // Ice festival
+  "新疆":   "https://images.unsplash.com/photo-1508739773434-c26b3d09e071?w=800&q=80", // Prairie
+  "乌鲁木齐": "https://images.unsplash.com/photo-1508739773434-c26b3d09e071?w=800&q=80",
 };
+const _CITY_HERO_FALLBACK = "https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?w=800&q=80"; // scenic travel
 
 function _getCityHeroUrl(dest) {
-  // P8.3: prefer Coze-generated hero image when available
+  // Coze hero_image takes top priority (live data from real Coze workflow)
   const cozeHero = state.cozeData?.hero_image;
   if (cozeHero && /^https?:\/\//i.test(cozeHero)) return cozeHero;
-  const d = dest || "";
   // For multi-city destinations like "深圳·西安·新疆", extract the first city
-  const firstCity = d.split(/[·,、·\s→>]/)[0].trim();
-  const searchIn = firstCity || d;
-  const cityKey = Object.keys(_CITY_IMG_SEEDS).find((k) => searchIn.includes(k) || k.includes(searchIn));
-  const seed = _CITY_IMG_SEEDS[cityKey] || `travel-scenic-${(firstCity||d).slice(0, 6) || "city"}`;
-  return `https://picsum.photos/seed/${encodeURIComponent(seed)}/800/450`;
+  const firstCity = (dest || "").split(/[·,、\s→>]/)[0].trim();
+  const key = Object.keys(GLOBAL_CITY_HERO_MAP).find((k) => firstCity.includes(k) || k.includes(firstCity));
+  return GLOBAL_CITY_HERO_MAP[key] || _CITY_HERO_FALLBACK;
 }
 
 function _buildListCard(p, idx, cardId, dur, pax, dest) {
@@ -12212,6 +12209,66 @@ function _applyCouponBar(barEl, coupon) {
 }
 
 function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
+  // P8.8: Polymorphic template — food_only shows restaurant UI, travel shows hotel UI
+  const layoutType = state._layoutType || "travel_full";
+  const isFoodDetail = layoutType === "food_only";
+
+  const el = document.createElement("div");
+  el.className = "cx-plan-detail";
+
+  if (isFoodDetail) {
+    // ── Food mode: restaurant detail (no hotel fields) ──────────────────────
+    const heroUrl    = p.real_photo_url || p.food_image || p.hotel?.hero_image || "";
+    const restName   = escapeHtml(p.name || p.restaurant_name || p.hotel?.name || "");
+    const restAddr   = escapeHtml(p.address || p.addr || "");
+    const restRating = p.rating || p.score || p.hotel?.rating || 0;
+    const restReview = escapeHtml(p.hotel?.guest_review || p.review || "");
+    const avgPrice   = p.avg_price || (p.budget_breakdown?.meals
+      ? Math.round((p.budget_breakdown.meals) / 3)
+      : 0);
+    const queueMin   = state.cozeData?.restaurant_queue;
+    const dishes     = (p.highlights || []).slice(0, 3);
+
+    el.innerHTML = `
+      ${heroUrl ? `<img class="cx-detail-hero" src="${heroUrl}" alt="${restName}" loading="lazy"
+        onerror="this.src='https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=800&q=80';this.onerror=null">` : ""}
+      <div class="cx-detail-body">
+        <div class="cx-detail-hotel-name" style="font-size:17px">${restName}</div>
+        <div class="cx-detail-meta" style="gap:10px;flex-wrap:wrap">
+          ${restRating ? `<span class="opt-hotel-stars">★ ${restRating}</span>` : ""}
+          ${avgPrice   ? `<span style="color:#f59e0b;font-weight:600">${pickText("人均","Avg","人均","인당")} ¥${avgPrice}</span>` : ""}
+          ${queueMin   ? `<span style="color:#ef4444">⏳ ${pickText("排队约","Wait ~","待ち約","대기 약")}${queueMin}${pickText("分钟","min","分","분")}</span>` : ""}
+        </div>
+        ${restAddr ? `<div style="color:#6b7280;font-size:13px;margin:4px 0 0">📍 ${restAddr}</div>` : ""}
+        ${restReview ? `<div class="opt-hotel-guestrev" style="margin-top:10px">"${restReview}"</div>` : ""}
+        ${dishes.length ? `
+        <div class="cx-detail-divider"></div>
+        <div class="cx-detail-section-label">${pickText("招牌菜 Top 3","Signature Dishes","看板メニュー","시그니처 메뉴")}</div>
+        <ul class="opt-highlights">
+          ${dishes.map((d) => `<li><span class="opt-check">🍽</span>${escapeHtml(d)}</li>`).join("")}
+        </ul>` : ""}
+        ${spokenText ? `
+        <div class="cx-detail-why">
+          <div class="cx-detail-why-label">${pickText("为何推荐","Why We Recommend","おすすめ理由","추천 이유")}</div>
+          ${escapeHtml(spokenText)}
+        </div>` : ""}
+        <div class="cx-detail-actions">
+          <button class="cx-detail-itin-btn"
+            data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
+            onclick="cxDetailOpenItinerary(this)">
+            ${pickText("查看完整美食路线 ↓","View Full Food Trail ↓","グルメルートを見る ↓","맛집 코스 보기 ↓")}
+          </button>
+          <button class="cx-detail-book-btn"
+            data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
+            onclick="cxGoToCheckout(this)">
+            ${pickText("预订此方案 →","Book This Plan →","このプランを予約 →","이 플랜 예약 →")}
+          </button>
+        </div>
+      </div>`;
+    return el;
+  }
+
+  // ── Travel / stay mode: hotel detail (original template) ───────────────────
   const heroUrl       = p.hotel?.hero_image || "";
   const ppn           = p.hotel?.price_per_night || 0;
   const hotelRating   = p.hotel?.rating || 0;
@@ -12222,7 +12279,6 @@ function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
     `<li><span class="opt-check">✓</span>${escapeHtml(h)}</li>`
   ).join("");
 
-  // "Why we recommend" — use spokenText for recommended plan, highlights for others
   const whyText = spokenText
     ? escapeHtml(spokenText)
     : (p.highlights || []).slice(0, 2).map((h) => escapeHtml(h)).join(" · ");
@@ -12243,8 +12299,6 @@ function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
     `<span class="opt-bb-item"><span style="background:${e.color}"></span>${e.label} ¥${Number((p.budget_breakdown || {})[e.key] || 0).toLocaleString()}</span>`
   ).join("");
 
-  const el = document.createElement("div");
-  el.className = "cx-plan-detail";
   el.innerHTML = `
     ${heroUrl ? `<img class="cx-detail-hero" src="${heroUrl}" alt="" loading="lazy" onerror="this.style.display='none'">` : ""}
     <div class="cx-detail-body">
@@ -12429,7 +12483,7 @@ async function cxProcessPayment(btn) {
   const msgs = [
     [pickText("正在与航司同步状态...", "Syncing with airline...", "航空会社と同期中...", "항공사와 동기화 중..."),
      pickText("通常约15秒", "Usually ~15s","通常約15秒", "보통 ~15초")],
-    [pickText("正在确认酒店房态...", "Confirming hotel availability...", "ホテルの空室を確認中...", "호텔 가용성 확인 중..."), ""],
+    [pickText("正在锁定最优资源...", "Locking best resources...", "リソースを確定中...", "최적 리소스 확정 중..."), ""],
     [pickText("正在锁定最优价格...", "Locking best rate...", "最良レートを確定中...", "최적 요금 확정 중..."), ""],
   ];
   let mi = 0;

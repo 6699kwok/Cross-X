@@ -61,6 +61,24 @@ function detectIntentAxis(message) {
   return "travel";
 }
 
+// ── P8.8: Requirement completeness gate ──────────────────────────────────────
+// For full-itinerary travel intent: require BOTH explicit duration AND explicit budget
+// from the user message or pre-filled constraints. Food/stay/activity are exempt
+// (they are standalone queries that don't need a day count or trip budget).
+// Returns array of missing slot names, empty = ok to proceed.
+function checkRequirements(message, constraints, intentAxis) {
+  if (intentAxis !== "travel") return [];
+  const hasDuration = /\d+\s*天|\d+\s*(?:days?|nights?)/i.test(message)
+    || !!(constraints.duration || constraints.days);
+  const hasBudget = /\d[\d,]*\s*万|\d[\d,]+\s*(?:元|人民币|RMB|CNY)/i.test(message)
+    || /(?:预算|budget)[^\d]*\d+/i.test(message)
+    || !!(constraints.budget);
+  const missing = [];
+  if (!hasDuration) missing.push("duration");
+  if (!hasBudget)   missing.push("budget");
+  return missing;
+}
+
 // ── Factory ────────────────────────────────────────────────────────────────────
 /**
  * Inject server.js-level utilities and live config values.
@@ -368,6 +386,32 @@ function createPlanRouter({
       // P8.6: Detect intent axis for specialty mode — affects prompt and layout_type
       const intentAxis = detectIntentAxis(message);
       if (intentAxis !== "travel") console.log(`[plan/coze] Intent axis: ${intentAxis} — specialty mode`);
+
+      // P8.8: Requirement gate — travel plans need explicit duration + budget.
+      // Emits clarify immediately (no Coze call, no LLM call) when slots are missing.
+      const missingSlots = checkRequirements(message, constraints, intentAxis);
+      if (missingSlots.length > 0) {
+        planDone = true;
+        const slotLabels = {
+          duration: pickLang(language, "行程天数", "trip duration", "日数", "여행 일수"),
+          budget:   pickLang(language, "总预算",   "total budget",  "予算", "예산"),
+        };
+        const asked = missingSlots.map((s) => slotLabels[s])
+          .join(pickLang(language, "和", " and ", "と", "과 "));
+        console.log(`[plan/coze] Requirement gate — missing: ${missingSlots.join(", ")}`);
+        emit({
+          type: "final", response_type: "clarify",
+          spoken_text: pickLang(language,
+            `您好！请告诉我您的${asked}，我马上为您量身定制方案。`,
+            `Hi! Please share your ${asked} and I'll build your custom plan right away.`,
+            `こんにちは！${asked}を教えてください。すぐにプランを作ります。`,
+            `안녕하세요! ${asked}를 알려주시면 바로 맞춤 플랜을 만들겠습니다.`),
+          missing_slots: missingSlots,
+          source: "requirement-gate",
+        });
+        res.end();
+        return;
+      }
 
       // P8.4 Serial scheduling: Coze first → buildResourceContext → OpenAI grounded in real-time data.
       // Step 1: Coze enrichment (always resolves — synthetic fallback on failure).
