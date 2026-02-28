@@ -6978,6 +6978,8 @@ function renderCardData(cd, spokenText) {
         const activities = (d.activities || []).map((act) => {
           const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
           const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
+          // P8.9: real_photo_url (from Coze via Rule 15) takes priority; picsum as last resort
+          const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
           const costRaw = act.cost_cny || act.cost || 0;
           const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` :"免费";
           const costCls  = costRaw === 0 ? " act-cost--free" : "";
@@ -6996,7 +6998,7 @@ function renderCardData(cd, spokenText) {
             ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
           return `${transitHtml}
             <div class="act-row">
-              <img class="act-img" src="https://picsum.photos/seed/${imgKw}/120/80" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
+              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
               <div class="act-body">
                 <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue}${cozeTicket}</div>
                 ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
@@ -7155,6 +7157,8 @@ function renderCardData(cd, spokenText) {
       const activities = (d.activities || []).map((act) => {
         const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
         const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
+        // P8.9: real photo first; picsum as last resort
+        const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
         const costRaw = act.cost_cny || act.cost || 0;
         const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` : "免费";
         const costCls  = costRaw === 0 ? " act-cost--free" : "";
@@ -7171,7 +7175,7 @@ function renderCardData(cd, spokenText) {
           ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
         return `${transitHtml}
           <div class="act-row">
-            <img class="act-img" src="https://picsum.photos/seed/${imgKw}/120/80" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
+            <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
             <div class="act-body">
               <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue2}${cozeTicket2}</div>
               ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
@@ -7204,9 +7208,11 @@ function renderCardData(cd, spokenText) {
     // Legacy items[] fallback
     dayPanelsHtml = `<div class="plan-items">` + cd.items.map((item) => {
       const imgKw = encodeURIComponent(item.image_keyword || item.name || "");
+      // P8.9: real photo first; picsum as last resort
+      const itemImgSrc = item.image_url || item.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
       const priceFmt = Number(item.price || 0).toLocaleString();
       return `<div class="cd-item-row">
-        <img class="cd-item-img" src="https://picsum.photos/seed/${imgKw}/120/80" alt="${escapeHtml(item.name || "")}" loading="lazy" onerror="this.style.display='none'">
+        <img class="cd-item-img" src="${itemImgSrc}" alt="${escapeHtml(item.name || "")}" loading="lazy" onerror="this.style.display='none'">
         <div class="cd-item-body">
           <div class="cd-item-name">${escapeHtml(item.name || "")}</div>
           <div class="cd-item-desc">${escapeHtml(item.description || "")}</div>
@@ -7409,6 +7415,8 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         const activities = (d.activities || []).map((act) => {
           const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
           const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
+          // P8.9: real photo first; picsum as last resort
+          const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
           const costRaw = act.cost_cny || act.cost || 0;
           const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` :"免费";
           const costCls  = costRaw === 0 ? " act-cost--free" : "";
@@ -7432,7 +7440,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
             ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
           return `${transitHtml}
             <div class="act-row">
-              <img class="act-img" src="https://picsum.photos/seed/${imgKw}/120/80" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
+              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
               <div class="act-body">
                 <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue3}${cozeTicket3}</div>
                 ${act.desc ? `<div class="act-note">${escapeHtml(act.desc)}</div>` : ""}
