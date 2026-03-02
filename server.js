@@ -5215,7 +5215,7 @@ function summarizeProviderCalls(providerKey, calls) {
 }
 
 function buildProviderProbeSummary() {
-  const gaodeKeyPresent = Boolean(process.env.GAODE_KEY || process.env.AMAP_KEY);
+  const gaodeKeyPresent = Boolean(process.env.AMAP_API_KEY || process.env.GAODE_KEY || process.env.AMAP_KEY);
   const partnerHubKeyPresent = Boolean(process.env.PARTNER_HUB_KEY);
   const partnerHubBaseUrlConfigured = Boolean(connectors.partnerHub && connectors.partnerHub.baseUrl);
   const partnerHubContractReady = Boolean(connectors.partnerHub && connectors.partnerHub.baseUrl);
@@ -6849,7 +6849,7 @@ const audit = createAuditLogger({
 
 const connectors = {
   gaode: createGaodeConnector({
-    key: process.env.GAODE_KEY || process.env.AMAP_KEY || "",
+    key: process.env.AMAP_API_KEY || process.env.GAODE_KEY || process.env.AMAP_KEY || "",
     city: process.env.CITY || "Shanghai",
   }),
   partnerHub: createPartnerHubConnector({
@@ -7994,7 +7994,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/system/providers") {
       const contracts = buildMcpContractsSummary();
-      const gaodeKeyPresent = Boolean(process.env.GAODE_KEY || process.env.AMAP_KEY);
+      const gaodeKeyPresent = Boolean(process.env.AMAP_API_KEY || process.env.GAODE_KEY || process.env.AMAP_KEY);
       const partnerHubKeyPresent = Boolean(process.env.PARTNER_HUB_KEY);
       const partnerHubBaseUrlConfigured = Boolean(connectors.partnerHub && connectors.partnerHub.baseUrl);
       const partnerHubReady = Boolean(connectors.partnerHub && connectors.partnerHub.enabled && (partnerHubKeyPresent || partnerHubBaseUrlConfigured));
