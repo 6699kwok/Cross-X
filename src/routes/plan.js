@@ -61,6 +61,61 @@ function isInjectionAttack(text) {
   return INJECTION_PATTERNS.some((re) => re.test(text));
 }
 
+// ── Coze output enrichment: fill real_vibes + insider_tips via OpenAI ────────
+/**
+ * After Coze bot returns card_data, all activity real_vibes/insider_tips are empty.
+ * This function fills them with a single compact OpenAI call (5s budget).
+ * Returns enriched card_data, or original on any error.
+ */
+async function enrichCozeActivities(card_data, { apiKey, model, baseUrl }) {
+  try {
+    // Collect activities missing real_vibes or insider_tips (skip transport)
+    const targets = [];
+    for (const day of card_data.days || []) {
+      for (const act of day.activities || []) {
+        if (act.type !== "transport" && (!act.real_vibes || !act.insider_tips)) {
+          targets.push({ name: act.name, type: act.type });
+        }
+      }
+    }
+    if (!targets.length) return card_data;
+
+    const dest = card_data.destination || "";
+    const result = await openAIRequest({
+      apiKey, model, baseUrl,
+      systemPrompt: `\u4f60\u662f\u65c5\u6e38\u6587\u6848\u4e13\u5bb6\u3002\u4e3a${dest}\u7684\u4ee5\u4e0b\u5730\u70b9\u586b\u5199 real_vibes\uff08\u6c1b\u56f4\u611f\u53d7\uff0c8\u5b57\u4ee5\u5185\uff09\u548c insider_tips\uff08\u5b9e\u7528\u8d34\u58eb\uff0c15\u5b57\u4ee5\u5185\uff09\u3002\u8fd4\u56de JSON \u6570\u7ec4\uff0c\u6bcf\u9879\u5305\u542b name\u3001real_vibes\u3001insider_tips\u3002`,
+      userContent: JSON.stringify(targets),
+      maxTokens: 600,
+      jsonMode: true,
+      timeoutMs: 5000,
+    });
+    if (!result.ok) return card_data;
+
+    let enriched;
+    try { enriched = JSON.parse(result.text); } catch { return card_data; }
+    const list = Array.isArray(enriched) ? enriched
+      : (enriched.list || enriched.activities || enriched.data || enriched.items || []);
+    if (!list.length) return card_data;
+
+    const lookup = Object.fromEntries(list.filter(i => i.name).map(i => [i.name, i]));
+    const patched = JSON.parse(JSON.stringify(card_data));
+    for (const day of patched.days || []) {
+      for (const act of day.activities || []) {
+        const p = lookup[act.name];
+        if (p) {
+          if (!act.real_vibes   && p.real_vibes)   act.real_vibes   = p.real_vibes;
+          if (!act.insider_tips && p.insider_tips)  act.insider_tips = p.insider_tips;
+        }
+      }
+    }
+    console.log(`[coze/enrich] Filled ${list.length} activities for ${dest}`);
+    return patched;
+  } catch (e) {
+    console.warn("[coze/enrich] Error:", e.message);
+    return card_data;
+  }
+}
+
 // ── P8.6: Intent axis detector ───────────────────────────────────────────────
 // Determines the primary intent of the user message to enable specialty mode.
 // Returns: "food" | "activity" | "stay" | "travel" (default full itinerary)
@@ -646,8 +701,14 @@ function createPlanRouter({
           emit({ type: "status", code: "T_CALC",   label: pickLang(language, "\u4ea4\u901a\u6838\u7b97\u5b8c\u6210", "Transport calculated", "\u4ea4\u901a\u8cbb\u78ba\u5b9a", "\uad50\ud1b5\ube44 \ud655\uc815") });
           emit({ type: "status", code: "B_CHECK",  label: pickLang(language, "\u9884\u7b97\u6821\u9a8c\u5b8c\u6210", "Budget verified", "\u4e88\u7b97\u78ba\u5b9a", "\uc608\uc0b0 \ud655\uc815") });
 
+          // Enrich Coze card with real_vibes + insider_tips (5s budget, fallback to original)
+          emit({ type: "status", code: "B_CHECK", label: pickLang(language, "\u6574\u5408\u666f\u70b9\u5185\u5bb9...", "Enhancing details...", "\u30b3\u30f3\u30c6\u30f3\u30c4\u6574\u5099\u4e2d...", "\ucf58\ud150\uce20 \uc815\ub9ac \uc911...") });
+          const _enrichedCard = await enrichCozeActivities(botResult.card_data, {
+            apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+          });
+
           let outSessionId = incomingSessionId;
-          const _botCard = botResult.card_data;
+          const _botCard = _enrichedCard;
           const _newTurn = { role: "user", content: effectiveMessage };
           const _updatedHistory = pruneHistory([...mergedHistory, _newTurn], 12);
           const _sessionPayload = {
