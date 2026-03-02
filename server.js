@@ -434,8 +434,9 @@ const AI_ENRICHMENT_CACHE = new Map();
 const AI_ENRICHMENT_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 /**
- * Generate enrichment data for any city via OpenAI when neither Coze nor
- * static CITY_DATA covers it. Cached per city+intent for 4 h.
+ * Generate enrichment data for any city.
+ * Priority: Amap POI (real-time, live data) → OpenAI (AI-generated) → hash fallback.
+ * Cached per city+intent for 4 h.
  */
 async function buildAIEnrichment(city, intentAxis) {
   const cacheKey = `${city}:${intentAxis || "food"}`;
@@ -445,7 +446,42 @@ async function buildAIEnrichment(city, intentAxis) {
     return cached.data;
   }
 
-  const isFood = !intentAxis || intentAxis === "food" || intentAxis === "activity";
+  const isFood = !intentAxis || intentAxis === "food";
+
+  // ── Level 1: Amap POI (real data, zero LLM cost) ──────────────────────────
+  if (AMAP_API_KEY) {
+    try {
+      const poiType  = isFood ? "restaurant" : "hotel";
+      const pois     = await queryAmapPoi(city, poiType);
+      if (pois && pois.length >= 3) {
+        const items = pois.slice(0, 6).map((p) => ({
+          name:          p.name,
+          address:       p.address || city,
+          avg_price:     p.price  || (isFood ? 60 : 400),
+          queue_min:     isFood   ? (p.rating >= 4.5 ? 30 : p.rating >= 4.0 ? 15 : 5) : 0,
+          open_hours:    isFood   ? "" : "9:00-18:00",
+          real_photo_url: "",
+        }));
+        const avgQueue = Math.round(items.reduce((s, i) => s + i.queue_min, 0) / items.length);
+        const enrichment = {
+          restaurant_queue:    avgQueue,
+          ticket_availability: true,
+          spoken_text:         `${city}${isFood ? "\u7f8e\u98df\u4e30\u5bcc" : "\u666f\u70b9\u4f17\u591a"}\uff0c\u5efa\u8bae\u63d0\u524d\u9884\u8ba2\u70ed\u95e8${isFood ? "\u9910\u5385" : "\u666f\u70b9"}\u3002`,
+          item_list:           items,
+          _synthetic:          false,   // real Amap data
+          _source:             "amap",
+        };
+        AI_ENRICHMENT_CACHE.set(cacheKey, { data: enrichment, ts: Date.now() });
+        console.log(`[ai-enrichment] Amap live data for ${city}: ${items.length} ${poiType}s`);
+        return enrichment;
+      }
+    } catch (e) {
+      console.warn(`[ai-enrichment] Amap failed for ${city}:`, e.message);
+    }
+  }
+
+  // ── Level 2: OpenAI generation (AI-generated, costs tokens) ──────────────
+  const startedAt    = Date.now();
   const itemTemplate = isFood
     ? `{"name":"\u5177\u4f53\u5e97\u540d","address":"\u771f\u5b9e\u5730\u5740","avg_price":65,"queue_min":20,"real_photo_url":""}`
     : `{"name":"\u5177\u4f53\u666f\u70b9\u540d","address":"\u771f\u5b9e\u5730\u5740","avg_price":80,"open_hours":"9:00-18:00","real_photo_url":""}`;
@@ -455,8 +491,7 @@ async function buildAIEnrichment(city, intentAxis) {
     : `Generate realistic attraction enrichment for ${city}, China. Return ONLY this JSON (3 items, use real attraction names that exist in ${city}):
 {"restaurant_queue":0,"ticket_availability":true,"spoken_text":"<one sentence about ${city} tourism in Chinese, e.g. ticket tips>","item_list":[${itemTemplate},${itemTemplate},${itemTemplate}]}`;
 
-  const startedAt = Date.now();
-  const ctrl = new AbortController();
+  const ctrl  = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 12000);
   try {
     const res = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
@@ -475,28 +510,30 @@ async function buildAIEnrichment(city, intentAxis) {
     });
     if (!res.ok) throw new Error(`openai_http_${res.status}`);
     const data = await res.json();
-    const raw = data?.choices?.[0]?.message?.content?.trim() || "";
-    const jsonStart = raw.indexOf("{");
-    const jsonEnd = raw.lastIndexOf("}");
-    if (jsonStart === -1 || jsonEnd === -1) throw new Error("no_json");
-    const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd + 1));
-    if (!Array.isArray(parsed.item_list) || parsed.item_list.length === 0) throw new Error("no_items");
-    const enrichment = { ...parsed, _synthetic: true, _ai_generated: true };
+    const raw  = data?.choices?.[0]?.message?.content?.trim() || "";
+    const s    = raw.indexOf("{"), e2 = raw.lastIndexOf("}");
+    if (s === -1 || e2 === -1) throw new Error("no_json");
+    const parsed = JSON.parse(raw.slice(s, e2 + 1));
+    if (!Array.isArray(parsed.item_list) || !parsed.item_list.length) throw new Error("no_items");
+    const enrichment = { ...parsed, _synthetic: true, _source: "openai" };
     AI_ENRICHMENT_CACHE.set(cacheKey, { data: enrichment, ts: Date.now() });
-    console.log(`[ai-enrichment] Generated for ${city} in ${Date.now() - startedAt}ms (${parsed.item_list.length} items)`);
+    console.log(`[ai-enrichment] OpenAI generated for ${city} in ${Date.now() - startedAt}ms (${parsed.item_list.length} items)`);
     return enrichment;
   } catch (e) {
-    console.warn(`[ai-enrichment] Failed for ${city}:`, e.message);
-    const h = String(city || "").split("").reduce((a, c) => (a + c.charCodeAt(0)) & 0xffff, 0);
-    return {
-      restaurant_queue: [15, 20, 25, 30][(h >> 3) % 4],
-      ticket_availability: true,
-      spoken_text: `${city || "\u76ee\u7684\u5730"}\u65c5\u6e38\u70ed\u5ea6\u9ad8\uff0c\u5efa\u8bae\u63d0\u524d\u9884\u8ba2\u666f\u70b9\u95e8\u7968\u548c\u7279\u8272\u9910\u5385\u3002`,
-      _synthetic: true,
-    };
+    console.warn(`[ai-enrichment] OpenAI failed for ${city}:`, e.message);
   } finally {
     clearTimeout(timer);
   }
+
+  // ── Level 3: hash-based fallback (no data, no tokens) ─────────────────────
+  const h = String(city || "").split("").reduce((a, c) => (a + c.charCodeAt(0)) & 0xffff, 0);
+  return {
+    restaurant_queue:    [15, 20, 25, 30][(h >> 3) % 4],
+    ticket_availability: true,
+    spoken_text:         `${city || "\u76ee\u7684\u5730"}\u65c5\u6e38\u70ed\u5ea6\u9ad8\uff0c\u5efa\u8bae\u63d0\u524d\u9884\u8ba2\u666f\u70b9\u95e8\u7968\u548c\u7279\u8272\u9910\u5385\u3002`,
+    _synthetic:          true,
+    _source:             "fallback",
+  };
 }
 
 /**
