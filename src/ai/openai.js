@@ -84,4 +84,135 @@ async function openAIRequest({
   }
 }
 
-module.exports = { openAIRequest, setDefaultModel, setDefaultBaseUrl };
+/**
+ * Streaming OpenAI chat/completions request with optional function/tool calling.
+ *
+ * @param {object} opts
+ * @param {string}   opts.apiKey
+ * @param {string}   [opts.model]
+ * @param {string}   [opts.baseUrl]
+ * @param {Array}    opts.messages      Full messages array (system+history+user)
+ * @param {Array}    [opts.tools]       OpenAI tool definitions
+ * @param {number}   [opts.temperature]
+ * @param {number}   [opts.maxTokens]
+ * @param {number}   [opts.timeoutMs]
+ * @param {function} [opts.onChunk]     (text: string) => void — called for each text delta
+ * @returns {Promise<{ok: boolean, text: string, tool_calls: Array}>}
+ */
+async function openAIStream({
+  apiKey,
+  model,
+  baseUrl,
+  messages,
+  tools,
+  temperature = 0.5,
+  maxTokens = 2200,
+  timeoutMs = 55000,
+  jsonMode = false,
+  onChunk,
+}) {
+  const endpoint = `${baseUrl || _defaultBaseUrl}/chat/completions`;
+  const body = JSON.stringify({
+    model: model || _defaultModel,
+    messages,
+    temperature,
+    max_tokens: maxTokens,
+    stream: true,
+    ...(tools && tools.length ? { tools, tool_choice: "auto" } : {}),
+    ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+  });
+
+  try {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${apiKey}`,
+        "Accept":        "text/event-stream",
+      },
+      body,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      console.warn("[openAIStream] HTTP error:", resp.status, errText.slice(0, 200));
+      return { ok: false, text: "", tool_calls: [] };
+    }
+
+    // Parse SSE stream
+    let textAccum = "";
+    // tool_calls accumulator: Map<index, {id, name, arguments_raw}>
+    const toolCallMap = new Map();
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    for await (const chunk of resp.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop(); // keep incomplete line
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") continue;
+
+        let parsed;
+        try { parsed = JSON.parse(payload); } catch { continue; }
+
+        const delta = parsed?.choices?.[0]?.delta;
+        if (!delta) continue;
+
+        // Accumulate text content
+        if (delta.content) {
+          textAccum += delta.content;
+          if (onChunk) {
+            try { onChunk(delta.content); } catch {}
+          }
+        }
+
+        // Accumulate tool_calls (streamed in fragments)
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCallMap.has(idx)) {
+              toolCallMap.set(idx, { id: "", name: "", arguments_raw: "" });
+            }
+            const entry = toolCallMap.get(idx);
+            if (tc.id)                       entry.id   += tc.id;
+            if (tc.function?.name)           entry.name += tc.function.name;
+            if (tc.function?.arguments)      entry.arguments_raw += tc.function.arguments;
+          }
+        }
+
+        // Check finish reason
+        const finishReason = parsed?.choices?.[0]?.finish_reason;
+        if (finishReason === "length") {
+          console.warn("[openAIStream] Response truncated (finish_reason=length)");
+        }
+      }
+    }
+
+    // Build tool_calls array
+    const tool_calls = [];
+    for (const [, entry] of [...toolCallMap.entries()].sort((a, b) => a[0] - b[0])) {
+      let args = {};
+      try { args = JSON.parse(entry.arguments_raw || "{}"); } catch {}
+      tool_calls.push({ id: entry.id, name: entry.name, arguments: args });
+    }
+
+    return { ok: true, text: textAccum, tool_calls };
+
+  } catch (e) {
+    if (e.name === "TimeoutError" || e.name === "AbortError") {
+      console.warn("[openAIStream] timeout after", timeoutMs, "ms");
+    } else {
+      console.warn("[openAIStream] req error:", e.message);
+    }
+    return { ok: false, text: "", tool_calls: [] };
+  }
+}
+
+module.exports = { openAIRequest, openAIStream, setDefaultModel, setDefaultBaseUrl };

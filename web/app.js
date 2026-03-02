@@ -7792,6 +7792,24 @@ function animateAnalysisText(el, text, speedMs = 20) {
   tick();
 }
 
+/**
+ * Append follow-up suggestion chips below the latest plan card.
+ * Chips trigger createTaskFromText when clicked.
+ */
+function _renderFollowUpChips(suggestions) {
+  if (!Array.isArray(suggestions) || !suggestions.length) return;
+  const chatEl = document.getElementById("chat-messages");
+  if (!chatEl) return;
+  const chipsHtml = suggestions.map((s) =>
+    `<button class="cx-followup-chip" onclick="createTaskFromText(${JSON.stringify(s)})">${escapeHtml(s)}</button>`
+  ).join("");
+  const wrapper = document.createElement("div");
+  wrapper.className = "cx-followup-chips";
+  wrapper.innerHTML = `<span class="cx-followup-label">\u8fd8\u53ef\u4ee5...</span>${chipsHtml}`;
+  chatEl.appendChild(wrapper);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 function renderItineraryOptionsCard(structured) {
   if (!structured || structured.response_type !== "options_card") return false;
 
@@ -8118,12 +8136,13 @@ async function createTaskFromText(text) {
         conversationHistory,
         signal: _planStreamSignal,
         onStatusUpdate: (code, label) => {
-          appendThinkingStep(_thinkingStream, code, label);
           // P8.7: Unified REALTIME_THINKING_MAP — no fixed hotel/generic text ever.
           // Context extracted once from the user's message (closure over `text`).
           const _dest   = _extractDestFromText(text);
           const _foodKw = _extractFoodKw(text);
           const _toolName = code.startsWith("TOOL:") ? code.slice(5) : code;
+          const stepCode  = TOOL_STEP_MAP[_toolName] || code;  // map agent tool → step id
+          appendThinkingStep(_thinkingStream, stepCode, label);
           const fn = REALTIME_THINKING_MAP[_toolName];
           applyThinkingIndicatorState(true,
             fn ? fn(_dest, _foodKw) : label || pickText("AI 处理中...", "AI processing...", "AI 処理中...", "AI 처리 중..."));
@@ -8233,6 +8252,10 @@ async function createTaskFromText(text) {
       } else if (smart.response_type === "options_card") {
         // Render 3-tier itinerary cards
         renderItineraryOptionsCard(smart);
+        // Follow-up suggestion chips
+        if (Array.isArray(smart.follow_up_suggestions) && smart.follow_up_suggestions.length) {
+          _renderFollowUpChips(smart.follow_up_suggestions);
+        }
         replyContent = smart.spoken_text || "";
       } else if (smart.response_type === "clarify") {
         // ── STRICT: clarify ONLY renders chips, never alongside an error
@@ -12417,6 +12440,9 @@ function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
           onclick="cxDetailOpenItinerary(this)">
           ${pickText("查看逐日行程 ↓","View Itinerary ↓","日程を見る ↓","일정 보기 ↓")}
         </button>
+        ${p.hotel?.name ? `<a class="cx-detail-hotel-link" href="https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(p.hotel.name)}" target="_blank" rel="noopener noreferrer">
+          🏨 ${pickText("在携程查看酒店","View on Ctrip","携程で見る","携程에서 보기")}
+        </a>` : ""}
         <button class="cx-detail-book-btn"
           data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
           onclick="cxGoToCheckout(this)">
@@ -12871,6 +12897,20 @@ function closeSheet() {
 const CX_PLAN_SESSION_KEY = "cx_plan_session";
 const CX_SESSION_TTL_MS   = 4 * 60 * 60 * 1000; // 4h — mirrors backend TTL
 
+// ── C4: Device ID — stable cross-session identity (localStorage, no auth needed) ──
+const CX_DEVICE_ID_KEY = "cx_device_id";
+function getDeviceId() {
+  let id;
+  try { id = localStorage.getItem(CX_DEVICE_ID_KEY); } catch {}
+  if (!id) {
+    id = (typeof crypto !== "undefined" && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : Math.random().toString(36).slice(2) + Date.now().toString(36);
+    try { localStorage.setItem(CX_DEVICE_ID_KEY, id); } catch {}
+  }
+  return id;
+}
+
 function savePlanSessionId(id) {
   if (!id) return;
   try { localStorage.setItem(CX_PLAN_SESSION_KEY, JSON.stringify({ id, savedAt: Date.now() })); } catch {}
@@ -12946,6 +12986,7 @@ async function consumePlanStream({
     body: JSON.stringify({
       message, language, city, constraints, conversationHistory,
       sessionId: loadPlanSessionId(), // P2: auto-carry session memory
+      deviceId:  getDeviceId(),       // C4: cross-session preference profile
     }),
     signal,
   });
@@ -13032,6 +13073,10 @@ const REALTIME_THINKING_MAP = {
   match_coupons:               (d) => pickText(`匹配${d}专属优惠`,         `Matching ${d} exclusive deals`,     `${d}の限定特典を取得中`,   `${d} 전용 혜택 검색 중`),
   plan_transport:              (d) => pickText(`规划${d}交通路线`,          `Plotting ${d} best route`,          `${d}のルートを最適化中`,   `${d} 경로 계획 중`),
   verify_budget:               ()  => pickText("精算最优预算...",           "Optimizing budget...",              "予算を最適化中...",        "예산 최적화 중..."),
+  // ── Agent-native tool names ────────────────────────────────────────────────
+  get_attractions:             (d) => pickText(`挖掘${d}必玩景点与体验`,    `Scanning attractions in ${d}`,      `${d}の観光スポット検索中`,  `${d} 명소 검색 중`),
+  get_route:                   (d) => pickText(`规划${d}交通路线`,          `Planning transport to ${d}`,        `${d}への交通を計画中`,      `${d} 교통 계획 중`),
+  get_city_enrichment:         (d) => pickText(`读取${d}实时资源数据`,      `Loading live data for ${d}`,        `${d}のリアルタイムデータ読み込み中`, `${d} 실시간 데이터 로딩 중`),
 };
 
 // Helper: extract destination city from user message (inline, no regex import needed)
@@ -13048,6 +13093,15 @@ function _extractFoodKw(msg) {
   return null;
 }
 const STEP_ORDER = PLAN_STEPS.map((s) => s.id);
+
+// Maps agent tool_call names → PLAN_STEPS ids so tool_call events advance the timeline
+const TOOL_STEP_MAP = {
+  search_hotels:       "H_SEARCH",
+  search_restaurants:  "H_SEARCH",
+  get_attractions:     "H_SEARCH",
+  get_city_enrichment: "H_SEARCH",
+  get_route:           "T_CALC",
+};
 
 /** Create the thinking-stream timeline and append to chatFeed. Returns root el. */
 function renderThinkingStream() {

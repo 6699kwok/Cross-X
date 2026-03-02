@@ -15,22 +15,62 @@ const { openAIRequest } = require("../ai/openai");
 const { PLANNER_SYSTEM_PROMPT, buildCrossXSystemPrompt, SPEAKER_SYSTEM_PROMPT } = require("./prompts");
 const { safeParseJson, CHINA_CITIES_RE, mockAmapRouting, mockCtripHotels } = require("./mock");
 
+// ── Flight data adapter ───────────────────────────────────────────────────────
+/**
+ * Convert queryJuheFlight() result into the same shape as mockAmapRouting()
+ * so the rest of the pipeline stays unchanged.
+ */
+function _flightDataToRoute(flightData) {
+  if (!flightData || !Array.isArray(flightData.flights) || !flightData.flights.length) return null;
+  const best = flightData.flights[0]; // already sorted by price asc
+  return {
+    transport_mode: "flight",
+    flight_no:      best.flightNo,
+    airline:        best.airline,
+    dep_time:       best.depTime,
+    arr_time:       best.arrTime,
+    duration_min:   _parseDurationMin(best.duration),
+    price_range:    best.price ? { low: best.price, high: best.price } : null,
+    stops:          best.stops || 0,
+    source:         "juhe",
+  };
+}
+
+/** Convert "2小时30分" / "02:30" / "150" → minutes */
+function _parseDurationMin(str) {
+  if (!str) return null;
+  const hm = String(str).match(/(\d+)\s*(?:小时|h|:)\s*(\d+)/i);
+  if (hm) return parseInt(hm[1]) * 60 + parseInt(hm[2]);
+  const h = String(str).match(/^(\d+)\s*(?:小时|h)$/i);
+  if (h) return parseInt(h[1]) * 60;
+  const m = String(str).match(/^(\d+)\s*(?:分|min)$/i);
+  if (m) return parseInt(m[1]);
+  const n = parseInt(str);
+  return isNaN(n) ? null : n;
+}
+
 // ── Injected dependencies (set once at server startup) ───────────────────────
 let _buildKnowledge = () => "";
 let _extractConstraints = (msg, ctx) => ({ city: null, duration: null, budget: null, party_size: null, service_types: [] });
 let _sessionItinerary = null; // Will be the Map from server.js
+let _queryFlight  = null;     // queryJuheFlight(fromCity, toCity, dateStr?) → flight data or null
+let _queryHotels  = null;     // queryAmapHotels(city, budgetPerNight?) → [{tier,name,...}] | null
 
 /**
  * Call once at startup to inject server.js-level dependencies.
- * @param {object} deps
+ * @param {object}   deps
  * @param {function} deps.buildChinaTravelKnowledge
  * @param {function} deps.extractAgentConstraints
  * @param {Map}      deps.sessionItinerary
+ * @param {function} deps.queryFlight   — async (from, to, date?) => {flights, ...} | null
+ * @param {function} deps.queryHotels   — async (city, budgetPerNight?) => [{tier,...}] | null
  */
-function configure({ buildChinaTravelKnowledge, extractAgentConstraints, sessionItinerary }) {
+function configure({ buildChinaTravelKnowledge, extractAgentConstraints, sessionItinerary, queryFlight, queryHotels }) {
   if (buildChinaTravelKnowledge) _buildKnowledge = buildChinaTravelKnowledge;
   if (extractAgentConstraints) _extractConstraints = extractAgentConstraints;
   if (sessionItinerary) _sessionItinerary = sessionItinerary;
+  if (queryFlight)  _queryFlight  = queryFlight;
+  if (queryHotels)  _queryHotels  = queryHotels;
 }
 
 // ── isComplexItinerary ───────────────────────────────────────────────────────
@@ -229,6 +269,8 @@ function buildResourceContext(cozeData, city, message, constraints, intentAxis) 
  * @param {boolean} [opts.summaryOnly]   Skip days[] generation (complex itinerary mode)
  * @param {string}  [opts.resourceContext] Pre-built Coze resource context string (P8.4)
  * @param {string}  [opts.intentAxis]     "food"|"activity"|"stay"|"travel" (P8.6)
+ * @param {string}  [opts.contextSummary] 【用户画像】line from conversation/context.js
+ * @param {Array}   [opts.fullHistory]    Merged server+browser conversation history
  * @returns {Promise<{ok: boolean, structured: object}>}
  */
 async function generateCrossXResponse({
@@ -239,6 +281,8 @@ async function generateCrossXResponse({
   summaryOnly,
   resourceContext,
   intentAxis,
+  contextSummary,
+  fullHistory,
 }) {
   const usedModel = model;
   let plan;
@@ -247,8 +291,12 @@ async function generateCrossXResponse({
   if (prePlan) {
     plan = prePlan;
   } else {
-    const historyForPlanner = Array.isArray(conversationHistory) && conversationHistory.length
-      ? conversationHistory.slice(-6).map((m) => {
+    // Prefer fullHistory (server-side merged) over browser-only conversationHistory
+    const _historySource = Array.isArray(fullHistory) && fullHistory.length
+      ? fullHistory
+      : (Array.isArray(conversationHistory) ? conversationHistory : []);
+    const historyForPlanner = _historySource.length
+      ? _historySource.slice(-6).map((m) => {
           const role = m.role === "assistant" ? "AI助手" : "用户";
           return `${role}: ${String(m.content || "").slice(0, 300)}`;
         }).join("\n")
@@ -305,11 +353,20 @@ async function generateCrossXResponse({
   const lbsResults = [];
   if (Array.isArray(plan.itinerary) && plan.itinerary.length > 1) {
     for (let i = 0; i < plan.itinerary.length - 1; i++) {
-      const route = mockAmapRouting(plan.itinerary[i].city, plan.itinerary[i + 1].city);
-      if (route) lbsResults.push({ leg: `${plan.itinerary[i].city}→${plan.itinerary[i + 1].city}`, ...route });
+      const from = plan.itinerary[i].city;
+      const to   = plan.itinerary[i + 1].city;
+      const flightData = _queryFlight ? await _queryFlight(from, to) : null;
+      const route = flightData
+        ? _flightDataToRoute(flightData)
+        : mockAmapRouting(from, to);
+      if (route) lbsResults.push({ leg: `${from}→${to}`, ...route });
     }
   } else {
-    const route = mockAmapRouting(city || "origin", dest);
+    const from = city || "origin";
+    const flightData = _queryFlight ? await _queryFlight(from, dest) : null;
+    const route = flightData
+      ? _flightDataToRoute(flightData)
+      : mockAmapRouting(from, dest);
     if (route) lbsResults.push({ leg: `${city || "出发地"}→${dest}`, ...route });
   }
 
@@ -322,16 +379,10 @@ async function generateCrossXResponse({
   // Never include hotels for the origin/departure city — that data would
   // mislead the Card Generator into generating origin-city content.
   const otaHotels = {};
-  destCities.forEach((c) => {
-    // Skip if this "destination" city is actually the same as the origin
-    // (can happen when destination extraction falls back to city param)
-    if (originCity && c === originCity && destCities.length === 1) {
-      // Keep it — user genuinely wants to stay in their own city
-      otaHotels[c] = mockCtripHotels(c, budgetPerNight);
-    } else {
-      otaHotels[c] = mockCtripHotels(c, budgetPerNight);
-    }
-  });
+  await Promise.all(destCities.map(async (c) => {
+    const realHotels = _queryHotels ? await _queryHotels(c, budgetPerNight) : null;
+    otaHotels[c] = realHotels || mockCtripHotels(c, budgetPerNight);
+  }));
 
   const realApiData = JSON.stringify({ routing: lbsResults, hotels: otaHotels }, null, 2);
   console.log("[Data Injection] Injecting:\n" + realApiData.slice(0, 400));
@@ -353,18 +404,25 @@ async function generateCrossXResponse({
   const _axisToLayout = { food: "food_only", activity: "travel_full", stay: "stay_focus", travel: "travel_full" };
   const targetLayout = _axisToLayout[intentAxis] || "travel_full";
   const specialtyNote = intentAxis === "food"
-    ? `\n[专项查询·美食] 当前请求为餐厅/美食专项查询，无需填充通用酒店住宿模板。\n` +
-      `plans[].hotel 字段可填写就餐餐厅名称，plans[].highlights 聚焦特色菜/氛围，\n` +
-      `days[].activities 重点体现餐厅名称、特色菜推荐、人均消费。\n` +
+    ? `\n[专项查询·美食] 当前请求为餐厅/美食专项查询，每个 plan 代表一家餐厅，请严格按以下结构输出：\n` +
       `card_data 顶层必须输出 "layout_type": "food_only"。\n` +
-      `P8.12 食物卡片必填字段：每个 plan 必须包含：\n` +
-      `  plans[].cuisine_type: 菜系（如"陕西菜"、"川菜"、"粤菜"、"江浙菜"、"清真菜"）\n` +
-      `  plans[].flavor: 口味特征（如"咸鲜微辣"、"酸爽开胃"、"浓郁醇厚"、"清淡爽口"）\n` +
-      `  plans[].origin: 发源地/代表区域（如"西安回民街"、"成都宽窄巷子"、"广州西关"）\n` +
-      `  plans[].real_photo_url: 从 Real_API_Data 的 item_list[].photo 原样复制真实照片URL；若无则省略此字段\n` +
-      `\u26a0\ufe0f \u300c\u5e97\u540d\u683c\u5f0f\u300d\u5f3a\u5236\u8981\u6c42\uff1a\u6bcf\u4e2a\u9910\u996e\u7c7b activity.name \u5fc5\u987b\u5199\u6210\u201c\u5728\u3010\u5177\u4f53\u9910\u5385\u540d\u3011\u4eab\u7528XX\u201d\u683c\u5f0f\uff0c\n` +
-      `\u4f8b\u5982\uff1a\u201c\u5728\u3010\u8001\u5b59\u5bb6\u7f8a\u8089\u6ce1\u9988\u00b7\u4e1c\u5927\u8857\u5e97\u3011\u4eab\u7528\u5348\u9910\u201d\u3001\u201c\u5728\u3010\u8d3e\u4e09\u704c\u6c64\u5305\u3011\u54c1\u5c1d\u8089\u5939\u9988\u201d\u3002\n` +
-      `\u8d27\u771f\u4ef7\u5b9e\uff1a\u4e25\u7981\u4ec5\u5199\u201c\u5403\u5348\u9910\u201d\u3001\u201c\u54c1\u5c1d\u5c0f\u5403\u201d\u7b49\u6a21\u7cca\u5360\u4f4d\u8bcd\u3002\n`
+      `每个 plan 对象必须包含以下字段（全部必填，无则填 null）：\n` +
+      `  "name":          餐厅真实名称（必须是真实存在的餐厅，如"老孙家羊肉泡馍"）\n` +
+      `  "headline":      一句话卖点（如"百年老字号，羊肉泡馍排队首选"）\n` +
+      `  "rating":        评分数字（如 4.8，从 Real_API_Data 复制或基于知识库估算）\n` +
+      `  "avg_price":     人均消费数字（如 65，单位元人民币）\n` +
+      `  "queue_min":     等位时间分钟数（如 20，无需排队填 0）\n` +
+      `  "address":       具体地址或商圈（如"西安市莲湖区回民街北广济街"）\n` +
+      `  "review":        代表性顾客评价一句话（如"羊肉鲜嫩不膻，泡馍分量十足"）\n` +
+      `  "dishes":        招牌菜数组，3-5道，如["羊肉泡馍","腊牛肉夹馍","凉皮"]\n` +
+      `  "cuisine_type":  菜系（如"陕西菜"、"川菜"、"粤菜"、"清真菜"）\n` +
+      `  "flavor":        口味特征（如"咸鲜微辣"、"浓郁醇厚"）\n` +
+      `  "origin":        发源地/代表区域（如"西安回民街"）\n` +
+      `  "real_photo_url": 从 Real_API_Data item_list[].photo 原样复制；无则省略\n` +
+      `  "tag":           档次标签（"实惠之选"|"口碑首选"|"高端体验"）\n` +
+      `  "is_recommended": 口碑首选方案设为 true\n` +
+      `严禁出现 hotel 字段。days[] 中每个 activity.name 写"在【餐厅名】享用XX"格式。\n` +
+      `⚠️ 真实性要求：禁止编造不存在的餐厅名称，必须是该城市真实知名餐厅。\n`
     : intentAxis === "activity"
     ? `\n[专项查询·景点] 当前请求为景点/活动专项查询，无需填充完整酒店住宿模板。\n` +
       `plans[].highlights 聚焦景点、门票价格、最佳游览时长。\n` +
@@ -424,7 +482,7 @@ ${resourceContext ? `\n${resourceContext}\n⚠️ 资源池中的餐厅等位时
 
   const _cardOpts = {
     apiKey, model: usedModel, baseUrl,
-    systemPrompt: buildCrossXSystemPrompt(language),
+    systemPrompt: (contextSummary ? `${contextSummary}\n` : "") + buildCrossXSystemPrompt(language),
     userContent: cardUserContent,
     temperature: 0.5,
     maxTokens: cardMaxTokens || 2200,

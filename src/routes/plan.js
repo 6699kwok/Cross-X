@@ -13,12 +13,22 @@ const { openAIRequest } = require("../ai/openai");
 const { DETAIL_SYSTEM_PROMPT_TEMPLATE } = require("../planner/prompts");
 const { safeParseJson } = require("../planner/mock");
 const { isComplexItinerary, buildPrePlan, generateCrossXResponse, buildResourceContext } = require("../planner/pipeline");
+const { extractPreferences, mergePreferences, buildContextSummary, pruneHistory } = require("../conversation/context");
+const { runAgentLoop } = require("../agent/loop");
+const { detectIntentLLM } = require("../ai/intent");
+const { needsDiscovery, runDiscovery } = require("../planner/discovery");
 
 // ── P1 session + security modules ─────────────────────────────────────────────
 const {
-  createSession, getSession, patchSession,
+  createSession, getSession, patchSession, touchSession,
   scrubPii, DEFAULT_TTL_MS,
 } = require("../session/store");
+
+// ── C4: Cross-session preference profile ──────────────────────────────────────
+const { loadProfile, saveProfile, generateProfileSummary } = require("../session/profile");
+
+// Preferences persist for 7 days — survives across days without user auth
+const PREF_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const { looksLikeUpdate, applyPlanPatch } = require("../session/updater");
 
 // ── Safety hard-stop: must match the fixed template in BUSINESS_BOUNDARY_BLOCK ─
@@ -67,38 +77,79 @@ const CITY_MENTION_RE = /北京|上海|深圳|广州|成都|重庆|杭州|苏州
 
 // Conversational gate — always ask questions first, then generate.
 // Returns array of missing slot names; empty = ok to proceed.
-function checkRequirements(message, constraints, intentAxis) {
+// intentResult: optional LLM-extracted intent object from detectIntentLLM()
+function checkRequirements(message, constraints, intentAxis, intentResult = null) {
+  // food / activity: no gate — recommend based on city + implied 1 day
+  if (intentAxis === "food" || intentAxis === "activity") return [];
+
   // P8.12: Step 0 — Destination first.
   // If the message has no explicit city AND it's not a local/nearby query
   // (e.g. "附近餐厅" where GPS city is intentional), ask for destination first.
   const isLocalQuery = /附近|周边|本地|就在这|本城|这里/.test(message);
-  const hasCityInMessage = CITY_MENTION_RE.test(message) || !!(constraints.destination);
+  const hasCityInMessage = !!(intentResult?.destination)   // LLM extracted destination
+    || CITY_MENTION_RE.test(message)
+    || !!(constraints.destination);
   if (!hasCityInMessage && !isLocalQuery) {
     return ["destination"];
   }
 
-  const hasDuration = /\d+\s*天|\d+\s*(?:days?|nights?)/i.test(message)
-    || !!(constraints.duration || constraints.days);
-  const hasBudget = /\d[\d,]*\s*万|\d[\d,]+\s*(?:元|人民币|RMB|CNY)/i.test(message)
-    || /(?:预算|budget|人均)[^\d]*\d+/i.test(message)
-    || !!(constraints.budget);
+  // Duration: prefer LLM-extracted value, then constraints, then regex
+  const hasDuration = !!(intentResult?.duration_days)
+    || !!(constraints.duration || constraints.days)
+    || /\d+\s*天|\d+\s*(?:days?|nights?)/i.test(message)
+    || /[一两二三四五六七八九十]+\s*天/.test(message)   // 三天、两天
+    || /两天一夜|三天两夜|四天三夜|五天四夜/.test(message)
+    || /一周|两周|半个月/.test(message)
+    || /周末|长周末|小长假|黄金周/.test(message);
 
-  if (intentAxis === "food") {
-    // 美食专项：只需人均预算，不需要天数
-    return hasBudget ? [] : ["budget"];
+  // Budget: no gate — pipeline estimates pax*days*800 as fallback.
+
+  // activity / stay / travel: only duration matters; budget has a reliable default
+  if (!hasDuration) return ["duration"];
+  return [];
+}
+
+// ── Follow-up suggestions by intent axis ─────────────────────────────────────
+const FOLLOW_UP_SUGGESTIONS = {
+  travel:   ["想调整预算", "多一天行程", "深挖一下美食"],
+  food:     ["换个口味风格", "再加一个餐厅", "附近还有什么好吃的"],
+  stay:     ["换便宜一点的", "换个区域", "看看民宿"],
+  activity: ["加一个景点", "换轻松一点的", "有没有门票优惠"],
+};
+
+/**
+ * Conversational clarification via LLM — natural question instead of hardcoded text.
+ * Falls back to hardcoded text if LLM fails or times out.
+ * @param {string} apiKey
+ * @param {string} model
+ * @param {string} baseUrl
+ * @param {string} effectiveMessage
+ * @param {Array}  missingSlots
+ * @param {string} language
+ * @returns {Promise<string>}
+ */
+async function buildConversationalClarify(apiKey, model, baseUrl, effectiveMessage, missingSlots, language) {
+  const slotLabels = {
+    destination: language === "ZH" ? "目的地城市" : "destination city",
+    duration:    language === "ZH" ? "行程天数"   : "trip duration",
+    budget:      language === "ZH" ? "预算"       : "budget",
+  };
+  const slotsText = missingSlots.map((s) => slotLabels[s] || s).join("，");
+
+  if (!apiKey || language !== "ZH") return null; // only ZH conversational; EN uses hardcoded
+
+  try {
+    const r = await openAIRequest({
+      apiKey, model, baseUrl,
+      systemPrompt: "\u4f60\u662f\u70ed\u60c5\u7684\u65c5\u884c\u52a9\u624b\u3002\u7528\u4e00\u53e5\u53e3\u8bed\u95ee\u51fa\u7f3a\u5c11\u7684\u4fe1\u606f\uff0c\u7981\u6b62\u7528\u201c\u60a8\u597d\u201d\uff0c\u7981\u6b62\u8bf4\u201c\u6211\u9700\u8981\u201d\uff0c\u76f4\u63a5\u95ee\u3002\u5185\u5bb9\u5c3120\u5b57\u5185\u3002\u53ea\u8f93\u51fa\u95ee\u53e5\uff0c\u4e0d\u8981\u4efb\u4f55\u89e3\u91ca\u3002",
+      userContent: `\u7528\u6237\u8bf4\uff1a${effectiveMessage}\n\u8fd8\u9700\u8981\u95ee\uff1a${slotsText}`,
+      temperature: 0.7, maxTokens: 60, jsonMode: false, timeoutMs: 3000,
+    });
+    if (r.ok && r.text) return r.text.trim().replace(/^["']|["']$/g, "");
+  } catch (e) {
+    console.warn("[clarify-llm] Timeout/error — using hardcoded fallback:", e.message);
   }
-  if (intentAxis === "activity" || intentAxis === "stay") {
-    // 景点/住宿：需要天数 + 预算
-    const missing = [];
-    if (!hasDuration) missing.push("duration");
-    if (!hasBudget)   missing.push("budget");
-    return missing;
-  }
-  // travel（默认完整行程）：需要天数 + 总预算
-  const missing = [];
-  if (!hasDuration) missing.push("duration");
-  if (!hasBudget)   missing.push("budget");
-  return missing;
+  return null;
 }
 
 // ── Factory ────────────────────────────────────────────────────────────────────
@@ -129,10 +180,13 @@ function createPlanRouter({
   getOpenAIConfig,
   getCozeConfig,
   callCozeWorkflow,
+  callCozeBotStreaming,
   detectQuickActionIntent, buildQuickActionResponse,
   detectCasualChatIntent, callCasualChat,
   classifyBookingIntent, callPythonRagService, searchAttractions,
   ragEngine, sessionItinerary, extractAgentConstraints,
+  // Agent loop deps (Module 2 tools)
+  queryAmapHotels, queryJuheFlight, mockAmapRouting, mockCtripHotels, buildAIEnrichment,
 }) {
 
   // ── POST /api/plan/coze — OpenAI Planning Pipeline (SSE) ──────────────────
@@ -176,6 +230,19 @@ function createPlanRouter({
     // [P1] Session: resolve incoming sessionId and load existing data (if any)
     const incomingSessionId = String(body.sessionId || "").trim();
     const existingSession   = incomingSessionId ? getSession(incomingSessionId) : null;
+
+    // [C4] Cross-session preference profile — keyed by deviceId from client localStorage
+    const deviceId    = String(body.deviceId || "").trim().slice(0, 64) || null;
+    const userProfile = deviceId ? loadProfile(deviceId) : null;
+    if (userProfile) console.log(`[profile] loaded deviceId=${deviceId.slice(0, 8)}… prefs=[${Object.keys(userProfile.preferences || {}).join(",")}] trips=${userProfile.tripCount}`);
+
+    // [Context] Restore stored preferences + history; merge with browser state
+    // Layer order (lowest → highest priority): profile → session → incoming turn
+    const storedPrefs   = mergePreferences(userProfile?.preferences || {}, existingSession?.preferences || {});
+    const storedHistory = Array.isArray(existingSession?.history) ? existingSession.history : [];
+    // mergedHistory: prefer stored (server-side) + any extra turns from browser not yet persisted
+    const mergedHistory = pruneHistory([...storedHistory, ...conversationHistory
+      .filter((m) => !storedHistory.some((s) => s.content === m.content && s.role === m.role))], 12);
 
     // SSE headers — sent here so ALL paths below can use emit()
     res.writeHead(200, {
@@ -327,7 +394,13 @@ function createPlanRouter({
         });
 
         if (patchResult.ok) {
-          patchSession(incomingSessionId, { plan: patchResult.patched, message, language, city });
+          // UPDATE path fix: also persist preferences + history so context survives
+          const updateHistory = pruneHistory([...storedHistory, { role: "user", content: message }], 12);
+          patchSession(incomingSessionId, {
+            plan: patchResult.patched, message, language, city,
+            preferences: storedPrefs,
+            history: updateHistory,
+          });
           emit({
             type: "final",
             response_type: "options_card",
@@ -412,15 +485,53 @@ function createPlanRouter({
         console.log(`[plan/coze] Slot-fill merge: "${_pc.originalMessage}" + "${message}" -> "${effectiveMessage}"`);
       }
 
-      // P8.6: Detect intent axis FIRST — affects buildPrePlan defaults + gate
-      const intentAxis = detectIntentAxis(effectiveMessage);
-      if (intentAxis !== "travel") console.log(`[plan/coze] Intent axis: ${intentAxis} — specialty mode`);
+      // Discovery second-turn merge — MUST happen before gate + intentAxis detection
+      // so that merged message carries city/food keywords from the original turn.
+      // didDiscoveryMerge flag prevents re-triggering needsDiscovery on the merged text.
+      let didDiscoveryMerge = false;
+      if (existingSession?.pendingDiscovery && existingSession?.originalMessage) {
+        const priorMsg = existingSession.originalMessage;
+        effectiveMessage = `${priorMsg} ${effectiveMessage}`.trim();
+        patchSession(incomingSessionId, { pendingDiscovery: false });
+        didDiscoveryMerge = true;
+        console.log(`[plan/coze] Discovery merge: "${priorMsg}" + follow-up \u2192 "${effectiveMessage.slice(0, 80)}"`);
+      }
+
+      // B1+C3: Detect intent axis + extract preferences via LLM (single call).
+      // Falls back to regex on timeout/error. Extracts axis, destination, duration,
+      // pax, and user preference flags (has_children, pace_slow, etc.) simultaneously.
+      const intentResult = await detectIntentLLM(effectiveMessage, {
+        apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+      });
+      const intentAxis = intentResult.axis;
+      if (intentAxis !== "travel") console.log(`[plan/coze] Intent axis: ${intentAxis} (${intentResult._source}) — specialty mode`);
+
+      // Merge LLM-extracted params into constraints (without overwriting explicit user values)
+      if (intentResult.destination  && !constraints.destination) constraints.destination = intentResult.destination;
+      if (intentResult.duration_days && !constraints.duration)   constraints.duration    = intentResult.duration_days;
+      if (intentResult.pax > 2       && !constraints.pax)        constraints.pax         = intentResult.pax;
+      if (intentResult.special_needs?.length)                     constraints._specialNeeds = intentResult.special_needs;
+
+      // C3: Use LLM-extracted preferences when available; fallback to regex.
+      const incomingPrefs = (intentResult._source === "llm" && Object.keys(intentResult.preferences || {}).length)
+        ? intentResult.preferences
+        : extractPreferences(effectiveMessage);
+      const mergedPrefs   = mergePreferences(storedPrefs, incomingPrefs);
+      const contextSummary = buildContextSummary(mergedPrefs);
+      if (contextSummary) console.log(`[plan/coze] Context: ${contextSummary}`);
+
+      // C4: Prepend semantic traveler portrait (LLM-generated, from cross-session profile)
+      const profileSummary = userProfile?.profileSummary || null;
+      const fullContext = [
+        profileSummary ? `【旅行者画像】${profileSummary}` : "",
+        contextSummary,
+      ].filter(Boolean).join("\n");
 
       const prePlan = complex ? null : buildPrePlan({ message: effectiveMessage, city, constraints, intentAxis });
 
-      // P8.8: Requirement gate — travel plans need explicit duration + budget.
-      // Emits clarify immediately (no Coze call, no LLM call) when slots are missing.
-      const missingSlots = checkRequirements(effectiveMessage, constraints, intentAxis);
+      // P8.8: Requirement gate — travel plans need explicit duration + destination.
+      // Uses LLM-extracted params first; emits clarify with 0 LLM tokens when slots missing.
+      const missingSlots = checkRequirements(effectiveMessage, constraints, intentAxis, intentResult);
       if (missingSlots.length > 0) {
         planDone = true;
         // P8.10: persist context so next turn can merge destination + original intent
@@ -429,7 +540,7 @@ function createPlanRouter({
           patchSession(gateSessionId, { pendingClarify: { originalMessage: effectiveMessage, missingSlots } });
         } else {
           gateSessionId = createSession(
-            { pendingClarify: { originalMessage: effectiveMessage, missingSlots }, language, city },
+            { pendingClarify: { originalMessage: effectiveMessage, missingSlots }, language, city, preferences: mergedPrefs },
             DEFAULT_TTL_MS,
           );
         }
@@ -443,13 +554,20 @@ function createPlanRouter({
         const asked = missingSlots.map((s) => slotLabels[s])
           .join(pickLang(language, "和", " and ", "と", "과 "));
         console.log(`[plan/coze] Requirement gate — missing: ${missingSlots.join(", ")}`);
+
+        // Conversational clarification: LLM natural question (ZH only, 3s timeout)
+        const conversationalText = await buildConversationalClarify(
+          OPENAI_API_KEY, OPENAI_MODEL, OPENAI_BASE_URL, effectiveMessage, missingSlots, language,
+        );
+        const clarifyText = conversationalText || pickLang(language,
+          `请告诉我您的${asked}，我马上为您量身定制方案。`,
+          `Hi! Please share your ${asked} and I'll build your custom plan right away.`,
+          `${asked}を教えてください。すぐにプランを作ります。`,
+          `${asked}를 알려주시면 바로 맞춤 플랜을 만들겠습니다.`);
+
         emit({
           type: "final", response_type: "clarify",
-          spoken_text: pickLang(language,
-            `您好！请告诉我您的${asked}，我马上为您量身定制方案。`,
-            `Hi! Please share your ${asked} and I'll build your custom plan right away.`,
-            `こんにちは！${asked}を教えてください。すぐにプランを作ります。`,
-            `안녕하세요! ${asked}를 알려주시면 바로 맞춤 플랜을 만들겠습니다.`),
+          spoken_text: clarifyText,
           missing_slots: missingSlots,
           source: "requirement-gate",
           sessionId: gateSessionId,   // P8.10: client persists, next request carries it
@@ -458,29 +576,199 @@ function createPlanRouter({
         return;
       }
 
-      // P8.4 Serial scheduling: Coze first → buildResourceContext → OpenAI grounded in real-time data.
-      // Step 1: Coze enrichment (always resolves — synthetic fallback on failure).
-      const cozeEnrichment = await callCozeWorkflow({ query: effectiveMessage, city, lang: language, budget: budgetVal, intentAxis });
-      console.log(`[plan/coze] Coze enrichment: ${cozeEnrichment?._synthetic ? "synthetic" : "live"} — queue=${cozeEnrichment?.restaurant_queue}min ticket=${cozeEnrichment?.ticket_availability}`);
+      // ── Discovery mode (小美式) ─────────────────────────────────────────────
+      // If this is a vague first-turn message, have a one-round conversation to
+      // understand preferences before generating the plan.
+      const _discoverySession = incomingSessionId ? existingSession : null;
+      if (!didDiscoveryMerge && needsDiscovery(effectiveMessage, intentAxis, _discoverySession)) {
+        planDone = true;
+        const discovery = await runDiscovery({
+          message: effectiveMessage, city, language, intentAxis,
+          apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+          emit,
+        });
 
-      // Step 2: Convert Coze data → structured resource context string for prompt injection.
-      // P8.7: intentAxis passed so buildResourceContext can include item_list inventory block.
-      const resourceContext = buildResourceContext(cozeEnrichment, city, effectiveMessage, constraints, intentAxis);
+        // Save discovery state: next turn will skip discovery and go straight to plan
+        let discoverySessionId = incomingSessionId;
+        const discoveryPayload = {
+          pendingDiscovery: true,
+          originalMessage:  effectiveMessage,
+          intentAxis,
+          language, city,
+          preferences: mergedPrefs,
+        };
+        if (discoverySessionId && getSession(discoverySessionId)) {
+          patchSession(discoverySessionId, discoveryPayload);
+        } else {
+          discoverySessionId = createSession(discoveryPayload, DEFAULT_TTL_MS);
+        }
 
-      // Step 3: OpenAI Card Generator, grounded in Coze resource pool.
-      const result = await generateCrossXResponse({
+        emit({
+          type:          "final",
+          response_type: "chat",
+          spoken_text:   discovery.spokenText || pickLang(language,
+            "\u8bf4\u8bf4\u770b\uff0c\u4f60\u60f3\u600e\u4e48\u73a9\uff1f",
+            "Tell me more — what kind of experience are you after?",
+            "\u3069\u3093\u306a\u65c5\u884c\u3092\u8003\u3048\u3066\u3044\u307e\u3059\u304b\uff1f",
+            "\u00f3Qu\u00e9 tipo de experiencia buscas?",
+          ),
+          source:    "discovery",
+          sessionId: discoverySessionId,
+        });
+        res.end();
+        return;
+      }
+
+      // Kill static progress timer — agent loop emits its own status events
+      planDone = true;
+
+      // ── Coze Bot: primary plan generator (real plugin data) ─────────────────
+      // Try bot first; if it returns a valid options_card, emit directly.
+      // Falls through to agent loop on failure / timeout.
+      if (typeof callCozeBotStreaming === "function") {
+        emit({ type: "status", code: "H_SEARCH", label: pickLang(language,
+          "\u6b63\u5728\u67e5\u8be2\u5b9e\u65f6\u65c5\u6e38\u8d44\u6e90...",
+          "Fetching live travel data...",
+          "\u65c5\u884c\u30c7\u30fc\u30bf\u3092\u53d6\u5f97\u4e2d...",
+          "\uc2e4\uc2dc\uac04 \uc5ec\ud589 \ub370\uc774\ud130 \uc870\ud68c \uc911...") });
+
+        const _botUserId = deviceId || incomingSessionId || "crossx_user";
+        const botResult  = await callCozeBotStreaming(
+          effectiveMessage,
+          _botUserId,
+          (text) => emit({ type: "status", code: "H_SEARCH", label: text }),
+          90000,
+        );
+
+        if (botResult.ok && botResult.card_data) {
+          // Bot succeeded — save session + emit final, skip OpenAI pipeline
+          emit({ type: "status", code: "H_SEARCH", label: pickLang(language, "\u5b9e\u65f6\u6570\u636e\u6574\u5408\u5b8c\u6210", "Live data integrated", "\u30c7\u30fc\u30bf\u7d71\u5408\u5b8c\u4e86", "\ub370\uc774\ud130 \ud1b5\ud569 \uc644\ub8cc") });
+          emit({ type: "status", code: "T_CALC",   label: pickLang(language, "\u4ea4\u901a\u6838\u7b97\u5b8c\u6210", "Transport calculated", "\u4ea4\u901a\u8cbb\u78ba\u5b9a", "\uad50\ud1b5\ube44 \ud655\uc815") });
+          emit({ type: "status", code: "B_CHECK",  label: pickLang(language, "\u9884\u7b97\u6821\u9a8c\u5b8c\u6210", "Budget verified", "\u4e88\u7b97\u78ba\u5b9a", "\uc608\uc0b0 \ud655\uc815") });
+
+          let outSessionId = incomingSessionId;
+          const _botCard = botResult.card_data;
+          const _newTurn = { role: "user", content: effectiveMessage };
+          const _updatedHistory = pruneHistory([...mergedHistory, _newTurn], 12);
+          const _sessionPayload = {
+            plan: _botCard, message: effectiveMessage, language, city,
+            preferences: mergedPrefs, history: _updatedHistory,
+          };
+          if (outSessionId && getSession(outSessionId)) {
+            patchSession(outSessionId, _sessionPayload);
+          } else {
+            outSessionId = createSession(_sessionPayload, DEFAULT_TTL_MS);
+          }
+          if (outSessionId && Object.keys(mergedPrefs).length > 0) {
+            touchSession(outSessionId, PREF_TTL_MS);
+          }
+          console.log(`[plan/coze] Bot OK — session ${outSessionId} (${_botCard.title || "untitled"})`);
+
+          // [C4] Async profile save
+          if (deviceId) {
+            const _dest2 = intentResult?.destination || city || null;
+            const _trips2 = (userProfile?.tripCount || 0) + 1;
+            setImmediate(async () => {
+              try {
+                let summary = userProfile?.profileSummary || null;
+                if (!summary || _trips2 % 3 === 0) {
+                  summary = await generateProfileSummary(mergedPrefs, {
+                    apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+                  });
+                }
+                saveProfile(deviceId, mergedPrefs, _dest2, summary);
+              } catch (_e) { console.warn("[profile] async save error:", _e.message); }
+            });
+          }
+
+          const _followUp = FOLLOW_UP_SUGGESTIONS[intentAxis] || FOLLOW_UP_SUGGESTIONS.travel;
+          emit({
+            type: "final",
+            response_type: "options_card",
+            spoken_text:   botResult.spoken_text,
+            card_data:     _botCard,
+            source:        "coze",
+            sessionId:     outSessionId || null,
+            coze_data:     null,
+            follow_up_suggestions: _followUp,
+          });
+          res.end();
+          return;
+        }
+
+        console.log("[plan/coze] Bot failed/timeout — falling back to agent loop");
+      }
+
+      // Agent loop — agent autonomously decides what data to fetch via tools (parallel execution).
+      const agentDeps = {
+        queryAmapHotels, queryJuheFlight, mockAmapRouting, mockCtripHotels, buildAIEnrichment,
+        callCozeWorkflow,
+      };
+      let result = await runAgentLoop({
         message: effectiveMessage, language, city,
         constraints: { ...constraints, _clientIp: clientIp },
-        conversationHistory,
+        contextSummary: fullContext,
+        history: mergedHistory,
         apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
-        prePlan,
-        resourceContext,
         intentAxis,
-        skipSpeaker:  true,
-        cardTimeoutMs: complex ? 55000 : 50000,
-        cardMaxTokens: complex ? 1400  : 2200,
-        summaryOnly:   complex,
+        deps: agentDeps,
+        emit,
       });
+
+      // Agent path: attach enrichmentData collected from tool results for detail view
+      if (result.ok && result.enrichmentData) {
+        result._cozeEnrichment = result.enrichmentData;
+      }
+
+      // Fallback: agent loop parse failure → original 3-node pipeline with Coze pre-enrichment.
+      if (!result.ok) {
+        console.warn("[plan/coze] Agent loop failed — falling back to pipeline");
+        // Use destination city (from intent extraction) for enrichment, not departure city
+        const destCity = constraints.destination || intentResult?.destination || city;
+        const cozeEnrichment = await callCozeWorkflow({ query: effectiveMessage, city: destCity, lang: language, budget: budgetVal, intentAxis });
+        console.log(`[plan/coze/fallback] Coze: ${cozeEnrichment?._synthetic ? "synthetic" : "live"} — queue=${cozeEnrichment?.restaurant_queue}min`);
+        const resourceContext = buildResourceContext(cozeEnrichment, city, effectiveMessage, constraints, intentAxis);
+        result = await generateCrossXResponse({
+          message: effectiveMessage, language, city,
+          constraints: { ...constraints, _clientIp: clientIp },
+          conversationHistory,
+          apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+          prePlan,
+          resourceContext,
+          intentAxis,
+          contextSummary: fullContext,
+          fullHistory: mergedHistory,
+          skipSpeaker:  true,
+          cardTimeoutMs: complex ? 40000 : 35000,
+          cardMaxTokens: complex ? 1400  : 2200,
+          summaryOnly:   complex,
+        });
+        result._cozeEnrichment = cozeEnrichment;
+
+        // Photo injection for fallback path — coze enrichment item_list → activities/meals
+        if (result.ok && result.structured?.card_data?.days) {
+          const photoMap = new Map();
+          for (const item of (cozeEnrichment?.item_list || [])) {
+            const photo = item.real_photo_url || item.photo_url || item.image_url;
+            if (item.name && photo) photoMap.set(item.name, photo);
+          }
+          if (photoMap.size) {
+            const cd = result.structured.card_data;
+            cd.days = (cd.days || []).map((day) => ({
+              ...day,
+              activities: (day.activities || []).map((act) =>
+                act.image_url ? act : (photoMap.has(act.name) ? { ...act, image_url: photoMap.get(act.name) } : act)
+              ),
+              meals: (day.meals || []).map((meal) => {
+                if (meal.image_url) return meal;
+                const photo = photoMap.get(meal.name) || photoMap.get(meal.restaurant);
+                return photo ? { ...meal, image_url: photo } : meal;
+              }),
+            }));
+            console.log(`[plan/coze/fallback] Photo injection: ${photoMap.size} items`);
+          }
+        }
+      }
 
       planDone = true;
 
@@ -517,22 +805,56 @@ function createPlanRouter({
         // [P1] Session: save or create session for future UPDATE requests
         let outSessionId = incomingSessionId;
         if (s.response_type === "options_card" && s.card_data) {
+          // Build updated history with this turn appended
+          const newTurn = { role: "user", content: effectiveMessage };
+          const updatedHistory = pruneHistory([...mergedHistory, newTurn], 12);
+          const sessionPayload = {
+            plan: s.card_data, message: effectiveMessage, language, city,
+            preferences: mergedPrefs,
+            history: updatedHistory,
+          };
           if (outSessionId && getSession(outSessionId)) {
-            patchSession(outSessionId, { plan: s.card_data, message: effectiveMessage, language, city });
+            patchSession(outSessionId, sessionPayload);
           } else {
-            outSessionId = createSession(
-              { plan: s.card_data, message: effectiveMessage, language, city },
-              DEFAULT_TTL_MS,
-            );
+            outSessionId = createSession(sessionPayload, DEFAULT_TTL_MS);
+          }
+          // Extend TTL to 7 days when user has accumulated preferences — cross-day memory
+          if (outSessionId && Object.keys(mergedPrefs).length > 0) {
+            touchSession(outSessionId, PREF_TTL_MS);
           }
           console.log(`[plan/coze] Session ${outSessionId} — plan saved (${s.card_data.title || "untitled"})`);
+
+          // [C4] Async profile save — fire-and-forget, does not block response
+          if (deviceId) {
+            const _dest = intentResult.destination || city || null;
+            const _tripCount = (userProfile?.tripCount || 0) + 1;
+            setImmediate(async () => {
+              try {
+                let summary = userProfile?.profileSummary || null;
+                // Regenerate semantic summary every 3 trips or on first save
+                if (!summary || _tripCount % 3 === 0) {
+                  summary = await generateProfileSummary(mergedPrefs, {
+                    apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+                  });
+                }
+                saveProfile(deviceId, mergedPrefs, _dest, summary);
+                console.log(`[profile] saved deviceId=${deviceId.slice(0, 8)}… trips=${_tripCount}${summary ? ` summary="${summary}"` : ""}`);
+              } catch (e) {
+                console.warn("[profile] async save error:", e.message);
+              }
+            });
+          }
         }
+
+        // Follow-up suggestions based on intent axis
+        const followUpSuggestions = FOLLOW_UP_SUGGESTIONS[intentAxis] || FOLLOW_UP_SUGGESTIONS.travel;
 
         emit({
           type: "final", ...s,
           source: "openai",
           sessionId: outSessionId || null,
-          coze_data: cozeEnrichment,   // always present (synthetic fallback guaranteed)
+          coze_data: result._cozeEnrichment || null,   // present on fallback path; null on agent path
+          follow_up_suggestions: followUpSuggestions,
         });
       } else {
         emit({

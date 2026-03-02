@@ -2595,6 +2595,41 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   cursor: default;
 }
 
+/* ── Follow-up suggestion chips (post-plan continuity) ──────────────────── */
+.cx-followup-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 4px;
+  padding: 4px 0;
+}
+.cx-followup-label {
+  font-size: 12px;
+  color: #6b7280;
+  margin-right: 2px;
+  white-space: nowrap;
+}
+.cx-followup-chip {
+  padding: 6px 14px;
+  background: rgba(255,255,255,0.7);
+  border: 1px solid #d1d5db;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: #374151;
+  cursor: pointer;
+  transition: all 0.14s;
+  white-space: nowrap;
+}
+.cx-followup-chip:hover {
+  border-color: #10b981;
+  background: rgba(16,185,129,0.08);
+  color: #065f46;
+  transform: translateY(-1px);
+}
+.cx-followup-chip:active { transform: scale(0.97); }
+
 /* ── Booking Guide Card ───────────────────────────────────────────────────── */
 .booking-guide-wrap { margin: 12px 0 0; }
 /* ── CrossX AI-Native Checkout Sheet ────────────────────────────────────────*/
@@ -4702,7 +4737,8 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 }
 .cx-detail-actions {
   display: flex;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: 8px;
 }
 .cx-detail-itin-btn {
@@ -4733,6 +4769,27 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 .cx-detail-book-btn:hover {
   transform: translateY(-1px);
   box-shadow: 0 4px 14px rgba(16, 185, 129, 0.45);
+}
+.cx-detail-hotel-link {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  background: #fff7ed;
+  color: #c2410c;
+  border: 1.5px solid #fed7aa;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.12s;
+  white-space: nowrap;
+}
+.cx-detail-hotel-link:hover {
+  background: #ffedd5;
+  box-shadow: 0 3px 10px rgba(194, 65, 12, 0.18);
 }
 
 /* ── Language switch smooth fade ─────────────────────────────────────────── */
