@@ -425,14 +425,78 @@ function buildSyntheticEnrichment(city) {
       _synthetic:          true,
     };
   }
-  // Unknown city — generic fallback
-  const h = String(city || "").split("").reduce((a, c) => (a + c.charCodeAt(0)) & 0xffff, 0);
-  return {
-    restaurant_queue:    [15, 20, 25, 30][(h >> 3) % 4],
-    ticket_availability: true,
-    spoken_text: `${city || "\u76ee\u7684\u5730"}\u65c5\u6e38\u70ed\u5ea6\u9ad8\uff0c\u5efa\u8bae\u63d0\u524d\u9884\u8ba2\u666f\u70b9\u95e8\u7968\u548c\u7279\u8272\u9910\u5385\u3002`,
-    _synthetic: true,
-  };
+  // Unknown city — return null to signal AI enrichment is needed
+  return null;
+}
+
+// In-memory cache for AI-generated enrichment: "city:intent" → { data, ts }
+const AI_ENRICHMENT_CACHE = new Map();
+const AI_ENRICHMENT_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
+
+/**
+ * Generate enrichment data for any city via OpenAI when neither Coze nor
+ * static CITY_DATA covers it. Cached per city+intent for 4 h.
+ */
+async function buildAIEnrichment(city, intentAxis) {
+  const cacheKey = `${city}:${intentAxis || "food"}`;
+  const cached = AI_ENRICHMENT_CACHE.get(cacheKey);
+  if (cached && Date.now() - cached.ts < AI_ENRICHMENT_TTL_MS) {
+    console.log(`[ai-enrichment] Cache hit: ${cacheKey}`);
+    return cached.data;
+  }
+
+  const isFood = !intentAxis || intentAxis === "food" || intentAxis === "activity";
+  const itemTemplate = isFood
+    ? `{"name":"\u5177\u4f53\u5e97\u540d","address":"\u771f\u5b9e\u5730\u5740","avg_price":65,"queue_min":20,"real_photo_url":""}`
+    : `{"name":"\u5177\u4f53\u666f\u70b9\u540d","address":"\u771f\u5b9e\u5730\u5740","avg_price":80,"open_hours":"9:00-18:00","real_photo_url":""}`;
+  const userPrompt = isFood
+    ? `Generate realistic restaurant enrichment for ${city}, China. Return ONLY this JSON (5 items, use real restaurant names that exist in ${city}):
+{"restaurant_queue":25,"ticket_availability":true,"spoken_text":"<one sentence about ${city} dining scene in Chinese, e.g. peak hours and tips>","item_list":[${itemTemplate},${itemTemplate},${itemTemplate},${itemTemplate},${itemTemplate}]}`
+    : `Generate realistic attraction enrichment for ${city}, China. Return ONLY this JSON (3 items, use real attraction names that exist in ${city}):
+{"restaurant_queue":0,"ticket_availability":true,"spoken_text":"<one sentence about ${city} tourism in Chinese, e.g. ticket tips>","item_list":[${itemTemplate},${itemTemplate},${itemTemplate}]}`;
+
+  const startedAt = Date.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const res = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [
+          { role: "system", content: "You are a China travel data API. Return ONLY valid JSON, no markdown, no explanation." },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.3,
+        max_tokens: 900,
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`openai_http_${res.status}`);
+    const data = await res.json();
+    const raw = data?.choices?.[0]?.message?.content?.trim() || "";
+    const jsonStart = raw.indexOf("{");
+    const jsonEnd = raw.lastIndexOf("}");
+    if (jsonStart === -1 || jsonEnd === -1) throw new Error("no_json");
+    const parsed = JSON.parse(raw.slice(jsonStart, jsonEnd + 1));
+    if (!Array.isArray(parsed.item_list) || parsed.item_list.length === 0) throw new Error("no_items");
+    const enrichment = { ...parsed, _synthetic: true, _ai_generated: true };
+    AI_ENRICHMENT_CACHE.set(cacheKey, { data: enrichment, ts: Date.now() });
+    console.log(`[ai-enrichment] Generated for ${city} in ${Date.now() - startedAt}ms (${parsed.item_list.length} items)`);
+    return enrichment;
+  } catch (e) {
+    console.warn(`[ai-enrichment] Failed for ${city}:`, e.message);
+    const h = String(city || "").split("").reduce((a, c) => (a + c.charCodeAt(0)) & 0xffff, 0);
+    return {
+      restaurant_queue: [15, 20, 25, 30][(h >> 3) % 4],
+      ticket_availability: true,
+      spoken_text: `${city || "\u76ee\u7684\u5730"}\u65c5\u6e38\u70ed\u5ea6\u9ad8\uff0c\u5efa\u8bae\u63d0\u524d\u9884\u8ba2\u666f\u70b9\u95e8\u7968\u548c\u7279\u8272\u9910\u5385\u3002`,
+      _synthetic: true,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -441,10 +505,17 @@ function buildSyntheticEnrichment(city) {
  * failure (missing key, workflow not found, network error, timeout).
  * Fields: hero_image?, restaurant_queue, ticket_availability, total_price?, spoken_text
  */
-async function callCozeWorkflow({ query, city, lang, budget }) {
+async function callCozeWorkflow({ query, city, lang, budget, intentAxis }) {
+  // Helper: get static enrichment OR fall through to AI
+  const getEnrichment = async () => {
+    const staticData = buildSyntheticEnrichment(city);
+    if (staticData !== null) return staticData; // Known city in static table
+    return buildAIEnrichment(city, intentAxis);  // Unknown city: AI-generated
+  };
+
   if (!COZE_API_KEY || !COZE_WORKFLOW_ID) {
-    console.log("[coze/workflow] No key/workflow configured — using synthetic enrichment");
-    return buildSyntheticEnrichment(city);
+    console.log("[coze/workflow] No key/workflow configured — using AI enrichment");
+    return getEnrichment();
   }
   try {
     const resp = await fetch(`${COZE_API_BASE}/v1/workflow/run`, {
@@ -460,36 +531,36 @@ async function callCozeWorkflow({ query, city, lang, budget }) {
           city: String(city || ""),
           lang: String(lang || "ZH"),
           budget: String(budget || ""),
+          location: String(city || ""),
         },
       }),
       signal: AbortSignal.timeout(25000),
     });
     const json = await resp.json();
     if (json.code !== 0) {
-      // 4200 = workflow not found; other codes = API error
-      console.warn(`[coze/workflow] API error ${json.code}: ${json.msg} — using synthetic enrichment`);
-      return buildSyntheticEnrichment(city);
+      console.warn(`[coze/workflow] API error ${json.code}: ${json.msg} — using AI enrichment`);
+      return getEnrichment();
     }
     // `data` may be a JSON string or already an object
     let output = json.data;
     if (typeof output === "string") {
       // Detect unresolved Coze template (End node misconfigured — variable not bound)
       if (output.includes("{{") && output.includes("}}")) {
-        console.warn("[coze/workflow] End node returned unresolved template — using synthetic enrichment");
-        return buildSyntheticEnrichment(city);
+        console.warn("[coze/workflow] End node returned unresolved template — using AI enrichment");
+        return getEnrichment();
       }
       try { output = JSON.parse(output); } catch {
         output = { spoken_text: output };
       }
     }
     if (!output || typeof output !== "object") {
-      return buildSyntheticEnrichment(city);
+      return getEnrichment();
     }
     console.log("[coze/workflow] Real enrichment received:", JSON.stringify(output).slice(0, 200));
     return output;
   } catch (e) {
-    console.warn("[coze/workflow] Call failed:", e.message, "— using synthetic enrichment");
-    return buildSyntheticEnrichment(city);
+    console.warn("[coze/workflow] Call failed:", e.message, "— using AI enrichment");
+    return getEnrichment();
   }
 }
 

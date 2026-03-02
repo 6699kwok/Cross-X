@@ -460,7 +460,7 @@ function createPlanRouter({
 
       // P8.4 Serial scheduling: Coze first → buildResourceContext → OpenAI grounded in real-time data.
       // Step 1: Coze enrichment (always resolves — synthetic fallback on failure).
-      const cozeEnrichment = await callCozeWorkflow({ query: effectiveMessage, city, lang: language, budget: budgetVal });
+      const cozeEnrichment = await callCozeWorkflow({ query: effectiveMessage, city, lang: language, budget: budgetVal, intentAxis });
       console.log(`[plan/coze] Coze enrichment: ${cozeEnrichment?._synthetic ? "synthetic" : "live"} — queue=${cozeEnrichment?.restaurant_queue}min ticket=${cozeEnrichment?.ticket_availability}`);
 
       // Step 2: Convert Coze data → structured resource context string for prompt injection.
