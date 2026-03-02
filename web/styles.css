@@ -2595,6 +2595,92 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   cursor: default;
 }
 
+/* ── E1: Travel Execution Chain cards ───────────────────────────────────── */
+
+/* Travel Confirm Card */
+.cx-tc-card { padding: 16px; border-radius: 16px; border: 1px solid var(--color-border); background: var(--color-surface); }
+.cx-tc-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.cx-tc-dest { font-size: 13px; font-weight: 600; color: var(--color-text-primary); }
+.cx-tc-tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: rgba(16,185,129,0.12); color: #065f46; font-weight: 600; }
+.cx-tc-hotel { font-size: 15px; font-weight: 700; color: var(--color-text-primary); margin-bottom: 4px; }
+.cx-tc-price { font-size: 18px; font-weight: 800; color: #10b981; margin-bottom: 12px; }
+.cx-tc-dur { font-size: 13px; font-weight: 400; color: var(--color-text-secondary); }
+.cx-tc-steps-preview { margin-bottom: 14px; display: flex; flex-direction: column; gap: 5px; }
+.cx-tc-step { font-size: 12px; color: var(--color-text-secondary); }
+.cx-tc-actions { display: flex; gap: 8px; }
+.cx-tc-confirm { flex: 1; padding: 11px; border-radius: 10px; border: none; background: #10b981; color: #fff; font-size: 14px; font-weight: 700; cursor: pointer; transition: background 0.15s; }
+.cx-tc-confirm:hover { background: #059669; }
+.cx-tc-cancel { padding: 11px 16px; border-radius: 10px; border: 1.5px solid var(--color-border); background: transparent; color: var(--color-text-secondary); font-size: 13px; cursor: pointer; }
+
+/* Travel Execution Steps Card */
+.cx-te-card { padding: 16px; border-radius: 16px; border: 1px solid var(--color-border); background: var(--color-surface); }
+.cx-te-title { font-size: 13px; font-weight: 700; color: var(--color-text-primary); margin-bottom: 10px; }
+.cx-te-bar { height: 4px; border-radius: 2px; background: var(--color-border); margin-bottom: 14px; overflow: hidden; }
+.cx-te-fill { height: 100%; background: #10b981; border-radius: 2px; transition: width 0.4s ease; }
+.cx-te-steps { display: flex; flex-direction: column; gap: 8px; }
+.cx-te-step { display: flex; align-items: center; gap: 10px; font-size: 13px; padding: 6px 8px; border-radius: 8px; transition: background 0.2s; }
+.cx-te-step--queued { color: var(--color-text-secondary); }
+.cx-te-step--running { background: rgba(16,185,129,0.08); color: var(--color-text-primary); font-weight: 600; }
+.cx-te-step--success { color: #10b981; }
+.cx-te-step--failed { color: #ef4444; }
+.cx-te-icon { font-size: 14px; width: 16px; text-align: center; flex-shrink: 0; }
+.cx-te-label { flex: 1; }
+.cx-te-status { font-size: 11px; color: var(--color-text-secondary); }
+.cx-te-step--running .cx-te-status { color: #10b981; }
+.cx-te-step--success .cx-te-status { color: #10b981; }
+.cx-te-step--failed .cx-te-status { color: #ef4444; }
+
+/* Travel Deliverable Card */
+.cx-td-card { padding: 16px; border-radius: 16px; border: 2px solid #10b981; background: var(--color-surface); }
+.cx-td-header { font-size: 16px; font-weight: 800; color: #10b981; margin-bottom: 8px; }
+.cx-td-ref { font-size: 11px; font-family: monospace; color: var(--color-text-secondary); letter-spacing: 0.05em; margin-bottom: 10px; }
+.cx-td-row { font-size: 13px; color: var(--color-text-primary); margin-bottom: 5px; }
+.cx-td-actions { display: flex; gap: 8px; margin-top: 14px; }
+.cx-td-btn { flex: 1; padding: 10px; border-radius: 8px; border: none; background: #10b981; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+.cx-td-btn--sec { background: transparent; border: 1.5px solid var(--color-border); color: var(--color-text-secondary); }
+
+/* Travel Failure Card */
+.cx-tf-card { padding: 16px; border-radius: 16px; border: 2px solid #ef4444; background: var(--color-surface); }
+.cx-tf-header { font-size: 15px; font-weight: 800; color: #ef4444; margin-bottom: 8px; }
+.cx-tf-reason { font-size: 13px; color: var(--color-text-secondary); margin-bottom: 14px; }
+.cx-tf-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.cx-tf-btn { padding: 10px 16px; border-radius: 8px; border: none; background: #10b981; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }
+.cx-tf-btn--sec { background: transparent; border: 1.5px solid var(--color-border); color: var(--color-text-secondary); }
+
+/* B2: Conversational free-text input row */
+.b2-clarify-input-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+  align-items: center;
+}
+.b2-clarify-input {
+  flex: 1;
+  padding: 9px 14px;
+  border: 1.5px solid var(--color-border);
+  border-radius: 20px;
+  font-size: 13px;
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  outline: none;
+  transition: border-color 0.15s;
+}
+.b2-clarify-input:focus { border-color: #10b981; }
+.b2-clarify-input::placeholder { color: var(--color-text-secondary); opacity: 0.7; }
+.b2-clarify-send {
+  padding: 9px 18px;
+  border-radius: 20px;
+  border: none;
+  background: #10b981;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+.b2-clarify-send:hover { background: #059669; }
+
 /* ── Follow-up suggestion chips (post-plan continuity) ──────────────────── */
 .cx-followup-chips {
   display: flex;
@@ -4981,6 +5067,54 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   .cx-lc-cta            { position: static; width: 100%; margin-top: 8px;
                           border-radius: 10px; padding: 10px; text-align: center; }
 }
+
+/* ── F3: Inline plan refinement bar ─────────────────────────────────────── */
+.cx-plan-refine {
+  margin: 12px 0 4px;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--color-border);
+  background: rgba(16,185,129,0.04);
+}
+.cx-pr-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.cx-pr-chip {
+  padding: 5px 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(16,185,129,0.35);
+  background: rgba(16,185,129,0.08);
+  color: #065f46;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.12s;
+}
+.cx-pr-chip:hover { background: rgba(16,185,129,0.18); border-color: #10b981; }
+.cx-pr-input-row { display: flex; gap: 6px; }
+.cx-pr-input {
+  flex: 1;
+  padding: 8px 12px;
+  border-radius: 16px;
+  border: 1.5px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  font-size: 12px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.cx-pr-input:focus { border-color: #10b981; }
+.cx-pr-input::placeholder { opacity: 0.55; }
+.cx-pr-send {
+  padding: 8px 14px;
+  border-radius: 16px;
+  border: none;
+  background: #10b981;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.cx-pr-send:hover { background: #059669; }
 
 /* ── P6: Advanced Loading — Shimmer Flow ─────────────────────────────────── */
 .cx-ai-shimmer {

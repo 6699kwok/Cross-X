@@ -6180,6 +6180,176 @@ function renderFallbackCard(taskId, reason) {
   `);
 }
 
+// ── E1: Travel Execution Chain ────────────────────────────────────────────
+
+const _TRAVEL_STEPS = [
+  { id: "reserve_hotel",   icon: "\u{1F3E8}", label: "\u9501\u5b9a\u9152\u5e97\u623f\u95f4", ms: 2500 },
+  { id: "book_activities", icon: "\u{1F3AB}", label: "\u9884\u8ba2\u666f\u70b9\u7968\u52a1", ms: 3000 },
+  { id: "plan_route",      icon: "\u{1F697}", label: "\u89c4\u5212\u4ea4\u901a\u8def\u7ebf", ms: 2000 },
+  { id: "gen_itinerary",   icon: "\u{1F4CB}", label: "\u751f\u6210\u884c\u7a0b\u5355",   ms: 1500 },
+];
+
+// Cache avoids passing large JSON through HTML onclick attributes
+const _travelPlanCache = {};
+function _travelCacheStore(plan, cardData) {
+  const key = "tp_" + Math.random().toString(36).slice(2, 8);
+  _travelPlanCache[key] = { plan, cardData };
+  return key;
+}
+function _travelCacheGet(key) { return _travelPlanCache[key] || {}; }
+
+function _travelShouldFail(plan, cardData) {
+  return plan.id === "budget" && /\u6df1\u5733/.test(cardData.destination || "");
+}
+
+function _planOptionSelect(cardId, idx) {
+  // Prefer data attributes from the rendered card (supports multiple cards in chat)
+  let cd = null;
+  const cardEl = document.getElementById(cardId);
+  if (cardEl) {
+    try {
+      const plans = JSON.parse(cardEl.dataset.plans || "null");
+      if (plans) cd = {
+        plans,
+        destination: cardEl.dataset.destination || "",
+        duration_days: Number(cardEl.dataset.duration || 3),
+      };
+    } catch {}
+  }
+  cd = cd || state._lastCardData;
+  if (!cd?.plans?.[idx]) { openPlanDetail(cardId, idx); return; }
+  renderTravelConfirmCard(cd.plans[idx], cd);
+}
+
+function renderTravelConfirmCard(plan, cardData) {
+  const key = _travelCacheStore(plan, cardData);
+  const dest = escapeHtml(cardData.destination || "");
+  const dur = cardData.duration_days || 3;
+  const hotel = escapeHtml(plan.hotel?.name || "\u5df2\u786e\u8ba4\u9152\u5e97");
+  const price = Number(plan.total_price || 0).toLocaleString();
+  const tag = escapeHtml(plan.tag || plan.id || "");
+  const stepsHtml = _TRAVEL_STEPS.map(s =>
+    `<div class="cx-tc-step">\u25cb ${s.icon} ${escapeHtml(s.label)}</div>`
+  ).join("");
+  addCard(`
+    <article class="card cx-tc-card">
+      <div class="cx-tc-header">
+        <span class="cx-tc-dest">\u{1F4CD} ${dest}</span>
+        <span class="cx-tc-tag">${tag}</span>
+      </div>
+      <div class="cx-tc-hotel">${hotel}</div>
+      <div class="cx-tc-price">\uffe5${price} <span class="cx-tc-dur">/ ${dur}\u5929</span></div>
+      <div class="cx-tc-steps-preview">${stepsHtml}</div>
+      <div class="cx-tc-actions">
+        <button class="cx-tc-confirm" onclick="_startTravelExecution('${key}', this.closest('.card'))">\u5f00\u59cb\u9884\u8ba2</button>
+        <button class="cx-tc-cancel" onclick="this.closest('.card').style.display='none'">\u518d\u770b\u770b</button>
+      </div>
+    </article>
+  `);
+}
+
+function renderTravelStepsCard(execId, steps) {
+  const stepsHtml = steps.map(s =>
+    `<div id="cx-tes-${execId}-${s.id}" class="cx-te-step cx-te-step--queued">
+      <span class="cx-te-icon">\u25cb</span>
+      <span class="cx-te-label">${s.icon} ${escapeHtml(s.label)}</span>
+      <span class="cx-te-status">\u5f85\u6267\u884c</span>
+    </div>`
+  ).join("");
+  addCard(`
+    <article class="card cx-te-card" id="cx-te-${execId}">
+      <div class="cx-te-title">\u6b63\u5728\u4e3a\u60a8\u9884\u8ba2...</div>
+      <div class="cx-te-bar"><div class="cx-te-fill" style="width:0%"></div></div>
+      <div class="cx-te-steps">${stepsHtml}</div>
+    </article>
+  `);
+}
+
+function _updateTravelStep(execId, stepId, status, pct) {
+  const el = document.getElementById(`cx-tes-${execId}-${stepId}`);
+  if (el) {
+    el.className = `cx-te-step cx-te-step--${status}`;
+    const icon = el.querySelector(".cx-te-icon");
+    if (icon) icon.textContent = status === "running" ? "\u25c9" : status === "success" ? "\u2713" : status === "failed" ? "\u2717" : "\u25cb";
+    const st = el.querySelector(".cx-te-status");
+    if (st) st.textContent = status === "running" ? "\u6267\u884c\u4e2d..." : status === "success" ? "\u5b8c\u6210" : status === "failed" ? "\u5931\u8d25" : "\u5f85\u6267\u884c";
+  }
+  const bar = document.querySelector(`#cx-te-${execId} .cx-te-fill`);
+  if (bar) bar.style.width = pct + "%";
+}
+
+async function _startTravelExecution(cacheKey, confirmCardEl) {
+  const { plan, cardData } = _travelCacheGet(cacheKey);
+  if (!plan || !cardData) return;
+  if (confirmCardEl) confirmCardEl.style.display = "none";
+  const execId = Math.random().toString(36).slice(2, 8);
+  const failAt = _travelShouldFail(plan, cardData) ? "reserve_hotel" : null;
+
+  renderTravelStepsCard(execId, _TRAVEL_STEPS);
+
+  for (let i = 0; i < _TRAVEL_STEPS.length; i++) {
+    const s = _TRAVEL_STEPS[i];
+    _updateTravelStep(execId, s.id, "running", Math.round((i / _TRAVEL_STEPS.length) * 100));
+    await new Promise(r => setTimeout(r, s.ms));
+    if (failAt === s.id) {
+      _updateTravelStep(execId, s.id, "failed", Math.round((i / _TRAVEL_STEPS.length) * 100));
+      renderTravelFailCard(s.id, plan, cardData);
+      return;
+    }
+    _updateTravelStep(execId, s.id, "success", Math.round(((i + 1) / _TRAVEL_STEPS.length) * 100));
+  }
+
+  renderTravelDeliverable(plan, cardData);
+}
+
+function renderTravelDeliverable(plan, cardData) {
+  const ref = "CX-" + Math.random().toString(36).slice(2, 8).toUpperCase();
+  const hotel = escapeHtml(plan.hotel?.name || "\u5df2\u786e\u8ba4\u9152\u5e97");
+  const dest = escapeHtml(cardData.destination || "");
+  const dur = cardData.duration_days || 3;
+  const price = Number(plan.total_price || 0).toLocaleString();
+  addCard(`
+    <article class="card cx-td-card">
+      <div class="cx-td-header">\u2713 \u9884\u8ba2\u6210\u529f</div>
+      <div class="cx-td-ref">\u884c\u7a0b\u7f16\u53f7 ${escapeHtml(ref)}</div>
+      <div class="cx-td-row">\u{1F4CD} ${dest} &nbsp;\u00b7&nbsp; ${dur}\u5929</div>
+      <div class="cx-td-row">\u{1F3E8} ${hotel}</div>
+      <div class="cx-td-row">\u{1F4B0} \u603b\u8ba1 \uffe5${price}</div>
+      <div class="cx-td-actions">
+        <button class="cx-td-btn">\u67e5\u770b\u5b8c\u6574\u884c\u7a0b</button>
+        <button class="cx-td-btn cx-td-btn--sec">\u5206\u4eab\u884c\u7a0b</button>
+      </div>
+    </article>
+  `);
+}
+
+function renderTravelFailCard(failedStep, plan, cardData) {
+  const reasons = { reserve_hotel: "\u8be5\u65b9\u6848\u9152\u5e97\u5e93\u5b58\u5df2\u6ee1\uff0c\u65e0\u6cd5\u9501\u5b9a" };
+  const reason = escapeHtml(reasons[failedStep] || "\u9884\u8ba2\u5931\u8d25");
+  const backup = (cardData.plans || []).find(p => p.id !== plan.id);
+  const backupKey = backup ? _travelCacheStore(backup, cardData) : null;
+  const destText = escapeHtml(cardData.destination || "");
+  addCard(`
+    <article class="card cx-tf-card">
+      <div class="cx-tf-header">\u2717 \u9884\u8ba2\u9047\u5230\u95ee\u9898</div>
+      <div class="cx-tf-reason">${reason}</div>
+      <div class="cx-tf-actions">
+        ${backupKey ? `<button class="cx-tf-btn" onclick="_startTravelExecution('${backupKey}', null)">\u5207\u6362\u5907\u9009\u65b9\u6848 \u2192</button>` : ""}
+        <button class="cx-tf-btn cx-tf-btn--sec" onclick="createTaskFromText('\u91cd\u65b0\u89c4\u5212${destText}')">\u91cd\u65b0\u89c4\u5212</button>
+      </div>
+    </article>
+  `);
+}
+
+// F3: Inline plan refinement — send adjustment text directly from plan card
+function _sendPlanRefine(text, inputEl) {
+  const t = String(text || "").trim();
+  if (!t) return;
+  if (inputEl) inputEl.value = "";
+  if (el.chatInput) el.chatInput.value = "";
+  createTaskFromText(t);
+}
+
 function renderSmartReplyCard(smart) {
   if (!smart || !smart.reply) return;
 
@@ -6634,7 +6804,7 @@ function quickActionSpeak(text) {
 
 // ── Clarification Chips Card ──────────────────────────────────────────────
 function renderClarifyCard(structured) {
-  const questionText = structured.spoken_text || structured.spoken_text || "请补充以下信息以生成您的专属方案：";
+  const questionText = structured.spoken_text || "请补充以下信息以生成您的专属方案：";
   const missing = Array.isArray(structured.missing_slots) ? structured.missing_slots : [];
 
   // Predefined quick-select options per slot
@@ -6691,9 +6861,8 @@ function renderClarifyCard(structured) {
     },
   };
 
-  // P8.10: "duration" from requirement-gate maps to "duration_days" in SLOT_CHIPS
+  // B2: "duration" from requirement-gate maps to "duration_days" in SLOT_CHIPS
   const SLOT_ALIAS = { duration: "duration_days" };
-  // Determine which slot groups to show (default to budget if nothing specified)
   const slotsToShow = missing.length > 0 ? missing : ["budget"];
   const chipGroups = slotsToShow
     .map((slot) => ({ slot, group: SLOT_CHIPS[SLOT_ALIAS[slot] || slot] }))
@@ -6704,38 +6873,18 @@ function renderClarifyCard(structured) {
     return;
   }
 
-  // P8.10: Gate multi-select — when both slots missing, require pick-both-then-confirm
-  const isGate = structured.source === "requirement-gate";
-
-  let groupsHtml;
-  if (isGate && slotsToShow.length >= 2) {
-    // Multi-select: each chip marks selected state; confirm fires only when all groups have a pick
-    groupsHtml = chipGroups.map(({ slot, group }) => {
-      const chips = group.options.map((opt) =>
-        `<button class="clarify-chip" data-value="${escapeHtml(opt.value)}" onclick="_gateChipSelect(this)">
-          <span class="clarify-chip-label">${escapeHtml(opt.label)}</span>
-        </button>`
-      ).join("");
-      return `<div class="clarify-group" data-slot="${escapeHtml(slot)}">
-        <div class="clarify-group-label"><span class="clarify-group-icon">${group.icon}</span>${escapeHtml(group.label)}</div>
-        <div class="clarify-chips">${chips}</div>
-      </div>`;
-    }).join("");
-    groupsHtml += `<button class="cx-gate-confirm" disabled onclick="_gateConfirmSubmit(this.closest('.clarify-card'))">生成我的方案 →</button>`;
-  } else {
-    // Single slot or non-gate: tap-to-send immediately
-    groupsHtml = chipGroups.map(({ group }) => {
-      const chips = group.options.map((opt) =>
-        `<button class="clarify-chip" onclick="sendClarifyChip(${JSON.stringify(opt.value)})">
-          <span class="clarify-chip-label">${escapeHtml(opt.label)}</span>
-        </button>`
-      ).join("");
-      return `<div class="clarify-group">
-        <div class="clarify-group-label"><span class="clarify-group-icon">${group.icon}</span>${escapeHtml(group.label)}</div>
-        <div class="clarify-chips">${chips}</div>
-      </div>`;
-    }).join("");
-  }
+  // B2: Unified layout — chips are quick-fill shortcuts; text input for free-form response
+  const groupsHtml = chipGroups.map(({ slot, group }) => {
+    const chips = group.options.map((opt) =>
+      `<button class="clarify-chip" onclick="_clarifyChipFill(this, ${JSON.stringify(opt.value)})">
+        <span class="clarify-chip-label">${escapeHtml(opt.label)}</span>
+      </button>`
+    ).join("");
+    return `<div class="clarify-group" data-slot="${escapeHtml(slot)}">
+      <div class="clarify-group-label"><span class="clarify-group-icon">${group.icon}</span>${escapeHtml(group.label)}</div>
+      <div class="clarify-chips">${chips}</div>
+    </div>`;
+  }).join("");
 
   addCard(`
     <article class="card smart-reply-card clarify-card">
@@ -6747,35 +6896,33 @@ function renderClarifyCard(structured) {
       </div>
       <div class="clarify-question">${escapeHtml(questionText)}</div>
       ${groupsHtml}
+      <div class="b2-clarify-input-row">
+        <input type="text" class="b2-clarify-input" placeholder="直接输入，或点击上方快捷选项..."
+          onkeydown="if(event.key==='Enter'&&!event.isComposing)_clarifySend(this.closest('.clarify-card'))">
+        <button class="b2-clarify-send" onclick="_clarifySend(this.closest('.clarify-card'))">发送</button>
+      </div>
     </article>
   `);
 }
 
-// Send a clarify chip selection as a user message
-function sendClarifyChip(value) {
-  if (el.chatInput) el.chatInput.value = "";
-  createTaskFromText(value);
-}
-
-// P8.10: Gate multi-select helpers
-function _gateChipSelect(btn) {
+// B2: Fill clarify text input from chip click (quick-select shortcut)
+function _clarifyChipFill(btn, value) {
+  // Visual: mark this chip selected, deselect siblings in same group
   btn.closest(".clarify-chips").querySelectorAll(".clarify-chip")
     .forEach((b) => b.classList.remove("cx-chip--selected"));
   btn.classList.add("cx-chip--selected");
-  const card = btn.closest(".clarify-card");
-  const groups = [...card.querySelectorAll(".clarify-group[data-slot]")];
-  const allPicked = groups.every((g) => g.querySelector(".cx-chip--selected"));
-  const confirmBtn = card.querySelector(".cx-gate-confirm");
-  if (confirmBtn) confirmBtn.disabled = !allPicked;
+  // Fill the text input in this card
+  const input = btn.closest(".clarify-card")?.querySelector(".b2-clarify-input");
+  if (input) { input.value = value; input.focus(); }
 }
 
-function _gateConfirmSubmit(cardEl) {
-  const groups = [...cardEl.querySelectorAll(".clarify-group[data-slot]")];
-  const parts = groups
-    .map((g) => g.querySelector(".cx-chip--selected")?.dataset?.value)
-    .filter(Boolean);
-  if (!parts.length) return;
-  createTaskFromText(parts.join(" "));
+// B2: Send clarify text input value as user message
+function _clarifySend(cardEl) {
+  const input = cardEl?.querySelector(".b2-clarify-input");
+  const text = input?.value?.trim();
+  if (!text) return;
+  input.value = "";
+  createTaskFromText(text);
 }
 
 // ── Shared list-card builder (called by renderCardData + refreshPlanCardLanguage) ──
@@ -6931,8 +7078,8 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
         <span class="cx-sb-text">${pickText("正在加载优惠...","Loading offers...","特典を取得中...","혜택 로딩 중...")}</span>
       </div>
     </div>
-    <button class="cx-lc-cta" onclick="event.stopPropagation(); openPlanDetail('${cardId}', ${idx})">
-      ${pickText("查看详情 →","View Details →","詳細を見る →","상세 보기 →")}
+    <button class="cx-lc-cta cx-lc-cta--select" onclick="event.stopPropagation(); _planOptionSelect('${cardId}', ${idx})">
+      ${pickText("选择此方案 →","Select Plan →","このプランを選ぶ →","이 플랜 선택 →")}
     </button>
   </div>`;
 }
@@ -6981,6 +7128,7 @@ function refreshPlanCardLanguage() {
 
 // ── card_data renderer — 3-plan comparison + day itinerary ────────────────
 function renderCardData(cd, spokenText) {
+  state._lastCardData = cd; // E1: cache for execution chain
   if (!cd) return false;
   const hasPlans = Array.isArray(cd.plans) && cd.plans.length > 0;
   const hasDays = Array.isArray(cd.days) && cd.days.length > 0;
@@ -7123,6 +7271,19 @@ function renderCardData(cd, spokenText) {
         <div class="plan-section-header">${pickText("选择你的方案","Choose Your Plan","プランを選ぶ","플랜 선택")}</div>
         <div class="cx-plan-list">${planCards}</div>
         ${dayItineraryHtml}
+        <div class="cx-plan-refine">
+          <div class="cx-pr-chips">
+            <button class="cx-pr-chip" onclick="_sendPlanRefine('\u66f4\u4fbf\u5b9c\u7684\u9152\u5e97')">\u66f4\u4fbf\u5b9c</button>
+            <button class="cx-pr-chip" onclick="_sendPlanRefine('\u591a\u4e00\u5929\u884c\u7a0b')">\u52a0\u4e00\u5929</button>
+            <button class="cx-pr-chip" onclick="_sendPlanRefine('\u6362\u4e2a\u533a\u57df')">\u6362\u533a\u57df</button>
+            <button class="cx-pr-chip" onclick="_sendPlanRefine('\u52a0\u5f3a\u7f8e\u98df\u63a8\u8350')">\u591a\u7f8e\u98df</button>
+          </div>
+          <div class="cx-pr-input-row">
+            <input class="cx-pr-input" placeholder="\u7528\u81ea\u7136\u8bed\u8a00\u8c03\u6574\u65b9\u6848..."
+              onkeydown="if(event.key==='Enter'&&!event.isComposing)_sendPlanRefine(this.value,this)">
+            <button class="cx-pr-send" onclick="_sendPlanRefine(this.previousElementSibling.value,this.previousElementSibling)">\u8c03\u6574</button>
+          </div>
+        </div>
         <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "")}</p>
       </article>
     `);
