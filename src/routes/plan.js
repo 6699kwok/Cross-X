@@ -84,11 +84,8 @@ function checkRequirements(message, constraints, intentAxis) {
     || !!(constraints.budget);
 
   if (intentAxis === "food") {
-    // P8.16: 美食专项同样需要天数 + 人均预算（三要素：Location + Duration + Budget 全部必填）
-    const missing = [];
-    if (!hasDuration) missing.push("duration");
-    if (!hasBudget)   missing.push("budget");
-    return missing;
+    // 美食专项：只需人均预算，不需要天数
+    return hasBudget ? [] : ["budget"];
   }
   if (intentAxis === "activity" || intentAxis === "stay") {
     // 景点/住宿：需要天数 + 预算

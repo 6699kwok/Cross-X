@@ -6963,21 +6963,16 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
   const statusBarId = `cx-sb-${cardId}-${idx}`;
   const cardCls = `cx-list-card${isRec ? " cx-list-card--rec" : ""}`;
 
-  // P8.16: Hero priority:
-  //   food_only  → Coze/LLM real restaurant photo → city landmark fallback
-  //   travel/stay → hotel hero_image → city landmark fallback
-  // City landmark (GLOBAL_CITY_HERO_MAP) is always the safe fallback — zero picsum/random.
-  const _restRealPhoto = isFoodCard
+  // P8.12: Hero image is ALWAYS the destination city landmark photo.
+  // This gives every card a recognisable city skyline/landmark at the top.
+  // The restaurant's actual photo appears inside the card body (restPhotoHtml below).
+  const heroUrl    = _getCityHeroUrl(dest);
+  const fallbackUrl = heroUrl; // already resolved — onerror uses same
+
+  // Restaurant-specific photo (shown inside card body for food_only)
+  const restPhotoUrl = isFoodCard
     ? (p.real_photo_url || p.food_image || p.item_image || null)
     : null;
-  const heroUrl     = isFoodCard
-    ? (_restRealPhoto || _getCityHeroUrl(dest))
-    : (p.hotel?.hero_image || _getCityHeroUrl(dest));
-  const fallbackUrl = _getCityHeroUrl(dest);
-
-  // restPhotoHtml: only shown in card body when hero is the city image (no real photo yet)
-  // Avoids duplicate: if hero already IS the restaurant photo, body shows nothing extra.
-  const restPhotoUrl = null; // hero handles restaurant photo; body doesn't duplicate
   // Hero always shows city name overlay (landmark photo of the destination)
   const coverLabel = escapeHtml(dest || "");
   const coverHtml  = `<div class="cx-lc-img-cover">
@@ -12384,91 +12379,67 @@ function _applyCouponBar(barEl, coupon) {
 // no price-per-night. Only real food data from Coze item_list + plan fields.
 // P10: If Coze returns no real photo, show "暂无实拍图" placeholder — NEVER use
 //      a generic stock photo to mask missing data ("宁可报错也不许用假图").
-// ── buildRestaurantDetailHTML ─────────────────────────────────────────────────
-// P8.16: ZERO hotel fields. Schema: photo | name | cuisine+flavor tags |
-//        rating + avgPrice + queue | address + nav button | review | dishes | CTA
 function buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, cozeData) {
-  const restName  = escapeHtml(p.name || p.restaurant_name || p.item_name || "");
-  const rating    = p.rating || p.score || 0;
-  const avgPrice  = p.avg_price || (p.budget_breakdown?.meals
+  // Real photo priority: Coze item photo > plan photo > null (no fake fallback)
+  const heroUrl  = p.real_photo_url || p.food_image || p.item_image || null;
+  const restName = escapeHtml(p.name || p.restaurant_name || p.item_name || "");
+  const rating   = p.rating || p.score || 0;
+  const avgPrice = p.avg_price || (p.budget_breakdown?.meals
     ? Math.round(p.budget_breakdown.meals / 3) : 0);
-  const review    = escapeHtml(p.review || p.user_review || p.review_snippet || "");
-  let   addr      = escapeHtml(p.address || p.addr || "");
-  let   queueMin  = cozeData?.restaurant_queue;
-  // Cuisine / flavor / origin from plan fields (populated by P8.12 prompt)
-  const cuisineType = escapeHtml(p.cuisine_type || "");
-  const flavor      = escapeHtml(p.flavor || "");
-  const origin      = escapeHtml(p.origin || "");
+  // Review: plan field first, never touch p.hotel.guest_review
+  const review   = escapeHtml(p.review || p.user_review || p.review_snippet || "");
+  // Address from plan data only
+  let addr       = escapeHtml(p.address || p.addr || "");
+  // Queue: real-time from Coze root; plan-level override allowed
+  let queueMin   = cozeData?.restaurant_queue;
 
-  // Real photo: Coze item_list match > plan photo fields > null (no fake stock)
-  let finalHero   = p.real_photo_url || p.food_image || p.item_image || null;
-  let finalPrice  = avgPrice;
-
+  // Enrich from Coze item_list when the plan option matches a known restaurant
   if (Array.isArray(cozeData?.item_list) && restName) {
     const match = cozeData.item_list.find((item) =>
       item.name && restName.includes(escapeHtml(item.name).slice(0, 4))
     );
     if (match) {
-      if (match.photo && /^https?:\/\//i.test(match.photo)) finalHero = match.photo;
-      if (match.address)   addr       = escapeHtml(match.address);
-      if (match.avg_price) finalPrice = match.avg_price;
-      if (match.queue_min) queueMin   = match.queue_min;
+      if (match.photo && /^https?:\/\//i.test(match.photo))
+        p._enrichedPhoto = match.photo;
+      if (match.address) addr = escapeHtml(match.address);
+      if (match.avg_price) p._enrichedPrice = match.avg_price;
+      if (match.queue_min) queueMin = match.queue_min;
     }
   }
+  const finalHero  = p._enrichedPhoto || heroUrl;   // null = no real photo
+  const finalPrice = p._enrichedPrice || avgPrice;
+  // Signature dishes: dedicated fields first, highlights as last resort
+  const dishes = (p.dishes || p.signature_dishes || p.menu_highlights || p.highlights || []).slice(0, 3);
 
-  const dishes = (p.dishes || p.signature_dishes || p.menu_highlights || p.highlights || []).slice(0, 4);
-
-  // Hero: real photo or "暂无实拍图" placeholder — ZERO stock / random images
+  // P10: real photo or explicit "暂无实拍图" placeholder — zero fake stock images
   const heroHtml = finalHero
     ? `<img class="cx-detail-hero" src="${finalHero}" alt="${restName}" loading="lazy"
          onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
       + `<div class="cx-rest-no-photo" style="display:none">📷 ${pickText("暂无实拍图","No photo yet","実写なし","실사 없음")}</div>`
     : `<div class="cx-rest-no-photo">📷 ${pickText("暂无实拍图","No photo yet","実写なし","실사 없음")}</div>`;
 
-  // Cuisine/flavor/origin tags (P8.12 + P8.16)
-  const cuisineTagsHtml = (cuisineType || flavor || origin)
-    ? `<div class="cx-food-tags" style="margin:6px 0">
-        ${cuisineType ? `<span class="cx-cuisine-tag">\uD83C\uDF74 ${cuisineType}</span>` : ""}
-        ${flavor      ? `<span class="cx-flavor-tag">\u2726 ${flavor}</span>` : ""}
-        ${origin      ? `<span class="cx-origin-tag">\uD83D\uDCCD ${origin}</span>` : ""}
-      </div>`
-    : "";
-
-  // Address + navigation button (Gaode/Amap deep link)
-  const navHref  = addr ? `https://uri.amap.com/marker?position=&name=${encodeURIComponent(addr)}&src=crossx&callnative=1` : "";
-  const addrHtml = addr
-    ? `<div class="cx-rest-addr-row">
-        <span class="cx-rest-addr">📍 ${addr}</span>
-        <a class="cx-rest-nav-btn" href="${navHref}" target="_blank" rel="noopener">
-          ${pickText("导航","Navigate","ナビ","내비")} →
-        </a>
-      </div>`
-    : "";
-
   const el = document.createElement("div");
   el.className = "cx-plan-detail";
-  // ── HTML structure (ZERO hotel / stars / check_in / check_out fields) ─────
   el.innerHTML = `
     ${heroHtml}
     <div class="cx-detail-body">
       <div class="cx-detail-rest-name">${restName}</div>
-      ${cuisineTagsHtml}
       <div class="cx-detail-meta" style="gap:10px;flex-wrap:wrap">
         ${rating     ? `<span class="cx-rest-score">★ ${rating} <span class="cx-rest-score-label">${pickText("大众评分","Rating","評点","평점")}</span></span>` : ""}
         ${finalPrice ? `<span class="cx-rest-avgprice">${pickText("人均","Avg","人均","인당")} ¥${finalPrice}</span>` : ""}
         ${queueMin   ? `<span class="cx-rest-queue">⏳ ${pickText("排队约","Wait ~","待ち約","대기 약")}${queueMin}${pickText("分钟","min","分","분")}</span>` : ""}
       </div>
-      ${addrHtml}
-      ${review ? `<div class="cx-rest-review"><span class="cx-rest-review-label">${pickText("真实评价","User Review","口コミ","실제 리뷰")}</span>"${review}"</div>` : ""}
+      ${addr   ? `<div class="cx-rest-addr">📍 ${addr}</div>` : ""}
+      ${review ? `<div class="cx-rest-review">"${review}"</div>` : ""}
       ${dishes.length ? `
       <div class="cx-detail-divider"></div>
-      <div class="cx-detail-section-label">${pickText("招牌菜 Top ${dishes.length}","Signature Dishes","看板メニュー","시그니처 메뉴")}</div>
+      <div class="cx-detail-section-label">${pickText("招牌菜 Top 3","Signature Dishes","看板メニュー Top 3","시그니처 메뉴 Top 3")}</div>
       <ul class="opt-highlights cx-rest-dishes">
         ${dishes.map((d) => `<li><span class="opt-check">🍽️</span>${escapeHtml(d)}</li>`).join("")}
       </ul>` : ""}
       ${spokenText ? `
       <div class="cx-detail-why">
-        <div class="cx-detail-why-label">${pickText("AI 推荐理由","Why We Recommend","おすすめ理由","추천 이유")}</div>
+        <div class="cx-detail-why-label">${pickText("为何推荐","Why We Recommend","おすすめ理由","추천 이유")}</div>
         ${escapeHtml(spokenText)}
       </div>` : ""}
       <div class="cx-detail-actions">
