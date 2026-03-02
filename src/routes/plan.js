@@ -637,7 +637,7 @@ function createPlanRouter({
           effectiveMessage,
           _botUserId,
           (text) => emit({ type: "status", code: "H_SEARCH", label: text }),
-          90000,
+          160000,
         );
 
         if (botResult.ok && botResult.card_data) {

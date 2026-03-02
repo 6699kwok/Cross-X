@@ -76,11 +76,8 @@ async function callCozeBotStreaming({
     let buffer       = "";
     let currentEvent = ""; // SSE event: field (separate line from data:)
 
-    let chunkCount = 0;
-    for await (const chunk of resp.body) {
-      chunkCount++;
+    outer: for await (const chunk of resp.body) {
       buffer += decoder.decode(chunk, { stream: true });
-      if (chunkCount <= 2) console.log("[cozebot/raw] chunk", chunkCount, ":", buffer.slice(0, 300));
       const lines = buffer.split("\n");
       buffer = lines.pop(); // keep incomplete line
 
@@ -103,25 +100,27 @@ async function callCozeBotStreaming({
         // Coze v3 streaming: event type from SSE event: line; data JSON has type/content directly
         const msgType    = parsed.type    || "";
         const msgContent = parsed.content || "";
-        // Debug: log first few events to understand actual format
-        if (toolCallCount === 0 && !answerContent) {
-          console.log(`[cozebot/debug] event=${currentEvent} type=${msgType} keys=${Object.keys(parsed).join(",")}`);
-        }
 
         // Emit thinking status on tool calls
         if (msgType === "function_call") {
           toolCallCount++;
           const now = Date.now();
-          if (onStatus && now - lastStatusAt > 4000) {
+          if (onStatus && now - lastStatusAt > 8000) {
             onStatus("\u6b63\u5728\u67e5\u8be2\u5b9e\u65f6\u65c5\u6e38\u8d44\u6e90...");  // 正在查询实时旅游资源...
             lastStatusAt = now;
           }
         }
 
-        // Capture the completed answer message
+        // After function_call completes, notify that real plugin data is being processed
+        if (currentEvent === "conversation.message.completed" && msgType === "function_call") {
+          if (onStatus) onStatus("\u63d2\u4ef6\u6570\u636e\u5df2\u5c31\u7eea\uff0c\u751f\u6210\u65b9\u6848\u4e2d...");  // 插件数据已就绪，生成方案中...
+        }
+
+        // Capture the completed answer message — break immediately to avoid AbortSignal timeout
         if (currentEvent === "conversation.message.completed" && msgType === "answer") {
           answerContent = msgContent;
           console.log("[cozebot] Answer captured, length:", answerContent.length);
+          break outer;
         }
 
         // Abort early on chat failure
