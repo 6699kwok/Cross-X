@@ -22,8 +22,9 @@
  * @param {string}   opts.botId       COZE_BOT_ID
  * @param {string}   opts.message     Full user message (capped to 800 chars)
  * @param {string}   [opts.userId]    Stable per-user ID (deviceId preferred)
- * @param {function} [opts.onStatus]  (text: string) => void — SSE thinking updates
- * @param {number}   [opts.timeoutMs] Default 50s
+ * @param {function} [opts.onStatus]   (text: string) => void — status label updates
+ * @param {function} [opts.onThinking] (chunk: string) => void — reasoning token stream
+ * @param {number}   [opts.timeoutMs]  Default 50s
  * @returns {Promise<{ok:boolean, card_data:object|null, spoken_text:string}>}
  */
 async function callCozeBotStreaming({
@@ -33,6 +34,7 @@ async function callCozeBotStreaming({
   message,
   userId = "crossx_user",
   onStatus,
+  onThinking,
   timeoutMs = 50000,
 }) {
   if (!apiKey || !botId || !message) {
@@ -69,12 +71,23 @@ async function callCozeBotStreaming({
       return { ok: false, card_data: null, spoken_text: "" };
     }
 
-    let answerContent = "";
-    let lastStatusAt  = 0;
-    let toolCallCount = 0;
+    let answerContent    = "";
+    let lastStatusAt     = 0;
+    let toolCallCount    = 0;
+    let thinkingBuf      = "";   // batched reasoning_content before flush
+    let lastThinkingFlush = 0;
     const decoder = new TextDecoder();
     let buffer       = "";
     let currentEvent = ""; // SSE event: field (separate line from data:)
+
+    // Flush accumulated reasoning tokens to the caller (throttled)
+    const flushThinking = () => {
+      if (thinkingBuf && onThinking) {
+        onThinking(thinkingBuf);
+        thinkingBuf = "";
+        lastThinkingFlush = Date.now();
+      }
+    };
 
     outer: for await (const chunk of resp.body) {
       buffer += decoder.decode(chunk, { stream: true });
@@ -101,9 +114,23 @@ async function callCozeBotStreaming({
         const msgType    = parsed.type    || "";
         const msgContent = parsed.content || "";
 
+        // Stream reasoning tokens from delta events (CoT thinking visualization)
+        if (currentEvent === "conversation.message.delta" && msgType === "answer" && onThinking) {
+          const rc = parsed.reasoning_content || "";
+          if (rc) {
+            thinkingBuf += rc;
+            const now = Date.now();
+            // Flush every 80 chars or 600ms, whichever comes first
+            if (thinkingBuf.length >= 80 || now - lastThinkingFlush > 600) {
+              flushThinking();
+            }
+          }
+        }
+
         // Emit thinking status on tool calls
         if (msgType === "function_call") {
           toolCallCount++;
+          flushThinking(); // flush any remaining reasoning before tool call status
           const now = Date.now();
           if (onStatus && now - lastStatusAt > 8000) {
             onStatus("\u6b63\u5728\u67e5\u8be2\u5b9e\u65f6\u65c5\u6e38\u8d44\u6e90...");  // 正在查询实时旅游资源...
@@ -118,6 +145,7 @@ async function callCozeBotStreaming({
 
         // Capture the completed answer message — break immediately to avoid AbortSignal timeout
         if (currentEvent === "conversation.message.completed" && msgType === "answer") {
+          flushThinking(); // flush any remaining reasoning tokens
           answerContent = msgContent;
           console.log("[cozebot] Answer captured, length:", answerContent.length);
           break outer;

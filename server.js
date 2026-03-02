@@ -7186,8 +7186,8 @@ const planRouter = createPlanRouter({
   getOpenAIConfig: () => ({ apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, keyHealth: OPENAI_KEY_HEALTH, baseUrl: OPENAI_BASE_URL }),
   getCozeConfig: () => ({ apiKey: COZE_API_KEY, workflowId: COZE_WORKFLOW_ID, botId: COZE_BOT_ID, apiBase: COZE_API_BASE }),
   callCozeWorkflow,
-  callCozeBotStreaming: (message, userId, onStatus, timeoutMs) =>
-    callCozeBotStreaming({ apiKey: COZE_BOT_API_KEY, apiBase: COZE_API_BASE, botId: COZE_BOT_ID, message, userId, onStatus, timeoutMs }),
+  callCozeBotStreaming: (message, userId, onStatus, timeoutMs, onThinking) =>
+    callCozeBotStreaming({ apiKey: COZE_BOT_API_KEY, apiBase: COZE_API_BASE, botId: COZE_BOT_ID, message, userId, onStatus, onThinking, timeoutMs }),
   detectQuickActionIntent, buildQuickActionResponse,
   detectCasualChatIntent, callCasualChat,
   classifyBookingIntent, callPythonRagService, searchAttractions,

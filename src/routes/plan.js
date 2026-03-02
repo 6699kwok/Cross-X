@@ -693,6 +693,7 @@ function createPlanRouter({
           _botUserId,
           (text) => emit({ type: "status", code: "H_SEARCH", label: text }),
           160000,
+          (chunk) => emit({ type: "thinking", text: chunk }),
         );
 
         if (botResult.ok && botResult.card_data) {
