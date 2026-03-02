@@ -619,6 +619,7 @@ async function enrichPlanWithAmapData(plan, city) {
 }
 
 const PUBLIC_DIR = path.join(__dirname, "web");
+const LEGACY_ASSETS_DIR = path.join(__dirname, "web");
 const DATA_DIR = path.join(__dirname, "data");
 const DB_FILE = path.join(DATA_DIR, "db.json");
 const ENV_LOCAL_FILE = path.join(__dirname, ".env.local");
@@ -6679,9 +6680,17 @@ function writeJson(res, statusCode, payload) {
 function mimeType(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
   if (filePath.endsWith(".css")) return "text/css; charset=utf-8";
-  if (filePath.endsWith(".js")) return "application/javascript; charset=utf-8";
+  if (filePath.endsWith(".js") || filePath.endsWith(".mjs")) return "application/javascript; charset=utf-8";
   if (filePath.endsWith(".svg")) return "image/svg+xml";
   if (filePath.endsWith(".json")) return "application/json; charset=utf-8";
+  if (filePath.endsWith(".jpg") || filePath.endsWith(".jpeg")) return "image/jpeg";
+  if (filePath.endsWith(".png")) return "image/png";
+  if (filePath.endsWith(".gif")) return "image/gif";
+  if (filePath.endsWith(".webp")) return "image/webp";
+  if (filePath.endsWith(".ico")) return "image/x-icon";
+  if (filePath.endsWith(".woff2")) return "font/woff2";
+  if (filePath.endsWith(".woff")) return "font/woff";
+  if (filePath.endsWith(".ttf")) return "font/ttf";
   return "text/plain; charset=utf-8";
 }
 
@@ -6692,16 +6701,26 @@ function serveStatic(req, res) {
   const filePath = path.join(PUBLIC_DIR, safePath);
   if (!filePath.startsWith(PUBLIC_DIR)) return writeJson(res, 403, { error: "Forbidden" });
 
-  fs.readFile(filePath, (err, content) => {
-    if (err) return writeJson(res, 404, { error: "Not found" });
+  function sendContent(resolvedPath, content) {
     res.writeHead(200, {
-      "Content-Type": mimeType(filePath),
+      "Content-Type": mimeType(resolvedPath),
       "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
       Pragma: "no-cache",
       Expires: "0",
       "X-CrossX-Build": BUILD_ID,
     });
     res.end(content);
+  }
+
+  fs.readFile(filePath, (err, content) => {
+    if (!err) return sendContent(filePath, content);
+    // Fallback: serve from legacy web/ directory (assets, images, fonts…)
+    const legacyPath = path.join(LEGACY_ASSETS_DIR, safePath);
+    if (!legacyPath.startsWith(LEGACY_ASSETS_DIR)) return writeJson(res, 404, { error: "Not found" });
+    fs.readFile(legacyPath, (err2, content2) => {
+      if (!err2) return sendContent(legacyPath, content2);
+      writeJson(res, 404, { error: "Not found" });
+    });
   });
 }
 
