@@ -21,3 +21,5 @@ npm-debug.log*
 
 # Data (runtime state)
 data/db.json
+data/sessions.json
+data/user_profiles.json
