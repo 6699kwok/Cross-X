@@ -148,6 +148,9 @@ function restoreConversationState() {
     }
     if (Array.isArray(saved.messages) && saved.messages.length > 0) {
       state.agentConversation.messages = saved.messages;
+      // Mark that we restored so init() can show context banner
+      state._sessionRestored = true;
+      state._restoredAt = saved.savedAt;
     }
     if (saved.slots && typeof saved.slots === "object") {
       Object.assign(state.agentConversation.slots, saved.slots);
@@ -1771,28 +1774,34 @@ async function toggleVoiceListening() {
 }
 
 function buildWelcomeIntro(locationLabel) {
-  // locationLabel: e.g. "广东省深圳市\u201d or null
+  // locationLabel: e.g. "广东省深圳市" or null
   const loc = locationLabel ? String(locationLabel).trim() : "";
+  // Time-of-day greeting prefix
+  const h = new Date().getHours();
+  const greetZh = h < 6 ? "\u591C\u5DF1\u6DF1\u4E86" : h < 11 ? "\u65E9\u5B89" : h < 14 ? "\u4E2D\u5348\u597D" : h < 18 ? "\u4E0B\u5348\u597D" : "\u665A\u4E0A\u597D";
+  const greetEn = h < 6 ? "Late night" : h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
+  const greetJa = h < 12 ? "\u304A\u306F\u3088\u3046\u3054\u3056\u3044\u307E\u3059" : h < 17 ? "\u3053\u3093\u306B\u3061\u306F" : "\u3053\u3093\u3070\u3093\u306F";
+  const greetKo = h < 12 ? "\uC88B\uC740 \uC544\uCE68\uC774\uC5D0\uC694" : h < 17 ? "\uC548\uB155\uD558\uC138\uC694" : "\uC548\uB155\uD558\uC138\uC694";
+
   if (state.uiLanguage === "ZH") {
-    return loc
-      ? `欢迎来到${loc}！我是 Cross X，你的跨境出行管家。告诉我一句话目标，我会为你定制方案并推进执行。`
-      : "你好，我是 Cross X。告诉我一句话目标，我会给你定制化方案并推进执行。";
+    const locPart = loc ? `\u6B22\u8FCE\u6765\u5230${loc}\uFF01` : `${greetZh}\uFF01`;
+    return `${locPart}\u6211\u662F Cross X\uFF0C\u4F60\u7684 AI \u51FA\u884C\u7BA1\u5BB6\u3002\u544A\u8BC9\u6211\u4E00\u53E5\u8BDD\u76EE\u6807\uFF0C\u6211\u4F1A\u4E3A\u4F60\u5B9A\u5236\u65B9\u6848\u5E76\u63A8\u8FDB\u6267\u884C\u3002`;
   }
   if (state.uiLanguage === "JA") {
     return loc
-      ? `${loc}へようこそ！Cross Xです。ひと言で目的を伝えてください。最適な案を作成し実行まで進めます。`
-      : "こんにちは、Cross Xです。ひと言で目的を伝えてください。最適な案を作成し実行まで進めます。";
+      ? `${loc}\u3078\u3088\u3046\u3053\u305D\uFF01Cross X\u3067\u3059\u3002\u3072\u3068\u8A00\u3067\u76EE\u7684\u3092\u4F1A\u3048\u3066\u304F\u3060\u3055\u3044\u3002\u6700\u9069\u306A\u6848\u3092\u4F5C\u6210\u3057\u5B9F\u884C\u307E\u3067\u9032\u3081\u307E\u3059\u3002`
+      : `${greetJa}\uFF01Cross X\u3067\u3059\u3002\u3072\u3068\u8A00\u3067\u76EE\u7684\u3092\u4F1A\u3048\u3066\u304F\u3060\u3055\u3044\u3002\u6700\u9069\u306A\u6848\u3092\u4F5C\u6210\u3057\u5B9F\u884C\u307E\u3067\u9032\u3081\u307E\u3059\u3002`;
   }
   if (state.uiLanguage === "KO") {
     return loc
-      ? `${loc}에 오신 것을 환영합니다! Cross X입니다. 한 문장으로 목표를 말하면 맞춤 옵션을 만들고 실행까지 진행합니다.`
-      : "안녕하세요, Cross X입니다. 한 문장으로 목표를 말하면 맞춤 옵션을 만들고 실행까지 진행합니다.";
+      ? `${loc}\uC5D0 \uC624\uC2E0 \uAC83\uC744 \uD658\uC601\uD569\uB2C8\uB2E4! Cross X\uC785\uB2C8\uB2E4. \uD55C \uBB38\uC7A5\uC73C\uB85C \uBAA9\uD45C\uB97C \uB9D0\uD558\uBA74 \uB9DE\uCDA4 \uC635\uC158\uC744 \uB9CC\uB4E4\uACE0 \uC2E4\uD589\uAE4C\uC9C0 \uC9C4\uD589\uD569\uB2C8\uB2E4.`
+      : `${greetKo}! Cross X\uC785\uB2C8\uB2E4. \uD55C \uBB38\uC7A5\uC73C\uB85C \uBAA9\uD45C\uB97C \uB9D0\uD558\uBA74 \uB9DE\uCDA4 \uC635\uC158\uC744 \uB9CC\uB4E4\uACE0 \uC2E4\uD589\uAE4C\uC9C0 \uC9C4\uD589\uD569\uB2C8\uB2E4.`;
   }
   // Default EN
   const locEn = state._locationLabelEn || loc;
   return locEn
-    ? `Welcome to ${locEn}! I'm Cross X, your cross-border travel assistant. Tell me your goal and I'll build a tailored plan.`
-    : "Hi, I am Cross X. Tell me one goal and I will generate tailored options and move execution forward.";
+    ? `${greetEn}! Welcome to ${locEn}. I\u2019m Cross X, your AI travel concierge. Tell me your goal and I\u2019ll build a tailored plan.`
+    : `${greetEn}! I\u2019m Cross X. Tell me your goal and I\u2019ll generate tailored options and move execution forward.`;
 }
 
 function getSystemMessageByKey(key) {
@@ -6292,6 +6301,8 @@ function _updateTravelStep(execId, stepId, status, pct) {
 async function _startTravelExecution(cacheKey, confirmCardEl) {
   const { plan, cardData } = _travelCacheGet(cacheKey);
   if (!plan || !cardData) return;
+  // Haptic feedback on mobile
+  if (navigator.vibrate) navigator.vibrate([10, 30, 10]);
   if (confirmCardEl) confirmCardEl.style.display = "none";
   const execId = Math.random().toString(36).slice(2, 8);
   const failAt = _travelShouldFail(plan, cardData) ? "reserve_hotel" : null;
@@ -12246,8 +12257,12 @@ async function init() {
     state.singleDialogMode = true;
   }
   addMessage(getSystemMessageByKey("welcome_intro"), "agent", { i18nKey: "welcome_intro" });
-  // Time-aware proactive suggestions (fresh sessions only)
-  setTimeout(() => _renderTimeAwareSuggestions(), 400);
+  // AI session context banner (restored sessions) or time-aware suggestions (fresh sessions)
+  if (state._sessionRestored) {
+    setTimeout(() => _renderSessionContextBanner(), 300);
+  } else {
+    setTimeout(() => _renderTimeAwareSuggestions(), 400);
+  }
   // C4: profile-aware greeting — show personalized message for returning users
   setTimeout(() => _loadProfileGreeting().catch(() => {}), 800);
   // Silently detect location in background to personalize the welcome message
@@ -13629,6 +13644,45 @@ function _renderPostBookingFollowUp(plan, cardData) {
       <div class="cx-pb-title">AI \u4e0b\u4e00\u6b65\u5efa\u8bae</div>
       <div class="cx-pb-chips">${chipsHtml}</div>
     </article>
+  `);
+}
+
+/**
+ * Session context banner — shown when a previous session is restored.
+ * Tells the user the AI still has their context so they can continue naturally.
+ */
+function _renderSessionContextBanner() {
+  const msgs = state.agentConversation.messages || [];
+  const slots = state.agentConversation.slots || {};
+  const savedAt = state._restoredAt;
+
+  // Build context summary from slots
+  const contextParts = [];
+  if (slots.destination) contextParts.push(`\u{1F4CD} ${slots.destination}`);
+  if (slots.duration)    contextParts.push(`\u23F1 ${slots.duration}\u5929`);
+  if (slots.pax > 1)     contextParts.push(`\u{1F465} ${slots.pax}\u4EBA`);
+
+  // Time since saved
+  let timeHint = "";
+  if (savedAt) {
+    const minAgo = Math.round((Date.now() - savedAt) / 60000);
+    timeHint = minAgo < 2 ? "\u521A\u624D" : minAgo < 60 ? `${minAgo}\u5206\u949F\u524D` : "\u4E4B\u524D";
+  }
+
+  const userMsgCount = msgs.filter(m => m.role === "user").length;
+  if (userMsgCount === 0) return; // nothing meaningful to recap
+
+  const contextStr = contextParts.length ? contextParts.join(" \u00B7 ") : `${userMsgCount}\u6761\u5BF9\u8BDD`;
+
+  addCard(`
+    <div class="cx-scb-row">
+      <span class="cx-scb-icon">\u{1F9E0}</span>
+      <div class="cx-scb-text">
+        <span class="cx-scb-label">AI \u8BB0\u5F97\u4F60${timeHint}\u7684\u5BF9\u8BDD</span>
+        <span class="cx-scb-ctx">${escapeHtml(contextStr)}</span>
+      </div>
+      <button class="cx-scb-clear" onclick="clearSession()" title="\u6E05\u9664\u8BB0\u5F55">\u00D7</button>
+    </div>
   `);
 }
 
