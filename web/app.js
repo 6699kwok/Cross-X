@@ -24,6 +24,7 @@ const IS_USER_PORTAL = !/\/admin\.html(?:$|\?)/i.test(String(window.location.pat
 const AGENT_INTENTS = ["eat", "travel", "hotel", "combo_eat_travel", "combo_hotel_travel", "unknown"];
 const AGENT_SLOT_KEYS = ["intent", "city", "area", "party_size", "budget", "time_constraint", "preferences", "execution_permission"];
 const AGENT_STATES = ["idle", "parsing", "asking", "planning", "confirming", "executing", "completed", "failed", "replanning"];
+const AGENT_FAILURE_CODES = ["queue_too_long", "budget_overflow", "resource_unavailable"];
 
 const state = {
   selectedConstraints: {},
@@ -4818,9 +4819,21 @@ function waitMs(ms) {
 async function runAgentDemoPath(pathName = "normal") {
   const path = String(pathName || "normal").toLowerCase();
   resetAgentConversationForDemo();
-  // Demo needs agent flow cards visible — disable single-dialog CSS hiding
+  // Demo needs agent flow cards visible — disable single-dialog CSS hiding temporarily
+  const _prevSingleDialog = state.singleDialogMode;
   state.singleDialogMode = false;
   document.body.classList.remove("single-dialog-mode");
+  try {
+    return await _runAgentDemoPathInner(path);
+  } finally {
+    if (_prevSingleDialog) {
+      state.singleDialogMode = true;
+      document.body.classList.add("single-dialog-mode");
+    }
+  }
+}
+
+async function _runAgentDemoPathInner(path) {
   addMessage(
     pickText(
       `已启动演示路径：${path}`,
