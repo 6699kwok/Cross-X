@@ -5989,7 +5989,6 @@ function _buildIntercityHtml(ic) {
 async function fetchLocalNav(el) {
   if (el.dataset.loaded === "1") return;
   el.dataset.loaded = "1";
-  el.classList.remove("act-local-nav--loading");
   const city  = el.dataset.city  || "";
   const hotel = el.dataset.hotel || "";
   const place = el.dataset.place || "";
@@ -6001,6 +6000,7 @@ async function fetchLocalNav(el) {
       `/api/local-route?from=${encodeURIComponent(hotel || city)}&to=${encodeURIComponent(place)}&city=${encodeURIComponent(city)}`
     );
     const data = await resp.json();
+    el.classList.remove("act-local-nav--loading");
     if (!data.ok || (!data.walk && !data.transit && !data.taxi)) {
       if (modesEl) modesEl.textContent = "暂无导航数据";
       return;
@@ -6014,6 +6014,7 @@ async function fetchLocalNav(el) {
       ? chips.join('<span class="act-nav-sep">\u00b7</span>')
       : "导航数据不可用";
   } catch {
+    el.classList.remove("act-local-nav--loading");
     el.classList.add("act-local-nav--error");
     if (modesEl) modesEl.textContent = "加载失败";
   }
@@ -7941,10 +7942,10 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
               <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
               <div class="act-body">
                 <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue3}${cozeTicket3}</div>
-                ${act.desc ? `<div class="act-note">${escapeHtml(act.desc)}</div>` : ""}
+                ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
-                ${act.real_vibe ? `<div class="act-vibes">"${escapeHtml(act.real_vibe)}"</div>` : ""}
-                ${act.insider_tip ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip)}</div>` : ""}
+                ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
+                ${(act.insider_tip||act.insider_tips) ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip||act.insider_tips)}</div>` : ""}
                 ${localNavHtml3}
               </div>
               <span class="act-cost${costCls}">${costFmt}</span>
