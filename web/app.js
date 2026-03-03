@@ -7376,10 +7376,12 @@ function renderCardData(cd, spokenText) {
         <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "")}</p>
       </article>
     `);
-    // Post-render: typewriter + coupon fetch
+    // Post-render: typewriter + coupon fetch + smooth scroll to card
     setTimeout(() => {
       const articleEl = document.getElementById(cardId);
       if (!articleEl) return;
+      // Smooth scroll plan card into view
+      articleEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
       // Typewriter on analysis text
       if (spokenText) {
         const analysisEl = articleEl.querySelector(".plan-analysis-text");
