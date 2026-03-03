@@ -8379,6 +8379,8 @@ async function createTaskFromText(text) {
   // auto-constraint notification hidden per UX design
   if (skeleton && el.chatSolutionStrip) skeleton.render(el.chatSolutionStrip, { count: 3, lines: 4 });
   setLoading("createTask", true);
+  // AI typing bubble — shows immediately in chat feed while AI is computing
+  const _typingBubble = _showTypingBubble();
   // P8.6: Intent-aware thinking phases — align copy to what the user is actually asking
   const _iFood  = /餐厅|美食|好吃|推荐.*吃|吃什么|小吃|eat|restaurant|food|dining/i.test(text);
   const _iStay  = /酒店|住宿|宾馆|民宿|hotel|hostel|stay|accommodation/i.test(text);
@@ -8437,6 +8439,7 @@ async function createTaskFromText(text) {
     const smart = await smartReplyPromise;
     clearInterval(thinkingRotateTimer);
     setThinkingIndicator(false);
+    _removeTypingBubble(_typingBubble);
     // P2: fade out thinking stream + skeleton; collapse reasoning panel
     teardownThinkingUI(_thinkingStream, _planSkeleton);
     collapseThinkingPanel(_thinkingPanel);
@@ -13650,6 +13653,24 @@ function _renderPostBookingFollowUp(plan, cardData) {
       <div class="cx-pb-chips">${chipsHtml}</div>
     </article>
   `);
+}
+
+// ── AI Typing Bubble ─────────────────────────────────────────────────────────
+// Shows a pulsing "●●●" bubble in the chat feed when AI is computing.
+function _showTypingBubble() {
+  const feed = document.getElementById("chatFeed");
+  if (!feed) return null;
+  const row = document.createElement("div");
+  row.className = "msg agent cx-typing-bubble-row";
+  row.innerHTML = `<span class="bubble cx-typing-bubble"><span></span><span></span><span></span></span>`;
+  feed.appendChild(row);
+  feed.scrollTop = feed.scrollHeight;
+  return row;
+}
+function _removeTypingBubble(row) {
+  if (!row || !row.parentElement) return;
+  row.classList.add("cx-fadeout");
+  setTimeout(() => { if (row.parentElement) row.remove(); }, 220);
 }
 
 // ── Typing hint ──────────────────────────────────────────────────────────────
