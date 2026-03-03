@@ -2531,6 +2531,42 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   border-radius: 10px;
   border-left: 3px solid rgba(16,185,129,0.4);
 }
+/* AI-known slot badges on clarify card */
+.cx-known-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: rgba(16,185,129,0.06);
+  border: 1px solid rgba(16,185,129,0.18);
+}
+.cx-known-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: #10b981;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-right: 4px;
+}
+.cx-known-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  background: rgba(16,185,129,0.12);
+  color: #059669;
+  font-size: 12px;
+  font-weight: 600;
+}
+.cx-known-check {
+  font-size: 10px;
+  color: #10b981;
+  margin-left: 1px;
+}
 .clarify-group { margin-bottom: 12px; }
 .clarify-group-label {
   font-size: 10px;
@@ -4927,6 +4963,20 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   gap: 14px;
   margin-top: 14px;
 }
+
+/* ── Staggered plan card reveal animation ────────────────────────────────── */
+@keyframes cxCardReveal {
+  from { opacity: 0; transform: translateY(14px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.cx-plan-list .cx-list-card {
+  animation: cxCardReveal 0.38s cubic-bezier(0.22,1,0.36,1) both;
+}
+.cx-plan-list .cx-list-card:nth-child(1) { animation-delay: 0ms; }
+.cx-plan-list .cx-list-card:nth-child(2) { animation-delay: 90ms; }
+.cx-plan-list .cx-list-card:nth-child(3) { animation-delay: 180ms; }
+/* Skip animation during smooth refresh (language switch) */
+.cx-smooth-refresh .cx-list-card { animation: none; }
 
 /* ── List Card (full-width horizontal layout) ────────────────────────────── */
 .cx-list-card {

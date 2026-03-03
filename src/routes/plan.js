@@ -631,10 +631,18 @@ function createPlanRouter({
           `${asked}を教えてください。すぐにプランを作ります。`,
           `${asked}를 알려주시면 바로 맞춤 플랜을 만들겠습니다.`);
 
+        // Build extracted_slots so frontend can show "AI已知" badges alongside missing chips
+        const extractedSlots = {};
+        if (constraints.destination) extractedSlots.destination = constraints.destination;
+        if (constraints.duration)    extractedSlots.duration     = constraints.duration;
+        if (constraints.pax > 1)     extractedSlots.party_size   = constraints.pax;
+        if (intentResult.pax > 1 && !extractedSlots.party_size) extractedSlots.party_size = intentResult.pax;
+
         emit({
           type: "final", response_type: "clarify",
           spoken_text: clarifyText,
           missing_slots: missingSlots,
+          extracted_slots: extractedSlots,
           source: "requirement-gate",
           sessionId: gateSessionId,   // P8.10: client persists, next request carries it
         });

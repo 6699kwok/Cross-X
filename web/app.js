@@ -5256,11 +5256,22 @@ function addMessage(text, who = "agent", options = null) {
   const row = document.createElement("div");
   row.className = `msg ${who}`;
   if (opts.i18nKey) row.dataset.i18nKey = String(opts.i18nKey);
-  row.innerHTML = `<span class="bubble">${escapeHtml(text)}</span>`;
+  const bubble = document.createElement("span");
+  bubble.className = "bubble";
+  // AI-native: typewriter effect for agent chat messages (skip for very long text)
+  const doTypewriter = opts.typewriter && who === "agent" && text.length <= 180;
+  bubble.textContent = doTypewriter ? "" : text;
+  if (!doTypewriter) bubble.innerHTML = escapeHtml(text);
+  row.appendChild(bubble);
   el.chatFeed.appendChild(row);
   motion.enter(row, { duration: 160, fromY: 8 });
   el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
   pulseConversationAura();
+  if (doTypewriter) {
+    // Speed: ~12ms/char for short messages, 8ms for longer ones
+    const spd = text.length < 60 ? 16 : text.length < 120 ? 11 : 7;
+    animateAnalysisText(bubble, text, spd);
+  }
   if (who === "agent" && opts.speak !== false) {
     speakAssistantMessage(text);
   }
@@ -6887,20 +6898,39 @@ function renderClarifyCard(structured) {
     </div>`;
   }).join("");
 
+  // AI-already-knows badges (confidence display)
+  const SLOT_DISPLAY = {
+    destination: { icon: "\u{1F4CD}", label: (v) => String(v) },
+    duration:    { icon: "\u23F1", label: (v) => `${v}\u5929` },
+    party_size:  { icon: "\u{1F465}", label: (v) => `${v}\u4EBA` },
+  };
+  const extracted = structured.extracted_slots && typeof structured.extracted_slots === "object"
+    ? structured.extracted_slots : {};
+  const knownBadges = Object.entries(extracted)
+    .filter(([k, v]) => v && SLOT_DISPLAY[k])
+    .map(([k, v]) => {
+      const d = SLOT_DISPLAY[k];
+      return `<span class="cx-known-badge">${d.icon} ${escapeHtml(d.label(v))} <span class="cx-known-check">\u2713</span></span>`;
+    }).join("");
+  const knownRow = knownBadges
+    ? `<div class="cx-known-row"><span class="cx-known-label">AI\u5DF2\u77E5\u6559</span>${knownBadges}</div>`
+    : "";
+
   addCard(`
     <article class="card smart-reply-card clarify-card">
       <div class="clarify-header">
         <div class="clarify-icon">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
         </div>
-        <div class="clarify-title">补充信息</div>
+        <div class="clarify-title">\u8865\u5145\u4FE1\u606F</div>
       </div>
+      ${knownRow}
       <div class="clarify-question">${escapeHtml(questionText)}</div>
       ${groupsHtml}
       <div class="b2-clarify-input-row">
-        <input type="text" class="b2-clarify-input" placeholder="直接输入，或点击上方快捷选项..."
+        <input type="text" class="b2-clarify-input" placeholder="\u76F4\u63A5\u8F93\u5165\uFF0C\u6216\u70B9\u51FB\u4E0A\u65B9\u5FEB\u6377\u9009\u9879..."
           onkeydown="if(event.key==='Enter'&&!event.isComposing)_clarifySend(this.closest('.clarify-card'))">
-        <button class="b2-clarify-send" onclick="_clarifySend(this.closest('.clarify-card'))">发送</button>
+        <button class="b2-clarify-send" onclick="_clarifySend(this.closest('.clarify-card'))">\u53D1\u9001</button>
       </div>
     </article>
   `);
@@ -8402,7 +8432,7 @@ async function createTaskFromText(text) {
       if (smart.response_type === "chat") {
         // ── CHAT: casual conversation bubble — no cards, no chips
         const txt = smart.spoken_text || smart.text || "";
-        if (txt) addMessage(txt, "agent");
+        if (txt) addMessage(txt, "agent", { typewriter: true });
         replyContent = txt;
       } else if (smart.response_type === "quick_action") {
         // ── QUICK ACTION: immediate service widget (taxi, translation, emergency, etc.)
@@ -8427,7 +8457,7 @@ async function createTaskFromText(text) {
       } else if (smart.response_type === "text" || smart.text) {
         // RAG or freeform text answer
         const txt = smart.text || smart.msg || "";
-        if (txt) addMessage(txt, "agent");
+        if (txt) addMessage(txt, "agent", { typewriter: true });
         replyContent = txt;
       } else if (smart.type === "error") {
         // ── STRICT: error ONLY shows friendly error message, no chips, no auto-handoff
