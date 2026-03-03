@@ -17,7 +17,7 @@ const { buildChinaTravelKnowledge } = require("./lib/knowledge/china-travel");
 const ragEngine = require("./lib/rag/engine");
 
 // ── Extracted planner modules ──────────────────────────────────────────────
-const { openAIRequest, setDefaultModel, setDefaultBaseUrl } = require("./src/ai/openai");
+const { openAIRequest, openAIStream, setDefaultModel, setDefaultBaseUrl } = require("./src/ai/openai");
 const { callCozeBotStreaming } = require("./src/ai/cozebot");
 const { safeParseJson } = require("./src/planner/mock");
 const { configure: configurePipeline, generateCrossXResponse } = require("./src/planner/pipeline");
@@ -10589,6 +10589,84 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         console.error("[payments/charge] error:", err.message);
         return writeJson(res, 200, { ok: false, errorCode: "charge_error", latency: 0, provider: railId, source: "payment_rail", data: { amount, currency, railId, errorMessage: err.message } });
       }
+    }
+
+    if (req.method === "POST" && pathname === "/api/agent/llm-plan/stream") {
+      const body = await readBody(req);
+      const { slots = {}, deviceId = "demo" } = body;
+      if (!OPENAI_API_KEY) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, reason: "no_llm_key" }));
+        return;
+      }
+      // Extract a complete JSON object for fieldName from partial accumulated text
+      const extractObjField = (text, fieldName) => {
+        const keyIdx = text.indexOf(`"${fieldName}"`);
+        if (keyIdx === -1) return null;
+        const braceIdx = text.indexOf("{", keyIdx);
+        if (braceIdx === -1) return null;
+        let depth = 0;
+        for (let i = braceIdx; i < text.length; i++) {
+          const ch = text[i];
+          if (ch === '"') { i++; while (i < text.length && text[i] !== '"') { if (text[i] === "\\") i++; i++; } continue; }
+          if (ch === "{") depth++;
+          else if (ch === "}") { depth--; if (depth === 0) { try { return JSON.parse(text.slice(braceIdx, i + 1)); } catch { return null; } } }
+        }
+        return null;
+      };
+      const intent = String(slots.intent || "eat");
+      const city   = String(slots.city || slots.area || "深圳");
+      const area   = String(slots.area || "");
+      const budget = String(slots.budget || "mid");
+      const pax    = Number(slots.party_size || 2);
+      const prefs  = Array.isArray(slots.preferences) ? slots.preferences.join(", ") : "";
+      const time   = String(slots.time_constraint || "");
+      const recentTrips = getRecentTrips(deviceId, 3);
+      const historySnippet = recentTrips.length
+        ? "用户最近行程：" + recentTrips.map((t) => `${t.city}${t.area || ""}${t.place}·¥${t.amount}`).join(", ")
+        : "";
+      const systemPrompt = `You are CrossX agent planner. Given slots, output exactly this JSON (no extra keys):
+{"type":"simple","summary":"one-sentence plan summary in Chinese","mainOption":{"key":"main","intent":"${intent}","title":"option title","place":"exact place name","eta":15,"amount":120,"risk":"low","reason":"why this is the best pick","requiresPayment":true,"requiresPermission":true},"backupOption":{"key":"backup","intent":"${intent}","title":"backup title","place":"backup place name","eta":20,"amount":95,"risk":"low","reason":"why backup","requiresPayment":true,"requiresPermission":true}}
+Rules: place names must be real ${city} venues. amount in CNY. eta in minutes.`;
+      const userContent = `intent=${intent} city=${city}${area ? " area=" + area : ""} budget=${budget} party_size=${pax}${prefs ? " prefs=" + prefs : ""}${time ? " time=" + time : ""}${historySnippet ? "\n" + historySnippet : ""}`;
+      res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
+      const sendSse = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+      let textAccum = "";
+      const emitted = { summary: false, mainOption: false, backupOption: false };
+      const tryEmit = () => {
+        if (!emitted.summary) {
+          const m = textAccum.match(/"summary"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (m) { emitted.summary = true; sendSse({ field: "summary", value: m[1] }); }
+        }
+        if (!emitted.mainOption) {
+          const obj = extractObjField(textAccum, "mainOption");
+          if (obj) { emitted.mainOption = true; sendSse({ field: "mainOption", value: obj }); }
+        }
+        if (!emitted.backupOption) {
+          const obj = extractObjField(textAccum, "backupOption");
+          if (obj) { emitted.backupOption = true; sendSse({ field: "backupOption", value: obj }); }
+        }
+      };
+      try {
+        await openAIStream({
+          apiKey: OPENAI_API_KEY, model: OPENAI_MODEL,
+          messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userContent }],
+          temperature: 0.3, maxTokens: 500, jsonMode: true, timeoutMs: 12000,
+          onChunk(chunk) { textAccum += chunk; tryEmit(); },
+        });
+        let plan = null;
+        try { plan = JSON.parse(textAccum); } catch {}
+        if (plan && plan.mainOption && plan.backupOption) {
+          sendSse({ field: "done", plan });
+        } else {
+          sendSse({ field: "error", reason: "parse_failed" });
+        }
+      } catch (err) {
+        console.error("[agent/llm-plan/stream] error:", err.message);
+        sendSse({ field: "error", reason: err.message });
+      }
+      res.end();
+      return;
     }
 
     if (req.method === "POST" && pathname === "/api/agent/llm-plan") {
