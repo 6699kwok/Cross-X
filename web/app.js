@@ -4846,11 +4846,23 @@ async function _runAgentDemoPathInner(path) {
   );
 
   if (path === "normal" || path === "path-a") {
-    await handleAgentConversationInput("我在深圳南山，2个人，预算中等，今晚想吃不排队的");
-    await waitMs(180);
+    // Bypass slow LLM call — set slots directly for instant demo start
+    const _demoInputA = "我在深圳南山，2个人，预算中等，今晚想吃不排队的";
+    addMessage(_demoInputA, "user");
+    state.agentConversation.lastUserInput = _demoInputA;
+    state.agentConversation.slots = normalizeAgentSlotsInPlace({
+      intent: "eat", city: "Shenzhen", area: "南山",
+      budget: "mid", party_size: "2", time_constraint: "今晚",
+      preferences: ["no_queue"],
+    });
+    setAgentMode("planning", { source: "demo_normal" });
+    state.agentConversation.currentPlan = buildAgentPlanFromSlots();
+    rerenderAgentFlowCards();
+    await waitMs(600);
     state.agentConversation.pendingOptionKey = "main";
     setAgentMode("confirming", { source: "demo_normal" });
     rerenderAgentFlowCards();
+    await waitMs(800);
     await runAgentExecution("main", false);
     return { ok: true, path };
   }
@@ -4883,6 +4895,8 @@ async function _runAgentDemoPathInner(path) {
   }
 
   if (path === "voice" || path === "path-c") {
+    // Phase 1: user speaks first request — simulate listening state
+    const _demoInputC1 = "帮我找深圳南山吃饭的地方";
     state.voice.conversationMode = true;
     state.voice.replyEnabled = true;
     state.voice.listening = true;
@@ -4890,7 +4904,13 @@ async function _runAgentDemoPathInner(path) {
     state.voice.speaking = false;
     renderVoiceControls();
     await waitMs(120);
-    await handleAgentConversationInput("帮我找深圳南山吃饭的地方");
+    // Bypass slow LLM — set initial slots from first voice input
+    addMessage(_demoInputC1, "user");
+    state.agentConversation.lastUserInput = _demoInputC1;
+    state.agentConversation.slots = normalizeAgentSlotsInPlace({
+      intent: "eat", city: "Shenzhen", area: "南山",
+    });
+    // Simulate: recognized → agent starts speaking
     state.voice.listening = false;
     state.voice.processing = true;
     renderVoiceControls();
@@ -4898,13 +4918,26 @@ async function _runAgentDemoPathInner(path) {
     state.voice.processing = false;
     state.voice.speaking = true;
     renderVoiceControls();
-    await waitMs(200);
+    await waitMs(280);
+    // Phase 2: user barge-in — refines with budget + no-queue
     interruptAssistantSpeech("demo_voice_barge_in");
-    await handleAgentConversationInput("等一下，预算低一点，别排队");
-    await waitMs(180);
+    const _demoInputC2 = "等一下，预算低一点，别排队";
+    addMessage(_demoInputC2, "user");
+    state.agentConversation.lastUserInput = _demoInputC2;
+    // Merge refinement into slots
+    state.agentConversation.slots = normalizeAgentSlotsInPlace({
+      ...state.agentConversation.slots,
+      budget: "low", party_size: "2", time_constraint: "今晚",
+      preferences: ["no_queue"],
+    });
+    setAgentMode("planning", { source: "demo_voice" });
+    state.agentConversation.currentPlan = buildAgentPlanFromSlots();
+    rerenderAgentFlowCards();
+    await waitMs(500);
     state.agentConversation.pendingOptionKey = "main";
     setAgentMode("confirming", { source: "demo_voice" });
     rerenderAgentFlowCards();
+    await waitMs(600);
     await runAgentExecution("main", false);
     state.voice.speaking = false;
     state.voice.conversationMode = false;
