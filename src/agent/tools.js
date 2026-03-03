@@ -208,8 +208,8 @@ async function executeTool(name, args, deps) {
           }
         }
         if (!route && mockAmapRouting) {
-          const mock = mockAmapRouting(origin, dest);
-          if (mock) route = { ...mock, source: "mock" };
+          const mock = await mockAmapRouting(origin, dest);
+          if (mock) route = { ...mock, source: mock._source || "amap_routing" };
         }
         console.log(`[agent] tool_call: get_route(${origin}→${dest}) → ${route?.transport_mode || "no route"}`);
         return { origin, destination: dest, date, route: route || null };

@@ -25,6 +25,7 @@ const { createPlanRouter } = require("./src/routes/plan");
 const { fetchFxRates, fetchJutuiRestaurants } = require("./src/services/api_gateway");
 const { startMcpServer } = require("./src/mcp/server");
 const { queryAmapPoi, queryAmapHotels, enrichPlanWithAmapData } = require("./src/services/amap");
+const { queryAmapRouting } = require("./src/services/amapRouting");
 const { buildSyntheticEnrichment, buildAIEnrichment, callCozeWorkflow } = require("./src/services/coze");
 const { queryJuheFlight, queryJuheFlightInvoice } = require("./src/services/juhe");
 const {
@@ -32,7 +33,34 @@ const {
   wgs84ToGcj02, reverseGeocodeWithAmap, offsetCoords,
 } = require("./src/services/geo");
 const { loadProfile } = require("./src/session/profile");
+const { mockAmapRouting } = require("./src/planner/mock");
 const sessionItinerary = new Map(); // 2h TTL session context, keyed by client IP
+
+// ── Real Amap routing — hybrid: mock HSR/flight + real Amap driving ──────────
+// Amap's transit/integrated API covers urban transit but not inter-city HSR.
+// Strategy: use mock's accurate HSR/flight modes as base, then enrich with
+// Amap's real driving distance/duration. Real transit data used when returned.
+async function amapRoutingWithFallback(fromCity, toCity) {
+  const base = mockAmapRouting(fromCity, toCity); // always available
+  if (!process.env.AMAP_API_KEY) return base;
+  try {
+    const live = await queryAmapRouting(fromCity, toCity);
+    if (!live) return base;
+    // Merge: keep mock HSR/flight, replace drive with real Amap data,
+    // add any real HSR/train found by Amap transit API
+    const merged = (base.modes || []).filter((m) => m.type !== "drive");
+    const liveHsr   = live.modes.find((m) => m.type === "hsr");
+    const liveTrain = live.modes.find((m) => m.type === "train");
+    const liveDrive = live.modes.find((m) => m.type === "drive");
+    if (liveHsr   && !merged.find((m) => m.type === "hsr"))   merged.push(liveHsr);
+    if (liveTrain && !merged.find((m) => m.type === "train")) merged.push(liveTrain);
+    if (liveDrive) merged.push(liveDrive); // always add real driving data
+    return { ...base, modes: merged, _source: "amap_enriched" };
+  } catch (err) {
+    console.warn("[amapRouting] enrichment error, using mock:", err.message);
+    return base;
+  }
+}
 
 // ─── Sichuan Attraction Knowledge Base (1650 records from RAG project CSVs) ───
 let _sichuanAttractions = null;
@@ -7021,7 +7049,7 @@ const planRouter = createPlanRouter({
   ragEngine, sessionItinerary, extractAgentConstraints,
   // Agent loop deps (Module 2 tools)
   queryAmapHotels, queryJuheFlight,
-  mockAmapRouting: require("./src/planner/mock").mockAmapRouting,
+  mockAmapRouting: amapRoutingWithFallback,
   mockCtripHotels: require("./src/planner/mock").mockCtripHotels,
   buildAIEnrichment,
 });
@@ -7030,7 +7058,7 @@ const planRouter = createPlanRouter({
 startMcpServer({
   queryAmapHotels,
   queryJuheFlight,
-  mockAmapRouting: require("./src/planner/mock").mockAmapRouting,
+  mockAmapRouting: amapRoutingWithFallback,
   mockCtripHotels: require("./src/planner/mock").mockCtripHotels,
   buildAIEnrichment,
 });
