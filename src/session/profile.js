@@ -52,13 +52,10 @@ function _scheduleFlush() {
 
 function _flush() {
   _flushTimer = null;
-  try {
-    const obj = {};
-    for (const [id, profile] of _profiles) obj[id] = profile;
-    fs.writeFileSync(PROFILE_FILE, JSON.stringify(obj, null, 2), "utf8");
-  } catch (e) {
-    console.warn("[profile] flush error:", e.message);
-  }
+  const obj = {};
+  for (const [id, profile] of _profiles) obj[id] = profile;
+  fs.promises.writeFile(PROFILE_FILE, JSON.stringify(obj, null, 2), "utf8")
+    .catch((e) => console.warn("[profile] flush error:", e.message));
 }
 
 // Flush on shutdown

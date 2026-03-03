@@ -15118,9 +15118,9 @@ function _renderSessionContextBanner() {
 
   // Build context summary from slots
   const contextParts = [];
-  if (slots.destination) contextParts.push(`\u{1F4CD} ${slots.destination}`);
-  if (slots.duration)    contextParts.push(`\u23F1 ${slots.duration}\u5929`);
-  if (slots.pax > 1)     contextParts.push(`\u{1F465} ${slots.pax}\u4EBA`);
+  if (slots.city)                        contextParts.push(`\uD83D\uDCCD ${[slots.area, slots.city].filter(Boolean).join(" \u00B7 ")}`);
+  if (slots.time_constraint)             contextParts.push(`\u23F1 ${slots.time_constraint}`);
+  if (slots.party_size > 1)             contextParts.push(`\uD83D\uDC65 ${slots.party_size}\u4EBA`);
 
   // Time since saved
   let timeHint = "";

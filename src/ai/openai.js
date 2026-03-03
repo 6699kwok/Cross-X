@@ -12,6 +12,17 @@
 let _defaultModel   = "gpt-4o-mini";
 let _defaultBaseUrl = "https://api.openai.com/v1";
 
+// ── Retry helper ──────────────────────────────────────────────────────────
+/** Returns true for HTTP status codes that are safe to retry. */
+function _isRetryable(status) {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+/** Exponential backoff: attempt 0→0ms, 1→1000ms, 2→2000ms */
+function _backoffMs(attempt) {
+  return attempt * 1000;
+}
+
 function setDefaultModel(model) {
   if (model) _defaultModel = String(model).trim();
 }
@@ -21,7 +32,9 @@ function setDefaultBaseUrl(url) {
 }
 
 /**
- * Single OpenAI chat/completions request.
+ * Single OpenAI chat/completions request with automatic retry.
+ * Retries up to 2 times on 429 / 5xx with exponential backoff (1s, 2s).
+ * Network errors and timeouts are NOT retried (already failed fast).
  * @returns {Promise<{ok: boolean, text: string}>}
  */
 async function openAIRequest({
@@ -48,40 +61,56 @@ async function openAIRequest({
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
   });
 
-  try {
-    const resp = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
-      body,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-
-    const data = await resp.text();
-    const parsed = JSON.parse(data);
-
-    if (parsed.error) {
-      console.warn("[openAIRequest] API error:", JSON.stringify(parsed.error).slice(0, 200));
-      return { ok: false, text: "" };
+  const MAX_ATTEMPTS = 3; // 1 initial + 2 retries
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, _backoffMs(attempt)));
     }
+    try {
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type":  "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+        },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
 
-    const text        = parsed.choices?.[0]?.message?.content || "";
-    const finishReason = parsed.choices?.[0]?.finish_reason  || "";
-    if (finishReason === "length") {
-      console.warn("[openAIRequest] Response truncated (finish_reason=length), maxTokens:", maxTokens);
-    }
-    return { ok: Boolean(text), text };
+      if (!resp.ok) {
+        if (_isRetryable(resp.status) && attempt < MAX_ATTEMPTS - 1) {
+          console.warn(`[openAIRequest] HTTP ${resp.status}, retrying (attempt ${attempt + 1})`);
+          continue;
+        }
+        console.warn("[openAIRequest] HTTP error:", resp.status);
+        return { ok: false, text: "" };
+      }
 
-  } catch (e) {
-    if (e.name === "TimeoutError" || e.name === "AbortError") {
-      console.warn("[openAIRequest] timeout after", timeoutMs, "ms");
-    } else {
-      console.warn("[openAIRequest] req error:", e.message);
+      const data = await resp.text();
+      const parsed = JSON.parse(data);
+
+      if (parsed.error) {
+        console.warn("[openAIRequest] API error:", JSON.stringify(parsed.error).slice(0, 200));
+        return { ok: false, text: "" };
+      }
+
+      const text        = parsed.choices?.[0]?.message?.content || "";
+      const finishReason = parsed.choices?.[0]?.finish_reason  || "";
+      if (finishReason === "length") {
+        console.warn("[openAIRequest] Response truncated (finish_reason=length), maxTokens:", maxTokens);
+      }
+      return { ok: Boolean(text), text };
+
+    } catch (e) {
+      if (e.name === "TimeoutError" || e.name === "AbortError") {
+        console.warn("[openAIRequest] timeout after", timeoutMs, "ms");
+      } else {
+        console.warn("[openAIRequest] req error:", e.message);
+      }
+      return { ok: false, text: "" }; // network/timeout errors — no retry
     }
-    return { ok: false, text: "" };
   }
+  return { ok: false, text: "" };
 }
 
 /**
@@ -122,18 +151,39 @@ async function openAIStream({
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
   });
 
-  try {
-    const resp = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-        "Accept":        "text/event-stream",
-      },
-      body,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+  const MAX_STREAM_ATTEMPTS = 3;
+  let resp;
+  for (let attempt = 0; attempt < MAX_STREAM_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, _backoffMs(attempt)));
+    }
+    try {
+      resp = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type":  "application/json",
+          "Authorization": `Bearer ${apiKey}`,
+          "Accept":        "text/event-stream",
+        },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!resp.ok && _isRetryable(resp.status) && attempt < MAX_STREAM_ATTEMPTS - 1) {
+        console.warn(`[openAIStream] HTTP ${resp.status}, retrying (attempt ${attempt + 1})`);
+        continue;
+      }
+      break; // success or non-retryable error
+    } catch (e) {
+      if (e.name === "TimeoutError" || e.name === "AbortError") {
+        console.warn("[openAIStream] timeout after", timeoutMs, "ms");
+      } else {
+        console.warn("[openAIStream] req error:", e.message);
+      }
+      return { ok: false, text: "", tool_calls: [] };
+    }
+  }
 
+  try {
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
       console.warn("[openAIStream] HTTP error:", resp.status, errText.slice(0, 200));

@@ -74,13 +74,12 @@ function _scheduleFlush() {
 
 function _flushNow() {
   _flushTimer = null;
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    const obj = Object.fromEntries(_store);
-    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(obj), "utf8");
-  } catch (e) {
-    console.warn("[session/store] Flush failed:", e.message);
+  if (!fs.existsSync(DATA_DIR)) {
+    try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
   }
+  const obj = Object.fromEntries(_store);
+  fs.promises.writeFile(SESSIONS_FILE, JSON.stringify(obj), "utf8")
+    .catch((e) => console.warn("[session/store] Flush failed:", e.message));
 }
 
 // Flush on clean shutdown
