@@ -4467,6 +4467,7 @@ function renderAgentDeliverableCard(result) {
       </div>
       <button class="cx-dlv-nav-btn" data-action="agent-nav" data-nav-url="${escapeHtml(navUrl)}">\uD83D\uDDFA\uFE0F ${pickText("\u5BFC\u822A\u8FC7\u53BB \u00B7 Navigate", "Navigate \u00B7 \u5BFC\u822A", "\u30CA\u30D3\u3078 \u00B7 \u5C0E\u822A", "\uAE38\uC548\uB0B4 \u00B7 \u5C0E\u822A")}</button>
       <div class="cx-dlv-acts">
+        ${result.receiptUrl ? `<a class="cx-dlv-act" href="${escapeHtml(result.receiptUrl)}" target="_blank" rel="noopener">\uD83D\uDCC4 ${pickText("\u4E0B\u8F7D\u6536\u636E", "Receipt", "\u30EC\u30B7\u30FC\u30C8", "\uc601\uc218\uc99d")}</a>` : ""}
         <button class="cx-dlv-act" data-action="agent-share-result">\uD83D\uDCE4 ${pickText("\u5206\u4EAB", "Share", "\u30B7\u30A7\u30A2", "\uACF5\uC720")}</button>
         <button class="cx-dlv-act" data-action="agent-request-execute" data-option="backup">\uD83D\uDD04 ${pickText("\u5907\u9009\u65B9\u6848", "Backup plan", "\u4EE3\u66FF\u6848", "\uB300\uC548")}</button>
       </div>
@@ -4705,10 +4706,33 @@ async function runStepTool(step, context) {
     };
   }
   if (stepKey === "filter" || stepKey === "validate" || stepKey === "queue") {
-    const check = checkConstraintsMock(ctx.slots || {}, ctx.candidate || null, stepKey);
+    let candidate = ctx.candidate || null;
+    if (candidate) {
+      try {
+        const _slots = ctx.slots || {};
+        const r = await fetch("/api/agent/check", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            candidateId: candidate.id || candidate.place || "",
+            party_size: _slots.party_size || 2,
+            time_constraint: _slots.time_constraint || "",
+            budget: _slots.budget || "mid",
+          }),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          if (d.ok) {
+            candidate = { ...candidate, available: d.available, queueMin: d.queueEstimateMin, amount: d.price || candidate.amount };
+          }
+        }
+      } catch (_) { /* use mock fallback */ }
+    }
+    const check = checkConstraintsMock(ctx.slots || {}, candidate, stepKey);
     return {
       ...check,
-      candidate: ctx.candidate || null,
+      candidate,
     };
   }
   if (stepKey === "lock") {
@@ -4976,6 +5000,33 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
       orderId: result.orderId,
     }),
   }).catch(() => {});
+
+  // Generate receipt (non-blocking)
+  (async () => {
+    try {
+      const _s = state.agentConversation.slots || {};
+      const r = await fetch("/api/agent/proof", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          orderId: result.orderId,
+          place: result.place,
+          city: _s.city || "",
+          area: _s.area || "",
+          intent: _s.intent || "eat",
+          amount: result.amount,
+          railId: state.agentConversation.paymentRail || "alipay_cn",
+          transactionId: result.proof && result.proof.transactionId ? result.proof.transactionId : "",
+          executedAt: new Date().toISOString(),
+        }),
+      });
+      const d = await r.json();
+      if (d.ok && d.receiptUrl) {
+        result.receiptUrl = d.receiptUrl;
+        rerenderAgentFlowCards();
+      }
+    } catch (_) {}
+  })();
 }
 
 function applyAssumptionsForMissingSlots(slots, missingSlots) {
