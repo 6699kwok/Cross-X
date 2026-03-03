@@ -1067,6 +1067,18 @@ function speakAssistantMessage(text) {
     if (isSpeechSynthesisSupported()) {
       window.speechSynthesis.cancel();
     }
+    // TTS waveform: add animated bars to the last agent bubble
+    const feed = document.getElementById("chatFeed");
+    const lastBubble = feed
+      ? [...feed.querySelectorAll(".msg.agent .bubble")].at(-1)
+      : null;
+    if (lastBubble && !lastBubble.querySelector(".cx-tts-wave")) {
+      const wave = document.createElement("span");
+      wave.className = "cx-tts-wave";
+      wave.innerHTML = "<span></span><span></span><span></span><span></span>";
+      wave.setAttribute("aria-hidden", "true");
+      lastBubble.appendChild(wave);
+    }
     renderVoiceControls();
     let played = false;
     if (state.viewMode !== "admin") {
@@ -1098,6 +1110,8 @@ function speakAssistantMessage(text) {
         window.speechSynthesis.cancel();
       }
       state.voice.speaking = false;
+      // Remove TTS waveform from all bubbles
+      document.querySelectorAll(".cx-tts-wave").forEach(w => w.remove());
       renderVoiceControls();
       scheduleVoiceRestart();
     });
