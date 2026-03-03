@@ -10579,9 +10579,21 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       }
     }
 
+    if (req.method === "POST" && pathname === "/api/payments/charge") {
+      const body = await readBody(req);
+      const { railId = "alipay_cn", amount = 0, currency = "CNY", userId = "demo", taskId = "" } = body;
+      try {
+        const result = await paymentRails.charge({ railId, amount: Number(amount), currency, userId, taskId });
+        return writeJson(res, 200, result);
+      } catch (err) {
+        console.error("[payments/charge] error:", err.message);
+        return writeJson(res, 200, { ok: false, errorCode: "charge_error", latency: 0, provider: railId, source: "payment_rail", data: { amount, currency, railId, errorMessage: err.message } });
+      }
+    }
+
     if (req.method === "POST" && pathname === "/api/agent/llm-plan") {
       const body = await readBody(req);
-      const { slots = {}, sessionContext = "" } = body;
+      const { slots = {}, sessionContext = "", deviceId = "demo" } = body;
       if (!OPENAI_API_KEY) return writeJson(res, 200, { ok: false, reason: "no_llm_key" });
       const intent = String(slots.intent || "eat");
       const city   = String(slots.city || slots.area || "深圳");
@@ -10590,10 +10602,17 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const pax    = Number(slots.party_size || 2);
       const prefs  = Array.isArray(slots.preferences) ? slots.preferences.join(", ") : "";
       const time   = String(slots.time_constraint || "");
+
+      // Build trip history snippet for context injection
+      const recentTrips = getRecentTrips(deviceId, 3);
+      const historySnippet = recentTrips.length
+        ? "用户最近行程：" + recentTrips.map((t) => `${t.city}${t.area || ""}${t.place}·¥${t.amount}`).join(", ")
+        : "";
+
       const systemPrompt = `You are CrossX agent planner. Given slots, output exactly this JSON (no extra keys):
 {"type":"simple","summary":"one-sentence plan summary in Chinese","mainOption":{"key":"main","intent":"${intent}","title":"option title","place":"exact place name","eta":15,"amount":120,"risk":"low","reason":"why this is the best pick","requiresPayment":true,"requiresPermission":true},"backupOption":{"key":"backup","intent":"${intent}","title":"backup title","place":"backup place name","eta":20,"amount":95,"risk":"low","reason":"why backup","requiresPayment":true,"requiresPermission":true}}
 Rules: place names must be real ${city} venues. amount in CNY. eta in minutes.`;
-      const userContent = `intent=${intent} city=${city}${area ? " area=" + area : ""} budget=${budget} party_size=${pax}${prefs ? " prefs=" + prefs : ""}${time ? " time=" + time : ""}${sessionContext ? "\n" + sessionContext : ""}`;
+      const userContent = `intent=${intent} city=${city}${area ? " area=" + area : ""} budget=${budget} party_size=${pax}${prefs ? " prefs=" + prefs : ""}${time ? " time=" + time : ""}${historySnippet ? "\n" + historySnippet : ""}${sessionContext ? "\n" + sessionContext : ""}`;
       try {
         const planRes = await openAIRequest({
           apiKey: OPENAI_API_KEY, model: OPENAI_MODEL || "gpt-4o-mini",
