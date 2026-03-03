@@ -67,6 +67,7 @@ const db = {
     },
     releases: [],
   },
+  trips: [],
   auditLogs: [],
   mcpCalls: [],
   metricEvents: [],
@@ -127,4 +128,32 @@ function lifecyclePush(collection, state, label, note) {
   collection.push({ state, label, at: nowIso(), note });
 }
 
-module.exports = { db, DATA_DIR, DB_FILE, ensureDataDir, nowIso, saveDb, lifecyclePush };
+/** Insert a completed agent trip into the trips log and persist. */
+function insertTrip({ deviceId, city, area, intent, place, amount, railId, slots, orderId }) {
+  const trip = {
+    id: orderId || `trip_${Date.now().toString(36)}`,
+    deviceId: String(deviceId || "demo"),
+    city: String(city || ""),
+    area: String(area || ""),
+    intent: String(intent || "eat"),
+    place: String(place || ""),
+    amount: Number(amount || 0),
+    railId: String(railId || "alipay_cn"),
+    slots: slots || {},
+    executedAt: nowIso(),
+  };
+  if (!Array.isArray(db.trips)) db.trips = [];
+  db.trips.unshift(trip); // newest first
+  if (db.trips.length > 200) db.trips = db.trips.slice(0, 200); // cap
+  saveDb();
+  return trip;
+}
+
+/** Return the N most recent trips for a device (default 5). */
+function getRecentTrips(deviceId, limit = 5) {
+  if (!Array.isArray(db.trips)) return [];
+  const id = String(deviceId || "demo");
+  return db.trips.filter((t) => t.deviceId === id).slice(0, limit);
+}
+
+module.exports = { db, DATA_DIR, DB_FILE, ensureDataDir, nowIso, saveDb, lifecyclePush, insertTrip, getRecentTrips };

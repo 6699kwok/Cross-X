@@ -34,7 +34,7 @@ const {
 } = require("./src/services/geo");
 const { loadProfile } = require("./src/session/profile");
 const { mockAmapRouting } = require("./src/planner/mock");
-const { db, DATA_DIR, DB_FILE, ensureDataDir, nowIso, saveDb, lifecyclePush } = require("./src/services/db");
+const { db, DATA_DIR, DB_FILE, ensureDataDir, nowIso, saveDb, lifecyclePush, insertTrip, getRecentTrips } = require("./src/services/db");
 const sessionItinerary = new Map(); // 2h TTL session context, keyed by client IP
 const WEATHER_CACHE    = new Map(); // city → {ts, data}, 1h TTL
 const WEATHER_TTL_MS   = 60 * 60 * 1000;
@@ -9329,6 +9329,12 @@ const server = http.createServer(async (req, res) => {
       return writeJson(res, 200, { ok: true, trip: buildTripSummary(trip) });
     }
 
+    if (req.method === "GET" && pathname === "/api/trips/recent") {
+      const { deviceId = "demo", limit = "5" } = Object.fromEntries(new URL(req.url, "http://x").searchParams);
+      const trips = getRecentTrips(deviceId, Math.min(Number(limit) || 5, 20));
+      return writeJson(res, 200, { ok: true, trips });
+    }
+
     if (req.method === "GET" && /^\/api\/trips\/[^/]+$/.test(pathname)) {
       const tripId = pathname.split("/")[3];
       const trip = requireTripPlan(tripId, res);
@@ -10523,6 +10529,100 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       saveDb();
       return writeJson(res, 200, { ok: true, orderId: order.id, paymentStatus: "paid" });
     }
+
+    // ── Agent Phase 2: Real execution endpoints ─────────────────────────────
+
+    if (req.method === "POST" && pathname === "/api/agent/search") {
+      const body = await readBody(req);
+      const { city = "Shanghai", intent = "eat", area = "", preferences = [] } = body;
+      const gaode = connectors.gaode;
+      if (!gaode || !gaode.enabled) {
+        return writeJson(res, 200, { ok: false, source: "mock", candidates: [] });
+      }
+      try {
+        const keywords = intent === "eat" ? (area ? `${area}餐厅` : "餐厅") : (intent === "hotel" ? "酒店" : "景点");
+        const live = await gaode.searchPoi({ keywords, cityName: city });
+        const prefs = Array.isArray(preferences) ? preferences : [];
+        const candidates = (live.pois || []).slice(0, 8).map((p, idx) => ({
+          place: p.name,
+          title: p.name + (p.address ? ` · ${p.address}` : ""),
+          score: Math.max(70, 96 - idx * 4),
+          etaMin: 10 + idx * 5,
+          amount: intent === "eat" ? 80 + idx * 30 : 200 + idx * 80,
+          noQueue: prefs.includes("no_queue") ? idx > 0 : false,
+          address: p.address || "",
+          location: p.location || "",
+        }));
+        return writeJson(res, 200, { ok: true, source: "gaode_live", candidates });
+      } catch (err) {
+        console.error("[agent/search] error:", err.message);
+        return writeJson(res, 200, { ok: false, source: "mock", candidates: [] });
+      }
+    }
+
+    if (req.method === "GET" && pathname === "/api/agent/route") {
+      const { city = "", place = "" } = Object.fromEntries(new URL(req.url, "http://x").searchParams);
+      if (!city || !place) return writeJson(res, 200, { ok: false, etaMin: 20, source: "mock" });
+      try {
+        const { queryLocalRoute } = require("./src/services/amapRouting");
+        const result = await queryLocalRoute(place, city, city);
+        if (!result) return writeJson(res, 200, { ok: false, etaMin: 20, source: "mock" });
+        const etaMin = (result.transit && result.transit.min) || (result.taxi && result.taxi.min) || (result.walk && result.walk.min) || 20;
+        return writeJson(res, 200, {
+          ok: true, source: "amap_live", etaMin,
+          distKm: (result.taxi && result.taxi.km) || (result.walk && result.walk.km) || 0,
+          walk: result.walk || null, transit: result.transit || null, taxi: result.taxi || null,
+        });
+      } catch (err) {
+        console.error("[agent/route] error:", err.message);
+        return writeJson(res, 200, { ok: false, etaMin: 20, source: "mock" });
+      }
+    }
+
+    if (req.method === "POST" && pathname === "/api/agent/llm-plan") {
+      const body = await readBody(req);
+      const { slots = {}, sessionContext = "" } = body;
+      if (!OPENAI_API_KEY) return writeJson(res, 200, { ok: false, reason: "no_llm_key" });
+      const intent = String(slots.intent || "eat");
+      const city   = String(slots.city || slots.area || "深圳");
+      const area   = String(slots.area || "");
+      const budget = String(slots.budget || "mid");
+      const pax    = Number(slots.party_size || 2);
+      const prefs  = Array.isArray(slots.preferences) ? slots.preferences.join(", ") : "";
+      const time   = String(slots.time_constraint || "");
+      const systemPrompt = `You are CrossX agent planner. Given slots, output exactly this JSON (no extra keys):
+{"type":"simple","summary":"one-sentence plan summary in Chinese","mainOption":{"key":"main","intent":"${intent}","title":"option title","place":"exact place name","eta":15,"amount":120,"risk":"low","reason":"why this is the best pick","requiresPayment":true,"requiresPermission":true},"backupOption":{"key":"backup","intent":"${intent}","title":"backup title","place":"backup place name","eta":20,"amount":95,"risk":"low","reason":"why backup","requiresPayment":true,"requiresPermission":true}}
+Rules: place names must be real ${city} venues. amount in CNY. eta in minutes.`;
+      const userContent = `intent=${intent} city=${city}${area ? " area=" + area : ""} budget=${budget} party_size=${pax}${prefs ? " prefs=" + prefs : ""}${time ? " time=" + time : ""}${sessionContext ? "\n" + sessionContext : ""}`;
+      try {
+        const planRes = await openAIRequest({
+          apiKey: OPENAI_API_KEY, model: OPENAI_MODEL || "gpt-4o-mini",
+          systemPrompt, userContent,
+          temperature: 0.3, maxTokens: 500, jsonMode: true, timeoutMs: 10000,
+        });
+        const plan = (() => { try { return JSON.parse(planRes.text || "null"); } catch { return null; } })();
+        if (!plan || !plan.mainOption || !plan.backupOption) {
+          return writeJson(res, 200, { ok: false, reason: "parse_failed" });
+        }
+        return writeJson(res, 200, { ok: true, plan });
+      } catch (err) {
+        console.error("[agent/llm-plan] error:", err.message);
+        return writeJson(res, 200, { ok: false, reason: err.message });
+      }
+    }
+
+    if (req.method === "POST" && pathname === "/api/agent/trips") {
+      const body = await readBody(req);
+      try {
+        const trip = insertTrip(body || {});
+        return writeJson(res, 200, { ok: true, trip });
+      } catch (err) {
+        console.error("[agent/trips] insert error:", err.message);
+        return writeJson(res, 500, { ok: false, error: err.message });
+      }
+    }
+
+    // ── End agent Phase 2 endpoints ──────────────────────────────────────────
 
     return writeJson(res, 404, { error: "API not found" });
   } catch (err) {

@@ -4672,17 +4672,36 @@ async function runStepTool(step, context) {
   const ctx = context || {};
   const stepKey = String(step && step.key ? step.key : "");
   if (stepKey === "query") {
-    const search = searchOptionsMock(ctx.slots || {}, ctx.intent || "eat");
+    // Try real Gaode search first; fall back to mock on failure or no results
+    let search = null;
+    try {
+      const slots = ctx.slots || {};
+      const r = await fetch("/api/agent/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          city: slots.city || "",
+          intent: ctx.intent || slots.intent || "eat",
+          area: slots.area || "",
+          preferences: slots.preferences || [],
+        }),
+      });
+      const data = await r.json();
+      if (data.ok && Array.isArray(data.candidates) && data.candidates.length) {
+        search = { candidates: data.candidates, source: data.source };
+      }
+    } catch (_) { /* network error → mock */ }
+    if (!search) search = searchOptionsMock(ctx.slots || {}, ctx.intent || "eat");
     const candidate = findCandidateForPlanOption(ctx.option, search, ctx.seedKey);
     return {
       ok: !!candidate,
-      tool: "search_options_mock",
+      tool: search.source === "gaode_live" ? "search_options_live" : "search_options_mock",
       candidate,
       search,
       code: candidate ? "ok" : "resource_unavailable",
       reason: candidate
-        ? pickText("已筛选出可执行候选。", "Executable candidates are ready.","実行可能候補を抽出しました。", "실행 가능한 후보를 추렸습니다.")
-        : pickText("没有可执行候选。", "No executable candidates found.","実行可能な候補がありません。", "실행 가능한 후보가 없습니다."),
+        ? pickText("已筛选出可执行候选。", "Executable candidates are ready.", "実行可能候補を抽出しました。", "실행 가능한 후보를 추렸습니다.")
+        : pickText("没有可执行候选。", "No executable candidates found.", "実行可能な候補がありません。", "실행 가능한 후보가 없습니다."),
     };
   }
   if (stepKey === "filter" || stepKey === "validate" || stepKey === "queue") {
@@ -4706,22 +4725,31 @@ async function runStepTool(step, context) {
       ok: true,
       tool: "payment_mock",
       code: "ok",
-      reason: pickText("支付校验通过（模拟）。", "Payment check passed (mock).","決済検証を通過しました（mock）。", "결제 검증을 통과했습니다 (mock)."),
+      reason: pickText("支付校验通过（模拟）。", "Payment check passed (mock).", "決済検証を通過しました（mock）。", "결제 검증을 통과했습니다 (mock)."),
     };
   }
   if (stepKey === "proof") {
-    const route = routeMock(ctx.slots || {}, ctx.candidate || null, `${ctx.seedKey}|route`);
-    const proof = proofGenerateMock(ctx.slots || {}, ctx.option || {}, ctx.runId || "run", route);
-    return {
-      ...proof,
-      route,
-    };
+    // Try real Amap local route first; fall back to mock ETA
+    let routeInfo = null;
+    try {
+      const slots = ctx.slots || {};
+      const place = encodeURIComponent((ctx.candidate && ctx.candidate.place) || (ctx.option && ctx.option.place) || "");
+      const city  = encodeURIComponent(slots.city || "");
+      if (place && city) {
+        const r = await fetch(`/api/agent/route?city=${city}&place=${place}`);
+        const data = await r.json();
+        if (data.ok && data.etaMin) routeInfo = { ...data, eta: data.etaMin, source: "amap_live" };
+      }
+    } catch (_) { /* fall back */ }
+    if (!routeInfo) routeInfo = routeMock(ctx.slots || {}, ctx.candidate || null, `${ctx.seedKey}|route`);
+    const proof = proofGenerateMock(ctx.slots || {}, ctx.option || {}, ctx.runId || "run", routeInfo);
+    return { ...proof, route: routeInfo };
   }
   return {
     ok: true,
     tool: "noop",
     code: "ok",
-    reason: pickText("步骤完成。", "Step completed.","ステップ完了。", "단계 완료."),
+    reason: pickText("步骤完成。", "Step completed.", "ステップ完了。", "단계 완료."),
   };
 }
 
@@ -4908,6 +4936,24 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
     ),
     "agent",
   );
+
+  // Persist trip history (non-blocking)
+  const _tripSlots = state.agentConversation.slots || {};
+  fetch("/api/agent/trips", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      deviceId: getDeviceId ? getDeviceId() : "demo",
+      city: _tripSlots.city || "",
+      area: _tripSlots.area || "",
+      intent: _tripSlots.intent || "eat",
+      place: result.place,
+      amount: result.amount,
+      railId: _tripSlots.paymentRail || state.agentConversation.paymentRail || "alipay_cn",
+      slots: _tripSlots,
+      orderId: result.orderId,
+    }),
+  }).catch(() => {});
 }
 
 function applyAssumptionsForMissingSlots(slots, missingSlots) {
@@ -5049,6 +5095,37 @@ function evaluateAgentConversation(options = {}) {
       "agent",
     );
   }
+
+  // Async LLM upgrade: try /api/agent/plan, update plan if it returns in time
+  (async () => {
+    const convSlots = state.agentConversation.slots || {};
+    try {
+      const r = await fetch("/api/agent/llm-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slots: convSlots, sessionContext: "" }),
+        signal: AbortSignal.timeout ? AbortSignal.timeout(9000) : undefined,
+      });
+      const data = await r.json();
+      if (
+        data.ok && data.plan && data.plan.mainOption && data.plan.backupOption &&
+        state.agentConversation.mode === "planning"
+      ) {
+        const llmPlan = normalizePlannerOutput(data.plan);
+        state.agentConversation.currentPlan = llmPlan;
+        state.agentConversation.smartHint = pickText("方案已由 AI 实时生成", "Plan generated by AI", "AIがリアルタイムで生成", "AI가 실시간 생성");
+        state.agentConversation.smartLoading = false;
+        appendAgentTelemetry("llm_plan_upgraded", { source: "api_agent_plan" });
+        rerenderAgentFlowCards();
+      }
+    } catch (_) { /* LLM unavailable → keep rule-based plan */ }
+    // Clear loading indicator regardless
+    if (state.agentConversation.smartLoading) {
+      state.agentConversation.smartLoading = false;
+      state.agentConversation.smartHint = "";
+      rerenderAgentFlowCards();
+    }
+  })();
 }
 
 function resetAgentConversationForDemo() {
@@ -13474,6 +13551,8 @@ async function init() {
   }
   // C4: profile-aware greeting — show personalized message for returning users
   setTimeout(() => _loadProfileGreeting().catch(() => {}), 800);
+  // Phase 2: show recent trip history chips on fresh sessions
+  setTimeout(() => _loadTripHistoryChip().catch(() => {}), 1000);
   // Silently detect location in background to personalize the welcome message
   setTimeout(() => silentAutoDetectLocation().catch(() => {}), 600);
   // P6: prefetch live FX rates from API gateway
@@ -15017,6 +15096,34 @@ function _renderTimeAwareSuggestions() {
       ${chipsHtml}
     </div>
   `);
+}
+
+/**
+ * Load last 3 completed trips from /api/trips/recent and render a history chip row.
+ * Only shown on fresh sessions (no restored conversation) to avoid clutter.
+ */
+async function _loadTripHistoryChip() {
+  if (state.agentConversation.messages.length > 0) return; // skip on restored sessions
+  try {
+    const deviceId = getDeviceId ? getDeviceId() : "demo";
+    const r = await fetch(`/api/trips/recent?deviceId=${encodeURIComponent(deviceId)}&limit=3`);
+    const data = await r.json();
+    const trips = (data.ok && Array.isArray(data.trips)) ? data.trips : [];
+    if (!trips.length) return;
+    const chipsHtml = trips.map((t) => {
+      const label = t.place ? escapeHtml(t.place) : pickText("上次行程", "Previous trip", "前回", "이전 여행");
+      const query = t.place && t.city
+        ? `${t.intent === "eat" ? "在" : "去"}${t.city}${t.area ? t.area : ""}${t.place}`
+        : "";
+      return `<button class="cx-taw-chip" ${query ? `onclick="createTaskFromText(${JSON.stringify(query)})"` : ""}>\u{1F4CC} ${label}</button>`;
+    }).join("");
+    addCard(`
+      <div class="cx-taw-row">
+        <span class="cx-taw-label">\u{1F551} \u4e0a\u6b21\u53bb\u8fc7</span>
+        ${chipsHtml}
+      </div>
+    `);
+  } catch (_) { /* non-critical */ }
 }
 
 init();
