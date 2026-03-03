@@ -4305,6 +4305,20 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 .pay-status--pending { background: #fef3c7; color: #92400e; }
 .pay-status--paid    { background: #dcfce7; color: #166534; }
 
+.deliverable-card-charge {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  flex-shrink: 0; width: 160px; padding: 12px 8px; border-radius: 10px;
+  background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+  color: #fff; text-align: center; gap: 6px;
+}
+.cdc-icon  { font-size: 28px; line-height: 1; }
+.cdc-rail  { font-size: 10px; opacity: .65; letter-spacing: .04em; text-transform: uppercase; }
+.cdc-cny   { font-size: 18px; font-weight: 700; }
+.cdc-usd   { font-size: 13px; color: #93c5fd; }
+.cdc-rate  { font-size: 10px; opacity: .7; }
+.cdc-eta   { font-size: 10px; opacity: .6; margin-top: 2px; }
+.cdc-ref   { font-size: 9px; opacity: .4; font-family: monospace; margin-top: 2px; word-break: break-all; }
+
 .deliverable-card .code {
   font-family: monospace;
   font-size: 0.82rem;

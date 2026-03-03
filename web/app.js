@@ -6094,66 +6094,84 @@ function renderTimeline(timeline) {
 }
 
 function renderDeliverable(order) {
-  const qrId      = `qr-canvas-${escapeHtml(order.id || Date.now().toString(36))}`;
-  const statusId  = `pay-status-${escapeHtml(order.id)}`;
-  const qrText    = order.proof.qrText || order.proof.orderNo || order.id;
-  const isSandbox = Boolean(order.proof && order.proof.qrSandbox);
-  const netPrice  = order.pricing ? Number(order.pricing.netPrice || 0) : null;
-  const markup    = order.pricing ? Number(order.pricing.markup || 0) : null;
+  const qrId       = `qr-canvas-${escapeHtml(order.id || Date.now().toString(36))}`;
+  const statusId   = `pay-status-${escapeHtml(order.id)}`;
+  const qrText     = order.proof.qrText || order.proof.orderNo || order.id;
+  const isSandbox  = Boolean(order.proof && order.proof.qrSandbox);
+  const isCard     = order.proof.railId === "card_delegate";
+  const fx         = order.proof.fx || null;
+  const netPrice   = order.pricing ? Number(order.pricing.netPrice || 0) : null;
+  const markup     = order.pricing ? Number(order.pricing.markup || 0) : null;
   const markupRate = order.pricing && order.pricing.markupRate ? `(${(Number(order.pricing.markupRate) * 100).toFixed(1)}%)` : "";
+
+  const rightPanel = isCard ? `
+    <div class="deliverable-card-charge">
+      <div class="cdc-icon">&#x1F4B3;</div>
+      <div class="cdc-rail">${pickText("外卡代扣", "Card Charge", "\u30ab\u30fc\u30c9\u6c7a\u6e08", "\uce74\ub4dc \ub300\ub9ac \uacb0\uc81c")}</div>
+      <div class="cdc-cny">&yen;${Number(order.price || 0).toFixed(2)} CNY</div>
+      ${fx ? `<div class="cdc-usd">&asymp; $${Number(fx.settledAmount || 0).toFixed(2)} USD <span class="cdc-rate">&times; ${fx.rate}</span></div>` : ""}
+      <div class="cdc-eta">&#x23F1; ${pickText("\u7ed3\u7b97\u52304215\u5206\u949f", "Settlement ~15 min", "\u6c7a\u6e08\u7d04 15\u5206", "\uacb0\uc81c \uc57d 15\ubd84")}</div>
+      ${order.proof.cardChargeId ? `<div class="cdc-ref">${escapeHtml(order.proof.cardChargeId)}</div>` : ""}
+    </div>` : `
+    <div class="deliverable-qr" style="text-align:center;flex-shrink:0;">
+      <canvas id="${qrId}" width="160" height="160" style="border-radius:8px;display:block;"></canvas>
+      <div class="status" style="font-size:10px;margin-top:4px;">${pickText("\u626b\u7801\u652f\u4ed8", "Scan to pay", "\u30b9\u30ad\u30e3\u30f3\u3057\u3066\u652f\u6255\u3044", "\uc2a4\uce94\ud558\uc5ec \uacb0\uc81c")}</div>
+    </div>`;
+
+  const simLabel = isCard
+    ? pickText("\u6a21\u62df\u6263\u6b3e\u6210\u529f", "Simulate card charge", "\u30ab\u30fc\u30c9\u6c7a\u6e08\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uce74\ub4dc \uacb0\uc81c \uc2dc\uBBAC\ub808\uc774\uc158")
+    : pickText("\u6a21\u62df\u652f\u4ed8\u6210\u529f", "Simulate payment", "\u652f\u6255\u3044\u3092\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uacb0\uc81c \uc2dc\uBBAC\ub808\uc774\uc158");
+
   addCard(`
     <article class="card deliverable-card" data-order-id="${escapeHtml(order.id)}">
       <h3>${escapeHtml(tTerm("proof"))} Card</h3>
-      <div id="${statusId}" class="pay-status-badge pay-status--pending">${pickText("待支付", "Awaiting payment", "\u652f\u6255\u3044\u5f85\u3061", "\uacb0\uC81C \uB300\uAE30")}</div>
+      <div id="${statusId}" class="pay-status-badge pay-status--pending">${pickText("\u5f85\u652f\u4ed8", "Awaiting payment", "\u652f\u6255\u3044\u5f85\u3061", "\uacb0\uC81C \uB300\uAE30")}</div>
       <div class="deliverable-row">
         <div class="deliverable-info">
-          <div>${pickText("订单号", "Order","注文番号", "주문 번호")}: <span class="code">${escapeHtml(order.proof.orderNo)}</span></div>
-          <div>${pickText("金额", "Amount","金額", "금액")}: <strong>${Number(order.price || 0)} ${escapeHtml(order.currency || "CNY")}</strong>${netPrice !== null ? ` <span class="status">净价 ${netPrice} + 服务费 ${markup} ${markupRate}</span>` : ""}</div>
-          <div>${pickText("交易主体", "Merchant of Record","取引主体", "거래 주체")}: ${escapeHtml((order.merchantOfRecord) || "Cross X代收代付")}</div>
-          <div>${pickText("地址", "Address","住所", "주소")}: ${escapeHtml(order.proof.bilingualAddress)}</div>
-          <div>${pickText("行程备注", "Trip note","旅程メモ", "여행 메모")}: ${escapeHtml(order.proof.itinerary || "")}</div>
+          <div>${pickText("\u8ba2\u5355\u53f7", "Order", "\u6ce8\u6587\u756a\u53f7", "\uc8fc\ubb38 \ubc88\ud638")}: <span class="code">${escapeHtml(order.proof.orderNo)}</span></div>
+          <div>${pickText("\u91d1\u989d", "Amount", "\u91d1\u984d", "\uae08\uc561")}: <strong>${Number(order.price || 0)} ${escapeHtml(order.currency || "CNY")}</strong>${netPrice !== null ? ` <span class="status">\u51c0\u4ef7 ${netPrice} + \u670d\u52a1\u8d39 ${markup} ${markupRate}</span>` : ""}</div>
+          <div>${pickText("\u4ea4\u6613\u4e3b\u4f53", "Merchant of Record", "\u53d6\u5f15\u4e3b\u4f53", "\uac70\ub798 \uc8fc\uccb4")}: ${escapeHtml((order.merchantOfRecord) || "Cross X\u4ee3\u6536\u4ee3\u4ed8")}</div>
+          <div>${pickText("\u5730\u5740", "Address", "\u4f4f\u6240", "\uc8fc\uc18c")}: ${escapeHtml(order.proof.bilingualAddress)}</div>
+          <div>${pickText("\u884c\u7a0b\u5907\u6ce8", "Trip note", "\u65c5\u7a0b\u30e1\u30e2", "\uc5ec\ud589 \uba54\ubaa8")}: ${escapeHtml(order.proof.itinerary || "")}</div>
         </div>
-        <div class="deliverable-qr" style="text-align:center;flex-shrink:0;">
-          <canvas id="${qrId}" width="160" height="160" style="border-radius:8px;display:block;"></canvas>
-          <div class="status" style="font-size:10px;margin-top:4px;">${pickText("扫码支付", "Scan to pay", "\u30b9\u30ad\u30e3\u30f3\u3057\u3066\u652f\u6255\u3044", "\uc2a4\uce94\ud558\uc5ec \uacb0\uc81c")}</div>
-        </div>
+        ${rightPanel}
       </div>
       <div class="actions">
-        <button class="secondary" data-action="open-order-detail" data-order="${order.id}">${pickText("订单详情", "Order detail","注文詳細", "주문 상세")}</button>
-        <button class="secondary" data-action="open-proof" data-order="${order.id}">${pickText("打开凭证", "Open proof","証憑を開く", "증빙 열기")}</button>
-        <button class="secondary" data-action="open-task" data-task="${order.taskId}">${pickText("任务详情", "Task detail","タスク詳細", "작업 상세")}</button>
-        <button class="secondary" data-action="share-order" data-order="${order.id}">${pickText("分享", "Share","共有", "공유")}</button>
-        ${isSandbox ? `<button class="secondary" data-action="simulate-pay" data-order="${escapeHtml(order.id)}" data-rail="${escapeHtml(order.proof.railId || "alipay_cn")}">${pickText("\u6a21\u62df\u652f\u4ed8\u6210\u529f", "Simulate payment", "\u652f\u6255\u3044\u3092\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uacb0\uc81c \uc2dc\uBBAC\ub808\uc774\uc158")}</button>` : ""}
+        <button class="secondary" data-action="open-order-detail" data-order="${order.id}">${pickText("\u8ba2\u5355\u8be6\u60c5", "Order detail", "\u6ce8\u6587\u8a73\u7d30", "\uc8fc\ubb38 \uc0c1\uc138")}</button>
+        <button class="secondary" data-action="open-proof" data-order="${order.id}">${pickText("\u6253\u5f00\u51ed\u8bc1", "Open proof", "\u8a3c\u6190\u3092\u958b\u304f", "\uc99d\ube59 \uc5f4\uae30")}</button>
+        <button class="secondary" data-action="open-task" data-task="${order.taskId}">${pickText("\u4efb\u52a1\u8be6\u60c5", "Task detail", "\u30bf\u30b9\u30af\u8a73\u7d30", "\uc791\uc5c5 \uc0c1\uc138")}</button>
+        <button class="secondary" data-action="share-order" data-order="${order.id}">${pickText("\u5206\u4eab", "Share", "\u5171\u6709", "\uacf5\uc720")}</button>
+        ${isSandbox ? `<button class="secondary" data-action="simulate-pay" data-order="${escapeHtml(order.id)}" data-rail="${escapeHtml(order.proof.railId || "alipay_cn")}">${simLabel}</button>` : ""}
       </div>
     </article>
   `);
-  // Render QR code after DOM insertion
-  setTimeout(() => {
-    const canvas = document.getElementById(qrId);
-    if (!canvas) return;
-    if (window.QRCode) {
-      window.QRCode.toCanvas(canvas, qrText, {
-        width: 160, margin: 2,
-        color: { dark: "#1a1a2e", light: "#f8f9ff" },
-      }, (err) => {
-        if (err) {
-          const ctx = canvas.getContext("2d");
-          if (ctx) { ctx.fillStyle = "#f0f0f0"; ctx.fillRect(0, 0, 160, 160); ctx.fillStyle = "#333"; ctx.font = "11px monospace"; ctx.fillText(qrText.slice(0, 20), 8, 80); }
+  // Render QR only for non-card rails
+  if (!isCard) {
+    setTimeout(() => {
+      const canvas = document.getElementById(qrId);
+      if (!canvas) return;
+      if (window.QRCode) {
+        window.QRCode.toCanvas(canvas, qrText, {
+          width: 160, margin: 2,
+          color: { dark: "#1a1a2e", light: "#f8f9ff" },
+        }, (err) => {
+          if (err) {
+            const ctx = canvas.getContext("2d");
+            if (ctx) { ctx.fillStyle = "#f0f0f0"; ctx.fillRect(0, 0, 160, 160); ctx.fillStyle = "#333"; ctx.font = "11px monospace"; ctx.fillText(qrText.slice(0, 20), 8, 80); }
+          }
+        });
+      } else {
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.fillStyle = "#f8f9ff"; ctx.fillRect(0, 0, 160, 160);
+          ctx.strokeStyle = "#ddd"; ctx.lineWidth = 1; ctx.strokeRect(2, 2, 156, 156);
+          ctx.fillStyle = "#1a1a2e"; ctx.font = "bold 12px monospace";
+          ctx.textAlign = "center"; ctx.fillText(qrText.slice(0, 18), 80, 75);
+          ctx.font = "10px sans-serif"; ctx.fillStyle = "#888"; ctx.fillText("QR \u00b7 scan to pay", 80, 95);
         }
-      });
-    } else {
-      // Fallback: styled placeholder
-      const ctx = canvas.getContext("2d");
-      if (ctx) {
-        ctx.fillStyle = "#f8f9ff"; ctx.fillRect(0, 0, 160, 160);
-        ctx.strokeStyle = "#ddd"; ctx.lineWidth = 1; ctx.strokeRect(2, 2, 156, 156);
-        ctx.fillStyle = "#1a1a2e"; ctx.font = "bold 12px monospace";
-        ctx.textAlign = "center"; ctx.fillText(qrText.slice(0, 18), 80, 75);
-        ctx.font = "10px sans-serif"; ctx.fillStyle = "#888"; ctx.fillText("QR \u00b7 scan to pay", 80, 95);
       }
-    }
-  }, 80);
-  // Start payment status polling
+    }, 80);
+  }
   _startPaymentPoll(order.id);
 }
 
@@ -10175,7 +10193,9 @@ function bindActions() {
       target.disabled    = true;
       target.textContent = pickText("\u5904\u7406\u4e2d\u2026", "Processing\u2026", "\u51e6\u7406\u4e2d\u2026", "\uCC98\uB9AC \uC911\u2026");
       const railId   = target.getAttribute("data-rail") || "alipay_cn";
-      const endpoint = railId === "wechat_cn" ? "/api/wechat/simulate-pay" : "/api/alipay/simulate-pay";
+      const endpoint = railId === "wechat_cn"    ? "/api/wechat/simulate-pay"
+                     : railId === "card_delegate" ? "/api/card/simulate-pay"
+                     : "/api/alipay/simulate-pay";
       try {
         await api(endpoint, { method: "POST", body: JSON.stringify({ orderId }) });
         // poll will detect paid state within 3s

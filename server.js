@@ -6368,6 +6368,8 @@ function createOrderForTask(task, proof) {
     railId:         _pd.railId         || null,
     alipayTradeNo:  _pd.alipayTradeNo  || null,
     wechatTradeNo:  _pd.wechatTradeNo  || null,
+    cardChargeId:   _pd.cardChargeId   || null,
+    fx:             _pd.fx             || null,
     orderNo:       proofOrderNo,
     bilingualAddress: proof?.bilingualAddress || "CN/EN address pending",
     navLink:       proof?.navLink || "https://maps.google.com",
@@ -10321,6 +10323,61 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       order.paymentStatus = "paid";
       order.paidAt        = nowIso();
       lifecyclePush(order.lifecycle, "paid", "Payment confirmed (simulated)", "wechat sandbox");
+      saveDb();
+      return writeJson(res, 200, { ok: true, orderId: order.id, paymentStatus: "paid" });
+    }
+
+    // ── POST /api/card/notify — Stripe webhook ────────────────────────────
+    if (req.method === "POST" && pathname === "/api/card/notify") {
+      const raw        = await readRawBody(req);
+      const sigHeader  = req.headers["stripe-signature"] || "";
+      const stripeKey  = String(process.env.STRIPE_SECRET_KEY     || "").trim();
+      const webhookSec = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+      let   event;
+      if (stripeKey && webhookSec && sigHeader) {
+        // Verify Stripe webhook signature (t=timestamp,v1=HMAC-SHA256)
+        try {
+          const parts     = Object.fromEntries(sigHeader.split(",").map((p) => p.split("=")));
+          const timestamp  = parts.t || "";
+          const expected   = crypto.createHmac("sha256", webhookSec)
+            .update(`${timestamp}.${raw}`)
+            .digest("hex");
+          const provided   = (parts.v1 || "").split(" ")[0];
+          if (provided !== expected) return writeJson(res, 400, { error: "invalid_signature" });
+          event = JSON.parse(raw);
+        } catch (err) {
+          console.warn("[card/notify] sig verify:", err.message);
+          return writeJson(res, 400, { error: "sig_error" });
+        }
+      } else {
+        try { event = JSON.parse(raw); } catch { return writeJson(res, 400, { error: "parse_error" }); }
+      }
+      if (event && (event.type === "payment_intent.succeeded")) {
+        const pi     = (event.data && event.data.object) || {};
+        const piId   = pi.id || "";
+        const order  = Object.values(db.orders).find(
+          (o) => o.proof && o.proof.cardChargeId === piId
+        );
+        if (order) {
+          order.paymentStatus = "paid";
+          order.paidAt        = nowIso();
+          lifecyclePush(order.lifecycle, "paid", "Payment confirmed", `Stripe ${piId}`);
+          saveDb();
+        }
+      }
+      return writeJson(res, 200, { received: true });
+    }
+
+    // ── POST /api/card/simulate-pay — sandbox card charge simulation ──────
+    if (req.method === "POST" && pathname === "/api/card/simulate-pay") {
+      const body  = await readBody(req);
+      const order = db.orders[String(body.orderId || "")];
+      if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      if (!order.proof || !order.proof.qrSandbox)
+        return writeJson(res, 403, { error: "simulate-pay only available in sandbox mode" });
+      order.paymentStatus = "paid";
+      order.paidAt        = nowIso();
+      lifecyclePush(order.lifecycle, "paid", "Card charged (simulated)", `CARD ${order.proof.cardChargeId || ""}`);
       saveDb();
       return writeJson(res, 200, { ok: true, orderId: order.id, paymentStatus: "paid" });
     }
