@@ -27,6 +27,7 @@ const { startMcpServer } = require("./src/mcp/server");
 const { queryAmapPoi, queryAmapHotels, enrichPlanWithAmapData } = require("./src/services/amap");
 const { buildSyntheticEnrichment, buildAIEnrichment, callCozeWorkflow } = require("./src/services/coze");
 const { queryJuheFlight, queryJuheFlightInvoice } = require("./src/services/juhe");
+const { loadProfile } = require("./src/session/profile");
 const sessionItinerary = new Map(); // 2h TTL session context, keyed by client IP
 
 // ─── Sichuan Attraction Knowledge Base (1650 records from RAG project CSVs) ───
@@ -7678,6 +7679,13 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         return writeJson(res, 500, { ok: false, error: e.message });
       }
+    }
+
+    if (req.method === "GET" && pathname === "/api/session/profile") {
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const deviceId = searchParams.get("deviceId") || "";
+      const profile = deviceId ? loadProfile(deviceId) : null;
+      return writeJson(res, 200, { ok: true, profile: profile || null });
     }
 
     if (req.method === "GET" && pathname === "/api/system/llm-status") {

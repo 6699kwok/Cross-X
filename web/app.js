@@ -6300,6 +6300,7 @@ async function _startTravelExecution(cacheKey, confirmCardEl) {
   }
 
   renderTravelDeliverable(plan, cardData);
+  setTimeout(() => _renderPostBookingFollowUp(plan, cardData), 600);
 }
 
 function renderTravelDeliverable(plan, cardData) {
@@ -12214,6 +12215,8 @@ async function init() {
     state.singleDialogMode = true;
   }
   addMessage(getSystemMessageByKey("welcome_intro"), "agent", { i18nKey: "welcome_intro" });
+  // C4: profile-aware greeting — show personalized message for returning users
+  setTimeout(() => _loadProfileGreeting().catch(() => {}), 800);
   // Silently detect location in background to personalize the welcome message
   setTimeout(() => silentAutoDetectLocation().catch(() => {}), 600);
   // P6: prefetch live FX rates from API gateway
@@ -13511,6 +13514,43 @@ function renderPaymentSuccessCard(result) {
 
   if (!Array.isArray(state.agentConversation.messages)) state.agentConversation.messages = [];
   state.agentConversation.messages.push({ role: "assistant", content: confirmMsg });
+}
+
+// C4: Profile-aware greeting for returning users
+async function _loadProfileGreeting() {
+  const deviceId = getDeviceId();
+  if (!deviceId) return;
+  let data;
+  try { data = await api(`/api/session/profile?deviceId=${encodeURIComponent(deviceId)}`); } catch { return; }
+  const profile = data?.profile;
+  if (!profile || !profile.tripCount || profile.tripCount < 1) return;
+  const cities = (profile.cities || []).slice(-2).join("\u3001");
+  const tc = profile.tripCount;
+  const greeting = tc >= 3
+    ? `\u6b22\u8fce\u56de\u6765\uff01\u4e0a\u6b21\u60a8\u7ecf\u5386\u4e86 ${tc} \u6b21\u884c\u7a0b${cities ? "\uff08" + cities + "\uff09" : ""}\uff0c\u6b64\u6b21\u60f3\u53bb\u54ea\u91cc\uff1f`
+    : `\u6b22\u8fce\u56de\u6765\uff01${cities ? "\u60a8\u4e4b\u524d\u53bb\u8fc7 " + cities + "\uff0c" : ""}\u8fd9\u6b21\u60f3\u53bb\u54ea\u91cc\uff1f`;
+  addMessage(greeting, "agent");
+}
+
+// E1: Post-booking proactive follow-up suggestions
+function _renderPostBookingFollowUp(plan, cardData) {
+  const dest = cardData.destination || "";
+  const destText = escapeHtml(dest);
+  const suggestions = [
+    { icon: "\u{1F3AB}", text: "\u9884\u8ba2\u666f\u70b9\u95e8\u7968", query: `\u5e2e\u6211\u9884\u8ba2${dest}\u7684\u666f\u70b9\u95e8\u7968` },
+    { icon: "\u{1F374}", text: "\u63a8\u8350\u5468\u8fb9\u7f8e\u98df",  query: `${dest}\u5468\u8fb9\u7f8e\u98df\u63a8\u8350` },
+    { icon: "\u2708\uFE0F",  text: "\u67e5\u8be2\u8fd4\u7a0b\u4ea4\u901a", query: `${dest}\u8fd4\u7a0b\u8def\u7ebf\u601d\u8def` },
+    { icon: "\u{1F5FA}\uFE0F", text: "\u89c4\u5212\u65b0\u884c\u7a0b",   query: "\u51fa\u53d1\u65b0\u6b21\u65c5\u884c" },
+  ];
+  const chipsHtml = suggestions.map(s =>
+    `<button class="cx-pb-chip" onclick="createTaskFromText(${JSON.stringify(s.query)})">${s.icon} ${escapeHtml(s.text)}</button>`
+  ).join("");
+  addCard(`
+    <article class="card cx-pb-card">
+      <div class="cx-pb-title">AI \u4e0b\u4e00\u6b65\u5efa\u8bae</div>
+      <div class="cx-pb-chips">${chipsHtml}</div>
+    </article>
+  `);
 }
 
 init();

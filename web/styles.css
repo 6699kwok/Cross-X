@@ -5068,6 +5068,23 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
                           border-radius: 10px; padding: 10px; text-align: center; }
 }
 
+/* ── E1: Post-booking proactive suggestions ──────────────────────────────── */
+.cx-pb-card { padding: 14px; border-radius: 14px; border: 1px dashed rgba(16,185,129,0.4); background: rgba(16,185,129,0.04); }
+.cx-pb-title { font-size: 11px; font-weight: 700; color: #10b981; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+.cx-pb-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.cx-pb-chip {
+  padding: 7px 13px;
+  border-radius: 16px;
+  border: 1px solid rgba(16,185,129,0.3);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.cx-pb-chip:hover { background: rgba(16,185,129,0.1); border-color: #10b981; transform: translateY(-1px); }
+
 /* ── F3: Inline plan refinement bar ─────────────────────────────────────── */
 .cx-plan-refine {
   margin: 12px 0 4px;
