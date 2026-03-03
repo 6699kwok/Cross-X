@@ -2688,9 +2688,45 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 .cx-te-step--failed .cx-te-status { color: #ef4444; }
 
 /* Travel Deliverable Card */
-.cx-td-card { padding: 16px; border-radius: 16px; border: 2px solid #10b981; background: var(--color-surface); }
+.cx-td-card {
+  padding: 16px; border-radius: 16px; border: 2px solid #10b981;
+  background: var(--color-surface);
+  position: relative; overflow: hidden;
+  animation: cxDeliverableReveal 0.5s cubic-bezier(0.22,1,0.36,1) forwards;
+}
+@keyframes cxDeliverableReveal {
+  from { opacity: 0; transform: scale(0.95) translateY(10px); }
+  to   { opacity: 1; transform: scale(1)   translateY(0); }
+}
 .cx-td-header { font-size: 16px; font-weight: 800; color: #10b981; margin-bottom: 8px; }
-.cx-td-ref { font-size: 11px; font-family: monospace; color: var(--color-text-secondary); letter-spacing: 0.05em; margin-bottom: 10px; }
+.cx-td-refcode { font-family: monospace; background: rgba(16,185,129,0.1); padding: 1px 6px; border-radius: 4px; }
+.cx-td-ref { font-size: 11px; color: var(--color-text-secondary); letter-spacing: 0.02em; margin-bottom: 10px; }
+/* Confetti burst */
+.cx-td-confetti {
+  position: absolute;
+  top: 12px; right: 12px;
+  width: 70px; height: 70px;
+  pointer-events: none;
+}
+.cx-td-confetti span {
+  position: absolute;
+  top: 50%; left: 50%;
+  font-size: 16px;
+  transform-origin: center;
+  animation: cxConfetti 0.7s cubic-bezier(0.22,1,0.36,1) forwards;
+  opacity: 0;
+  transform: translate(-50%, -50%) rotate(var(--d)) translateY(calc(-1 * var(--r)));
+}
+@keyframes cxConfetti {
+  0%   { opacity: 0; transform: translate(-50%,-50%) rotate(var(--d)) translateY(0); }
+  60%  { opacity: 1; transform: translate(-50%,-50%) rotate(var(--d)) translateY(calc(-1 * var(--r))); }
+  100% { opacity: 0.6; transform: translate(-50%,-50%) rotate(var(--d)) translateY(calc(-1 * var(--r) - 8px)); }
+}
+.cx-td-confetti span:nth-child(1) { animation-delay: 0ms; }
+.cx-td-confetti span:nth-child(2) { animation-delay: 80ms; }
+.cx-td-confetti span:nth-child(3) { animation-delay: 160ms; }
+.cx-td-confetti span:nth-child(4) { animation-delay: 240ms; }
+.cx-td-confetti span:nth-child(5) { animation-delay: 320ms; }
 .cx-td-row { font-size: 13px; color: var(--color-text-primary); margin-bottom: 5px; }
 .cx-td-actions { display: flex; gap: 8px; margin-top: 14px; }
 .cx-td-btn { flex: 1; padding: 10px; border-radius: 8px; border: none; background: #10b981; color: #fff; font-size: 13px; font-weight: 600; cursor: pointer; }

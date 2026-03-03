@@ -6327,23 +6327,32 @@ async function _startTravelExecution(cacheKey, confirmCardEl) {
 
 function renderTravelDeliverable(plan, cardData) {
   const ref = "CX-" + Math.random().toString(36).slice(2, 8).toUpperCase();
-  const hotel = escapeHtml(plan.hotel?.name || "\u5df2\u786e\u8ba4\u9152\u5e97");
+  const hotel = escapeHtml(plan.hotel?.name || "\u5DF2\u786E\u8BA4\u9152\u5E97");
   const dest = escapeHtml(cardData.destination || "");
   const dur = cardData.duration_days || 3;
   const price = Number(plan.total_price || 0).toLocaleString();
+  // Confetti emoji burst for visual celebration
+  const confettiEl = `<div class="cx-td-confetti" aria-hidden="true">
+    ${"🎉🌟✨🎊🎈".split("").map((e, i) =>
+      `<span style="--d:${i * 72}deg;--r:${30 + i * 11}px">${e}</span>`
+    ).join("")}
+  </div>`;
   addCard(`
     <article class="card cx-td-card">
-      <div class="cx-td-header">\u2713 \u9884\u8ba2\u6210\u529f</div>
-      <div class="cx-td-ref">\u884c\u7a0b\u7f16\u53f7 ${escapeHtml(ref)}</div>
-      <div class="cx-td-row">\u{1F4CD} ${dest} &nbsp;\u00b7&nbsp; ${dur}\u5929</div>
+      ${confettiEl}
+      <div class="cx-td-header">\u2713 \u9884\u8BA2\u6210\u529F</div>
+      <div class="cx-td-ref">\u884C\u7A0B\u7F16\u53F7 <span class="cx-td-refcode">${escapeHtml(ref)}</span></div>
+      <div class="cx-td-row">\u{1F4CD} ${dest} &nbsp;\u00B7&nbsp; ${dur}\u5929</div>
       <div class="cx-td-row">\u{1F3E8} ${hotel}</div>
-      <div class="cx-td-row">\u{1F4B0} \u603b\u8ba1 \uffe5${price}</div>
+      <div class="cx-td-row">\u{1F4B0} \u603B\u8BA1 \uFFE5${price}</div>
       <div class="cx-td-actions">
-        <button class="cx-td-btn">\u67e5\u770b\u5b8c\u6574\u884c\u7a0b</button>
-        <button class="cx-td-btn cx-td-btn--sec">\u5206\u4eab\u884c\u7a0b</button>
+        <button class="cx-td-btn">\u67E5\u770B\u5B8C\u6574\u884C\u7A0B</button>
+        <button class="cx-td-btn cx-td-btn--sec">\u5206\u4EAB\u884C\u7A0B</button>
       </div>
     </article>
   `);
+  // Haptic celebration pulse
+  if (navigator.vibrate) navigator.vibrate([20, 60, 20, 60, 20]);
 }
 
 function renderTravelFailCard(failedStep, plan, cardData) {
