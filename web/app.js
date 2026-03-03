@@ -8571,6 +8571,7 @@ async function createTaskFromText(text) {
   } finally {
     clearInterval(thinkingRotateTimer);
     setThinkingIndicator(false);
+    _removeTypingBubble(_typingBubble);  // ensure cleanup on abort/error
     // P2: release abort controller when stream finishes (normally or by abort)
     if (_currentPlanAbortController && _currentPlanAbortController.signal === _planStreamSignal) {
       _currentPlanAbortController = null;
