@@ -5065,9 +5065,21 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 }
 .cx-lc-top {
   display: flex;
-  align-items: baseline;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
+}
+.cx-lc-price-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+.cx-lc-perday {
+  font-size: 10px;
+  color: #6b7280;
+  font-weight: 500;
+  white-space: nowrap;
 }
 .cx-lc-tag {
   font-size: 9px;

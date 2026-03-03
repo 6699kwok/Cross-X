@@ -7104,9 +7104,12 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
     <div class="cx-lc-body">
       <div class="cx-lc-top">
         <span class="cx-lc-tag" style="color:${style.color}">${escapeHtml(p.tag || "")}</span>
-        <div class="cx-lc-price">${priceDisplay}</div>
+        <div class="cx-lc-price-col">
+          <div class="cx-lc-price">${priceDisplay}</div>
+          ${rawPrice > 0 && dur > 1 ? `<div class="cx-lc-perday">\u00A5${Math.round(rawPrice / dur).toLocaleString()}${pickText("\/\u5929","\/d","\/\u65E5","\/\uC77C")}</div>` : ""}
+        </div>
       </div>
-      <div class="cx-lc-price-sub">${pax > 1 ? pax + pickText(" 人 / "," pax · "," 名 / "," 명 · ") : ""}${dur}${pickText("天","d","日","일")}</div>
+      <div class="cx-lc-price-sub">${pax > 1 ? pax + pickText(" \u4EBA / "," pax \u00B7 "," \u540D / "," \uBA85 \u00B7 ") : ""}${dur}${pickText("\u5929","d","\u65E5","\uC77C")}</div>
       <div class="cx-lc-hotel">${displayTitle}</div>
       <div class="cx-lc-meta">
         ${displayRating   ? `<span>★ ${displayRating}</span>` : ""}
