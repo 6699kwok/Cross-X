@@ -3995,7 +3995,7 @@ function rerenderAgentFlowCards() {
   if (mode === "completed") {
     renderAgentExecutionCard(state.agentConversation.currentRun);
     if (state.agentConversation.currentRun && state.agentConversation.currentRun.result) {
-      renderAgentResultCard(state.agentConversation.currentRun.result);
+      renderAgentDeliverableCard(state.agentConversation.currentRun.result);
     }
     return;
   }
@@ -4413,6 +4413,81 @@ function renderAgentResultCard(result) {
     </div>
   `,
   );
+}
+
+function buildAmapNavUrl(place, city) {
+  return `https://uri.amap.com/search?keyword=${encodeURIComponent(place)}&city=${encodeURIComponent(city || place)}`;
+}
+
+function renderAgentDeliverableCard(result) {
+  if (!shouldRenderAgentFlowCards()) return;
+  if (!result) return;
+  const root = el.executionResultSection;
+  if (!root) return;
+
+  const slots = state.agentConversation.slots || {};
+  const city  = String(slots.city || "");
+  const area  = String(slots.area || "");
+  const place = String(result.place || "");
+  const amount = Number(result.amount || 0);
+  const eta    = Number(result.eta || 0);
+  const orderId = String(result.orderId || "");
+
+  // Bilingual subtitle: area · city or just city
+  const locationLine = [area, city].filter(Boolean).join(" · ");
+
+  const navUrl = buildAmapNavUrl(place, city);
+  const qrImgId = `cx-dlv-qr-${stableHash32(orderId).toString(36)}`;
+
+  const confettiPieces = ["\uD83C\uDF89", "\uD83C\uDF1F", "\u2728", "\uD83C\uDF8A", "\uD83C\uDF88"]
+    .map((e, i) => `<span class="cx-dlv-cp" style="--d:${i * 72}deg;--r:${26 + i * 10}px;--delay:${i * 70}ms">${e}</span>`)
+    .join("");
+
+  root.innerHTML = `
+    <div class="cx-dlv-card">
+      <div class="cx-dlv-confetti" aria-hidden="true">${confettiPieces}</div>
+      <div class="cx-dlv-header">
+        <span class="cx-dlv-check">\u2713</span>
+        <span class="cx-dlv-title">${pickText("\u6267\u884C\u5B8C\u6210", "Execution complete", "\u5B8C\u4E86", "\uC644\uB8CC")}</span>
+      </div>
+      <div class="cx-dlv-body">
+        <div class="cx-dlv-qr-wrap">
+          <img id="${qrImgId}" class="cx-dlv-qr-img" src="" alt="QR" />
+          <div class="cx-dlv-qr-hint">${pickText("\u626B\u7801\u67E5\u8BA2\u5355", "Scan for order", "\u30B9\u30AD\u30E3\u30F3", "\uC8FC\uBB38 QR")}</div>
+        </div>
+        <div class="cx-dlv-info">
+          <div class="cx-dlv-place">${escapeHtml(place)}</div>
+          ${locationLine ? `<div class="cx-dlv-location">${escapeHtml(locationLine)}</div>` : ""}
+          <div class="cx-dlv-chips">
+            <span class="cx-dlv-chip">\uD83D\uDCB0 ${amount} CNY</span>
+            ${eta ? `<span class="cx-dlv-chip">\u23F1 ${eta} min</span>` : ""}
+          </div>
+          <div class="cx-dlv-order">\uD83D\uDCCB ${escapeHtml(orderId)}</div>
+        </div>
+      </div>
+      <button class="cx-dlv-nav-btn" data-action="agent-nav" data-nav-url="${escapeHtml(navUrl)}">\uD83D\uDDFA\uFE0F ${pickText("\u5BFC\u822A\u8FC7\u53BB \u00B7 Navigate", "Navigate \u00B7 \u5BFC\u822A", "\u30CA\u30D3\u3078 \u00B7 \u5C0E\u822A", "\uAE38\uC548\uB0B4 \u00B7 \u5C0E\u822A")}</button>
+      <div class="cx-dlv-acts">
+        <button class="cx-dlv-act" data-action="agent-share-result">\uD83D\uDCE4 ${pickText("\u5206\u4EAB", "Share", "\u30B7\u30A7\u30A2", "\uACF5\uC720")}</button>
+        <button class="cx-dlv-act" data-action="agent-request-execute" data-option="backup">\uD83D\uDD04 ${pickText("\u5907\u9009\u65B9\u6848", "Backup plan", "\u4EE3\u66FF\u6848", "\uB300\uC548")}</button>
+      </div>
+    </div>`;
+
+  // QR + vibrate only on first render (guard against rerender in completed mode)
+  if (!root.dataset.dlvRendered) {
+    root.dataset.dlvRendered = "1";
+    const qrImg = document.getElementById(qrImgId);
+    if (window.QRCode && qrImg) {
+      QRCode.toDataURL(`https://crossx.app/order/${orderId}`, { width: 96, margin: 1, color: { dark: "#1e293b", light: "#ffffff" } })
+        .then((url) => { qrImg.src = url; })
+        .catch(() => { qrImg.alt = orderId; });
+    } else if (qrImg) {
+      qrImg.alt = orderId;
+      qrImg.style.display = "none";
+    }
+    if (navigator.vibrate) navigator.vibrate([18, 55, 18, 55, 18]);
+  }
+
+  motion.bindPressables(root);
 }
 
 function renderAgentFailureCard(failure) {
@@ -11228,10 +11303,35 @@ function bindActions() {
     }
 
     if (action === "agent-nav") {
-      notify(
-        pickText("已打开导航（mock）。", "Navigation opened (mock).","ナビを開きました（mock）。", "내비를 열었습니다 (mock)."),
-        "success",
+      // Use nav URL stored on button; fall back to building from current result + slots
+      let navUrl = String(target.dataset.navUrl || "");
+      if (!navUrl) {
+        const result = state.agentConversation.currentRun && state.agentConversation.currentRun.result;
+        const place = (result && result.place) || "";
+        const city  = (state.agentConversation.slots && state.agentConversation.slots.city) || "";
+        navUrl = buildAmapNavUrl(place, city);
+      }
+      window.open(navUrl, "_blank", "noopener,noreferrer");
+      notify(pickText("已打开高德地图。", "Amap opened.", "\u9AD8\u5FB3\u30DE\u30C3\u30D7\u3092\u958B\u304D\u307E\u3057\u305F\u3002", "\uACE0\uB355\uB9F5\uC774 \uC5F4\uB838\uC2B5\uB2C8\uB2E4."), "success");
+      return;
+    }
+
+    if (action === "agent-share-result") {
+      const result = state.agentConversation.currentRun && state.agentConversation.currentRun.result;
+      const place  = (result && result.place) || pickText("目的地", "destination", "目的地", "목적지");
+      const amount = result ? Number(result.amount || 0) : 0;
+      const text   = pickText(
+        `Cross X 已帮我锁定「${place}」，费用 ${amount} CNY。`,
+        `Cross X locked "${place}" for me, ${amount} CNY total.`,
+        `Cross X が「${place}」を予約しました。${amount} CNY。`,
+        `Cross X가 「${place}」를 예약했습니다. ${amount} CNY.`,
       );
+      if (navigator.share) {
+        navigator.share({ title: "Cross X 行程", text }).catch(() => {});
+      } else {
+        navigator.clipboard && navigator.clipboard.writeText(text).catch(() => {});
+        notify(pickText("行程摘要已复制。", "Trip summary copied.", "旅程概要をコピーしました。", "여정 요약을 복사했습니다."), "success");
+      }
       return;
     }
 

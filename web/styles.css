@@ -6705,3 +6705,55 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   color:#fff; font-size:14px; font-weight:700; cursor:pointer; transition:opacity .15s; }
 .cx-ce-apply:hover { opacity:.88; }
 .cx-ce-actions .secondary { padding:11px 18px; }
+
+/* ── Agent Deliverable Card (QR + bilingual nav + confetti) ───────────────── */
+.cx-dlv-card { position:relative; border-radius:16px; border:1.5px solid #d1fae5;
+  background:linear-gradient(135deg,#f0fdf4 0%,#ecfdf5 100%);
+  padding:16px; overflow:hidden; }
+
+/* Confetti burst */
+.cx-dlv-confetti { position:absolute; top:18px; right:20px; width:60px; height:60px; pointer-events:none; }
+.cx-dlv-cp { position:absolute; left:50%; top:50%; font-size:18px; line-height:1;
+  transform:rotate(var(--d)) translateX(0) scale(0);
+  animation:cxDlvPop .65s cubic-bezier(.23,1,.32,1) var(--delay,0ms) forwards; }
+@keyframes cxDlvPop {
+  0%   { transform:rotate(var(--d)) translateX(0) scale(0); opacity:1; }
+  70%  { opacity:1; }
+  100% { transform:rotate(var(--d)) translateX(var(--r)) scale(1.1); opacity:0; }
+}
+
+/* Header */
+.cx-dlv-header { display:flex; align-items:center; gap:7px; margin-bottom:12px; }
+.cx-dlv-check { width:22px; height:22px; border-radius:50%; background:#10b981; color:#fff;
+  display:flex; align-items:center; justify-content:center; font-size:13px; font-weight:800; flex-shrink:0; }
+.cx-dlv-title { font-size:14px; font-weight:700; color:#065f46; }
+
+/* Body: QR + info side by side */
+.cx-dlv-body { display:flex; gap:14px; margin-bottom:14px; }
+.cx-dlv-qr-wrap { display:flex; flex-direction:column; align-items:center; gap:4px; flex-shrink:0; }
+.cx-dlv-qr-img { width:80px; height:80px; border-radius:8px; border:1px solid #d1fae5;
+  background:#fff; object-fit:contain; }
+.cx-dlv-qr-hint { font-size:9px; color:#6ee7b7; text-align:center; white-space:nowrap; }
+
+/* Place info */
+.cx-dlv-info { display:flex; flex-direction:column; gap:5px; flex:1; min-width:0; }
+.cx-dlv-place { font-size:16px; font-weight:800; color:#064e3b; line-height:1.2; }
+.cx-dlv-location { font-size:12px; color:#059669; }
+.cx-dlv-chips { display:flex; gap:6px; flex-wrap:wrap; }
+.cx-dlv-chip { background:#d1fae5; color:#065f46; border-radius:999px;
+  padding:3px 9px; font-size:12px; font-weight:600; }
+.cx-dlv-order { font-size:11px; color:#6ee7b7; font-family:monospace; }
+
+/* Navigate CTA */
+.cx-dlv-nav-btn { width:100%; padding:12px; border-radius:12px; border:none;
+  background:linear-gradient(135deg,#10b981,#059669); color:#fff;
+  font-size:14px; font-weight:700; cursor:pointer; margin-bottom:10px;
+  transition:opacity .15s,transform .1s; }
+.cx-dlv-nav-btn:active { transform:scale(.98); opacity:.9; }
+
+/* Share / Backup row */
+.cx-dlv-acts { display:flex; gap:8px; }
+.cx-dlv-act { flex:1; padding:9px; border-radius:10px; border:1.5px solid #a7f3d0;
+  background:transparent; color:#065f46; font-size:12px; font-weight:600; cursor:pointer;
+  transition:background .14s; }
+.cx-dlv-act:hover { background:#d1fae5; }
