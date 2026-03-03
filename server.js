@@ -25,7 +25,7 @@ const { createPlanRouter } = require("./src/routes/plan");
 const { fetchFxRates, fetchJutuiRestaurants } = require("./src/services/api_gateway");
 const { startMcpServer } = require("./src/mcp/server");
 const { queryAmapPoi, queryAmapHotels, enrichPlanWithAmapData } = require("./src/services/amap");
-const { queryAmapRouting, queryLocalRoute } = require("./src/services/amapRouting");
+const { queryAmapRouting, queryLocalRoute, geocodePlacesBatch } = require("./src/services/amapRouting");
 const { buildSyntheticEnrichment, buildAIEnrichment, callCozeWorkflow } = require("./src/services/coze");
 const { queryJuheFlight, queryJuheFlightInvoice } = require("./src/services/juhe");
 const {
@@ -34,7 +34,69 @@ const {
 } = require("./src/services/geo");
 const { loadProfile } = require("./src/session/profile");
 const { mockAmapRouting } = require("./src/planner/mock");
+const { db, DATA_DIR, DB_FILE, ensureDataDir, nowIso, saveDb, lifecyclePush } = require("./src/services/db");
 const sessionItinerary = new Map(); // 2h TTL session context, keyed by client IP
+const WEATHER_CACHE    = new Map(); // city → {ts, data}, 1h TTL
+const WEATHER_TTL_MS   = 60 * 60 * 1000;
+
+// ── WMO weather code (Open-Meteo) → emoji + label ────────────────────────────
+function mapWeatherCode(code) {
+  const c = Number(code);
+  if (c === 0)                      return { icon: "☀️",  label: "晴" };
+  if (c === 1)                      return { icon: "🌤️", label: "基本晴" };
+  if (c === 2)                      return { icon: "⛅",  label: "多云" };
+  if (c === 3)                      return { icon: "☁️",  label: "阴" };
+  if (c === 45 || c === 48)         return { icon: "🌫️", label: "雾" };
+  if (c >= 51 && c <= 57)           return { icon: "🌦️", label: "毛毛雨" };
+  if (c >= 61 && c <= 67)           return { icon: "🌧️", label: "雨" };
+  if (c >= 71 && c <= 77)           return { icon: "❄️",  label: "雪" };
+  if (c >= 80 && c <= 82)           return { icon: "🌧️", label: "阵雨" };
+  if (c === 85 || c === 86)         return { icon: "❄️",  label: "阵雪" };
+  if (c === 95)                     return { icon: "⛈️",  label: "雷暴" };
+  if (c === 96 || c === 99)         return { icon: "⛈️",  label: "雷暴伴冰雹" };
+  return { icon: "🌤️", label: "晴" };
+}
+
+// ── City → lat/lng lookup for major Chinese cities (Open-Meteo needs coords) ─
+const CITY_COORDS = {
+  "北京":   [39.9042, 116.4074], "上海":   [31.2304, 121.4737],
+  "深圳":   [22.5431, 114.0579], "广州":   [23.1291, 113.2644],
+  "成都":   [30.5728,  104.0668], "西安":   [34.2658, 108.9541],
+  "杭州":   [30.2741, 120.1551], "武汉":   [30.5928, 114.3055],
+  "重庆":   [29.5630, 106.5516], "南京":   [32.0603, 118.7969],
+  "厦门":   [24.4797, 118.0894], "青岛":   [36.0671, 120.3826],
+  "三亚":   [18.2528, 109.5119], "桂林":   [25.2736, 110.2904],
+  "昆明":   [25.0453, 102.7097], "丽江":   [26.8721, 100.2299],
+  "拉萨":   [29.6520,  91.1322], "乌鲁木齐":[43.8256,  87.6169],
+  "哈尔滨": [45.8038, 126.5349], "大连":   [38.9140, 121.6147],
+  "长沙":   [28.2278, 112.9388], "郑州":   [34.7466, 113.6254],
+  "苏州":   [31.2989, 120.5853], "天津":   [39.3434, 117.3616],
+  "香港":   [22.3193, 114.1694], "澳门":   [22.1987, 113.5439],
+  "台北":   [25.0330, 121.5654], "黄山":   [29.7147, 118.3378],
+  "张家界": [29.1166, 110.4791], "敦煌":   [40.1424,  94.6615],
+};
+
+async function getCityCoords(cityName) {
+  const short = cityName.replace(/[市省自治区直辖市特别行政区]$/, "");
+  if (CITY_COORDS[short]) return CITY_COORDS[short];
+  if (CITY_COORDS[cityName]) return CITY_COORDS[cityName];
+  // Fall back to Amap geocoding
+  const key = String(process.env.AMAP_API_KEY || "").trim();
+  if (!key) return null;
+  try {
+    const r = await fetch(
+      `https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(key)}&address=${encodeURIComponent(short)}&output=JSON`,
+      { signal: AbortSignal.timeout(4000) }
+    );
+    const d = await r.json();
+    const loc = d?.geocodes?.[0]?.location;
+    if (loc) {
+      const [lng, lat] = loc.split(",").map(Number);
+      return [lat, lng]; // Open-Meteo expects [lat, lng]
+    }
+  } catch { /* ignore */ }
+  return null;
+}
 
 // ── Real Amap routing — hybrid: mock HSR/flight + real Amap driving ──────────
 // Amap's transit/integrated API covers urban transit but not inter-city HSR.
@@ -341,8 +403,7 @@ async function callPythonRagService(question, sessionId = "crossx") {
 
 const PUBLIC_DIR = path.join(__dirname, "web");
 const LEGACY_ASSETS_DIR = path.join(__dirname, "web");
-const DATA_DIR = path.join(__dirname, "data");
-const DB_FILE = path.join(DATA_DIR, "db.json");
+// DATA_DIR, DB_FILE — imported from src/services/db.js
 const ENV_LOCAL_FILE = path.join(__dirname, ".env.local");
 
 function formatEnvValue(raw) {
@@ -431,106 +492,9 @@ function persistOpenAiRuntimeEnv({ clear = false, updates = null }) {
   }
 }
 
-const db = {
-  users: {
-    demo: {
-      id: "demo",
-      language: "EN",
-      city: "Shanghai",
-      viewMode: "user",
-      preferences: {
-        budget: "mid",
-        dietary: "",
-        family: false,
-        accessibility: "optional",
-        transport: "mixed",
-        walking: "walk",
-        allergy: "",
-      },
-      savedPlaces: {
-        hotel: "",
-        office: "",
-        airport: "PVG",
-      },
-      location: {
-        lat: null,
-        lng: null,
-        accuracy: null,
-        updatedAt: null,
-        source: "none",
-      },
-      privacy: {
-        locationEnabled: true,
-      },
-      authDomain: {
-        noPinEnabled: true,
-        dailyLimit: 2000,
-        singleLimit: 500,
-      },
-      paymentRail: {
-        selected: "alipay_cn",
-      },
-      plusSubscription: {
-        active: false,
-        plan: "none",
-        benefits: [],
-      },
-    },
-  },
-  tasks: {},
-  tripPlans: {},
-  orders: {},
-  settlements: [],
-  providerLedger: [],
-  reconciliationRuns: [],
-  miniProgram: {
-    version: "0.1.0",
-    channels: {
-      alipay: { status: "ready", pathPrefix: "pages/" },
-      wechat: { status: "ready", pathPrefix: "pages/" },
-    },
-    releases: [],
-  },
-  auditLogs: [],
-  mcpCalls: [],
-  metricEvents: [],
-  chatNotifications: [],
-  supportTickets: [],
-  supportSessions: {},
-  idempotency: {},
-  featureFlags: {
-    plusConcierge: { enabled: false, rollout: 0 },
-    manualFallback: { enabled: true, rollout: 100 },
-    liveTranslation: { enabled: false, rollout: 10 },
-  },
-  mcpContracts: {
-    gaode_or_fallback: { id: "gaode_or_fallback", provider: "Gaode LBS", external: true, slaMs: 2200, enforced: true },
-    partner_hub_queue: { id: "partner_hub_queue", provider: "Partner Hub Queue API", external: true, slaMs: 1800, enforced: true },
-    partner_hub_booking: { id: "partner_hub_booking", provider: "Partner Hub Booking API", external: true, slaMs: 2500, enforced: true },
-    partner_hub_traffic: { id: "partner_hub_traffic", provider: "Partner Hub Traffic API", external: true, slaMs: 1800, enforced: true },
-    partner_hub_transport: { id: "partner_hub_transport", provider: "Partner Hub Transport API", external: true, slaMs: 2500, enforced: true },
-    payment_rail: { id: "payment_rail", provider: "ACT Rail Gateway", external: true, slaMs: 3200, enforced: true },
-  },
-  mcpPolicy: {
-    enforceSla: false,
-    simulateBreachRate: 0,
-  },
-  paymentCompliance: {
-    policy: {
-      blockUncertifiedRails: true,
-      requireFraudScreen: true,
-    },
-    rails: {
-      alipay_cn: { certified: true, kycPassed: true, pciDss: true, riskTier: "low", enabled: true },
-      wechat_cn: { certified: true, kycPassed: true, pciDss: true, riskTier: "medium", enabled: true },
-      card_delegate: { certified: true, kycPassed: true, pciDss: true, riskTier: "high", enabled: true },
-    },
-  },
-};
+// db, DATA_DIR, DB_FILE — imported from src/services/db.js
 
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-}
+// ensureDataDir — imported from src/services/db.js
 
 function loadDb() {
   try {
@@ -676,18 +640,7 @@ function loadDb() {
   }
 }
 
-function saveDb() {
-  try {
-    ensureDataDir();
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
-  } catch (err) {
-    console.error("Failed to save db:", err.message);
-  }
-}
-
-function nowIso() {
-  return new Date().toISOString();
-}
+// saveDb, nowIso — imported from src/services/db.js
 
 function normalizeLang(language) {
   const upper = String(language || "EN").toUpperCase();
@@ -4067,15 +4020,7 @@ function applySessionSlotsToConstraints(task, slots) {
   return changed;
 }
 
-function lifecyclePush(collection, state, label, note) {
-  if (!Array.isArray(collection)) return;
-  collection.push({
-    state,
-    label,
-    at: nowIso(),
-    note,
-  });
-}
+// lifecyclePush — imported from src/services/db.js
 
 function tripProgress(plan) {
   const taskIds = Array.isArray(plan && plan.taskIds) ? plan.taskIds : [];
@@ -7561,6 +7506,107 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ── /api/map-key — returns Amap JS SDK web key for frontend map ──────────
+    if (req.method === "GET" && pathname === "/api/map-key") {
+      const webKey = String(process.env.AMAP_WEB_KEY || process.env.AMAP_API_KEY || "").trim();
+      return writeJson(res, 200, { ok: true, key: webKey });
+    }
+
+    // ── /api/geocode-places — batch geocode POI names for map pins ────────────
+    if (req.method === "POST" && pathname === "/api/geocode-places") {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      let parsed = {};
+      try { parsed = JSON.parse(body); } catch { /* ignore */ }
+      const places = Array.isArray(parsed.places) ? parsed.places.map(String).slice(0, 20) : [];
+      const city   = String(parsed.city || "").trim();
+      if (!city || !places.length) {
+        return writeJson(res, 400, { ok: false, error: "city and places[] required" });
+      }
+      try {
+        const results = await geocodePlacesBatch(places, city);
+        return writeJson(res, 200, { ok: true, results });
+      } catch (e) {
+        console.warn("[/api/geocode-places] error:", e.message);
+        return writeJson(res, 500, { ok: false, error: e.message });
+      }
+    }
+
+    // ── /api/weather — destination forecast via Open-Meteo (free, no key) ───────
+    if (req.method === "GET" && pathname === "/api/weather") {
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const city = (searchParams.get("city") || "").trim();
+      const days = Math.min(parseInt(searchParams.get("days") || "5", 10), 7);
+      if (!city) return writeJson(res, 400, { ok: false, error: "city required" });
+
+      const cacheKey = `${city}:${days}`;
+      const cached = WEATHER_CACHE.get(cacheKey);
+      if (cached && Date.now() - cached.ts < WEATHER_TTL_MS) {
+        return writeJson(res, 200, cached.data);
+      }
+      try {
+        // Resolve city to lat/lng
+        const coords = await getCityCoords(city);
+        if (!coords) return writeJson(res, 200, { ok: false, city, error: "city coordinates not found" });
+        const [lat, lng] = coords;
+
+        const meteoUrl = `https://api.open-meteo.com/v1/forecast` +
+          `?latitude=${lat}&longitude=${lng}` +
+          `&current=temperature_2m,weathercode,apparent_temperature,relativehumidity_2m` +
+          `&daily=temperature_2m_max,temperature_2m_min,weathercode` +
+          `&timezone=Asia%2FShanghai&forecast_days=${days}`;
+        const meteoRes = await fetch(meteoUrl, { signal: AbortSignal.timeout(6000) });
+        if (!meteoRes.ok) throw new Error(`Open-Meteo HTTP ${meteoRes.status}`);
+        const meteoData = await meteoRes.json();
+
+        const cur = meteoData.current || {};
+        const { icon: curIcon, label: curLabel } = mapWeatherCode(cur.weathercode ?? 0);
+
+        const times    = meteoData.daily?.time || [];
+        const highTemps = meteoData.daily?.temperature_2m_max || [];
+        const lowTemps  = meteoData.daily?.temperature_2m_min || [];
+        const codes     = meteoData.daily?.weathercode || [];
+
+        const forecast = times.map((date, i) => {
+          const { icon, label } = mapWeatherCode(codes[i] ?? 0);
+          return {
+            date,
+            high_c: Math.round(highTemps[i] ?? 20),
+            low_c:  Math.round(lowTemps[i]  ?? 10),
+            icon, label, code: Number(codes[i] ?? 0),
+          };
+        });
+
+        const hasRain = forecast.some((d) => d.code >= 51 && d.code < 70 || d.code >= 80 && d.code < 83);
+        const hasSnow = forecast.some((d) => d.icon === "❄️");
+        const hasCold = forecast.some((d) => d.low_c < 10);
+        const hasHot  = forecast.some((d) => d.high_c > 32);
+        let tip = "🌤️ 天气状况较好，祝旅途愉快！";
+        if (hasSnow)                 tip = "❄️ 出行期间可能降雪，请备好防寒保暖装备";
+        else if (hasRain && hasCold) tip = "🌧️🧥 有降雨且气温较低，建议携带雨伞和保暖外套";
+        else if (hasRain)            tip = "🌂 出行期间可能有降雨，建议携带折叠雨伞";
+        else if (hasCold)            tip = "🧥 早晚温差较大，注意添衣保暖";
+        else if (hasHot)             tip = "☀️ 天气炎热，注意防晒补水，避免正午暴晒";
+
+        const result = {
+          ok: true, city,
+          current: {
+            temp_c:   Math.round(cur.temperature_2m    ?? 20),
+            feels_c:  Math.round(cur.apparent_temperature ?? 20),
+            humidity: Math.round(cur.relativehumidity_2m  ?? 50),
+            icon: curIcon, label: curLabel,
+          },
+          forecast, tip, _source: "open-meteo",
+        };
+        WEATHER_CACHE.set(cacheKey, { ts: Date.now(), data: result });
+        console.log(`[/api/weather] ${city}(${lat},${lng}): ${forecast.map((d) => d.icon + d.high_c + "\xb0").join(" ")}`);
+        return writeJson(res, 200, result);
+      } catch (e) {
+        console.warn("[/api/weather] error:", e.message);
+        return writeJson(res, 200, { ok: false, city, error: e.message });
+      }
+    }
+
     if (req.method === "GET" && pathname === "/api/system/llm-status") {
       const primaryProvider = ANTHROPIC_KEY_HEALTH.looksValid ? "claude" : (OPENAI_KEY_HEALTH.looksValid ? "openai" : "fallback");
       return writeJson(res, 200, {
@@ -10009,6 +10055,55 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       return writeJson(res, 200, {
         status: "success", orderId, itineraryId,
         msg: "支付成功！您的行程已确认，电子凭证已发送至您的邮箱。",
+      });
+    }
+
+    // ── POST /api/booking/pay — Charge via payment rail + attach QR to order ─
+    if (req.method === "POST" && pathname === "/api/booking/pay") {
+      const body    = await readBody(req);
+      const { orderId, railId } = body || {};
+      if (!orderId) return writeJson(res, 400, { error: "orderId required" });
+      const order = db.orders[orderId];
+      if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      if (order.status !== "awaiting_payment")
+        return writeJson(res, 409, { error: "order_not_payable", status: order.status });
+
+      const charge = await paymentRails.charge({
+        railId:   railId || "alipay_cn",
+        amount:   order.totalCost,
+        currency: order.currency || "CNY",
+        userId:   order.userId || "demo",
+        taskId:   orderId,
+      });
+      if (!charge.ok) {
+        return writeJson(res, 402, {
+          ok: false,
+          errorCode: charge.errorCode,
+          provider:  charge.provider,
+          reason:    charge.data && charge.data.complianceReason,
+        });
+      }
+
+      order.proof = {
+        ...charge.data,
+        qrSandbox: Boolean(charge.data.sandbox),
+      };
+      order.paymentRail = charge.data.railId;
+      saveDb();
+
+      return writeJson(res, 200, {
+        ok:         true,
+        orderId,
+        qrCode:     charge.data.qrCode     || null,
+        paymentRef: charge.data.paymentRef,
+        gatewayRef: charge.data.gatewayRef,
+        railId:     charge.data.railId,
+        railLabel:  charge.data.railLabel,
+        sandbox:    Boolean(charge.data.sandbox),
+        provider:   charge.provider,
+        source:     charge.source,
+        latency:    charge.latency,
+        fx:         charge.data.fx         || null,
       });
     }
 

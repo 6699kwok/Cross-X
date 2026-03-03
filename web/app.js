@@ -7444,7 +7444,10 @@ function renderCardData(cd, spokenText) {
         cd.days.map((d, i) =>
           `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})">Day ${d.day}</button>`
         ).join("") +
+        `<button class="day-tab" data-day="map" onclick="switchPlanDay('${cardId}','map')">🗺 地图</button>` +
         "</div>";
+
+      const _mapPanelHtml1 = _buildMapPanelHtml(cardId, cd.destination, cd.days);
 
       const dayPanelsHtml = cd.days.map((d, di) => {
         const icHtml = _buildIntercityHtml(d.intercity_transport);
@@ -7481,6 +7484,7 @@ function renderCardData(cd, spokenText) {
               </div>` : "";
           return `${transitHtml}
             <div class="act-row">
+              <div class="act-drag-handle">\u22EE</div>
               <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
               <div class="act-body">
                 <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue}${cozeTicket}</div>
@@ -7491,6 +7495,7 @@ function renderCardData(cd, spokenText) {
                 ${localNavHtml}
               </div>
               <span class="act-cost${costCls}">${costFmt}</span>
+              <button class="act-delete-btn" onclick="deleteActivity(this)" title="删除">✕</button>
             </div>`;
         }).join("");
         const hotelHtml = d.hotel ? (() => {
@@ -7504,7 +7509,7 @@ function renderCardData(cd, spokenText) {
           return `<div class="act-day-budget"><div class="act-day-budget-items">${parts}</div>${b.total>0?`<div class="act-day-budget-total">合计 ¥${b.total}</div>`:""}</div>`;
         })() : "";
         return `<div class="plan-day-panel${di === 0 ? " active" : ""}" data-panel="${di}" id="${cardId}-panel-${di}">
-          <div class="day-panel-label">${escapeHtml(d.label || `Day ${d.day}`)}</div>
+          <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="编辑行程">✏️</button></div>
           ${icHtml}<div class="day-activities">${activities}</div>${hotelHtml}${budgetHtml}
         </div>`;
       }).join("");
@@ -7519,6 +7524,7 @@ function renderCardData(cd, spokenText) {
           ${arrivalNote}
           ${dayTabsHtml}
           <div class="plan-day-panels" id="${cardId}-panels">${dayPanelsHtml}</div>
+          ${_mapPanelHtml1}
         </div>`;
     } else if (hasPlans) {
       // Summary mode: days will be fetched on demand when user clicks "查看逐日行程"
@@ -7552,6 +7558,7 @@ function renderCardData(cd, spokenText) {
             ${dest || dur ? `<div class="plan-card-meta">📍 ${dest ? dest + "  ·  " : ""}${dur}${pickText("天","d","日","일")}${pax > 1 ? "  ·  " + pax + pickText("人","pax","名","명") : ""}</div>` : ""}
           </div>
         </div>
+        <div id="${cardId}-weather" class="cx-weather-strip cx-weather-strip--loading">⏳ 正在获取天气预报...</div>
         ${spokenText ? `
         <div class="plan-analysis-block">
           <div class="plan-analysis-label">
@@ -7565,6 +7572,7 @@ function renderCardData(cd, spokenText) {
         <div class="cx-plan-list">${planCards}</div>
         ${dayItineraryHtml}
         ${_buildRefineBar(cd)}
+        <div style="text-align:center;margin:6px 0 2px"><button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 \u5206\u4eab\u884c\u7a0b</button></div>
         <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "")}</p>
       </article>
     `);
@@ -7586,11 +7594,14 @@ function renderCardData(cd, spokenText) {
           const barEl = articleEl.querySelector(`#cx-sb-${cardId}-${idx}`);
           if (barEl) fetchCouponBar(dest, barEl).catch(() => {});
         });
+        // Fetch weather forecast for destination
+        fetchWeatherStrip(cardId, dest).catch(() => {});
       }
     }, 150);
     if (spokenText) speakAssistantMessage(spokenText);
-    // Save plan for spotlight panel
+    // Save plan for spotlight panel + per-card share registry
     state.lastAiPlan = { cd, spokenText };
+    _planCardData.set(cardId, cd);
     updateSpotlightWithAiPlan(cd, spokenText);
     return true;
   }
@@ -7626,6 +7637,7 @@ function renderCardData(cd, spokenText) {
   // ── Day tabs + panels ─────────────────────────────────────────────────
   let dayTabsHtml = "";
   let dayPanelsHtml = "";
+  let _mapPanelHtml2 = "";
 
   if (hasDays) {
     const cardId = "plan-" + Math.random().toString(36).slice(2, 8);
@@ -7633,7 +7645,10 @@ function renderCardData(cd, spokenText) {
       cd.days.map((d, i) =>
         `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})" data-day="${i}">Day ${d.day}</button>`
       ).join("") +
+      `<button class="day-tab" data-day="map" onclick="switchPlanDay('${cardId}','map')">🗺 地图</button>` +
       `</div>`;
+
+    _mapPanelHtml2 = _buildMapPanelHtml(cardId, cd.destination, cd.days);
 
     dayPanelsHtml = cd.days.map((d, di) => {
       const _icHtml2   = _buildIntercityHtml(d.intercity_transport);
@@ -7667,6 +7682,7 @@ function renderCardData(cd, spokenText) {
             </div>` : "";
         return `${transitHtml}
           <div class="act-row">
+            <div class="act-drag-handle">\u22EE</div>
             <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
             <div class="act-body">
               <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue2}${cozeTicket2}</div>
@@ -7677,6 +7693,7 @@ function renderCardData(cd, spokenText) {
               ${localNavHtml2}
             </div>
             <span class="act-cost${costCls}">${costFmt}</span>
+            <button class="act-delete-btn" onclick="deleteActivity(this)" title="删除">✕</button>
           </div>`;
       }).join("");
       const _hotelHtml2 = d.hotel ? (() => {
@@ -7690,7 +7707,7 @@ function renderCardData(cd, spokenText) {
         return `<div class="act-day-budget"><div class="act-day-budget-items">${parts}</div>${b.total>0?`<div class="act-day-budget-total">合计 ¥${b.total}</div>`:""}</div>`;
       })() : "";
       return `<div class="plan-day-panel${di === 0 ? " active" : ""}" data-panel="${di}" id="${cardId}-panel-${di}">
-        <div class="day-panel-label">${escapeHtml(d.label || `Day ${d.day}`)}</div>
+        <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="编辑行程">✏️</button></div>
         ${_icHtml2}<div class="day-activities">${activities}</div>${_hotelHtml2}${_budgetHtml2}
       </div>`;
     }).join("");
@@ -7778,6 +7795,7 @@ function renderCardData(cd, spokenText) {
       ${hotelHtml}
       ${dayTabsHtml}
       ${dayPanelsHtml}
+      ${_mapPanelHtml2}
       ${budgetBar ? `<div class="budget-breakdown-bar">${budgetBar}</div>
       <div class="bb-legend">${budgetLegend}</div>` : ""}
       <button class="payment-confirm-btn"
@@ -7785,20 +7803,432 @@ function renderCardData(cd, spokenText) {
         onclick="handleCardPaymentConfirm(this)">
         确认行程 · 开始预订 ¥${escapeHtml(totalFmt)}
       </button>
+      <div style="text-align:center;margin:8px 0 2px"><button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 \u5206\u4eab\u884c\u7a0b</button></div>
       <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "")}</p>
     </article>
   `);
   if (spokenText) speakAssistantMessage(spokenText);
+  _planCardData.set(cardId, cd);
   return true;
+}
+
+// ── Per-card plan data registry (cardId → cd) ─────────────────────────────
+// Allows openShareCard to share the correct card's data when multiple cards exist
+const _planCardData = new Map();
+
+// ── Cached Amap web key (fetched once, reused across all map tabs) ─────────
+let _amapWebKey = null;
+
+// ── Itinerary edit mode: drag-and-drop reorder + delete ───────────────────
+let _cxDragEl = null; // element currently being dragged
+
+function _initDragListeners(panel) {
+  if (panel.dataset.dragInit === "1") return;
+  panel.dataset.dragInit = "1";
+
+  panel.addEventListener("dragstart", (e) => {
+    _cxDragEl = e.target.closest(".act-row");
+    if (!_cxDragEl) return;
+    _cxDragEl.classList.add("cx-dragging");
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", ""); // required for Firefox
+  });
+
+  panel.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    const target = e.target.closest(".act-row");
+    if (!target || target === _cxDragEl) return;
+    e.dataTransfer.dropEffect = "move";
+    // Clear indicators on siblings first
+    panel.querySelectorAll(".act-row").forEach((r) => {
+      if (r !== target) r.classList.remove("cx-drag-over--top", "cx-drag-over--bottom");
+    });
+    const rect  = target.getBoundingClientRect();
+    const isTop = e.clientY < rect.top + rect.height / 2;
+    target.classList.toggle("cx-drag-over--top",    isTop);
+    target.classList.toggle("cx-drag-over--bottom", !isTop);
+  });
+
+  panel.addEventListener("dragleave", (e) => {
+    const target = e.target.closest(".act-row");
+    if (target) target.classList.remove("cx-drag-over--top", "cx-drag-over--bottom");
+  });
+
+  panel.addEventListener("drop", (e) => {
+    e.preventDefault();
+    const target = e.target.closest(".act-row");
+    if (!target || !_cxDragEl || target === _cxDragEl) return;
+    const rect   = target.getBoundingClientRect();
+    const before = e.clientY < rect.top + rect.height / 2;
+    target.classList.remove("cx-drag-over--top", "cx-drag-over--bottom");
+    const parent = target.parentNode;
+    if (before) parent.insertBefore(_cxDragEl, target);
+    else        parent.insertBefore(_cxDragEl, target.nextSibling);
+    _cxDragEl.classList.remove("cx-dragging");
+    _cxDragEl = null;
+  });
+
+  panel.addEventListener("dragend", () => {
+    if (_cxDragEl) _cxDragEl.classList.remove("cx-dragging");
+    panel.querySelectorAll(".act-row").forEach((r) =>
+      r.classList.remove("cx-drag-over--top", "cx-drag-over--bottom", "cx-dragging")
+    );
+    _cxDragEl = null;
+  });
+}
+
+function toggleDayEdit(btn) {
+  const panel = btn.closest(".plan-day-panel");
+  if (!panel) return;
+  const editing = panel.classList.toggle("plan-day-panel--editing");
+  btn.classList.toggle("active", editing);
+  btn.title = editing ? "完成编辑" : "编辑行程";
+  btn.textContent = editing ? "✓" : "✏️";
+  panel.querySelectorAll(".act-row").forEach((row) => { row.draggable = editing; });
+  if (editing) _initDragListeners(panel);
+}
+
+function deleteActivity(btn) {
+  const row = btn.closest(".act-row");
+  if (!row) return;
+  // Also remove an immediately preceding transit strip if any
+  const prev = row.previousElementSibling;
+  row.style.maxHeight = row.offsetHeight + "px";
+  row.style.overflow  = "hidden";
+  row.style.transition = "opacity 0.18s, max-height 0.25s, padding 0.25s";
+  requestAnimationFrame(() => {
+    row.style.opacity   = "0";
+    row.style.maxHeight = "0";
+    row.style.paddingTop    = "0";
+    row.style.paddingBottom = "0";
+  });
+  setTimeout(() => {
+    if (prev?.classList.contains("act-transit")) prev.remove();
+    row.remove();
+  }, 270);
+}
+
+// ── Share card generation ──────────────────────────────────────────────────
+function _cityGradient(city) {
+  const GRADS = [
+    "linear-gradient(135deg,#1e3a5f 0%,#0f766e 100%)",
+    "linear-gradient(135deg,#7c3aed 0%,#db2777 100%)",
+    "linear-gradient(135deg,#b45309 0%,#92400e 100%)",
+    "linear-gradient(135deg,#0f4c81 0%,#1e40af 100%)",
+    "linear-gradient(135deg,#166534 0%,#15803d 100%)",
+    "linear-gradient(135deg,#7f1d1d 0%,#be185d 100%)",
+  ];
+  let h = 0;
+  for (let i = 0; i < city.length; i++) h = (h * 31 + city.charCodeAt(i)) & 0xffff;
+  return GRADS[h % GRADS.length];
+}
+
+function _buildShareCardHtml(cd) {
+  const dest = escapeHtml(cd.destination || "旅行计划");
+  const daysN = cd.duration_days || (cd.days || []).length || "";
+  const pax = cd.pax || 1;
+  const heroUrl = _getCityHeroUrl(cd.destination || "");
+  const grad = _cityGradient(cd.destination || "");
+  const total = Number(cd.total_price || 0);
+  const totalFmt = total ? `¥${total.toLocaleString()}` : "";
+  const perDay = (total && daysN) ? ` · ¥${Math.round(total / Number(daysN)).toLocaleString()}/天` : "";
+
+  const dayItems = (cd.days || []).slice(0, 5).map((d, i) => {
+    const acts = (d.activities || []).slice(0, 2).map(a =>
+      `<div class="cx-sc-act">\u2022 ${escapeHtml(a.name || "")}</div>`
+    ).join("");
+    return `<div class="cx-sc-day">
+      <div class="cx-sc-day-label">Day ${d.day || i + 1} · ${escapeHtml(d.label || "")}</div>
+      ${acts || ""}
+    </div>`;
+  }).join("");
+
+  return `<div class="cx-sc-root" style="background:${grad}">
+    ${heroUrl ? `<img class="cx-sc-hero-img" src="${heroUrl}" crossorigin="anonymous" onerror="this.style.display='none'">` : ""}
+    <div class="cx-sc-overlay">
+      <div class="cx-sc-brand">\u2708 Cross X</div>
+      <div class="cx-sc-dest">${dest}</div>
+      <div class="cx-sc-meta">${daysN ? `${daysN}\u5929` : ""}${pax > 1 ? ` \u00b7 ${pax}\u4eba` : ""}${totalFmt ? ` \u00b7 ${totalFmt}` : ""}${perDay}</div>
+    </div>
+    <div class="cx-sc-body">
+      ${dayItems || '<div class="cx-sc-empty">\u7cbe\u5f69\u65c5\u7a0b\u5373\u5c06\u5f00\u59cb</div>'}
+    </div>
+    <div class="cx-sc-footer">
+      <span class="cx-sc-footer-logo">Cross X · AI \u65c5\u884c\u89c4\u5212</span>
+      <span class="cx-sc-footer-tip">\u626b\u7801\u83b7\u53d6\u5b8c\u6574\u884c\u7a0b</span>
+    </div>
+  </div>`;
+}
+
+function _showShareModal(blob, fileName) {
+  document.getElementById("cx-share-modal")?.remove();
+  const url = URL.createObjectURL(blob);
+  const modal = document.createElement("div");
+  modal.id = "cx-share-modal";
+  modal.className = "cx-share-modal";
+  modal.innerHTML = `
+    <div class="cx-sm-box">
+      <div class="cx-sm-header">
+        <span>\u884c\u7a0b\u5206\u4eab\u56fe</span>
+        <button class="cx-sm-close">\u2715</button>
+      </div>
+      <div class="cx-sm-preview">
+        <img src="${url}" style="max-width:100%;border-radius:12px;" alt="\u5206\u4eab\u56fe">
+      </div>
+      <div class="cx-sm-actions">
+        <a class="cx-sm-dl-btn" href="${url}" download="${escapeHtml(fileName)}">\u2b07 \u4e0b\u8f7d\u56fe\u7247</a>
+        <button class="cx-sm-copy-btn">\u590d\u5236\u56fe\u7247</button>
+      </div>
+    </div>
+  `;
+  const cleanup = () => URL.revokeObjectURL(url);
+  modal.querySelector(".cx-sm-close").addEventListener("click", () => { modal.remove(); cleanup(); });
+  modal.querySelector(".cx-sm-copy-btn").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      showToast("\u56fe\u7247\u5df2\u590d\u5236\u5230\u526a\u8d34\u677f");
+    } catch { showToast("\u8bf7\u957f\u6309\u56fe\u7247\u4fdd\u5b58"); }
+  });
+  modal.addEventListener("click", (e) => { if (e.target === modal) { modal.remove(); cleanup(); } });
+  document.body.appendChild(modal);
+}
+
+async function openShareCard(cardId) {
+  const cd = _planCardData.get(cardId) || state.lastAiPlan?.cd;
+  if (!cd) { showToast("\u6682\u65e0\u884c\u7a0b\u6570\u636e"); return; }
+  const btn = document.querySelector(`#${cardId} .cx-share-btn`);
+  if (btn) { btn.disabled = true; btn.textContent = "\u23f3 \u751f\u6210\u4e2d\u2026"; }
+  try {
+    // Ensure render container exists
+    let renderEl = document.getElementById("cx-share-render");
+    if (!renderEl) {
+      renderEl = document.createElement("div");
+      renderEl.id = "cx-share-render";
+      renderEl.className = "cx-share-card-render";
+      document.body.appendChild(renderEl);
+    }
+    renderEl.innerHTML = _buildShareCardHtml(cd);
+    // Wait for hero image to load (or fail) before capture
+    const img = renderEl.querySelector(".cx-sc-hero-img");
+    if (img) await new Promise(res => { img.onload = res; img.onerror = res; setTimeout(res, 3000); });
+
+    // Lazy-load html2canvas
+    if (!window.html2canvas) {
+      await new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    }
+    const canvas = await html2canvas(renderEl, { scale: 2, useCORS: true, backgroundColor: null, logging: false });
+    const blob = await new Promise(res => canvas.toBlob(res, "image/png"));
+    const dest = cd.destination || "\u65c5\u7a0b";
+    const fileName = `CrossX_${dest}_\u884c\u7a0b\u5206\u4eab.png`;
+
+    // Try native share (mobile)
+    const file = new File([blob], fileName, { type: "image/png" });
+    if (navigator.share && navigator.canShare?.({ files: [file] })) {
+      await navigator.share({ files: [file], title: `${dest}\u65c5\u884c\u8ba1\u5212`, text: "\u7528 Cross X \u751f\u6210\u7684\u65c5\u884c\u8ba1\u5212\uff0c\u5feb\u6765\u770b\u770b\uff01" });
+    } else {
+      _showShareModal(blob, fileName);
+    }
+  } catch (e) {
+    console.error("share card error", e);
+    showToast("\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "\ud83d\udce4 \u5206\u4eab\u884c\u7a0b"; }
+  }
 }
 
 // ── Day tab switcher (called from inline onclick) ─────────────────────────
 function switchPlanDay(cardId, dayIdx) {
   const tabs = document.getElementById(`${cardId}-tabs`);
   const panels = document.getElementById(`${cardId}-panels`);
+  const mapPanel = document.getElementById(`${cardId}-map-panel`);
   if (!tabs || !panels) return;
-  tabs.querySelectorAll(".day-tab").forEach((t, i) => t.classList.toggle("active", i === dayIdx));
-  panels.querySelectorAll(".plan-day-panel").forEach((p, i) => p.classList.toggle("active", i === dayIdx));
+  const isMap = dayIdx === "map";
+  tabs.querySelectorAll(".day-tab").forEach((t, i) =>
+    t.classList.toggle("active", isMap ? t.dataset.day === "map" : i === dayIdx)
+  );
+  panels.querySelectorAll(".plan-day-panel").forEach((p, i) =>
+    p.classList.toggle("active", !isMap && i === dayIdx)
+  );
+  if (mapPanel) mapPanel.classList.toggle("active", isMap);
+  if (isMap) initPlanMap(cardId);
+}
+
+// ── Weather strip: fetch forecast + render into plan card ─────────────────
+const _weatherCache = new Map(); // city → {ts, data}; 1h client-side cache
+const _WEATHER_CLIENT_TTL = 60 * 60 * 1000;
+
+const _WEEK_DAYS = ["周日","周一","周二","周三","周四","周五","周六"];
+
+async function fetchWeatherStrip(cardId, city) {
+  const el = document.getElementById(`${cardId}-weather`);
+  if (!el || !city) return;
+
+  // Client-side cache check
+  const cached = _weatherCache.get(city);
+  if (cached && Date.now() - cached.ts < _WEATHER_CLIENT_TTL) {
+    _renderWeatherStrip(el, cached.data, city);
+    return;
+  }
+
+  try {
+    const r = await fetch(`/api/weather?city=${encodeURIComponent(city)}&days=5`);
+    const data = await r.json();
+    if (!data.ok) { el.textContent = ""; el.style.display = "none"; return; }
+    _weatherCache.set(city, { ts: Date.now(), data });
+    _renderWeatherStrip(el, data, city);
+  } catch {
+    el.textContent = "";
+    el.style.display = "none";
+  }
+}
+
+function _renderWeatherStrip(el, data, city) {
+  el.classList.remove("cx-weather-strip--loading");
+  const cur = data.current || {};
+
+  // Day pills
+  const dayPills = (data.forecast || []).map((d, i) => {
+    const dt = new Date(d.date);
+    const label = i === 0 ? "今天" : (i === 1 ? "明天" : _WEEK_DAYS[dt.getDay()]);
+    return `<div class="cx-ws-day${i === 0 ? " cx-ws-day--today" : ""}">
+      <div class="cx-ws-d-label">${label}</div>
+      <div class="cx-ws-d-icon">${d.icon}</div>
+      <div class="cx-ws-d-range">${d.high_c}° / ${d.low_c}°</div>
+      <div class="cx-ws-d-cond">${d.label}</div>
+    </div>`;
+  }).join("");
+
+  el.innerHTML = `
+    <div class="cx-ws-header">
+      <span class="cx-ws-city">🌤 ${escapeHtml(city)} 天气</span>
+      <span class="cx-ws-source">Open-Meteo</span>
+    </div>
+    <div class="cx-ws-now">
+      <span class="cx-ws-now-icon">${cur.icon || "🌤️"}</span>
+      <span class="cx-ws-now-temp">${cur.temp_c}°C</span>
+      <span class="cx-ws-now-meta">${cur.label} · 体感${cur.feels_c}° · 湿度${cur.humidity}%</span>
+    </div>
+    <div class="cx-ws-days">${dayPills}</div>
+    ${data.tip ? `<div class="cx-ws-tip">${data.tip}</div>` : ""}`;
+}
+
+// ── Map panel helpers ─────────────────────────────────────────────────────
+function _collectMapActivities(days) {
+  const acts = [];
+  (days || []).forEach((d) => {
+    if (d.hotel?.name) acts.push({ name: d.hotel.name, type: "hotel" });
+    (d.activities || []).filter((a) => !/^(transport|city_change)$/i.test(a.type || ""))
+      .forEach((a) => { if (a.name) acts.push({ name: a.name, type: a.type || "sight" }); });
+  });
+  return acts;
+}
+
+function _buildMapPanelHtml(cardId, destination, days) {
+  const acts = _collectMapActivities(days);
+  return `<div id="${cardId}-map-panel" class="cx-map-wrap" data-city="${escapeHtml(destination || "")}" data-activities="${escapeHtml(JSON.stringify(acts))}"><div id="${cardId}-map" class="cx-map"><div class="cx-map-placeholder"><span class="cx-map-placeholder-icon">🗺️</span><span>切换此标签加载地图</span></div></div><div class="cx-map-legend" id="${cardId}-map-legend"></div></div>`;
+}
+
+// ── Amap JS SDK map: geocode activities + render interactive pin map ───────
+async function initPlanMap(cardId) {
+  const mapPanel = document.getElementById(`${cardId}-map-panel`);
+  const mapDiv   = document.getElementById(`${cardId}-map`);
+  if (!mapPanel || !mapDiv) return;
+  if (mapDiv.dataset.initialized === "1") return; // already rendered
+  mapDiv.dataset.initialized = "1";
+
+  const city = (mapPanel.dataset.city || "").trim();
+  let activities = [];
+  try { activities = JSON.parse(mapPanel.dataset.activities || "[]"); } catch { /* ignore */ }
+
+  const legendEl = document.getElementById(`${cardId}-map-legend`);
+
+  // Helper: show placeholder text
+  const showPlaceholder = (icon, text) => {
+    mapDiv.innerHTML = `<div class="cx-map-placeholder"><span class="cx-map-placeholder-icon">${icon}</span><span>${text}</span></div>`;
+  };
+
+  if (!city || !activities.length) { showPlaceholder("📍", "暂无地点数据"); return; }
+
+  showPlaceholder("⏳", "地图加载中...");
+
+  // 1. Fetch Amap web key from backend (cached after first fetch)
+  if (_amapWebKey === null) {
+    try {
+      const r = await fetch("/api/map-key");
+      const d = await r.json();
+      _amapWebKey = d.key || "";
+    } catch { _amapWebKey = ""; }
+  }
+  const amapKey = _amapWebKey;
+
+  if (!amapKey) {
+    showPlaceholder("⚠️", "地图未配置（需 AMAP_WEB_KEY）");
+    if (legendEl) legendEl.innerHTML = activities.slice(0, 10).map((a, i) =>
+      `<span><span class="cx-map-legend-num">${i + 1}</span>${escapeHtml(a.name)}</span>`
+    ).join("");
+    return;
+  }
+
+  // 2. Load Amap JS SDK v2.0 lazily
+  if (!window.AMap) {
+    await new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(amapKey)}`;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("Amap SDK load failed"));
+      document.head.appendChild(s);
+    }).catch(() => null);
+    if (!window.AMap) { showPlaceholder("❌", "地图加载失败，请检查网络"); return; }
+  }
+
+  // 3. Geocode activity names via backend
+  const names = [...new Set(activities.map((a) => a.name))].slice(0, 15);
+  let geocoded = [];
+  try {
+    const gr = await fetch("/api/geocode-places", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ places: names, city }),
+    });
+    const gd = await gr.json();
+    geocoded = (gd.results || []).filter((g) => g.loc);
+  } catch { /* ignore */ }
+
+  if (!geocoded.length) { showPlaceholder("📍", "地点定位失败，请稍后重试"); return; }
+
+  // 4. Build map
+  mapDiv.innerHTML = "";
+  const lnglats = geocoded.map((g) => {
+    const [lng, lat] = g.loc.split(",").map(Number);
+    return new AMap.LngLat(lng, lat);
+  });
+
+  const map = new AMap.Map(mapDiv, { zoom: 13, center: lnglats[0] });
+
+  // Numbered pin markers
+  geocoded.forEach((g, i) => {
+    new AMap.Marker({
+      position: lnglats[i],
+      title: g.name,
+      content: `<div class="cx-map-pin"><span>${i + 1}</span></div>`,
+      offset: new AMap.Pixel(-12, -12),
+    }).setMap(map);
+  });
+
+  if (lnglats.length > 1) map.setFitView();
+
+  // Update legend
+  if (legendEl) {
+    legendEl.innerHTML = geocoded.slice(0, 10).map((g, i) =>
+      `<span><span class="cx-map-legend-num">${i + 1}</span>${escapeHtml(g.name)}</span>`
+    ).join("");
+  }
 }
 
 // ── Plan detail reveal — shows day-by-day itinerary without triggering booking
@@ -7939,6 +8369,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
               </div>` : "";
           return `${transitHtml}
             <div class="act-row">
+              <div class="act-drag-handle">\u22EE</div>
               <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
               <div class="act-body">
                 <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue3}${cozeTicket3}</div>
@@ -7949,6 +8380,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
                 ${localNavHtml3}
               </div>
               <span class="act-cost${costCls}">${costFmt}</span>
+              <button class="act-delete-btn" onclick="deleteActivity(this)" title="删除">✕</button>
             </div>`;
         }).join("");
 
@@ -7984,7 +8416,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         })() : "";
 
         return `<div class="plan-day-panel${globalIdx === 0 ? " active" : ""}" data-panel="${globalIdx}" id="${cardId}-panel-${globalIdx}">
-          <div class="day-panel-label">${escapeHtml(d.label || `Day ${d.day}`)}</div>
+          <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="编辑行程">✏️</button></div>
           ${intercityHtml}
           <div class="day-activities">${activities}</div>
           ${hotelHtml}
@@ -8020,12 +8452,17 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
           const dayTabsHtml = `<div class="plan-day-tabs" id="${cardId}-tabs">` +
             result.days.map((d, i) =>
               `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})">Day ${d.day}</button>`
-            ).join("") + "</div>";
+            ).join("") +
+            `<button class="day-tab" data-day="map" onclick="switchPlanDay('${cardId}','map')">🗺 地图</button>` +
+            "</div>";
+
+          const _dest3 = planSummary?.destination || card.dataset.destination || "";
+          const _mapPanel3 = _buildMapPanelHtml(cardId, _dest3, result.days);
 
           const loadingEl = itinerarySec.querySelector(".plan-detail-loading");
           if (loadingEl) loadingEl.remove();
           itinerarySec.insertAdjacentHTML("beforeend",
-            `${arrivalBanner}${dayTabsHtml}<div class="plan-day-panels" id="${cardId}-panels">${buildDayPanelHtml(result.days, globalOffset)}</div>`
+            `${arrivalBanner}${dayTabsHtml}<div class="plan-day-panels" id="${cardId}-panels">${buildDayPanelHtml(result.days, globalOffset)}</div>${_mapPanel3}`
           );
           itinerarySec.classList.remove("plan-itinerary-section--pending");
         } else {

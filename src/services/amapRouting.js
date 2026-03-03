@@ -270,4 +270,22 @@ async function queryLocalRoute(originName, destName, city) {
   return { ...result, _source: "amap_live" };
 }
 
-module.exports = { queryAmapRouting, queryLocalRoute };
+/**
+ * Batch-geocode an array of place names scoped to a city.
+ * Returns [{name, loc}] where loc is "lng,lat" string or null on failure.
+ * Used by /api/geocode-places to supply map pin coordinates.
+ */
+async function geocodePlacesBatch(placeNames, city) {
+  const key = String(process.env.AMAP_API_KEY || "").trim();
+  if (!key || !Array.isArray(placeNames) || !placeNames.length) return [];
+  const cityShort = city.replace(/[市省自治区直辖市特别行政区]$/, "");
+  const results = await Promise.all(
+    placeNames.map(async (name) => ({
+      name: String(name),
+      loc: await geocodePlaceInCity(key, String(name), cityShort) || null,
+    }))
+  );
+  return results;
+}
+
+module.exports = { queryAmapRouting, queryLocalRoute, geocodePlacesBatch };

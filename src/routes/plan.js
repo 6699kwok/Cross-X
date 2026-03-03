@@ -17,6 +17,7 @@ const { extractPreferences, mergePreferences, buildContextSummary, pruneHistory 
 const { runAgentLoop } = require("../agent/loop");
 const { detectIntentLLM } = require("../ai/intent");
 const { needsDiscovery, runDiscovery } = require("../planner/discovery");
+const { callLangGraph } = require("../services/langgraph");
 
 // ── P1 session + security modules ─────────────────────────────────────────────
 const {
@@ -696,10 +697,89 @@ function createPlanRouter({
       // Kill static progress timer — agent loop emits its own status events
       planDone = true;
 
-      // ── Coze Bot: primary plan generator (real plugin data) ─────────────────
-      // Try bot first; if it returns a valid options_card, emit directly.
-      // Falls through to agent loop on failure / timeout.
-      if (typeof callCozeBotStreaming === "function") {
+      // ── LangGraph Native Engine (CrossX AI Native, primary path) ─────────────
+      // Try Python LangGraph service first — produces CrossX-native card_data.
+      // Falls through to Coze Bot → agent loop on failure/timeout/unavailable.
+      {
+        emit({ type: "status", code: "H_SEARCH", label: pickLang(language,
+          "AI\u5f15\u64ce\u52a0\u8f7d\u4e2d...", "AI engine loading...",
+          "AI\u30a8\u30f3\u30b8\u30f3\u8d77\u52d5\u4e2d...", "AI \uc5d4\uc9c4 \ub85c\ub529 \uc911...") });
+
+        const lgResult = await callLangGraph({
+          query: effectiveMessage,
+          city:  constraints.destination || intentResult?.destination || city,
+          lang:  language,
+          constraints,
+        });
+
+        if (lgResult.ok && lgResult.card_data) {
+          emit({ type: "status", code: "H_SEARCH", label: pickLang(language,
+            "\u5b9e\u65f6\u6570\u636e\u6574\u5408\u5b8c\u6210", "Live data integrated",
+            "\u30c7\u30fc\u30bf\u7d71\u5408\u5b8c\u4e86", "\ub370\uc774\ud130 \ud1b5\ud569 \uc644\ub8cc") });
+          emit({ type: "status", code: "T_CALC", label: pickLang(language,
+            "\u4ea4\u901a\u6838\u7b97\u5b8c\u6210", "Transport calculated",
+            "\u4ea4\u901a\u8cbb\u78ba\u5b9a", "\uad50\ud1b5\ube44 \ud655\uc815") });
+          emit({ type: "status", code: "B_CHECK", label: pickLang(language,
+            "\u9884\u7b97\u6821\u9a8c\u5b8c\u6210", "Budget verified",
+            "\u4e88\u7b97\u78ba\u5b9a", "\uc608\uc0b0 \ud655\uc815") });
+
+          let outSessionId = incomingSessionId;
+          const _lgCard = lgResult.card_data;
+          const _newTurn = { role: "user", content: effectiveMessage };
+          const _updatedHistory = pruneHistory([...mergedHistory, _newTurn], 12);
+          const _sessionPayload = {
+            plan: _lgCard, message: effectiveMessage, language, city,
+            preferences: mergedPrefs, history: _updatedHistory,
+          };
+          if (outSessionId && getSession(outSessionId)) {
+            patchSession(outSessionId, _sessionPayload);
+          } else {
+            outSessionId = createSession(_sessionPayload, DEFAULT_TTL_MS);
+          }
+          if (outSessionId && Object.keys(mergedPrefs).length > 0) {
+            touchSession(outSessionId, PREF_TTL_MS);
+          }
+          console.log(`[plan/coze] LangGraph OK — session ${outSessionId} (${_lgCard.title || "untitled"})`);
+
+          if (deviceId) {
+            const _dest  = intentResult?.destination || city || null;
+            const _trips = (userProfile?.tripCount || 0) + 1;
+            setImmediate(async () => {
+              try {
+                let summary = userProfile?.profileSummary || null;
+                if (!summary || _trips % 3 === 0) {
+                  summary = await generateProfileSummary(mergedPrefs, {
+                    apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
+                  });
+                }
+                saveProfile(deviceId, mergedPrefs, _dest, summary);
+              } catch (_e) { console.warn("[profile] async save error:", _e.message); }
+            });
+          }
+
+          const _followUp = FOLLOW_UP_SUGGESTIONS[intentAxis] || FOLLOW_UP_SUGGESTIONS.travel;
+          emit({
+            type:                  "final",
+            response_type:         "options_card",
+            spoken_text:           lgResult.spoken_text,
+            card_data:             _lgCard,
+            source:                "langgraph",
+            sessionId:             outSessionId || null,
+            coze_data:             null,
+            follow_up_suggestions: _followUp,
+          });
+          res.end();
+          return;
+        }
+
+        console.log("[plan/coze] LangGraph unavailable/failed — falling through to agent loop");
+      }
+
+      // ── Coze Bot: deep-reasoning path (豆包, ~160s) ─────────────────────────
+      // Disabled by default — agent loop (~38s) is faster and equally accurate.
+      // Re-enable: set COZE_BOT_ENABLED=true in .env.local
+      const _cozeBotEnabled = process.env.COZE_BOT_ENABLED === "true";
+      if (_cozeBotEnabled && typeof callCozeBotStreaming === "function") {
         emit({ type: "status", code: "H_SEARCH", label: pickLang(language,
           "\u6b63\u5728\u67e5\u8be2\u5b9e\u65f6\u65c5\u6e38\u8d44\u6e90...",
           "Fetching live travel data...",
