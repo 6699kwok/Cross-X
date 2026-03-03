@@ -6374,6 +6374,39 @@ function renderTravelFailCard(failedStep, plan, cardData) {
 }
 
 // F3: Inline plan refinement — send adjustment text directly from plan card
+/**
+ * Build contextual refinement chips based on current plan data (cd).
+ * Chips use destination, duration, pax for natural-language queries.
+ */
+function _buildRefineBar(cd) {
+  const dest = cd.destination || "";
+  const dur  = cd.duration_days || 3;
+  const pax  = cd.pax || 1;
+  const destQ = dest ? `\u5728${dest}` : "";
+
+  const chips = [
+    { label: "\u66F4\u4FBF\u5B9C",   q: `${destQ}\u7F8E\u4F46\u66F4\u4FBF\u5B9C\u7684\u9152\u5E97` },
+    { label: `\u6539${dur + 1}\u5929`, q: `\u884C\u7A0B\u6539\u4E3A${dur + 1}\u5929${destQ}` },
+    { label: pax > 1 ? `+\u4EBA\u6570` : `2\u4EBA\u884C`, q: pax > 1
+        ? `\u4EBA\u6570\u6539\u4E3A${pax + 1}\u4EBA${destQ}`
+        : `\u6539\u4E3A2\u4EBA\u884C\u7A0B${destQ}` },
+    { label: "\u591A\u7F8E\u98DF",   q: `${destQ}\u52A0\u5F3A\u7F8E\u98DF\u4F53\u9A8C` },
+  ];
+
+  const chipsHtml = chips.map(c =>
+    `<button class="cx-pr-chip" onclick="_sendPlanRefine(${JSON.stringify(c.q)})">${escapeHtml(c.label)}</button>`
+  ).join("");
+
+  return `<div class="cx-plan-refine">
+    <div class="cx-pr-chips">${chipsHtml}</div>
+    <div class="cx-pr-input-row">
+      <input class="cx-pr-input" placeholder="${escapeHtml("\u7528\u81EA\u7136\u8BED\u8A00\u8C03\u6574\u65B9\u6848...")}"
+        onkeydown="if(event.key==='Enter'&&!event.isComposing)_sendPlanRefine(this.value,this)">
+      <button class="cx-pr-send" onclick="_sendPlanRefine(this.previousElementSibling.value,this.previousElementSibling)">\u8C03\u6574</button>
+    </div>
+  </div>`;
+}
+
 function _sendPlanRefine(text, inputEl) {
   const t = String(text || "").trim();
   if (!t) return;
@@ -7325,19 +7358,7 @@ function renderCardData(cd, spokenText) {
         <div class="plan-section-header">${pickText("选择你的方案","Choose Your Plan","プランを選ぶ","플랜 선택")}</div>
         <div class="cx-plan-list">${planCards}</div>
         ${dayItineraryHtml}
-        <div class="cx-plan-refine">
-          <div class="cx-pr-chips">
-            <button class="cx-pr-chip" onclick="_sendPlanRefine('\u66f4\u4fbf\u5b9c\u7684\u9152\u5e97')">\u66f4\u4fbf\u5b9c</button>
-            <button class="cx-pr-chip" onclick="_sendPlanRefine('\u591a\u4e00\u5929\u884c\u7a0b')">\u52a0\u4e00\u5929</button>
-            <button class="cx-pr-chip" onclick="_sendPlanRefine('\u6362\u4e2a\u533a\u57df')">\u6362\u533a\u57df</button>
-            <button class="cx-pr-chip" onclick="_sendPlanRefine('\u52a0\u5f3a\u7f8e\u98df\u63a8\u8350')">\u591a\u7f8e\u98df</button>
-          </div>
-          <div class="cx-pr-input-row">
-            <input class="cx-pr-input" placeholder="\u7528\u81ea\u7136\u8bed\u8a00\u8c03\u6574\u65b9\u6848..."
-              onkeydown="if(event.key==='Enter'&&!event.isComposing)_sendPlanRefine(this.value,this)">
-            <button class="cx-pr-send" onclick="_sendPlanRefine(this.previousElementSibling.value,this.previousElementSibling)">\u8c03\u6574</button>
-          </div>
-        </div>
+        ${_buildRefineBar(cd)}
         <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "")}</p>
       </article>
     `);
