@@ -3828,12 +3828,20 @@ function rerenderAgentFlowCards() {
     return;
   }
   if (mode === "replanning") {
+    const _failCode = state.agentConversation.lastFailureCode || "";
+    const _replanTipMap = {
+      queue_too_long:       pickText("检测到排队过长，正在切换无需排队的备选方案\u2026", "Queue too long — switching to a no-wait backup\u2026", "", ""),
+      budget_overflow:      pickText("预算超限，正在调整为更优惠的备选方案\u2026", "Over budget — adjusting to a more affordable backup\u2026", "", ""),
+      resource_unavailable: pickText("资源暂时不可用，正在重新规划备选路线\u2026", "Resource unavailable — replanning a backup route\u2026", "", ""),
+    };
+    const _replanTip = _replanTipMap[_failCode] || pickText("正在根据失败原因切换备选方案\u2026", "Switching to backup based on failure\u2026", "", "");
     renderTaskPanel(
       el.planCardsSection,
-      `
-      <h3>${pickText("自动重规划中", "Replanning automatically", "自動再計画中", "자동 재계획 중")}</h3>
-      <div class="status">${pickText("主方案受阻，我正在根据失败原因切换备选方案。", "Primary option is blocked. I am switching to backup based on failure reason.", "主案が中断したため、失敗理由に応じて代替案へ再計画します。", "주안이 막혀 실패 원인 기반으로 대안 재계획을 진행합니다.")}</div>
-    `,
+      `<div class="cx-replan-status">
+        <div class="cx-replan-spinner"></div>
+        <div class="cx-replan-label">${pickText("自动重规划中", "Replanning automatically", "自動再計画中", "자동 재계획 중")}</div>
+        <div class="cx-replan-tip">${_replanTip}</div>
+      </div>`,
     );
     return;
   }
@@ -4089,6 +4097,18 @@ function renderAgentConfirmCard(optionKey = "main") {
   const plan = state.agentConversation.currentPlan;
   if (!plan) return;
   const option = optionKey === "backup" ? plan.backupOption : plan.mainOption;
+
+  // Backup reason banner — shown when confirm follows an auto-replan failure
+  const _backupFailCode = optionKey === "backup" ? (state.agentConversation.lastFailureCode || "") : "";
+  const _backupReasonMap = {
+    queue_too_long:       pickText("排队过长", "queue too long", "", ""),
+    budget_overflow:      pickText("预算超限", "over budget", "", ""),
+    resource_unavailable: pickText("资源不可用", "resource unavailable", "", ""),
+  };
+  const _backupReason = _backupFailCode ? (_backupReasonMap[_backupFailCode] || pickText("执行受阻", "execution blocked", "", "")) : "";
+  const _backupBanner = _backupReason
+    ? `<div class="cx-backup-reason-banner">\uD83D\uDD04 ${pickText(`主方案因「${_backupReason}」失败，已为您切换备选方案`, `Primary failed (${_backupReason}) — switched to backup`, "", "")}</div>`
+    : "";
   const total = Number(option.amount || 0);
   const serviceFee = Math.max(6, Math.round(total * 0.08));
   const merchantFee = Math.max(0, total - serviceFee);
@@ -4119,13 +4139,14 @@ function renderAgentConfirmCard(optionKey = "main") {
       modifyLabel: pickText("修改条件", "Modify", "条件修正", "조건 수정"),
       cancelLabel: pickText("取消", "Cancel", "キャンセル", "취소"),
     });
+    if (_backupBanner) el.confirmCardSection.insertAdjacentHTML("afterbegin", _backupBanner);
     motion.bindPressables(el.confirmCardSection);
     return;
   }
   renderTaskPanel(
     el.confirmCardSection,
     `
-    <h3>${pickText("执行确认", "Execution confirmation", "実行確認", "실행 확인")}</h3>
+    ${_backupBanner}<h3>${pickText("执行确认", "Execution confirmation", "実行確認", "실행 확인")}</h3>
     <div class="status">${pickText("你将获得", "You will get", "取得内容", "제공 항목")}: ${pickText("锁位结果 / 双语导航卡 / 订单凭证", "booking lock / bilingual navigation / order proof", "予約確保 / 多言語ナビ / 注文証憑", "예약 잠금 / 이중언어 길안내 / 주문 증빙")}</div>
     <div class="status">${pickText("应付总额", "Total payable", "支払総額", "총 결제금액")}: <strong>${total} CNY</strong></div>
     <div class="actions">
@@ -4481,8 +4502,13 @@ async function autoReplanAfterFailure(run, detail) {
     failureCode: failure.code || "unknown",
     pendingOption: "backup",
   });
-  addMessage(failure.reason || pickText("主方案失败。", "Primary option failed.","主案が失敗しました。", "주안이 실패했습니다."), "agent");
-  addMessage(failure.action || pickText("我已生成新备选，请确认是否继续。", "I prepared a new backup. Confirm to continue.","新しい代替案を用意しました。続行するか確認してください。", "새 대안을 준비했습니다. 계속 진행할지 확인해 주세요."), "agent");
+
+  // Show replanning spinner first — let user see intermediate state
+  rerenderAgentFlowCards();
+  await waitMs(1400);
+
+  addMessage(failure.reason || pickText("主方案失败。", "Primary option failed.", "主案が失敗しました。", "주안이 실패했습니다."), "agent");
+  addMessage(failure.action || pickText("我已生成新备选，请确认是否继续。", "I prepared a new backup. Confirm to continue.", "新しい代替案を用意しました。続行するか確認してください。", "새 대안을 준비했습니다. 계속 진행할지 확인해 주세요."), "agent");
   setAgentMode("confirming", { source: "auto_replan" });
   rerenderAgentFlowCards();
 }
@@ -4792,6 +4818,9 @@ function waitMs(ms) {
 async function runAgentDemoPath(pathName = "normal") {
   const path = String(pathName || "normal").toLowerCase();
   resetAgentConversationForDemo();
+  // Demo needs agent flow cards visible — disable single-dialog CSS hiding
+  state.singleDialogMode = false;
+  document.body.classList.remove("single-dialog-mode");
   addMessage(
     pickText(
       `已启动演示路径：${path}`,
@@ -4814,14 +4843,27 @@ async function runAgentDemoPath(pathName = "normal") {
   }
 
   if (path === "fail" || path === "path-b") {
-    await handleAgentConversationInput("我想在深圳南山找一家不排队的晚餐，预算中等，2个人，今晚");
-    await waitMs(180);
+    // Bypass slow LLM call — set slots directly for instant demo start
+    const _demoInput = "我想在深圳南山找一家不排队的晚餐，预算中等，2个人，今晚";
+    addMessage(_demoInput, "user");
+    state.agentConversation.lastUserInput = _demoInput;
+    state.agentConversation.slots = normalizeAgentSlotsInPlace({
+      intent: "eat", city: "Shenzhen", area: "南山",
+      budget: "mid", party_size: "2", time_constraint: "今晚",
+      preferences: ["no_queue"],
+    });
+    setAgentMode("planning", { source: "demo_fail" });
+    state.agentConversation.currentPlan = buildAgentPlanFromSlots();
+    rerenderAgentFlowCards();
+    await waitMs(600);
     state.agentConversation.pendingOptionKey = "main";
     setAgentMode("confirming", { source: "demo_fail" });
     rerenderAgentFlowCards();
+    await waitMs(800);
     await runAgentExecution("main", true);
-    await waitMs(220);
+    await waitMs(400);
     if (state.agentConversation.mode === "confirming") {
+      await waitMs(1200);
       await runAgentExecution("backup", false);
     }
     return { ok: true, path };
