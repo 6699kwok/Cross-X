@@ -8314,6 +8314,7 @@ async function createTaskFromText(text) {
           appendThinkingText(_thinkingPanel, chunk);
         },
         onSessionId: (id) => { savePlanSessionId(id); renderSessionBadge(true); },
+        onIntentPreview: (ev) => _renderIntentPreview(ev, _thinkingStream),
       });
     } catch (e) {
       if (e && e.name === "AbortError") return null; // new message sent — silently discard
@@ -12215,6 +12216,8 @@ async function init() {
     state.singleDialogMode = true;
   }
   addMessage(getSystemMessageByKey("welcome_intro"), "agent", { i18nKey: "welcome_intro" });
+  // Time-aware proactive suggestions (fresh sessions only)
+  setTimeout(() => _renderTimeAwareSuggestions(), 400);
   // C4: profile-aware greeting — show personalized message for returning users
   setTimeout(() => _loadProfileGreeting().catch(() => {}), 800);
   // Silently detect location in background to personalize the welcome message
@@ -13141,7 +13144,7 @@ function renderBoundaryRejectionCard(text) {
 // Returns the final event object when stream ends.
 async function consumePlanStream({
   message, language, city, constraints, conversationHistory,
-  onStatusUpdate, onThinking, onSessionId,
+  onStatusUpdate, onThinking, onSessionId, onIntentPreview,
   signal,  // AbortController.signal — abort this fetch when user sends new message
 }) {
   const resp = await fetch("/api/plan/coze", {
@@ -13172,7 +13175,9 @@ async function consumePlanStream({
         if (!line.startsWith("data: ")) continue;
         try {
           const ev = JSON.parse(line.slice(6));
-          if (ev.type === "status" && typeof onStatusUpdate === "function") {
+          if (ev.type === "intent_preview" && typeof onIntentPreview === "function") {
+            onIntentPreview(ev);
+          } else if (ev.type === "status" && typeof onStatusUpdate === "function") {
             onStatusUpdate(ev.code, ev.label);
           } else if (ev.type === "tool_call" && typeof onStatusUpdate === "function") {
             // P8.6: Coze/backend emits tool_call events → TOOL_SIGNAL_MAP lookup
@@ -13266,6 +13271,50 @@ const TOOL_STEP_MAP = {
   get_city_enrichment: "H_SEARCH",
   get_route:           "T_CALC",
 };
+
+/**
+ * Intent preview pill row — injected into the thinking stream header when the
+ * backend signals what it understood (dest / days / pax) before generating a plan.
+ */
+function _renderIntentPreview(ev, streamEl) {
+  if (!ev || (!ev.dest && !ev.days)) return;
+  const axisIcon = ev.axis === "eat" ? "\u{1F374}" : ev.axis === "hotel" ? "\u{1F3E8}" : "\u2708\uFE0F";
+  const parts = [];
+  if (ev.dest) parts.push(`\u{1F4CD} ${ev.dest}`);
+  if (ev.days) parts.push(`\u23F1 ${ev.days}\u5929`);
+  if (ev.pax)  parts.push(`\u{1F465} ${ev.pax}\u4EBA`);
+
+  const row = document.createElement("div");
+  row.className = "cx-ip-row";
+  row.innerHTML = `<span class="cx-ip-label">${axisIcon} AI \u7406\u89E3\u5230</span>${
+    parts.map(p => `<span class="cx-ip-tag">${p}</span>`).join("")
+  }`;
+
+  if (streamEl) {
+    // Insert after the title row inside the thinking stream
+    const title = streamEl.querySelector(".cx-ts-title");
+    if (title) {
+      // Also update the title text to show destination for ambient awareness
+      if (ev.dest) {
+        title.innerHTML = `<span class="cx-ts-ping"></span>\u{1F4CD} ${escapeHtml(ev.dest)} \u2014 AI \u7CBE\u7B97\u4E2D...`;
+      }
+      title.after(row);
+    } else {
+      streamEl.prepend(row);
+    }
+  } else {
+    // Fallback: inject into chat feed directly
+    const feed = document.getElementById("chatFeed");
+    if (feed) { feed.appendChild(row); feed.scrollTop = feed.scrollHeight; }
+  }
+
+  // Also surface the destination in the global thinking indicator text
+  if (ev.dest) {
+    applyThinkingIndicatorState(true,
+      `\u{1F4CD} ${ev.dest} \u2014 ${pickText("\u6B63\u5728\u751F\u6210\u65B9\u6848...", "Generating plan...", "\u30D7\u30E9\u30F3\u3092\u751F\u6210\u4E2D...", "\uD50C\uB79C \uC0DD\uC131 \uC911...")}`
+    );
+  }
+}
 
 /** Create the thinking-stream timeline and append to chatFeed. Returns root el. */
 function renderThinkingStream() {
@@ -13550,6 +13599,67 @@ function _renderPostBookingFollowUp(plan, cardData) {
       <div class="cx-pb-title">AI \u4e0b\u4e00\u6b65\u5efa\u8bae</div>
       <div class="cx-pb-chips">${chipsHtml}</div>
     </article>
+  `);
+}
+
+/**
+ * Time-aware scenario suggestions — injected into the chat on fresh sessions.
+ * Shows 3 contextual chips based on hour of day so the app feels proactive
+ * before the user even types anything.
+ */
+function _renderTimeAwareSuggestions() {
+  // Only show on a fresh session (no prior conversation restored)
+  if (state.agentConversation.messages.length > 0) return;
+  const city = getCurrentCity() || "\u5f53\u524d\u57ce\u5e02"; // 当前城市
+  const h = new Date().getHours();
+
+  let scenarios;
+  if (h >= 6 && h < 10) {
+    // Morning
+    scenarios = [
+      { icon: "\u2615", label: "\u65e9\u9910\u4e0d\u6392\u961f", query: `\u5e2e\u6211\u5728${city}\u627e\u4e0d\u7528\u6392\u961f\u7684\u65e9\u9910\u5e97` },
+      { icon: "\u{1F30A}", label: "\u4eca\u65e5\u51fa\u884c\u8ba1\u5212", query: `\u5e2e\u6211\u89c4\u5212${city}\u4e00\u65e5\u6e38` },
+      { icon: "\u2708\uFE0F", label: "\u5468\u672b\u77ed\u9014\u65c5\u884c", query: `\u5929\u6d25\u51fa\u53d1\u5468\u672b2\u65e5\u6e38` },
+    ];
+  } else if (h >= 10 && h < 14) {
+    // Lunch
+    scenarios = [
+      { icon: "\u{1F35c}", label: "\u5348\u9910\u60a8\u770b", query: `\u5e2e\u6211\u5728${city}\u627e\u5348\u9910\uff0c\u4e0d\u6392\u961f\u3001\u5473\u9053\u597d` },
+      { icon: "\u{1F1e8}\u{1F1f3}", label: "\u5468\u672b\u53bb\u54ea\u73a9", query: `\u63a8\u8350\u4e00\u4e2a\u5468\u672b2\u65e5\u6e38\u76ee\u7684\u5730` },
+      { icon: "\u{1F3e8}", label: "\u8ba2\u9152\u5e97\u6700\u4f18\u60e0", query: `\u5e2e\u6211\u5728${city}\u627e\u6027\u4ef7\u6bd4\u9ad8\u7684\u9152\u5e97` },
+    ];
+  } else if (h >= 14 && h < 18) {
+    // Afternoon
+    scenarios = [
+      { icon: "\u{1F3de}\uFE0F", label: "\u4e0b\u5348\u51fa\u6e38", query: `${city}\u4e0b\u5348\u9002\u5408\u53bb\u54ea\u91cc\u73a9` },
+      { icon: "\u{1F374}", label: "\u665a\u9910\u9884\u8ba2", query: `\u5e2e\u6211\u9884\u8ba2${city}\u4eca\u665a\u6b63\u9910` },
+      { icon: "\u{1F6eb}", label: "\u660e\u5929\u98de\u673a\u884c\u7a0b", query: `\u5e2e\u6211\u89c4\u5212\u4e00\u4e2a3\u65e5\u5c0f\u957f\u5047\u65c5\u884c` },
+    ];
+  } else if (h >= 18 && h < 23) {
+    // Evening
+    scenarios = [
+      { icon: "\u{1F962}", label: "\u4eca\u665a\u5403\u4ec0\u4e48", query: `\u5e2e\u6211\u5728${city}\u627e\u4eca\u665a\u6b63\u9910\uff0c\u4e0d\u6392\u961f` },
+      { icon: "\u{1F319}", label: "\u591c\u6e38\u597d\u53bb\u5904", query: `${city}\u591c\u665a\u9002\u5408\u53bb\u54ea\u91cc` },
+      { icon: "\u{1F5fa}\uFE0F", label: "\u89c4\u5212\u660e\u65e5\u884c\u7a0b", query: `\u5e2e\u6211\u89c4\u5212\u660e\u5929\u5728${city}\u7684\u884c\u7a0b` },
+    ];
+  } else {
+    // Late night
+    scenarios = [
+      { icon: "\u{1F319}", label: "\u5c0f\u591c\u664b\u5440", query: `${city}\u6df1\u591c\u5403\u5565` },
+      { icon: "\u{1F4c5}", label: "\u660e\u5929\u65e9\u9910\u5b89\u6392", query: `\u5e2e\u6211\u5b89\u6392\u660e\u5929\u65e9\u9910` },
+      { icon: "\u2708\uFE0F", label: "\u8ba1\u5212\u4e0b\u6b21\u65c5\u884c", query: `\u63a8\u8350\u4e00\u4e2a\u5468\u672b\u51fa\u884c\u76ee\u7684\u5730` },
+    ];
+  }
+
+  const chipsHtml = scenarios.map(s =>
+    `<button class="cx-taw-chip" onclick="createTaskFromText(${JSON.stringify(s.query)})">${s.icon} ${escapeHtml(s.label)}</button>`
+  ).join("");
+
+  addCard(`
+    <div class="cx-taw-row">
+      <span class="cx-taw-label">\u{1F4a1} \u5feb\u901f\u5f00\u59cb</span>
+      ${chipsHtml}
+    </div>
   `);
 }
 

@@ -3527,6 +3527,35 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   50%       { opacity: 0.35; transform: scale(0.7); }
 }
 
+/* ── Intent Preview Pill ──────────────────────────────────────────────────── */
+.cx-ip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0 8px;
+  animation: fadeInScale 0.2s ease forwards;
+}
+.cx-ip-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #6b7280;
+  letter-spacing: 0.02em;
+  margin-right: 2px;
+}
+.cx-ip-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 9px;
+  border-radius: 99px;
+  background: rgba(37,99,235,0.08);
+  border: 1px solid rgba(37,99,235,0.18);
+  font-size: 12px;
+  font-weight: 500;
+  color: #1d4ed8;
+}
+
 /* ── P2: Plan Skeleton ────────────────────────────────────────────────────── */
 .cx-plan-skeleton {
   display: grid;
@@ -5084,6 +5113,40 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   transition: all 0.15s;
 }
 .cx-pb-chip:hover { background: rgba(16,185,129,0.1); border-color: #10b981; transform: translateY(-1px); }
+
+/* ── Time-aware welcome suggestions ─────────────────────────────────────── */
+.cx-taw-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 2px 4px;
+  animation: fadeInScale 0.25s ease forwards;
+}
+.cx-taw-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: #9ca3af;
+  margin-right: 2px;
+}
+.cx-taw-chip {
+  padding: 6px 13px;
+  border-radius: 16px;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.cx-taw-chip:hover {
+  border-color: #6366f1;
+  color: #6366f1;
+  background: rgba(99,102,241,0.06);
+  transform: translateY(-1px);
+}
 
 /* ── F3: Inline plan refinement bar ─────────────────────────────────────── */
 .cx-plan-refine {

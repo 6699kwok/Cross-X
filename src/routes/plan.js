@@ -561,6 +561,17 @@ function createPlanRouter({
       const intentAxis = intentResult.axis;
       if (intentAxis !== "travel") console.log(`[plan/coze] Intent axis: ${intentAxis} (${intentResult._source}) — specialty mode`);
 
+      // Intent preview: let frontend show what AI understood before plan generates
+      if (intentResult._source === "llm" && (intentResult.destination || intentResult.duration_days)) {
+        emit({
+          type: "intent_preview",
+          dest: intentResult.destination || null,
+          days: intentResult.duration_days || null,
+          axis: intentAxis,
+          pax:  intentResult.pax > 1 ? intentResult.pax : null,
+        });
+      }
+
       // Merge LLM-extracted params into constraints (without overwriting explicit user values)
       if (intentResult.destination  && !constraints.destination) constraints.destination = intentResult.destination;
       if (intentResult.duration_days && !constraints.duration)   constraints.duration    = intentResult.duration_days;
