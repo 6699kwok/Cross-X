@@ -1149,6 +1149,11 @@ body.admin-mode .actions.admin-only {
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 10px;
 }
+.agent-plan-grid .agent-option-card {
+  animation: cxCardReveal 0.38s cubic-bezier(0.22,1,0.36,1) both;
+}
+.agent-plan-grid .agent-option-card:nth-child(1) { animation-delay: 0ms; }
+.agent-plan-grid .agent-option-card:nth-child(2) { animation-delay: 90ms; }
 
 .agent-option-card {
   display: grid;
