@@ -7258,6 +7258,16 @@ function renderCardData(cd, spokenText) {
     // Build plan option cards using shared builder
     const planCards = cd.plans.map((p, idx) => _buildListCard(p, idx, cardId, dur, pax, cd.destination || "")).join("");
 
+    // P0②: Data quality banner — warn when agent used synthetic/mock data
+    const qualityBanner = (cd._dataQuality === "synthetic" || cd._dataQuality === "mock")
+      ? `<div class="cx-quality-banner"><span class="cx-quality-banner-icon">⚠️</span>${pickText(
+          "当前数据来自模拟资源库，真实价格及可用性请出行前确认",
+          "Data from simulation — verify pricing and availability before travel",
+          "シミュレーションデータ — 出発前に実際の情報をご確認ください",
+          "시뮬레이션 데이터 — 출발 전 실제 정보를 확인하세요"
+        )}</div>`
+      : "";
+
     // Day-by-day itinerary section (shared, shown after plan selection or always for balanced)
     let dayItineraryHtml = "";
     if (hasDays) {
@@ -7381,6 +7391,7 @@ function renderCardData(cd, spokenText) {
           </div>
           <div class="plan-analysis-text">${escapeHtml(spokenText)}</div>
         </div>` : ""}
+        ${qualityBanner}
         <div class="plan-section-header">${pickText("选择你的方案","Choose Your Plan","プランを選ぶ","플랜 선택")}</div>
         <div class="cx-plan-list">${planCards}</div>
         ${dayItineraryHtml}
@@ -7556,6 +7567,16 @@ function renderCardData(cd, spokenText) {
     ? `<div class="arrival-banner">✈️ ${escapeHtml(cd.arrival_note)}</div>`
     : "";
 
+  // P0②: quality banner for legacy single-plan card
+  const legacyQualityBanner = (cd._dataQuality === "synthetic" || cd._dataQuality === "mock")
+    ? `<div class="cx-quality-banner"><span class="cx-quality-banner-icon">⚠️</span>${pickText(
+        "当前数据来自模拟资源库，真实价格及可用性请出行前确认",
+        "Data from simulation — verify pricing and availability before travel",
+        "シミュレーションデータ — 出発前に実際の情報をご確認ください",
+        "시뮬레이션 데이터 — 출발 전 실제 정보를 확인하세요"
+      )}</div>`
+    : "";
+
   clearChatCards({ keepDeliverable: true, keepSmartReply: false });
   addCard(`
     <article class="card smart-reply-card plan-card">
@@ -7578,6 +7599,7 @@ function renderCardData(cd, spokenText) {
         </div>
         <div class="plan-analysis-text">${escapeHtml(spokenText)}</div>
       </div>` : ""}
+      ${legacyQualityBanner}
       ${arrivalNote}
       ${hotelHtml}
       ${dayTabsHtml}
@@ -11490,6 +11512,7 @@ function bindInput() {
     el.chatInput.value = "";
     autoResizeChatInput();
     updateChatSendState();
+    _hideTypingHint();
     try {
       // AI-native flow: always use plan stream (createTaskFromText)
       await createTaskFromText(text);
