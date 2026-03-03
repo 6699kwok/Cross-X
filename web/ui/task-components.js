@@ -131,6 +131,7 @@
           </ul>
         </details>
         <div class="status">${esc(payload.cancelPolicy || "")}</div>
+        ${payload.railPickerHtml || ""}
         <div class="actions">
           <button data-action="agent-confirm-execution" data-option="${esc(payload.optionKey || "main")}">${esc(payload.confirmLabel || "Confirm and execute")}</button>
           <button class="secondary" data-action="agent-open-condition-editor">${esc(payload.modifyLabel || "Modify")}</button>
@@ -162,6 +163,7 @@
             })
             .join("")}
         </ol>
+        ${payload.controlsHtml || ""}
       `,
       );
     },

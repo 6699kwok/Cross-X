@@ -25,6 +25,7 @@ const AGENT_INTENTS = ["eat", "travel", "hotel", "combo_eat_travel", "combo_hote
 const AGENT_SLOT_KEYS = ["intent", "city", "area", "party_size", "budget", "time_constraint", "preferences", "execution_permission"];
 const AGENT_STATES = ["idle", "parsing", "asking", "planning", "confirming", "executing", "completed", "failed", "replanning"];
 const AGENT_FAILURE_CODES = ["queue_too_long", "budget_overflow", "resource_unavailable"];
+let _ceSlots = null; // working copy for condition editor drawer
 
 const state = {
   selectedConstraints: {},
@@ -119,6 +120,7 @@ const state = {
     smartRequestId: 0,
     smartSignature: "",
     warnedMissingLlm: false,
+    paymentRail: "alipay_cn",
   },
 };
 
@@ -3707,21 +3709,156 @@ function renderTaskPanel(node, html, animate = true) {
   }
 }
 
-function openConditionEditorDrawer(trigger = null) {
-  if (!el.conditionEditorDrawer) return;
-  const slots = state.agentConversation.slots || {};
-  if (el.conditionIntent) el.conditionIntent.value = normalizeIntent(slots.intent || "eat");
-  if (el.conditionCity) el.conditionCity.value = String(slots.city || "");
-  if (el.conditionArea) el.conditionArea.value = String(slots.area || "");
-  if (el.conditionPartySize) el.conditionPartySize.value = String(slots.party_size || "");
-  if (el.conditionBudget) el.conditionBudget.value = normalizeBudgetTier(slots.budget);
-  if (el.conditionTimeConstraint) el.conditionTimeConstraint.value = String(slots.time_constraint || "");
-  if (el.conditionPreferences) el.conditionPreferences.value = Array.isArray(slots.preferences) ? slots.preferences.join(",") : "";
-  if (el.conditionExecutionPermission) el.conditionExecutionPermission.value = slots.execution_permission === true ? "true" : "false";
-  if (taskComponents && taskComponents.ConditionEditorDrawer) {
-    taskComponents.ConditionEditorDrawer.open(drawerController, el.conditionEditorDrawer, trigger);
+function _buildConditionEditorHtml(slots) {
+  const s = slots || {};
+  const prefs = Array.isArray(s.preferences) ? s.preferences : [];
+  const chip = (action, slot, value, icon, label, active) =>
+    `<button type="button" class="cx-ce-chip${active ? " cx-ce-active" : ""}" data-action="${action}" data-slot="${slot}" data-value="${escapeHtml(value)}">${icon ? `<span class="cx-ce-chip-icon">${icon}</span>` : ""}<span>${escapeHtml(label)}</span></button>`;
+  const prefChip = (value, icon, label) =>
+    chip("agent-drawer-toggle-pref", "preferences", value, icon, label, prefs.includes(value)).replace('data-slot="preferences"', `data-pref="${value}"`);
+
+  const intentOpts = [
+    { v: "eat",   icon: "\uD83C\uDF5C", label: pickText("吃饭", "Eat",    "\u98DF\u4E8B", "\uC2DD\uC0AC") },
+    { v: "trip",  icon: "\uD83D\uDE95", label: pickText("出行", "Travel", "\u79FB\u52D5", "\uC774\uB3D9") },
+    { v: "hotel", icon: "\uD83C\uDFE8", label: pickText("酒店", "Hotel",  "\u30DB\u30C6\u30EB", "\uD638\uD154") },
+    { v: "combo", icon: "\uD83D\uDD17", label: pickText("组合", "Combo",  "\u8907\u5408", "\uBCF5\uD569") },
+  ];
+  const budgetOpts = [
+    { v: "low",  icon: "\uD83D\uDFE2", label: pickText("\xA5100\u5185", "\u2264\xA5100", "\xA5100\u4EE5\u4E0B", "\xA5100 \uC774\uD558") },
+    { v: "mid",  icon: "\uD83D\uDFE1", label: pickText("\xA5100-250", "\xA5100-250", "\xA5100-250", "\xA5100-250") },
+    { v: "high", icon: "\uD83D\uDD34", label: pickText("\xA5250+", "\xA5250+", "\xA5250\u4EE5\u4E0A", "\xA5250 \uC774\uC0C1") },
+  ];
+  const partyOpts = [
+    { v: "1", label: pickText("1\u4EBA", "Solo", "1\u4EBA", "1\uC778") },
+    { v: "2", label: pickText("2\u4EBA", "2 pax", "2\u4EBA", "2\uC778") },
+    { v: "4", label: pickText("4\u4EBA", "4 pax", "4\u4EBA", "4\uC778") },
+  ];
+  const timeOpts = [
+    { v: "ASAP",         label: pickText("\u73B0\u5728", "ASAP", "\u4ECA\u3059\u3050", "\uC9C0\uAE08") },
+    { v: "\u4ECA\u665A", label: pickText("\u4ECA\u665A", "Tonight", "\u4ECA\u591C", "\uC624\uB298 \uC800\uB141") },
+    { v: "20:00 before", label: pickText("20:00\u524D", "Before 20:00", "20:00\u307E\u3067", "20:00 \uC774\uC804") },
+  ];
+  const cityOpts = [
+    { v: "Shanghai", label: pickText("\u4E0A\u6D77", "Shanghai", "\u4E0A\u6D77", "\uC0C1\uD558\uC774") },
+    { v: "Shenzhen", label: pickText("\u6DF1\u5733", "Shenzhen", "\u6DF1\u5733", "\uC120\uC804") },
+    { v: "Beijing",  label: pickText("\u5317\u4EAC", "Beijing",  "\u5317\u4EAC", "\uBCA0\uC774\uC9D5") },
+  ];
+  const prefOpts = [
+    { v: "no_queue",   icon: "\u26A1", label: pickText("\u4E0D\u6392\u961F", "No queue",   "\u4E26\u3073\u306A\u3057", "\uC904 \uC5C6\uC74C") },
+    { v: "walk_first", icon: "\uD83D\uDEB6", label: pickText("\u6B65\u884C\u4F18\u5148", "Walk first",  "\u5F92\u6B69\u512A\u5148", "\uB3C4\uBCF4 \uC6B0\uC120") },
+    { v: "halal",      icon: "\uD83C\uDF19", label: pickText("\u6E05\u771F", "Halal",      "\u30CF\u30E9\u30FC\u30EB", "\uD560\uB791") },
+    { v: "family",     icon: "\uD83D\uDC68\u200D\uD83D\uDC69\u200D\uD83D\uDC67", label: pickText("\u4EB2\u5B50", "Family",     "\u89AA\u5B50", "\uAC00\uC871") },
+    { v: "accessible", icon: "\u267F", label: pickText("\u65E0\u969C\u788D", "Accessible", "\u30D0\u30EA\u30A2\u30D5\u30EA\u30FC", "\uBB34\uC7A5\uC560") },
+    { v: "veg",        icon: "\uD83E\uDD6C", label: pickText("\u7D20\u98DF", "Veg",        "\u30D9\u30B8", "\uCC44\uC2DD") },
+  ];
+  const customCity = !cityOpts.find((o) => o.v === s.city) && s.city ? s.city : "";
+  const customParty = !partyOpts.find((o) => o.v === String(s.party_size || "")) && s.party_size ? s.party_size : "";
+
+  return `<div class="cx-ce-wrap">
+    <div class="cx-ce-section">
+      <div class="cx-ce-label">${pickText("\u4EFB\u52A1\u7C7B\u578B", "Intent", "\u30BF\u30B9\u30AF\u30BF\u30A4\u30D7", "\uC791\uC5C5 \uC720\uD615")}</div>
+      <div class="cx-ce-chips">${intentOpts.map((o) => chip("agent-drawer-pick-slot", "intent", o.v, o.icon, o.label, normalizeIntent(s.intent || "") === o.v)).join("")}</div>
+    </div>
+    <div class="cx-ce-section">
+      <div class="cx-ce-label">${pickText("\u9884\u7B97", "Budget", "\u4E88\u7B97", "\uC608\uC0B0")}</div>
+      <div class="cx-ce-chips">${budgetOpts.map((o) => chip("agent-drawer-pick-slot", "budget", o.v, o.icon, o.label, normalizeBudgetTier(s.budget) === o.v)).join("")}</div>
+    </div>
+    <div class="cx-ce-section">
+      <div class="cx-ce-label">${pickText("\u4EBA\u6570", "Party size", "\u4EBA\u6570", "\uC778\uC6D0")}</div>
+      <div class="cx-ce-chips">
+        ${partyOpts.map((o) => chip("agent-drawer-pick-slot", "party_size", o.v, "", o.label, String(s.party_size || "") === o.v)).join("")}
+        <input type="number" class="cx-ce-text-input" data-ce-slot="party_size" min="1" max="20" placeholder="${pickText("\u5176\u4ED6", "Other", "\u305D\u306E\u4ED6", "\uAE30\uD0C0")}" value="${escapeHtml(customParty)}" />
+      </div>
+    </div>
+    <div class="cx-ce-section">
+      <div class="cx-ce-label">${pickText("\u65F6\u95F4", "Time", "\u6642\u9593", "\uC2DC\uAC04")}</div>
+      <div class="cx-ce-chips">
+        ${timeOpts.map((o) => chip("agent-drawer-pick-slot", "time_constraint", o.v, "", o.label, s.time_constraint === o.v)).join("")}
+        <input type="text" class="cx-ce-text-input" data-ce-slot="time_constraint" placeholder="${pickText("\u81EA\u5B9A\u4E49", "Custom", "\u30AB\u30B9\u30BF\u30E0", "\uC0AC\uC6A9\uC790 \uC9C0\uC815")}" value="${escapeHtml(!timeOpts.find((o) => o.v === s.time_constraint) && s.time_constraint ? s.time_constraint : "")}" />
+      </div>
+    </div>
+    <div class="cx-ce-section">
+      <div class="cx-ce-label">${pickText("\u57CE\u5E02", "City", "\u90FD\u5E02", "\uB3C4\uC2DC")}</div>
+      <div class="cx-ce-chips">
+        ${cityOpts.map((o) => chip("agent-drawer-pick-slot", "city", o.v, "", o.label, s.city === o.v)).join("")}
+        <input type="text" class="cx-ce-text-input" data-ce-slot="city" placeholder="${pickText("\u5176\u4ED6\u57CE\u5E02", "Other city", "\u4ED6\u306E\u90FD\u5E02", "\uB2E4\uB978 \uB3C4\uC2DC")}" value="${escapeHtml(customCity)}" />
+      </div>
+    </div>
+    <div class="cx-ce-section">
+      <div class="cx-ce-label">${pickText("\u533A\u57DF", "Area", "\u30A8\u30EA\u30A2", "\uC9C0\uC5ED")}</div>
+      <div class="cx-ce-chips">
+        <input type="text" class="cx-ce-text-input cx-ce-text-wide" data-ce-slot="area" placeholder="${pickText("\u5982\uff1a\u5357\u5C71 / Bund", "e.g. Nanshan / Bund", "\u4F8B: \u5357\u5C71 / Bund", "\uC608: \uB0A8\uC0B0 / Bund")}" value="${escapeHtml(s.area || "")}" />
+      </div>
+    </div>
+    <div class="cx-ce-section">
+      <div class="cx-ce-label">${pickText("\u504F\u597D", "Preferences", "\u597D\u307F", "\uC120\uD638")}</div>
+      <div class="cx-ce-chips cx-ce-chips-wrap">${prefOpts.map((o) => prefChip(o.v, o.icon, o.label)).join("")}</div>
+    </div>
+    <div class="cx-ce-preview">
+      <div class="cx-ce-preview-label">${pickText("\u65B9\u6848\u9884\u89C8", "Plan preview", "\u30D7\u30E9\u30F3\u30D7\u30EC\u30D3\u30E5\u30FC", "\uD50C\uB79C \uBBF8\uB9AC\uBCF4\uAE30")}</div>
+      <div class="cx-ce-preview-content"></div>
+    </div>
+    <div class="cx-ce-actions">
+      <button type="button" class="cx-ce-apply" data-action="agent-drawer-apply">${pickText("\u5E94\u7528\u5E76\u91CD\u65B0\u89C4\u5212", "Apply & replan", "\u9069\u7528\u3057\u3066\u518D\u8A08\u753B", "\uC801\uC6A9 \uD6C4 \uC7AC\uACC4\uD68D")}</button>
+      <button type="button" class="secondary" data-action="close-condition-editor">${pickText("\u53D6\u6D88", "Cancel", "\u30AD\u30E3\u30F3\u30BB\u30EB", "\uCDE8\uC18C")}</button>
+    </div>
+  </div>`;
+}
+
+function _updateCePreview() {
+  const form = el.conditionEditorForm;
+  if (!form || !_ceSlots) return;
+  const preview = form.querySelector(".cx-ce-preview-content");
+  if (!preview) return;
+  const savedSlots = state.agentConversation.slots;
+  state.agentConversation.slots = normalizeAgentSlotsInPlace({ ..._ceSlots });
+  let plan = null;
+  try { plan = buildAgentPlanFromSlots(); } catch { /* ignore */ }
+  state.agentConversation.slots = savedSlots;
+  if (!plan || !plan.mainOption) {
+    preview.textContent = pickText("暂无候选", "No candidates yet", "候補なし", "후보 없음");
     return;
   }
+  const main = plan.mainOption;
+  const backup = plan.backupOption;
+  preview.innerHTML = `
+    <div class="cx-ce-preview-opt">
+      <span class="cx-ce-pv-tag">${pickText("主", "A", "主", "주")}</span>
+      <span class="cx-ce-pv-place">${escapeHtml(main.place || "-")}</span>
+      <span class="cx-ce-pv-meta">${Number(main.amount || 0)} CNY · ${Number(main.eta || 0)} min</span>
+    </div>
+    ${backup ? `<div class="cx-ce-preview-opt cx-ce-pv-b">
+      <span class="cx-ce-pv-tag">${pickText("备", "B", "備", "대")}</span>
+      <span class="cx-ce-pv-place">${escapeHtml(backup.place || "-")}</span>
+      <span class="cx-ce-pv-meta">${Number(backup.amount || 0)} CNY · ${Number(backup.eta || 0)} min</span>
+    </div>` : ""}`;
+}
+
+function _renderConditionEditorVisual() {
+  const form = el.conditionEditorForm;
+  if (!form || !_ceSlots) return;
+  form.innerHTML = _buildConditionEditorHtml(_ceSlots);
+  const attach = (selector, slotKey, parser) => {
+    const el2 = form.querySelector(selector);
+    if (!el2) return;
+    el2.addEventListener("input", (e) => {
+      const v = parser ? parser(e.target.value) : e.target.value.trim() || null;
+      _ceSlots[slotKey] = v;
+      _updateCePreview();
+    });
+  };
+  attach('[data-ce-slot="city"]', "city", (v) => v.trim() || null);
+  attach('[data-ce-slot="area"]', "area", (v) => v.trim() || null);
+  attach('[data-ce-slot="party_size"]', "party_size", (v) => v.trim() || null);
+  attach('[data-ce-slot="time_constraint"]', "time_constraint", (v) => v.trim() || null);
+  _updateCePreview();
+}
+
+function openConditionEditorDrawer(trigger = null) {
+  if (!el.conditionEditorDrawer) return;
+  _ceSlots = { ...(state.agentConversation.slots || {}) };
+  if (!Array.isArray(_ceSlots.preferences)) _ceSlots.preferences = [];
+  _renderConditionEditorVisual();
   if (drawerController) {
     drawerController.open(el.conditionEditorDrawer, { trigger });
   } else {
@@ -4093,6 +4230,21 @@ function renderAgentPlanningCard(plan) {
   );
 }
 
+function _buildRailPickerHtml(selectedRail) {
+  const rails = [
+    { id: "alipay_cn",     icon: "\uD83D\uDD35", label: pickText("支付宝", "Alipay", "Alipay", "Alipay") },
+    { id: "wechat_cn",     icon: "\uD83D\uDFE2", label: pickText("微信支付", "WeChat Pay", "WeChat Pay", "WeChat Pay") },
+    { id: "card_delegate", icon: "\uD83C\uDFE6", label: pickText("委托代付卡", "Delegate Card", "委任カード", "위임 카드") },
+  ];
+  const opts = rails
+    .map(
+      (r) =>
+        `<button class="cx-rail-option${r.id === selectedRail ? " cx-rail-selected" : ""}" data-action="agent-select-rail" data-rail="${r.id}"><span class="cx-rail-icon">${r.icon}</span><span class="cx-rail-label">${r.label}</span></button>`,
+    )
+    .join("");
+  return `<div class="cx-rail-selector"><div class="cx-rail-selector-label">${pickText("支付方式", "Payment method", "決済方法", "결제 방법")}</div><div class="cx-rail-options">${opts}</div></div>`;
+}
+
 function renderAgentConfirmCard(optionKey = "main") {
   if (!shouldRenderAgentFlowCards()) return;
   const plan = state.agentConversation.currentPlan;
@@ -4139,6 +4291,7 @@ function renderAgentConfirmCard(optionKey = "main") {
       confirmLabel: pickText("确认并开始执行", "Confirm & execute", "確認して実行", "확인 후 실행"),
       modifyLabel: pickText("修改条件", "Modify", "条件修正", "조건 수정"),
       cancelLabel: pickText("取消", "Cancel", "キャンセル", "취소"),
+      railPickerHtml: _buildRailPickerHtml(state.agentConversation.paymentRail || "alipay_cn"),
     });
     if (_backupBanner) el.confirmCardSection.insertAdjacentHTML("afterbegin", _backupBanner);
     motion.bindPressables(el.confirmCardSection);
@@ -4150,6 +4303,7 @@ function renderAgentConfirmCard(optionKey = "main") {
     ${_backupBanner}<h3>${pickText("执行确认", "Execution confirmation", "実行確認", "실행 확인")}</h3>
     <div class="status">${pickText("你将获得", "You will get", "取得内容", "제공 항목")}: ${pickText("锁位结果 / 双语导航卡 / 订单凭证", "booking lock / bilingual navigation / order proof", "予約確保 / 多言語ナビ / 注文証憑", "예약 잠금 / 이중언어 길안내 / 주문 증빙")}</div>
     <div class="status">${pickText("应付总额", "Total payable", "支払総額", "총 결제금액")}: <strong>${total} CNY</strong></div>
+    ${_buildRailPickerHtml(state.agentConversation.paymentRail || "alipay_cn")}
     <div class="actions">
       <button data-action="agent-confirm-execution" data-option="${escapeHtml(optionKey)}">${pickText("确认并开始执行", "Confirm & execute", "確認して実行", "확인 후 실행")}</button>
       <button class="secondary" data-action="agent-open-condition-editor">${pickText("修改条件", "Modify", "条件修正", "조건 수정")}</button>
@@ -4159,6 +4313,24 @@ function renderAgentConfirmCard(optionKey = "main") {
   );
 }
 
+function _buildRunControlsHtml(run) {
+  if (!run || run.status === "completed" || run.status === "canceled") return "";
+  const runId = escapeHtml(run.id || "");
+  if (run.paused === true) {
+    return `<div class="cx-run-controls">
+      <button class="cx-run-btn cx-run-resume" data-action="agent-resume-run" data-run="${runId}">${pickText("▶ 继续执行", "▶ Resume", "▶ 再開", "▶ 재개")}</button>
+      <button class="cx-run-btn cx-run-cancel" data-action="agent-cancel-run" data-run="${runId}">${pickText("✕ 取消", "✕ Cancel", "✕ キャンセル", "✕ 취소")}</button>
+    </div>`;
+  }
+  if (run.status === "running") {
+    return `<div class="cx-run-controls">
+      <button class="cx-run-btn cx-run-pause" data-action="agent-pause-run" data-run="${runId}">${pickText("⏸ 暂停", "⏸ Pause", "⏸ 一時停止", "⏸ 일시중지")}</button>
+      <button class="cx-run-btn cx-run-cancel" data-action="agent-cancel-run" data-run="${runId}">${pickText("✕ 取消", "✕ Cancel", "✕ キャンセル", "✕ 취소")}</button>
+    </div>`;
+  }
+  return "";
+}
+
 function renderAgentExecutionCard(run) {
   if (!shouldRenderAgentFlowCards()) return;
   if (!run) return;
@@ -4166,7 +4338,8 @@ function renderAgentExecutionCard(run) {
   const done = (run.steps || []).filter((s) => s.status === "done").length;
   const running = (run.steps || []).filter((s) => s.status === "running").length;
   const failed = (run.steps || []).filter((s) => s.status === "failed").length;
-  const normalizedRunStatus = run.status === "completed" ? "completed" : run.status === "failed" ? "failed" : run.status === "running" ? "running" : "queued";
+  const normalizedRunStatus = run.status === "completed" ? "completed" : run.status === "failed" || run.status === "canceled" ? "failed" : run.paused === true ? "paused" : run.status === "running" ? "running" : "queued";
+  const controlsHtml = _buildRunControlsHtml(run);
   const steps = (run.steps || []).map((step) => {
     const normalized = step.status === "done" ? "success" : (step.status || "queued");
     return {
@@ -4187,6 +4360,7 @@ function renderAgentExecutionCard(run) {
       done,
       total,
       steps,
+      controlsHtml,
     });
     motion.bindPressables(el.executionStepsSection);
     return;
@@ -4204,6 +4378,7 @@ function renderAgentExecutionCard(run) {
     <div class="status">${pickText("状态", "Status", "状態", "상태")}: <strong>${escapeHtml(localizeStatus(normalizedRunStatus))}</strong></div>
     <div class="status">${pickText("完成", "Done", "完了", "완료")}: ${done}/${total}</div>
     <ol class="steps">${list}</ol>
+    ${controlsHtml}
   `,
   );
 }
@@ -4522,6 +4697,8 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
   const run = {
     id: `run_${Date.now().toString(36)}`,
     status: "queued",
+    paused: false,
+    canceled: false,
     optionKey,
     option,
     steps: buildRunSteps(option),
@@ -4558,6 +4735,13 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
   rerenderAgentFlowCards();
 
   for (let i = 0; i < run.steps.length; i += 1) {
+    // Pause checkpoint — spin until resumed or canceled
+    while (run.paused === true) {
+      if (run.canceled === true) break;
+      await waitMs(200);
+    }
+    if (run.canceled === true) break;
+
     const step = run.steps[i];
     step.status = "running";
     rerenderAgentFlowCards();
@@ -4614,6 +4798,19 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
       tool: toolResult.tool,
     });
     rerenderAgentFlowCards();
+  }
+
+  if (run.canceled === true) {
+    run.status = "canceled";
+    setAgentMode("failed", { runId: run.id, failureCode: "user_canceled" });
+    state.agentConversation.lastFailureCode = "user_canceled";
+    rerenderAgentFlowCards();
+    addMessage(
+      pickText("执行已取消，返回方案选择。", "Execution canceled. Returning to plan.", "実行をキャンセルしました。プラン選択に戻ります。", "실행이 취소되었습니다. 플랜 선택으로 돌아갑니다."),
+      "agent",
+    );
+    appendAgentTelemetry("execution_canceled", { runId: run.id });
+    return;
   }
 
   run.status = "completed";
@@ -4804,6 +5001,7 @@ function resetAgentConversationForDemo() {
   state.agentConversation.smartLoading = false;
   state.agentConversation.smartSignature = "";
   state.agentConversation.warnedMissingLlm = false;
+  state.agentConversation.paymentRail = "alipay_cn";
   clearAgentFlowCards();
   syncSelectedConstraintsFromAgentSlots();
   syncChipSelectionFromConstraints();
@@ -10932,6 +11130,13 @@ function bindActions() {
       return;
     }
 
+    if (action === "agent-select-rail") {
+      const railId = String(target.dataset.rail || "alipay_cn");
+      state.agentConversation.paymentRail = railId;
+      renderAgentConfirmCard(state.agentConversation.pendingOptionKey || "main");
+      return;
+    }
+
     if (action === "agent-confirm-execution") {
       const optionKey = String(target.dataset.option || state.agentConversation.pendingOptionKey || "main");
       const slots = state.agentConversation.slots || {};
@@ -10939,7 +11144,53 @@ function bindActions() {
       state.agentConversation.slots = slots;
       const forceFail = state.agentConversation._forceFailNextRun === true;
       state.agentConversation._forceFailNextRun = false;
+      try {
+        await fetch("/api/payments/rails/select", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ railId: state.agentConversation.paymentRail || "alipay_cn" }),
+        });
+      } catch (_) { /* non-blocking */ }
       await runAgentExecution(optionKey, forceFail);
+      return;
+    }
+
+    if (action === "agent-pause-run") {
+      const run = state.agentConversation.currentRun;
+      if (run && run.status === "running" && !run.paused) {
+        run.paused = true;
+        appendAgentTelemetry("execution_paused", { runId: run.id });
+        rerenderAgentFlowCards();
+        addMessage(
+          pickText("执行已暂停，点击「继续执行」恢复。", "Execution paused. Tap Resume to continue.", "実行を一時停止しました。「再開」で続行します。", "실행이 일시중지되었습니다. 재개를 탭해 계속하세요."),
+          "agent",
+        );
+      }
+      return;
+    }
+
+    if (action === "agent-resume-run") {
+      const run = state.agentConversation.currentRun;
+      if (run && run.paused === true) {
+        run.paused = false;
+        appendAgentTelemetry("execution_resumed", { runId: run.id });
+        rerenderAgentFlowCards();
+        addMessage(
+          pickText("已恢复执行。", "Execution resumed.", "実行を再開しました。", "실행이 재개되었습니다."),
+          "agent",
+        );
+      }
+      return;
+    }
+
+    if (action === "agent-cancel-run") {
+      const run = state.agentConversation.currentRun;
+      if (run && run.status !== "completed" && run.status !== "canceled") {
+        run.canceled = true;
+        run.paused = false; // unblock pause loop so canceled check fires
+        appendAgentTelemetry("execution_cancel_requested", { runId: run.id });
+        rerenderAgentFlowCards();
+      }
       return;
     }
 
@@ -10986,6 +11237,49 @@ function bindActions() {
 
     if (action === "agent-open-condition-editor") {
       openConditionEditorDrawer(target);
+      return;
+    }
+
+    if (action === "agent-drawer-pick-slot") {
+      const slotKey = String(target.dataset.slot || "");
+      const slotVal = String(target.dataset.value || "") || null;
+      if (_ceSlots && slotKey && AGENT_SLOT_KEYS.includes(slotKey)) {
+        _ceSlots[slotKey] = slotVal;
+        _renderConditionEditorVisual();
+      }
+      return;
+    }
+
+    if (action === "agent-drawer-toggle-pref") {
+      const pref = String(target.dataset.pref || "").toLowerCase();
+      if (_ceSlots && pref) {
+        const list = Array.isArray(_ceSlots.preferences) ? [..._ceSlots.preferences] : [];
+        const idx = list.indexOf(pref);
+        if (idx >= 0) list.splice(idx, 1); else list.push(pref);
+        _ceSlots.preferences = list;
+        _renderConditionEditorVisual();
+      }
+      return;
+    }
+
+    if (action === "agent-drawer-apply") {
+      if (_ceSlots) {
+        const normalized = normalizeAgentSlotsInPlace({ ..._ceSlots });
+        state.agentConversation.slots = normalized;
+        AGENT_SLOT_KEYS.forEach((k) => {
+          if (k === "preferences") {
+            if (Array.isArray(normalized[k]) && normalized[k].length) markAgentPreferenceEvidence();
+          } else if (normalized[k]) {
+            markAgentSlotEvidence(k, true);
+          }
+        });
+        _ceSlots = null;
+      }
+      closeConditionEditorDrawer();
+      evaluateAgentConversation({ silent: false });
+      if (["planning", "confirming"].includes(state.agentConversation.mode)) {
+        refineAgentPlanWithSmartReply(state.agentConversation.lastUserInput || "", { announce: false });
+      }
       return;
     }
 
