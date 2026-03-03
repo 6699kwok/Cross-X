@@ -4736,10 +4736,39 @@ async function runStepTool(step, context) {
     };
   }
   if (stepKey === "lock") {
-    const reserve = reserveMock(ctx.slots || {}, ctx.candidate || null, `${ctx.seedKey}|lock`, (ctx.option && ctx.option.key) || "main");
+    let candidate = ctx.candidate || null;
+    let reservationId = null;
+    let confirmedAmount = null;
+    if (candidate) {
+      try {
+        const r = await fetch("/api/agent/reserve", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            candidateId: candidate.id || candidate.place || "",
+            place: candidate.place || "",
+            amount: candidate.amount || (ctx.option && ctx.option.amount) || 0,
+            party_size: (ctx.slots || {}).party_size || 2,
+            time_constraint: (ctx.slots || {}).time_constraint || "",
+            railId: state.agentConversation.paymentRail || "alipay_cn",
+          }),
+          signal: AbortSignal.timeout(4000),
+        });
+        if (r.ok) {
+          const d = await r.json();
+          if (d.ok) {
+            reservationId = d.reservationId;
+            confirmedAmount = d.confirmedAmount;
+            candidate = { ...candidate, amount: d.confirmedAmount || candidate.amount };
+          }
+        }
+      } catch (_) { /* use mock fallback */ }
+    }
+    const reserve = reserveMock(ctx.slots || {}, candidate, `${ctx.seedKey}|lock`, (ctx.option && ctx.option.key) || "main");
     return {
       ...reserve,
-      candidate: ctx.candidate || null,
+      ...(reservationId ? { reservationId, tool: "reserve_real" } : {}),
+      candidate,
     };
   }
   if (stepKey === "pay") {
@@ -4865,6 +4894,7 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
   const seedKey = createAgentSeedKey(`run_${optionKey}`, slots);
   let activeCandidate = null;
   let routeInfo = null;
+  let reservationId = null;
   let forcedFailureCode = "";
   const deterministicFailureCode = deriveDeterministicFailureCode(optionKey, slots, seedKey);
   if (forceFail) {
@@ -4908,6 +4938,7 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
     step.output = toolResult;
     if (toolResult.candidate) activeCandidate = toolResult.candidate;
     if (toolResult.route) routeInfo = toolResult.route;
+    if (toolResult.reservationId) reservationId = toolResult.reservationId;
 
     if (forcedFailureCode && stepCanFailWithCode(step.key, forcedFailureCode)) {
       step.status = "failed";
@@ -4965,9 +4996,9 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
   run.status = "completed";
   setAgentMode("completed", { runId: run.id, option: option.key || optionKey });
   const result = {
-    orderId: `MOCK-${Date.now().toString().slice(-6)}`,
+    orderId: reservationId || `MOCK-${Date.now().toString().slice(-6)}`,
     place: option.place,
-    amount: option.amount,
+    amount: (activeCandidate && activeCandidate.amount) || option.amount,
     eta: routeInfo && Number(routeInfo.eta || 0) ? Number(routeInfo.eta) : Number(option.eta || 0),
     proof: routeInfo ? routeInfo : null,
   };

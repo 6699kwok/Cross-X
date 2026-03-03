@@ -10804,6 +10804,36 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       return;
     }
 
+    // ── POST /api/agent/reserve — seat/table lock (webhook or deterministic) ─
+    if (req.method === "POST" && pathname === "/api/agent/reserve") {
+      const body = await readBody(req);
+      const { candidateId = "", place = "", amount = 0, party_size = 2, time_constraint = "", railId = "alipay_cn" } = body;
+      const webhookUrl = String(process.env.PARTNER_WEBHOOK_URL || "").trim();
+      if (webhookUrl) {
+        try {
+          const ac = new AbortController();
+          const tid = setTimeout(() => ac.abort(), 3000);
+          const r = await fetch(`${webhookUrl}/v1/reserve`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ candidateId, place, amount: Number(amount), party_size, time_constraint, railId }),
+            signal: ac.signal,
+          });
+          clearTimeout(tid);
+          if (r.ok) {
+            const data = await r.json();
+            return writeJson(res, 200, { ok: true, source: "webhook", ...data });
+          }
+        } catch (_) { /* fall through to deterministic */ }
+      }
+      // Deterministic fallback — stable ID per venue, 15-min hold window
+      const h = Math.abs(Array.from(String(candidateId || place)).reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 13));
+      const reservationId = `RES-${h.toString(36).toUpperCase().padStart(6, "0")}-${Date.now().toString(36).slice(-4).toUpperCase()}`;
+      const confirmedAmount = Number(amount) || 0;
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      return writeJson(res, 200, { ok: true, source: "deterministic", reservationId, confirmedAmount, expiresAt });
+    }
+
     // ── End agent Phase 2 endpoints ──────────────────────────────────────────
 
     return writeJson(res, 404, { error: "API not found" });
