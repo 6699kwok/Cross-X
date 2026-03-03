@@ -6094,14 +6094,17 @@ function renderTimeline(timeline) {
 }
 
 function renderDeliverable(order) {
-  const qrId = `qr-canvas-${escapeHtml(order.id || Date.now().toString(36))}`;
-  const qrText = order.proof.qrText || order.proof.orderNo || order.id;
-  const netPrice = order.pricing ? Number(order.pricing.netPrice || 0) : null;
-  const markup = order.pricing ? Number(order.pricing.markup || 0) : null;
+  const qrId      = `qr-canvas-${escapeHtml(order.id || Date.now().toString(36))}`;
+  const statusId  = `pay-status-${escapeHtml(order.id)}`;
+  const qrText    = order.proof.qrText || order.proof.orderNo || order.id;
+  const isSandbox = Boolean(order.proof && order.proof.qrSandbox);
+  const netPrice  = order.pricing ? Number(order.pricing.netPrice || 0) : null;
+  const markup    = order.pricing ? Number(order.pricing.markup || 0) : null;
   const markupRate = order.pricing && order.pricing.markupRate ? `(${(Number(order.pricing.markupRate) * 100).toFixed(1)}%)` : "";
   addCard(`
-    <article class="card deliverable-card">
+    <article class="card deliverable-card" data-order-id="${escapeHtml(order.id)}">
       <h3>${escapeHtml(tTerm("proof"))} Card</h3>
+      <div id="${statusId}" class="pay-status-badge pay-status--pending">${pickText("待支付", "Awaiting payment", "\u652f\u6255\u3044\u5f85\u3061", "\uacb0\uC81C \uB300\uAE30")}</div>
       <div class="deliverable-row">
         <div class="deliverable-info">
           <div>${pickText("订单号", "Order","注文番号", "주문 번호")}: <span class="code">${escapeHtml(order.proof.orderNo)}</span></div>
@@ -6112,7 +6115,7 @@ function renderDeliverable(order) {
         </div>
         <div class="deliverable-qr" style="text-align:center;flex-shrink:0;">
           <canvas id="${qrId}" width="160" height="160" style="border-radius:8px;display:block;"></canvas>
-          <div class="status" style="font-size:10px;margin-top:4px;">${pickText("扫码导航/核销", "Scan to navigate/redeem","スキャンして使用", "스캔하여 사용")}</div>
+          <div class="status" style="font-size:10px;margin-top:4px;">${pickText("扫码支付", "Scan to pay", "\u30b9\u30ad\u30e3\u30f3\u3057\u3066\u652f\u6255\u3044", "\uc2a4\uce94\ud558\uc5ec \uacb0\uc81c")}</div>
         </div>
       </div>
       <div class="actions">
@@ -6120,6 +6123,7 @@ function renderDeliverable(order) {
         <button class="secondary" data-action="open-proof" data-order="${order.id}">${pickText("打开凭证", "Open proof","証憑を開く", "증빙 열기")}</button>
         <button class="secondary" data-action="open-task" data-task="${order.taskId}">${pickText("任务详情", "Task detail","タスク詳細", "작업 상세")}</button>
         <button class="secondary" data-action="share-order" data-order="${order.id}">${pickText("分享", "Share","共有", "공유")}</button>
+        ${isSandbox ? `<button class="secondary" data-action="simulate-alipay-pay" data-order="${escapeHtml(order.id)}">${pickText("\u6a21\u62df\u652f\u4ed8\u6210\u529f", "Simulate payment", "\u652f\u6255\u3044\u3092\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uacb0\uc81c \uc2dc\uBBAC\ub808\uc774\uc158")}</button>` : ""}
       </div>
     </article>
   `);
@@ -6145,10 +6149,60 @@ function renderDeliverable(order) {
         ctx.strokeStyle = "#ddd"; ctx.lineWidth = 1; ctx.strokeRect(2, 2, 156, 156);
         ctx.fillStyle = "#1a1a2e"; ctx.font = "bold 12px monospace";
         ctx.textAlign = "center"; ctx.fillText(qrText.slice(0, 18), 80, 75);
-        ctx.font = "10px sans-serif"; ctx.fillStyle = "#888"; ctx.fillText("QR · scan to navigate", 80, 95);
+        ctx.font = "10px sans-serif"; ctx.fillStyle = "#888"; ctx.fillText("QR \u00b7 scan to pay", 80, 95);
       }
     }
   }, 80);
+  // Start payment status polling
+  _startPaymentPoll(order.id);
+}
+
+// ── Payment status polling ─────────────────────────────────────────────────
+const _activePayPolls = new Map();
+
+function _startPaymentPoll(orderId) {
+  if (_activePayPolls.has(orderId)) return;
+  let attempts = 0;
+  const tid = setInterval(async () => {
+    attempts++;
+    try {
+      const r = await api(`/api/orders/${encodeURIComponent(orderId)}/status`);
+      if (r && (r.status === "paid" || r.status === "completed")) {
+        _stopPaymentPoll(orderId);
+        _onPaymentConfirmed(orderId);
+        return;
+      }
+    } catch { /* network hiccup — keep polling */ }
+    if (attempts >= 60) _stopPaymentPoll(orderId); // stop after 3 min
+  }, 3000);
+  _activePayPolls.set(orderId, tid);
+}
+
+function _stopPaymentPoll(orderId) {
+  const tid = _activePayPolls.get(orderId);
+  if (tid != null) clearInterval(tid);
+  _activePayPolls.delete(orderId);
+}
+
+function _onPaymentConfirmed(orderId) {
+  const badge = document.getElementById(`pay-status-${orderId}`);
+  if (badge) {
+    badge.textContent = pickText("\u5df2\u652f\u4ed8 \u2713", "Paid \u2713", "\u652f\u6255\u6e08\u307f \u2713", "\uACB0\uC81C \uC644\uB8CC \u2713");
+    badge.className   = "pay-status-badge pay-status--paid";
+  }
+  const article = document.querySelector(`[data-order-id="${orderId}"]`);
+  if (article) {
+    const btn = article.querySelector(`[data-action="simulate-alipay-pay"]`);
+    if (btn) btn.style.display = "none";
+  }
+  if (navigator.vibrate) navigator.vibrate([20, 60, 20, 60, 20]);
+  addCard(`<article class="card cx-td-card">
+    <div class="cx-td-confetti" aria-hidden="true">
+      ${"🎉🌟✨🎊🎈".split("").map((e, i) => `<span style="--d:${i * 72}deg;--r:${30 + i * 11}px">${e}</span>`).join("")}
+    </div>
+    <div class="cx-td-header">${pickText("\u2713 \u652f\u4ed8\u6210\u529f", "\u2713 Payment confirmed", "\u2713 \u652f\u6255\u5b8c\u4e86", "\u2713 \uACB0\uC81C \uC644\uB8CC")}</div>
+    <div class="cx-td-row">${pickText("\u8ba2\u5355\u5df2\u5b8c\u6210\uff0c\u611f\u8c22\u4f7f\u7528 Cross X", "Order complete. Thank you for using Cross X.", "\u3054\u5229\u7528\u3042\u308a\u304c\u3068\u3046\u3054\u3056\u3044\u307e\u3059\u3002", "Cross X\ub97c \uc774\uc6a9\ud574 \uc8fc\uc154\uc11c \uac10\uc0ac\ud569\ub2c8\ub2e4.")}</div>
+  </article>`);
 }
 
 function notify(message, type = "info", actionLabel = "", onAction = null) {
@@ -10112,6 +10166,22 @@ function bindActions() {
 
     if (target.classList.contains("tab")) {
       switchTab(target.dataset.tab);
+      return;
+    }
+
+    if (target.dataset.action === "simulate-alipay-pay") {
+      const orderId = target.getAttribute("data-order");
+      if (!orderId) return;
+      target.disabled    = true;
+      target.textContent = pickText("\u5904\u7406\u4e2d\u2026", "Processing\u2026", "\u51e6\u7406\u4e2d\u2026", "\uCC98\uB9AC \uC911\u2026");
+      try {
+        await api("/api/alipay/simulate-pay", { method: "POST", body: JSON.stringify({ orderId }) });
+        // poll will detect paid state within 3s
+      } catch {
+        target.disabled    = false;
+        target.textContent = pickText("\u6a21\u62df\u652f\u4ed8\u6210\u529f", "Simulate payment", "\u652f\u6255\u3044\u3092\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uACB0\uC81C \uC2DC\uBBAC\uB808\uC774\uC158");
+        notify(pickText("\u64cd\u4f5c\u5931\u8d25", "Operation failed", "\u64cd\u4f5c\u306b\u5931\u6557", "\uc791\uc5c5 \uc2e4\ud328"), "error");
+      }
       return;
     }
 
