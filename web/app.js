@@ -6252,7 +6252,19 @@ function _planOptionSelect(cardId, idx) {
   }
   cd = cd || state._lastCardData;
   if (!cd?.plans?.[idx]) { openPlanDetail(cardId, idx); return; }
-  renderTravelConfirmCard(cd.plans[idx], cd);
+  // Brief selection flash on the chosen card before confirm card appears
+  if (cardEl) {
+    const planCards = cardEl.querySelectorAll(".cx-list-card");
+    const chosen = planCards[idx];
+    if (chosen) {
+      chosen.classList.add("cx-list-card--selected");
+      chosen.style.transition = "box-shadow 0.18s, transform 0.18s";
+      chosen.style.transform = "scale(1.015)";
+      setTimeout(() => { chosen.style.transform = ""; }, 200);
+    }
+  }
+  // Small delay so user sees the selection before confirm card replaces view
+  setTimeout(() => renderTravelConfirmCard(cd.plans[idx], cd), 180);
 }
 
 function renderTravelConfirmCard(plan, cardData) {
