@@ -31,9 +31,9 @@ function buildAgentFinalSystemPrompt(language) {
     : " Rules: 1)names must come from tool results, no hallucination. 2)hotel.hero_image=\"\". 3)activity image_url from tool result real_photo_url. 4)note/label max 15 chars. 5)plans must have budget/balanced/premium tiers.");
 }
 
-const MAX_TOOL_ROUNDS    = 2;    // cap at 2 rounds — tools are fast, diminishing returns after
-const TOOL_ROUND_TOKENS  = 600;  // small — LLM only decides which tools to call
-const FINAL_ROUND_TOKENS = 2600; // compact card_data JSON — gpt-4o-mini ~20s at this size
+const MAX_TOOL_ROUNDS   = 2;   // cap at 2 rounds — tools are fast, diminishing returns after
+const TOOL_ROUND_TOKENS = 600; // small — LLM only decides which tools to call
+// FINAL_ROUND_TOKENS is now computed per-request based on trip duration (see runAgentLoop).
 
 // ── System prompt builder ─────────────────────────────────────────────────────
 function buildSystemPrompt({ language, contextSummary, city, constraints, intentAxis }) {
@@ -120,9 +120,32 @@ async function runAgentLoop({
 }) {
   const systemContent = buildSystemPrompt({ language, contextSummary, city, constraints, intentAxis });
 
+  // P1a: Adaptive final-round token budget — longer trips produce larger JSON
+  const _tripDays = Number(constraints?.duration_days || constraints?.duration || 3);
+  const FINAL_ROUND_TOKENS = _tripDays >= 8 ? 3600 : _tripDays >= 4 ? 2600 : 2000;
+  console.log(`[agent] Adaptive token budget: ${FINAL_ROUND_TOKENS} (${_tripDays} days)`);
+
   // ── Initial messages ──────────────────────────────────────────────────────
   const messages = [{ role: "system", content: systemContent }];
-  for (const m of (Array.isArray(history) ? history.slice(-6) : [])) {
+
+  // Gap 6: Smarter history window — keep last 4 turns verbatim, summarise older turns
+  // so the agent retains awareness of earlier requests without ballooning context.
+  const histArr = Array.isArray(history) ? history : [];
+  const MAX_RECENT_TURNS = 4;
+  const droppedTurns = histArr.slice(0, Math.max(0, histArr.length - MAX_RECENT_TURNS));
+  const recentTurns  = histArr.slice(-MAX_RECENT_TURNS);
+  if (droppedTurns.length > 0) {
+    const priorUserMsgs = droppedTurns
+      .filter((m) => m.role === "user" && m.content)
+      .map((m) => String(m.content).slice(0, 100))
+      .join(" → ");
+    if (priorUserMsgs) {
+      messages.push({ role: "user",      content: `[Earlier requests: ${priorUserMsgs}]` });
+      messages.push({ role: "assistant", content: "Understood the prior context." });
+      console.log(`[agent] Gap6: summarised ${droppedTurns.length} dropped turns`);
+    }
+  }
+  for (const m of recentTurns) {
     if (m.role && m.content) {
       messages.push({ role: m.role, content: String(m.content).slice(0, 800) });
     }
@@ -375,6 +398,68 @@ async function runAgentLoop({
       }
       return plan;
     });
+  }
+
+  // ── P0: Hallucination detection + _dataQuality tagging ─────────────────
+  // Build set of every real name returned by tools in this session.
+  // Scans ALL tool messages (not just collectedToolResults) to handle same-tool
+  // called multiple times (e.g. 2× get_city_enrichment overwrites collectedToolResults).
+  {
+    const _knownNames = new Set();
+    for (const m of messages) {
+      if (m.role !== "tool") continue;
+      try {
+        const d = JSON.parse(m.content);
+        const allItems = [
+          ...(d.item_list    || []),
+          ...(d.restaurants  || []),
+          ...(d.attractions  || []),
+          ...(d.hotels       || []),
+        ];
+        for (const item of allItems) {
+          if (item.name) _knownNames.add(item.name);
+        }
+      } catch {}
+    }
+
+    // Overall data quality: highest-fidelity source wins
+    const _srcList = Object.values(collectedToolResults)
+      .map((r) => r?._source || r?.source || "unknown");
+    const _dq = _srcList.some((s) => s === "amap" || s === "juhe") ? "live"
+               : _srcList.some((s) => s === "openai")              ? "ai"
+               : _srcList.some((s) => s === "synthetic")           ? "synthetic"
+               : "mock";
+
+    // Tag each activity/meal with _verified (name in tool results) or _unverified (hallucination candidate)
+    let _vOk = 0, _vFail = 0;
+    if (structured.card_data?.days) {
+      structured = {
+        ...structured,
+        card_data: {
+          ...structured.card_data,
+          _dataQuality: _dq,
+          days: structured.card_data.days.map((day) => ({
+            ...day,
+            activities: (day.activities || []).map((act) => {
+              // Skip transport/check-in entries — their names are route/airline labels
+              if (/transport|check.?in|hotel/i.test(act.type || "")) return act;
+              const ok = _knownNames.size > 0 && _knownNames.has(act.name);
+              ok ? _vOk++ : _vFail++;
+              return ok ? { ...act, _verified: true } : { ...act, _unverified: true };
+            }),
+            meals: (day.meals || []).map((meal) => {
+              const mname = meal.name || meal.restaurant;
+              const ok = _knownNames.size > 0 && Boolean(mname) && _knownNames.has(mname);
+              ok ? _vOk++ : _vFail++;
+              return ok ? { ...meal, _verified: true } : { ...meal, _unverified: true };
+            }),
+          })),
+        },
+      };
+    }
+    const _total = _vOk + _vFail;
+    const _pct   = _total > 0 ? Math.round((_vFail / _total) * 100) : 0;
+    console.log(`[agent] P0 hallucination: ${_vOk}/${_total} verified (${_pct}% unverified) | quality=${_dq} | known_names=${_knownNames.size}`);
   }
 
   // Build a coze-compatible enrichmentData from collected tool results

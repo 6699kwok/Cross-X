@@ -10,6 +10,17 @@
 // ── Chain restaurant blocklist (global fast food / coffee / bubble tea) ──────
 const CHAIN_RESTAURANT_RE = /麦当劳|肯德基|必胜客|汉堡王|华莱士|赛百味|Subway|星巴克|Starbucks|瑞幸|奈雪|喜茶|蜜雪冰城|沙县|兰州拉面|沙县小吃|正新鸡排|绝味|周黑鸭|卤味|Jollibee|Tim Hortons|Costa|COSTA|DQ|Dairy Queen|Shake Shack|Taco Bell|Popeyes|Chick-fil-A|Pizza|肯德基|KFC/i;
 
+// ── Per-city local cuisine keyword — biases Amap toward authentic local food ─
+const CITY_CUISINE_KEYWORD = {
+  '上海': '本帮菜', '北京': '北京菜', '深圳': '粤菜', '成都': '川菜',
+  '杭州': '浙菜', '广州': '粤菜', '重庆': '重庆火锅', '武汉': '湖北菜',
+  '西安': '陕菜', '厦门': '闽南菜', '南京': '苏菜', '苏州': '苏菜',
+  '青岛': '海鲜', '长沙': '湘菜', '昆明': '云南菜', '哈尔滨': '黑龙江菜',
+  '天津': '津菜', '贵阳': '黔菜', '大理': '云南菜', '丽江': '云南菜',
+  '桂林': '桂菜', '三亚': '海南菜', '黄山': '皖菜', '张家界': '湘菜',
+  '拉萨': '藏菜', '乌鲁木齐': '新疆菜',
+};
+
 /**
  * Query Amap POI API for hotels, restaurants, or attractions in a city.
  * Returns array of { name, address, tel, rating, price, type } or null on failure.
@@ -18,26 +29,32 @@ async function queryAmapPoi(city, poiType = "hotel") {
   const AMAP_API_KEY = String(process.env.AMAP_API_KEY || process.env.GAODE_API_KEY || "").trim();
   if (!AMAP_API_KEY) return null;
 
+  // Restaurants: no types filter (Amap types override keyword relevance, causing chains to dominate)
   const typeMap = {
     hotel:      "100000",
     budget:     "100000",
     luxury:     "100000",
-    restaurant: "050301|050302|050303|050304",
     halal:      "050301",
     transport:  "150200|150300",
-    attraction: "110000|110100|110200|110300",  // 旅游景点 categories
+    attraction: "110000|110100|110200|110300",
   };
   const types = typeMap[poiType] || "100000";
 
-  // Keyword biases Amap search toward the right POI sub-type
-  const keyword = poiType === "restaurant" ? "\u7279\u8272\u9910\u5385"  // 特色餐厅
-                : poiType === "attraction"  ? "\u666f\u70b9"              // 景点
-                : "\u9152\u5e97";                                          // 酒店
+  // City-specific cuisine keyword gets local restaurants; generic fallback avoids "特色" (pulls chains)
+  const cityKey = city.replace(/市$/, "");
+  const keyword = poiType === "restaurant"
+                  ? (CITY_CUISINE_KEYWORD[cityKey] || "\u5f53\u5730\u7279\u8272\u7f8e\u98df")  // 当地特色美食
+                  : poiType === "attraction" ? "\u666f\u70b9"                                    // 景点
+                  : "\u9152\u5e97";                                                               // 酒店
 
+  // For restaurants: omit types filter — Amap types override keyword relevance
+  // and cause chain restaurants (KFC/McDonald's) to dominate via review count.
+  // Cuisine keyword alone produces accurate local results.
+  const typesParam = poiType === "restaurant" ? "" : `&types=${types}`;
   const url = `https://restapi.amap.com/v3/place/text?key=${AMAP_API_KEY}` +
     `&keywords=${encodeURIComponent(keyword)}` +
     `&city=${encodeURIComponent(city)}&citylimit=true` +
-    `&types=${types}&extensions=all&offset=30&output=JSON`;
+    `${typesParam}&extensions=all&offset=20&output=JSON`;
   try {
     const resp = await fetch(url, { signal: AbortSignal.timeout(6000) });
     if (!resp.ok) { console.warn("[amap] HTTP", resp.status); return null; }
@@ -48,13 +65,14 @@ async function queryAmapPoi(city, poiType = "hotel") {
     }
 
     let pois = data.pois.map((p) => ({
-      name:    String(p.name || ""),
-      address: String(Array.isArray(p.address) ? p.address.join("") : (p.address || "")),
-      tel:     String(Array.isArray(p.tel) ? p.tel[0] : (p.tel || "")),
-      rating:  p.biz_ext ? (parseFloat(p.biz_ext.rating) || 0) : 0,
-      price:   p.biz_ext ? (parseFloat(p.biz_ext.cost)   || 0) : 0,
-      area:    String(p.adname || p.pname || city),
-      type:    String(p.type || ""),
+      name:      String(p.name || ""),
+      address:   String(Array.isArray(p.address) ? p.address.join("") : (p.address || "")),
+      tel:       String(Array.isArray(p.tel) ? p.tel[0] : (p.tel || "")),
+      rating:    p.biz_ext ? (parseFloat(p.biz_ext.rating) || 0) : 0,
+      price:     p.biz_ext ? (parseFloat(Array.isArray(p.biz_ext.cost) ? 0 : p.biz_ext.cost) || 0) : 0,
+      open_time: p.biz_ext ? (String(p.biz_ext.open_time || "")).trim() : "",
+      area:      String(p.adname || p.pname || city),
+      type:      String(p.type || ""),
     })).filter((p) => p.name);
 
     // For restaurants: filter chains + low-price fast food, sort by local quality

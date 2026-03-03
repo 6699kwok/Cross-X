@@ -6327,27 +6327,49 @@ function _updateTravelStep(execId, stepId, status, pct) {
 async function _startTravelExecution(cacheKey, confirmCardEl) {
   const { plan, cardData } = _travelCacheGet(cacheKey);
   if (!plan || !cardData) return;
-  // Haptic feedback on mobile
   if (navigator.vibrate) navigator.vibrate([10, 30, 10]);
   if (confirmCardEl) confirmCardEl.style.display = "none";
   const execId = Math.random().toString(36).slice(2, 8);
-  const failAt = _travelShouldFail(plan, cardData) ? "reserve_hotel" : null;
-
   renderTravelStepsCard(execId, _TRAVEL_STEPS);
 
-  for (let i = 0; i < _TRAVEL_STEPS.length; i++) {
-    const s = _TRAVEL_STEPS[i];
-    _updateTravelStep(execId, s.id, "running", Math.round((i / _TRAVEL_STEPS.length) * 100));
-    await new Promise(r => setTimeout(r, s.ms));
-    if (failAt === s.id) {
-      _updateTravelStep(execId, s.id, "failed", Math.round((i / _TRAVEL_STEPS.length) * 100));
-      renderTravelFailCard(s.id, plan, cardData);
-      return;
+  // Visual animation runs in parallel with real API call
+  const animationDone = (async () => {
+    for (let i = 0; i < _TRAVEL_STEPS.length; i++) {
+      const s = _TRAVEL_STEPS[i];
+      _updateTravelStep(execId, s.id, "running", Math.round((i / _TRAVEL_STEPS.length) * 100));
+      await new Promise(r => setTimeout(r, s.ms));
+      _updateTravelStep(execId, s.id, "success", Math.round(((i + 1) / _TRAVEL_STEPS.length) * 100));
     }
-    _updateTravelStep(execId, s.id, "success", Math.round(((i + 1) / _TRAVEL_STEPS.length) * 100));
+  })();
+
+  const taskId = state.currentTask?.id;
+  let executeResult = null;
+  let execError = null;
+
+  if (taskId) {
+    try {
+      await api(`/api/tasks/${taskId}/confirm`, {
+        method: "POST",
+        body: JSON.stringify({ accepted: true, planId: plan.id, ts: Date.now() }),
+      });
+      executeResult = await api(`/api/tasks/${taskId}/execute`, { method: "POST" });
+    } catch (err) {
+      execError = err;
+    }
   }
 
-  renderTravelDeliverable(plan, cardData);
+  await animationDone;
+
+  if (taskId && (execError || !executeResult?.order)) {
+    renderTravelFailCard("reserve_hotel", plan, cardData);
+    return;
+  }
+
+  if (executeResult?.order) {
+    renderDeliverable(executeResult.order);
+  } else {
+    renderTravelDeliverable(plan, cardData);
+  }
   setTimeout(() => _renderPostBookingFollowUp(plan, cardData), 600);
 }
 

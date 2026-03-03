@@ -342,9 +342,9 @@ async function buildAIEnrichment(city, intentAxis) {
           name:           p.name,
           address:        p.address || city,
           avg_price:      isFood       ? (p.price || 60)  : undefined,
-          ticket_price:   isAttraction ? (p.price || 80)  : undefined,
+          ticket_price:   isAttraction ? (p.price || null) : undefined,  // null = price unknown; 0 = genuinely free
           queue_min:      isFood       ? (p.rating >= 4.5 ? 30 : p.rating >= 4.0 ? 15 : 5) : undefined,
-          open_hours:     isAttraction ? "9:00-18:00"     : undefined,
+          open_hours:     isAttraction ? (p.open_time ? p.open_time.trim().split(/\s+/).pop() : "9:00-18:00") : undefined,
           real_photo_url: "",
         }));
         const avgQueue = isFood
@@ -436,11 +436,22 @@ async function callCozeWorkflow({ query, city, lang, budget, intentAxis }) {
   const COZE_WORKFLOW_ID = String(process.env.COZE_WORKFLOW_ID || "7611467642825605161").trim();
   const COZE_API_BASE    = String(process.env.COZE_API_BASE || "https://api.coze.cn").replace(/\/+$/, "");
 
-  // Helper: get static enrichment OR fall through to AI
+  // Helper: Amap first (real POI), merge synthetic queue/tips, fall back to static
   const getEnrichment = async () => {
+    const amapData = await buildAIEnrichment(city, intentAxis);
+    if (amapData && amapData._source === "amap") {
+      // Real Amap item_list + curated queue/tips from synthetic where available
+      const synthetic = buildSyntheticEnrichment(city);
+      return {
+        ...amapData,
+        restaurant_queue: synthetic?.restaurant_queue ?? amapData.restaurant_queue,
+        spoken_text:      synthetic?.spoken_text      ?? amapData.spoken_text,
+      };
+    }
+    // Amap unavailable — synthetic for known cities, or whatever buildAIEnrichment returned
     const staticData = buildSyntheticEnrichment(city);
-    if (staticData !== null) return staticData; // Known city in static table
-    return buildAIEnrichment(city, intentAxis);  // Unknown city: AI-generated
+    if (staticData !== null) return staticData;
+    return amapData;
   };
 
   if (!COZE_API_KEY || !COZE_WORKFLOW_ID) {

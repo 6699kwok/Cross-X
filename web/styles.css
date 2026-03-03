@@ -3479,6 +3479,22 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   opacity: 0.6;
 }
 
+/* ── P0②: Data quality banner — shown when agent used synthetic/mock data ── */
+.cx-quality-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 8px 14px;
+  background: #fff8e1;
+  border-left: 3px solid #f59e0b;
+  border-radius: 0 6px 6px 0;
+  font-size: 12px;
+  color: #78350f;
+  line-height: 1.5;
+}
+.cx-quality-banner-icon { flex-shrink: 0; margin-top: 1px; }
+
 /* ── Selected card ───────────────────────────────────────────────────────── */
 .itinerary-option-card.card-selected {
   border-color: #10b981;
