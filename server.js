@@ -6359,12 +6359,15 @@ function createOrderForTask(task, proof) {
   const proofOrderNo = `CX${Date.now().toString().slice(-8)}`;
   const _pd    = (proof && proof._payData) || {};
   const qrText = _pd.qrCode
+    || (_pd.wechatTradeNo ? `weixin://wxpay/bizpayurl?pr=CROSSX_${_pd.wechatTradeNo}` : null)
     || (_pd.alipayTradeNo ? `alipays://payment/crossx/${_pd.alipayTradeNo}/${pricing.finalPrice}` : null)
     || `CROSSX-${orderId}-${Date.now()}`;
   const proofObj = {
     qrText,
-    qrSandbox:     Boolean(_pd.sandbox),
-    alipayTradeNo: _pd.alipayTradeNo || null,
+    qrSandbox:      Boolean(_pd.sandbox),
+    railId:         _pd.railId         || null,
+    alipayTradeNo:  _pd.alipayTradeNo  || null,
+    wechatTradeNo:  _pd.wechatTradeNo  || null,
     orderNo:       proofOrderNo,
     bilingualAddress: proof?.bilingualAddress || "CN/EN address pending",
     navLink:       proof?.navLink || "https://maps.google.com",
@@ -10263,6 +10266,61 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       order.paymentStatus = "paid";
       order.paidAt        = nowIso();
       lifecyclePush(order.lifecycle, "paid", "Payment confirmed (simulated)", "sandbox simulate-pay");
+      saveDb();
+      return writeJson(res, 200, { ok: true, orderId: order.id, paymentStatus: "paid" });
+    }
+
+    // ── POST /api/wechat/notify — WeChat Pay v3 async notification ────────
+    if (req.method === "POST" && pathname === "/api/wechat/notify") {
+      const raw      = await readRawBody(req);
+      let   payload;
+      try { payload = JSON.parse(raw); } catch { return res.end(JSON.stringify({ code: "FAIL", message: "parse error" })); }
+      const apiKeyV3 = String(process.env.WECHAT_API_KEY_V3 || "").trim();
+      let   outTradeNo;
+      if (apiKeyV3 && payload.resource) {
+        // AEAD_AES_256_GCM decryption
+        try {
+          const { algorithm, associated_data, nonce, ciphertext } = payload.resource;
+          const keyBuf  = Buffer.from(apiKeyV3, "utf8");
+          const cipher  = Buffer.from(ciphertext, "base64");
+          const tag     = cipher.slice(-16);
+          const body    = cipher.slice(0, -16);
+          const decipher = crypto.createDecipheriv("aes-256-gcm", keyBuf, nonce);
+          decipher.setAuthTag(tag);
+          if (associated_data) decipher.setAAD(Buffer.from(associated_data));
+          const plain  = Buffer.concat([decipher.update(body), decipher.final()]);
+          const tx     = JSON.parse(plain.toString("utf8"));
+          if (tx.trade_state === "SUCCESS") outTradeNo = tx.out_trade_no;
+        } catch (err) { console.warn("[wechat notify] decrypt:", err.message); }
+      } else if (payload.resource) {
+        // No API key — skip verify in dev
+        outTradeNo = payload.resource.out_trade_no;
+      }
+      if (outTradeNo) {
+        const order = Object.values(db.orders).find(
+          (o) => o.proof && o.proof.wechatTradeNo === outTradeNo
+        );
+        if (order) {
+          order.paymentStatus = "paid";
+          order.paidAt        = nowIso();
+          lifecyclePush(order.lifecycle, "paid", "Payment confirmed", `WeChat ${outTradeNo}`);
+          saveDb();
+        }
+      }
+      res.setHeader("Content-Type", "application/json");
+      return res.end(JSON.stringify({ code: "SUCCESS", message: "成功" }));
+    }
+
+    // ── POST /api/wechat/simulate-pay — sandbox WeChat payment simulation ─
+    if (req.method === "POST" && pathname === "/api/wechat/simulate-pay") {
+      const body  = await readBody(req);
+      const order = db.orders[String(body.orderId || "")];
+      if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      if (!order.proof || !order.proof.qrSandbox)
+        return writeJson(res, 403, { error: "simulate-pay only available in sandbox mode" });
+      order.paymentStatus = "paid";
+      order.paidAt        = nowIso();
+      lifecyclePush(order.lifecycle, "paid", "Payment confirmed (simulated)", "wechat sandbox");
       saveDb();
       return writeJson(res, 200, { ok: true, orderId: order.id, paymentStatus: "paid" });
     }

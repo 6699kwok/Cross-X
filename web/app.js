@@ -6123,7 +6123,7 @@ function renderDeliverable(order) {
         <button class="secondary" data-action="open-proof" data-order="${order.id}">${pickText("打开凭证", "Open proof","証憑を開く", "증빙 열기")}</button>
         <button class="secondary" data-action="open-task" data-task="${order.taskId}">${pickText("任务详情", "Task detail","タスク詳細", "작업 상세")}</button>
         <button class="secondary" data-action="share-order" data-order="${order.id}">${pickText("分享", "Share","共有", "공유")}</button>
-        ${isSandbox ? `<button class="secondary" data-action="simulate-alipay-pay" data-order="${escapeHtml(order.id)}">${pickText("\u6a21\u62df\u652f\u4ed8\u6210\u529f", "Simulate payment", "\u652f\u6255\u3044\u3092\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uacb0\uc81c \uc2dc\uBBAC\ub808\uc774\uc158")}</button>` : ""}
+        ${isSandbox ? `<button class="secondary" data-action="simulate-pay" data-order="${escapeHtml(order.id)}" data-rail="${escapeHtml(order.proof.railId || "alipay_cn")}">${pickText("\u6a21\u62df\u652f\u4ed8\u6210\u529f", "Simulate payment", "\u652f\u6255\u3044\u3092\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uacb0\uc81c \uc2dc\uBBAC\ub808\uc774\uc158")}</button>` : ""}
       </div>
     </article>
   `);
@@ -6192,7 +6192,7 @@ function _onPaymentConfirmed(orderId) {
   }
   const article = document.querySelector(`[data-order-id="${orderId}"]`);
   if (article) {
-    const btn = article.querySelector(`[data-action="simulate-alipay-pay"]`);
+    const btn = article.querySelector(`[data-action="simulate-pay"]`);
     if (btn) btn.style.display = "none";
   }
   if (navigator.vibrate) navigator.vibrate([20, 60, 20, 60, 20]);
@@ -10169,13 +10169,15 @@ function bindActions() {
       return;
     }
 
-    if (target.dataset.action === "simulate-alipay-pay") {
+    if (target.dataset.action === "simulate-pay") {
       const orderId = target.getAttribute("data-order");
       if (!orderId) return;
       target.disabled    = true;
       target.textContent = pickText("\u5904\u7406\u4e2d\u2026", "Processing\u2026", "\u51e6\u7406\u4e2d\u2026", "\uCC98\uB9AC \uC911\u2026");
+      const railId   = target.getAttribute("data-rail") || "alipay_cn";
+      const endpoint = railId === "wechat_cn" ? "/api/wechat/simulate-pay" : "/api/alipay/simulate-pay";
       try {
-        await api("/api/alipay/simulate-pay", { method: "POST", body: JSON.stringify({ orderId }) });
+        await api(endpoint, { method: "POST", body: JSON.stringify({ orderId }) });
         // poll will detect paid state within 3s
       } catch {
         target.disabled    = false;
@@ -11707,12 +11709,22 @@ function bindInput() {
   function showPaymentQR(provider) {
     if (!el.payQrSection) return;
     const priceText = (el.payQrAmount && el.payTotal && el.payTotal.textContent) ? el.payTotal.textContent : "";
-    const isWeChat = provider === "wechat";
-    const qrData = encodeURIComponent(isWeChat ? "weixin://wxpay/crossx_order_" + Date.now() : "alipays://platformapi/startapp?appId=20000067&url=" + encodeURIComponent("https://crossx.ai/pay?ref=" + Date.now()));
-    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&color=000000&bgcolor=ffffff&data=${qrData}&format=svg`;
-    if (el.payQrImg) { el.payQrImg.src = qrUrl; el.payQrImg.alt = isWeChat ? "WeChat Pay QR" : "Alipay QR"; }
-    if (el.payQrLabel) el.payQrLabel.textContent = isWeChat ? "微信扫码支付" :"支付宝扫码支付";
-    if (el.payQrHint) el.payQrHint.textContent = isWeChat ? "请打开微信 → 扫一扫" :"请打开支付宝 → 扫一扫";
+    const isWeChat  = provider === "wechat";
+    const deeplink  = isWeChat
+      ? `weixin://wxpay/bizpayurl?pr=CROSSX_${Date.now()}`
+      : `alipays://platformapi/startapp?appId=20000067&url=${encodeURIComponent("https://crossx.ai/pay?ref=" + Date.now())}`;
+    if (el.payQrImg) {
+      el.payQrImg.alt = isWeChat ? "WeChat Pay QR" : "Alipay QR";
+      if (window.QRCode) {
+        QRCode.toDataURL(deeplink, { width: 180, margin: 1 }, (err, url) => {
+          if (!err && el.payQrImg) el.payQrImg.src = url;
+        });
+      } else {
+        el.payQrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&color=000000&bgcolor=ffffff&data=${encodeURIComponent(deeplink)}&format=svg`;
+      }
+    }
+    if (el.payQrLabel) el.payQrLabel.textContent = isWeChat ? "微信扫码支付" : "支付宝扫码支付";
+    if (el.payQrHint) el.payQrHint.textContent = isWeChat ? "请打开微信 → 扫一扫" : "请打开支付宝 → 扫一扫";
     if (el.payQrAmount) el.payQrAmount.textContent = priceText || el.payTotal?.textContent || "";
     el.payQrSection.classList.remove("hidden");
   }
