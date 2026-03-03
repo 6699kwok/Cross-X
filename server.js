@@ -7087,6 +7087,59 @@ ${transactionId ? `<tr><td>交易参考</td><td>${_escHtml(transactionId)}</td><
 </body></html>`;
 }
 
+// ── In-memory rate limiter ────────────────────────────────────────────────────
+// Fixed window (1 min) keyed by "ip:tier".
+// Tiers:  llm=10/min (LLM completions)  agent=30/min (all other /api/agent/* + charge)
+const _rlStore = new Map(); // "ip:tier" → { count, windowStart }
+const RL_WINDOW_MS = 60_000;
+const RL_LIMITS    = { llm: 10, agent: 30 };
+
+function _rlGetIp(req) {
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return String(xff).split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+
+/**
+ * Check and consume one token for this request.
+ * Returns null when allowed, or { retryAfterMs } when rate-limited.
+ */
+function _rlCheck(req, pathname) {
+  const tier =
+    pathname === "/api/agent/llm-plan" || pathname === "/api/agent/llm-plan/stream"
+      ? "llm"
+      : pathname.startsWith("/api/agent/") || pathname === "/api/payments/charge"
+        ? "agent"
+        : null;
+  if (!tier) return null;
+
+  const ip  = _rlGetIp(req);
+  const key = `${ip}:${tier}`;
+  const now = Date.now();
+
+  let bucket = _rlStore.get(key);
+  if (!bucket || now - bucket.windowStart >= RL_WINDOW_MS) {
+    _rlStore.set(key, { count: 1, windowStart: now });
+    return null; // first request in this window — allow
+  }
+
+  bucket.count += 1;
+  if (bucket.count > RL_LIMITS[tier]) {
+    const retryAfterMs = RL_WINDOW_MS - (now - bucket.windowStart);
+    return { retryAfterMs };
+  }
+  return null;
+}
+
+// Prune stale buckets every 5 min so the Map doesn't grow unbounded
+const _rlGc = setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of _rlStore) {
+    if (now - bucket.windowStart >= RL_WINDOW_MS) _rlStore.delete(key);
+  }
+}, 5 * 60_000);
+_rlGc.unref();
+
 const server = http.createServer(async (req, res) => {
   const parsed = parseUrl(req.url, true);
   const { pathname } = parsed;
@@ -7099,6 +7152,18 @@ const server = http.createServer(async (req, res) => {
 
   try {
     cleanIdempotencyStore();
+
+    // ── Rate limiting (agent + LLM endpoints) ──────────────────────────────
+    const _rlDenied = _rlCheck(req, pathname);
+    if (_rlDenied) {
+      const retryAfterSec = Math.ceil(_rlDenied.retryAfterMs / 1000);
+      res.setHeader("Retry-After", String(retryAfterSec));
+      return writeJson(res, 429, {
+        error: "rate_limit_exceeded",
+        message: `Too many requests. Retry in ${retryAfterSec}s.`,
+        retryAfterMs: _rlDenied.retryAfterMs,
+      });
+    }
 
     if (req.method === "GET" && pathname === "/hotel/district/cityList") {
       const countryCode = String(parsed.query.countryCode || "CN").toUpperCase();
