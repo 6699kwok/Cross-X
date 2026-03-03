@@ -2677,7 +2677,24 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 .cx-te-steps { display: flex; flex-direction: column; gap: 8px; }
 .cx-te-step { display: flex; align-items: center; gap: 10px; font-size: 13px; padding: 6px 8px; border-radius: 8px; transition: background 0.2s; }
 .cx-te-step--queued { color: var(--color-text-secondary); }
-.cx-te-step--running { background: rgba(16,185,129,0.08); color: var(--color-text-primary); font-weight: 600; }
+.cx-te-step--running {
+  background: rgba(16,185,129,0.08);
+  color: var(--color-text-primary);
+  font-weight: 600;
+  position: relative;
+  overflow: hidden;
+}
+.cx-te-step--running::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(16,185,129,0.15) 50%, transparent 100%);
+  animation: cxStepShimmer 1.4s ease-in-out infinite;
+}
+@keyframes cxStepShimmer {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
 .cx-te-step--success { color: #10b981; }
 .cx-te-step--failed { color: #ef4444; }
 .cx-te-icon { font-size: 14px; width: 16px; text-align: center; flex-shrink: 0; }
