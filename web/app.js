@@ -5945,6 +5945,80 @@ function clearChatCards(options = {}) {
   }
 }
 
+// ── _buildIntercityHtml — shared inter-city transport banner with mode pills ──
+function _buildIntercityHtml(ic) {
+  if (!ic?.from) return "";
+  const _ICONS = { flight: "✈️", hsr: "🚄", train: "🚂", bus: "🚌", drive: "🚗", car: "🚗", walk: "🚶" };
+  const mIcon = _ICONS[ic.mode] || "🚌";
+  const cost  = ic.cost_cny > 0 ? `<span class="act-intercity-cost">¥${Number(ic.cost_cny).toLocaleString()}</span>` : "";
+  const fmtDur = (m) => m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? (m % 60) + "m" : ""}` : `${m}m`;
+
+  let optsHtml = "";
+  if (Array.isArray(ic.route_options) && ic.route_options.length > 1) {
+    const pills = ic.route_options.map((opt) => {
+      const oIcon  = _ICONS[opt.type] || "🚌";
+      const dur    = opt.duration_min > 0 ? fmtDur(opt.duration_min) : "";
+      const price  = opt.price_cny > 0 ? `¥${Number(opt.price_cny).toLocaleString()}` : "";
+      const meta   = [dur, opt.freq].filter(Boolean).join(" · ");
+      const active = opt.type === ic.mode;
+      return `<div class="cx-route-opt${active ? " cx-route-opt--active" : ""}">
+        <span class="cx-ro-icon">${oIcon}</span>
+        <div class="cx-ro-info">
+          <span class="cx-ro-label">${escapeHtml(opt.label || opt.type)}</span>
+          ${meta ? `<span class="cx-ro-meta">${escapeHtml(meta)}</span>` : ""}
+        </div>
+        ${price ? `<span class="cx-ro-price">${price}</span>` : ""}
+      </div>`;
+    }).join("");
+    optsHtml = `<div class="cx-route-opts">${pills}</div>`;
+  }
+
+  return `<div class="act-intercity">
+    <div class="act-intercity-header">
+      <span class="act-intercity-icon">${mIcon}</span>
+      <span class="act-intercity-route">${escapeHtml(ic.from || "")} → ${escapeHtml(ic.to || "")}</span>
+      ${cost}
+    </div>
+    ${optsHtml}
+    ${ic.detail ? `<div class="act-intercity-detail">${escapeHtml(ic.detail)}</div>` : ""}
+    ${ic.tip ? `<div class="act-intercity-tip">💡 ${escapeHtml(ic.tip)}</div>` : ""}
+  </div>`;
+}
+
+// ── fetchLocalNav — lazily load walk/transit/taxi times for an activity ──────
+async function fetchLocalNav(el) {
+  if (el.dataset.loaded === "1") return;
+  el.dataset.loaded = "1";
+  el.classList.remove("act-local-nav--loading");
+  const city  = el.dataset.city  || "";
+  const hotel = el.dataset.hotel || "";
+  const place = el.dataset.place || "";
+  if (!city || !place) return;
+  const modesEl = el.querySelector(".act-local-nav-modes");
+  if (modesEl) modesEl.textContent = "加载中\u2026";
+  try {
+    const resp = await fetch(
+      `/api/local-route?from=${encodeURIComponent(hotel || city)}&to=${encodeURIComponent(place)}&city=${encodeURIComponent(city)}`
+    );
+    const data = await resp.json();
+    if (!data.ok || (!data.walk && !data.transit && !data.taxi)) {
+      if (modesEl) modesEl.textContent = "暂无导航数据";
+      return;
+    }
+    const fmtMin = (m) => m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? (m % 60) + "m" : ""}` : `${m}m`;
+    const chips = [];
+    if (data.walk)    chips.push(`<span class="act-nav-chip"><span class="act-nav-chip-icon">🚶</span>${fmtMin(data.walk.min)}</span>`);
+    if (data.transit) chips.push(`<span class="act-nav-chip"><span class="act-nav-chip-icon">🚇</span>${fmtMin(data.transit.min)}${data.transit.fare_cny > 0 ? " \u00a5" + data.transit.fare_cny : ""}</span>`);
+    if (data.taxi)    chips.push(`<span class="act-nav-chip"><span class="act-nav-chip-icon">🚕</span>${fmtMin(data.taxi.min)} \u00a5${data.taxi.cost_cny}</span>`);
+    if (modesEl) modesEl.innerHTML = chips.length
+      ? chips.join('<span class="act-nav-sep">\u00b7</span>')
+      : "导航数据不可用";
+  } catch {
+    el.classList.add("act-local-nav--error");
+    if (modesEl) modesEl.textContent = "加载失败";
+  }
+}
+
 function renderPlanCard(task) {
   if (!shouldRenderExecutionCards()) return;
   const currentStep = (task.steps || task.plan.steps || []).find((item) => item.status === "running");
@@ -7372,18 +7446,9 @@ function renderCardData(cd, spokenText) {
         "</div>";
 
       const dayPanelsHtml = cd.days.map((d, di) => {
-        // Intercity transport banner for city-change days
-        const IC_ICON_MAP = { flight: "✈️", hsr: "🚄", bus: "🚌", car: "🚗" };
-        const icHtml = d.intercity_transport?.from ? (() => {
-          const ic = d.intercity_transport;
-          const mIcon = IC_ICON_MAP[ic.mode] || "🚌";
-          const iCost = ic.cost_cny > 0 ? `<span class="act-intercity-cost">¥${Number(ic.cost_cny).toLocaleString()}</span>` : "";
-          return `<div class="act-intercity">
-            <div class="act-intercity-header"><span class="act-intercity-icon">${mIcon}</span><span class="act-intercity-route">${escapeHtml(ic.from||"")} → ${escapeHtml(ic.to||"")}</span>${iCost}</div>
-            ${ic.detail ? `<div class="act-intercity-detail">${escapeHtml(ic.detail)}</div>` : ""}
-            ${ic.tip ? `<div class="act-intercity-tip">💡 ${escapeHtml(ic.tip)}</div>` : ""}
-          </div>`;
-        })() : "";
+        const icHtml = _buildIntercityHtml(d.intercity_transport);
+        const _dayCity  = d.city || cd.destination || "";
+        const _dayHotel = d.hotel?.name || "";
         const activities = (d.activities || []).map((act) => {
           const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
           const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
@@ -7405,6 +7470,14 @@ function renderCardData(cd, spokenText) {
             ? `<span class="act-coze-queue">⏳ 排队约${state.cozeData.restaurant_queue}分钟</span>` : "";
           const cozeTicket = isSight && state.cozeData?.ticket_availability
             ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
+          // Local nav strip (skip transport/city_change rows)
+          const isTransportRow = /^(transport|city_change)$/i.test(act.type || "");
+          const localNavHtml = (!isTransportRow && _dayCity && act.name)
+            ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
+                data-city="${escapeHtml(_dayCity)}" data-hotel="${escapeHtml(_dayHotel)}" data-place="${escapeHtml(act.name)}">
+                <span class="act-local-nav-label">📍 导航</span>
+                <span class="act-local-nav-modes">点击查看</span>
+              </div>` : "";
           return `${transitHtml}
             <div class="act-row">
               <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
@@ -7414,6 +7487,7 @@ function renderCardData(cd, spokenText) {
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
                 ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
                 ${(act.insider_tip||act.insider_tips) ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip||act.insider_tips)}</div>` : ""}
+                ${localNavHtml}
               </div>
               <span class="act-cost${costCls}">${costFmt}</span>
             </div>`;
@@ -7561,12 +7635,9 @@ function renderCardData(cd, spokenText) {
       `</div>`;
 
     dayPanelsHtml = cd.days.map((d, di) => {
-      const _IC_ICON = { flight: "✈️", hsr: "🚄", bus: "🚌", car: "🚗" };
-      const _icHtml2 = d.intercity_transport?.from ? (() => {
-        const ic = d.intercity_transport;
-        const cost2 = ic.cost_cny > 0 ? `<span class="act-intercity-cost">¥${Number(ic.cost_cny).toLocaleString()}</span>` : "";
-        return `<div class="act-intercity"><div class="act-intercity-header"><span class="act-intercity-icon">${_IC_ICON[ic.mode]||"🚌"}</span><span class="act-intercity-route">${escapeHtml(ic.from||"")} → ${escapeHtml(ic.to||"")}</span>${cost2}</div>${ic.detail?`<div class="act-intercity-detail">${escapeHtml(ic.detail)}</div>`:""}${ic.tip?`<div class="act-intercity-tip">💡 ${escapeHtml(ic.tip)}</div>`:""}</div>`;
-      })() : "";
+      const _icHtml2   = _buildIntercityHtml(d.intercity_transport);
+      const _dayCity2  = d.city || cd.destination || "";
+      const _dayHotel2 = d.hotel?.name || "";
       const activities = (d.activities || []).map((act) => {
         const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
         const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
@@ -7586,6 +7657,13 @@ function renderCardData(cd, spokenText) {
           ? `<span class="act-coze-queue">⏳ 排队约${state.cozeData.restaurant_queue}分钟</span>` : "";
         const cozeTicket2 = isSight2 && state.cozeData?.ticket_availability
           ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
+        const isTransportRow2 = /^(transport|city_change)$/i.test(act.type || "");
+        const localNavHtml2 = (!isTransportRow2 && _dayCity2 && act.name)
+          ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
+              data-city="${escapeHtml(_dayCity2)}" data-hotel="${escapeHtml(_dayHotel2)}" data-place="${escapeHtml(act.name)}">
+              <span class="act-local-nav-label">📍 导航</span>
+              <span class="act-local-nav-modes">点击查看</span>
+            </div>` : "";
         return `${transitHtml}
           <div class="act-row">
             <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
@@ -7595,6 +7673,7 @@ function renderCardData(cd, spokenText) {
               ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
               ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
               ${(act.insider_tip||act.insider_tips) ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip||act.insider_tips)}</div>` : ""}
+              ${localNavHtml2}
             </div>
             <span class="act-cost${costCls}">${costFmt}</span>
           </div>`;
@@ -7819,21 +7898,9 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         const globalIdx = startGlobalIdx + di;
 
         // ── Intercity transport banner (flight/HSR/bus) ──────────────────────
-        const IC_ICON = { flight: "✈️", hsr: "🚄", bus: "🚌", car: "🚗" };
-        const intercityHtml = d.intercity_transport?.from ? (() => {
-          const ic = d.intercity_transport;
-          const modeIcon = IC_ICON[ic.mode] || "🚌";
-          const cost = ic.cost_cny > 0 ? `<span class="act-intercity-cost">¥${Number(ic.cost_cny).toLocaleString()}</span>` : "";
-          return `<div class="act-intercity">
-            <div class="act-intercity-header">
-              <span class="act-intercity-icon">${modeIcon}</span>
-              <span class="act-intercity-route">${escapeHtml(ic.from || "")} → ${escapeHtml(ic.to || "")}</span>
-              ${cost}
-            </div>
-            ${ic.detail ? `<div class="act-intercity-detail">${escapeHtml(ic.detail)}</div>` : ""}
-            ${ic.tip ? `<div class="act-intercity-tip">💡 ${escapeHtml(ic.tip)}</div>` : ""}
-          </div>`;
-        })() : "";
+        const intercityHtml = _buildIntercityHtml(d.intercity_transport);
+        const _dayCity3  = d.city || planSummary?.destination || "";
+        const _dayHotel3 = d.hotel?.name || planSummary?.hotel?.name || "";
 
         // ── Activity rows ────────────────────────────────────────────────────
         const activities = (d.activities || []).map((act) => {
@@ -7862,6 +7929,13 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
             ? `<span class="act-coze-queue">⏳ 排队约${state.cozeData.restaurant_queue}分钟</span>` : "";
           const cozeTicket3 = isSight3 && state.cozeData?.ticket_availability
             ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
+          const isTransportRow3 = /^(transport|city_change)$/i.test(act.type || "");
+          const localNavHtml3 = (!isTransportRow3 && _dayCity3 && act.name)
+            ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
+                data-city="${escapeHtml(_dayCity3)}" data-hotel="${escapeHtml(_dayHotel3)}" data-place="${escapeHtml(act.name)}">
+                <span class="act-local-nav-label">📍 导航</span>
+                <span class="act-local-nav-modes">点击查看</span>
+              </div>` : "";
           return `${transitHtml}
             <div class="act-row">
               <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
@@ -7871,6 +7945,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
                 ${act.real_vibe ? `<div class="act-vibes">"${escapeHtml(act.real_vibe)}"</div>` : ""}
                 ${act.insider_tip ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip)}</div>` : ""}
+                ${localNavHtml3}
               </div>
               <span class="act-cost${costCls}">${costFmt}</span>
             </div>`;

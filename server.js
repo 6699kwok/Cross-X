@@ -25,7 +25,7 @@ const { createPlanRouter } = require("./src/routes/plan");
 const { fetchFxRates, fetchJutuiRestaurants } = require("./src/services/api_gateway");
 const { startMcpServer } = require("./src/mcp/server");
 const { queryAmapPoi, queryAmapHotels, enrichPlanWithAmapData } = require("./src/services/amap");
-const { queryAmapRouting } = require("./src/services/amapRouting");
+const { queryAmapRouting, queryLocalRoute } = require("./src/services/amapRouting");
 const { buildSyntheticEnrichment, buildAIEnrichment, callCozeWorkflow } = require("./src/services/coze");
 const { queryJuheFlight, queryJuheFlightInvoice } = require("./src/services/juhe");
 const {
@@ -7540,6 +7540,25 @@ const server = http.createServer(async (req, res) => {
       const deviceId = searchParams.get("deviceId") || "";
       const profile = deviceId ? loadProfile(deviceId) : null;
       return writeJson(res, 200, { ok: true, profile: profile || null });
+    }
+
+    // ── /api/local-route — intra-city walking/transit/taxi between two POIs ──
+    if (req.method === "GET" && pathname === "/api/local-route") {
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const from = (searchParams.get("from") || "").trim();
+      const to   = (searchParams.get("to")   || "").trim();
+      const city = (searchParams.get("city") || "").trim();
+      if (!from || !to || !city) {
+        return writeJson(res, 400, { ok: false, error: "from, to, city required" });
+      }
+      try {
+        const result = await queryLocalRoute(from, to, city);
+        if (!result) return writeJson(res, 200, { ok: false, source: "none" });
+        return writeJson(res, 200, { ok: true, from, to, city, ...result });
+      } catch (e) {
+        console.warn("[/api/local-route] error:", e.message);
+        return writeJson(res, 500, { ok: false, error: e.message });
+      }
     }
 
     if (req.method === "GET" && pathname === "/api/system/llm-status") {

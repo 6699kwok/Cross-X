@@ -5955,6 +5955,102 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   color: #6b7280;
 }
 
+/* ── Route options comparison strip (intercity multi-mode selector) ─────── */
+.cx-route-opts {
+  display: flex;
+  gap: 6px;
+  margin: 8px 0 4px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+.cx-route-opts::-webkit-scrollbar { display: none; }
+
+.cx-route-opt {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border-radius: 20px;
+  border: 1.5px solid #e5e7eb;
+  background: #fff;
+  cursor: default;
+  transition: border-color 0.15s, background 0.15s;
+}
+.cx-route-opt--active {
+  border-color: #2d87f0;
+  background: #eff6ff;
+}
+.cx-ro-icon { font-size: 15px; line-height: 1; }
+.cx-ro-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.cx-ro-label {
+  font-size: 12px;
+  font-weight: 700;
+  color: #1e3a5f;
+  line-height: 1.2;
+}
+.cx-ro-meta {
+  font-size: 10px;
+  color: #6b7280;
+  line-height: 1.2;
+}
+.cx-ro-price {
+  font-size: 11px;
+  font-weight: 700;
+  color: #2d87f0;
+  margin-left: 4px;
+  white-space: nowrap;
+}
+.cx-route-opt--active .cx-ro-label { color: #1d4ed8; }
+.cx-route-opt--active .cx-ro-price { color: #1d4ed8; }
+
+/* ── Local navigation strip (hotel → activity) ────────────────────────── */
+.act-local-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0 6px 0;
+  padding: 5px 8px;
+  background: #f9fafb;
+  border-radius: 8px;
+  font-size: 11px;
+  color: #6b7280;
+  cursor: pointer;
+  border: 1px solid #f3f4f6;
+  transition: background 0.15s;
+}
+.act-local-nav:hover { background: #f3f4f6; }
+.act-local-nav-label {
+  font-size: 11px;
+  color: #9ca3af;
+  flex-shrink: 0;
+}
+.act-local-nav-modes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+.act-nav-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 11px;
+  color: #374151;
+  white-space: nowrap;
+}
+.act-nav-chip-icon { font-size: 12px; }
+.act-nav-sep { color: #d1d5db; font-size: 10px; }
+.act-local-nav--loading .act-local-nav-modes { color: #d1d5db; font-style: italic; }
+.act-local-nav--error  .act-local-nav-modes { color: #f87171; }
+
 /* Transit strip — how to get from one activity to the next */
 .act-transit {
   display: flex;

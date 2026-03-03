@@ -252,6 +252,21 @@ ${BUSINESS_BOUNDARY_BLOCK}
 13. 人数感知服务（CRITICAL）：若 prompt 包含"大家庭出行"（pax≥5）指令，则每个方案的 transport_plan 必须注明商务车/包车接送，且每天有餐饮的 activity.note 必须包含包间预订建议；若包含"家庭出行"（pax 3-4），transport_plan 须包含拼车/商务车建议
 14. 真实店名强制（CRITICAL）：若 prompt 包含【真实餐厅名录】或【真实景点名录】区块，则每个饮食/活动类 activity.name 必须使用该名录中的真实店名，格式为"在【店名】享用XX"或"游览【景点名】"——严禁仅写"吃午餐"、"参观景点"等模糊占位描述
 15. 真实图片强制（CRITICAL）：若名录条目含"photo:URL"字段，则对应 activity 必须新增 "image_url" 键并将该 URL 原样复制填入（不得截断或修改 URL）；若条目无 photo 字段则 image_url 省略即可
+16. 城际换乘日 intercity_transport（CRITICAL）：当某天是跨城市换乘日（type:"city_change" 或首天抵达需要城际交通时），必须在该 day 对象中添加 "intercity_transport" 字段：
+    {
+      "from": "出发城市",
+      "to": "到达城市",
+      "mode": "从 Real_API_Data.routing[].recommended 字段复制，如 flight|hsr|train|bus|drive",
+      "cost_cny": 数字（从 Real_API_Data.routing[].modes[] 中找 mode 对应条目的 price_cny）,
+      "detail": "交通详情一句话（如：宝安机场→咸阳机场，约2h45min）",
+      "tip": "实用提示（如：建议提前2小时到达机场）",
+      "route_options": [
+        将 Real_API_Data.routing[] 中该出发/到达腿（leg字段匹配"出发→到达"）的 modes[] 数组原样复制到此处。
+        每个元素保留 type / label / duration_min / price_cny / freq 字段。
+        如果 Real_API_Data 中没有匹配的路线腿，则 route_options 留空数组 []。
+      ]
+    }
+    注意：route_options 必须包含 Real_API_Data 中该段腿所有可用交通模式，不可只写一种。
 
 # 【多城市/国际行程处理规则】
 当用户行程涉及多个城市或国际出发地时（如"巴黎飞深圳→西安→新疆"）：

@@ -175,4 +175,99 @@ async function queryAmapRouting(fromCity, toCity) {
   return { fromCity, toCity, modes, recommended, note, _source: "amap_live" };
 }
 
-module.exports = { queryAmapRouting };
+// ── In-city route: geocode two POI names → walk + transit + taxi ──────────────
+
+/**
+ * Geocode a place name scoped to a city (e.g. "世界之窗" in "深圳").
+ * Uses a separate cache key so city context is included.
+ */
+async function geocodePlaceInCity(key, placeName, city) {
+  const cacheKey = `${city.toLowerCase()}:${placeName.toLowerCase()}`;
+  if (GEO_CACHE.has(cacheKey)) return GEO_CACHE.get(cacheKey);
+  const url = `${AMAP_BASE}/geocode/geo?key=${encodeURIComponent(key)}` +
+    `&address=${encodeURIComponent(placeName)}&city=${encodeURIComponent(city)}&output=JSON`;
+  const data = await fetchJson(url);
+  const loc  = data?.geocodes?.[0]?.location || null;
+  if (loc) GEO_CACHE.set(cacheKey, loc);
+  return loc;
+}
+
+/**
+ * Query intra-city routes between two named places (e.g. hotel → attraction).
+ * Returns { walk?, transit?, taxi?, _source } or null on failure.
+ *   walk:    { min, km }
+ *   transit: { min, fare_cny, transfers }
+ *   taxi:    { min, cost_cny, km }
+ */
+async function queryLocalRoute(originName, destName, city) {
+  const key = String(process.env.AMAP_API_KEY || "").trim();
+  if (!key) return null;
+
+  const cityShort = city.replace(/[市省自治区直辖市特别行政区]$/, "");
+
+  const [origLoc, destLoc] = await Promise.all([
+    geocodePlaceInCity(key, originName, cityShort),
+    geocodePlaceInCity(key, destName,   cityShort),
+  ]);
+  if (!origLoc || !destLoc) return null;
+
+  const walkUrl    = `${AMAP_BASE}/direction/walking` +
+    `?key=${encodeURIComponent(key)}&origin=${origLoc}&destination=${destLoc}&output=JSON`;
+  const transitUrl = `${AMAP_BASE}/direction/transit/integrated` +
+    `?key=${encodeURIComponent(key)}&origin=${origLoc}&destination=${destLoc}` +
+    `&city=${encodeURIComponent(cityShort)}&cityd=${encodeURIComponent(cityShort)}&output=JSON`;
+  const drivingUrl = `${AMAP_BASE}/direction/driving` +
+    `?key=${encodeURIComponent(key)}&origin=${origLoc}&destination=${destLoc}&strategy=0&output=JSON`;
+
+  const [walkData, transitData, drivingData] = await Promise.all([
+    fetchJson(walkUrl),
+    fetchJson(transitUrl),
+    fetchJson(drivingUrl),
+  ]);
+
+  const result = {};
+
+  // Walking
+  const walkPath = walkData?.route?.paths?.[0];
+  if (walkPath) {
+    const walkMin = Math.round(Number(walkPath.duration || 0) / 60);
+    const walkKm  = Math.round(Number(walkPath.distance  || 0) / 100) / 10;
+    if (walkMin > 0) result.walk = { min: walkMin, km: walkKm };
+  }
+
+  // Transit (metro/bus) — pick cheapest/fastest option
+  const transits = transitData?.route?.transits || [];
+  if (transits.length) {
+    // Prefer options with fewest transfers, then shortest duration
+    const best = transits.slice(0, 5).reduce((a, b) => {
+      const aT = Number(a.nightwalking || a.duration || 99999);
+      const bT = Number(b.nightwalking || b.duration || 99999);
+      const aSeg = (a.segments || []).length;
+      const bSeg = (b.segments || []).length;
+      return aSeg !== bSeg ? (aSeg < bSeg ? a : b) : (aT < bT ? a : b);
+    });
+    const tMin  = Math.round(Number(best.duration || 0) / 60);
+    const tFare = parseCostYuan(best.cost) || 0;
+    const tXfer = Math.max(0, (best.segments || []).length - 1);
+    if (tMin > 0) result.transit = { min: tMin, fare_cny: tFare, transfers: tXfer };
+  }
+
+  // Taxi (driving distance + rough fare estimate)
+  const drivePath = drivingData?.route?.paths?.[0];
+  if (drivePath) {
+    const driveMin = Math.round(Number(drivePath.duration || 0) / 60);
+    const distKm   = Math.round(Number(drivePath.distance || 0) / 100) / 10;
+    if (driveMin > 0) {
+      // Rough taxi fare: ¥13 flag-fall + ¥2.5/km, capped at reasonable max
+      const taxiCost = Math.round(Math.min(13 + distKm * 2.5, 200));
+      result.taxi = { min: driveMin, cost_cny: taxiCost, km: distKm };
+    }
+  }
+
+  if (!Object.keys(result).length) return null;
+
+  console.log(`[localRoute] ${originName}→${destName}(${city}): walk=${result.walk?.min}m transit=${result.transit?.min}m taxi=${result.taxi?.min}m`);
+  return { ...result, _source: "amap_live" };
+}
+
+module.exports = { queryAmapRouting, queryLocalRoute };
