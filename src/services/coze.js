@@ -332,8 +332,10 @@ async function buildAIEnrichment(city, intentAxis) {
   const AMAP_API_KEY = String(process.env.AMAP_API_KEY || process.env.GAODE_API_KEY || "").trim();
   if (AMAP_API_KEY) {
     try {
-      const poiType  = isFood                        ? "restaurant"
-                     : intentAxis === "activity"    ? "attraction"
+      const _isAttr  = intentAxis === "activity" || intentAxis === "attraction"
+                     || intentAxis === "sightseeing" || intentAxis === "travel";
+      const poiType  = isFood    ? "restaurant"
+                     : _isAttr  ? "attraction"
                      : "hotel";
       const pois     = await queryAmapPoi(city, poiType);
       if (pois && pois.length >= 3) {
