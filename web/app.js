@@ -11437,7 +11437,9 @@ function bindInput() {
     el.chatInput.addEventListener("input", () => {
       autoResizeChatInput();
       updateChatSendState();
+      _updateTypingHint(el.chatInput.value);
     });
+    el.chatInput.addEventListener("blur", () => _hideTypingHint());
     if (el.chatInput instanceof HTMLTextAreaElement) {
       el.chatInput.addEventListener("keydown", (event) => {
         if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
@@ -13645,6 +13647,51 @@ function _renderPostBookingFollowUp(plan, cardData) {
       <div class="cx-pb-chips">${chipsHtml}</div>
     </article>
   `);
+}
+
+// ── Typing hint ──────────────────────────────────────────────────────────────
+// Lightweight keyword pattern matching — no LLM calls, <1ms per keystroke.
+const _TYPING_HINT_PATTERNS = [
+  // City + action patterns
+  { re: /(?:去|到|在)\s*([^\s，,。.]{2,4}(?:市|省|区)?)\s*(?:玩|旅|住|找|吃|游)/,
+    fn: (m) => `\u{1F4CD} \u68C0\u6D4B\u5230\u76EE\u7684\u5730: ${m[1]} \u2014 \u53EF\u4EE5\u76F4\u63A5\u8BF4\u5929\u6570\u548C\u4EBA\u6570` },
+  // City name alone (2-3 char known cities)
+  { re: /(?:^|\s)([\u5317\u4EAC\u4E0A\u6D77\u6DF1\u5733\u5E7F\u5DDE\u6210\u90FD\u897F\u5B89\u676D\u5DDE\u5357\u4EAC\u91CD\u5E86\u6B66\u6C49\u897F\u85CF\u4E09\u4E9A\u5E38\u5DDE\u82CF\u5DDE\u8D35\u9633\u6606\u660E\u5927\u8FDE\u6C88\u9633\u54C8\u5C14\u6EE8\u957F\u6CAD\u9752\u5C9B\u5E26\u7684\u516C])(?=[\u73A9\u65C5\u5403\u4F4F\u6E38\u770B\u5730\u65B9]|$)/,
+    fn: (m) => `\u{1F4CD} ${m[1]} \u2014 \u8FD8\u9700\u8981\uFF1A\u5929\u6570\u3001\u4EBA\u6570\u6216\u9884\u7B97` },
+  // Duration
+  { re: /(\d+)\s*(?:\u5929|\u665A|\u591C)(?:\u884C\u7A0B|\u65C5\u884C|)/,
+    fn: (m) => `\u23F1 ${m[1]}\u5929\u884C\u7A0B \u2014 \u516C AI \u5C06\u8BA1\u7B97\u6700\u4F73\u8DEF\u7EBF\u548C\u9152\u5E97` },
+  // Party size
+  { re: /(\d+)\s*(?:\u4E2A\u4EBA|\u4EBA)/,
+    fn: (m) => `\u{1F465} ${m[1]}\u4EBA\u51FA\u884C \u2014 \u65B9\u6848\u5C06\u6309\u4EBA\u5747\u8BA1\u7B97\u9884\u7B97` },
+  // Food intent
+  { re: /(?:\u5403\u5417|\u5403\u997F|\u8FDB\u9910|\u6B63\u9910|\u665A\u9910|\u5348\u9910|\u65E9\u9910|\u7F8E\u98DF)/,
+    fn: () => `\u{1F374} \u7F8E\u98DF\u6A21\u5F0F \u2014 \u8BF4\u51FA\u57CE\u5E02\u548C\u4EBA\u6570\uFF0CAI \u5C07\u5B89\u6392\u4E0D\u6392\u961F\u9910\u5385` },
+  // Hotel intent
+  { re: /(?:\u9152\u5E97|\u4F4F\u5B88|\u5165\u4F4F|\u5B9A\u4E2A)/,
+    fn: () => `\u{1F3E8} \u9152\u5E97\u6A21\u5F0F \u2014 \u8BF4\u51FA\u57CE\u5E02\u548C\u5165\u4F4F\u65E5\u671F` },
+];
+
+function _updateTypingHint(raw) {
+  const hintEl = document.getElementById("typingHint");
+  if (!hintEl) return;
+  const text = (raw || "").trim();
+  if (text.length < 2) { _hideTypingHint(); return; }
+
+  for (const { re, fn } of _TYPING_HINT_PATTERNS) {
+    const m = text.match(re);
+    if (m) {
+      hintEl.textContent = fn(m);
+      hintEl.classList.remove("hidden");
+      return;
+    }
+  }
+  _hideTypingHint();
+}
+
+function _hideTypingHint() {
+  const hintEl = document.getElementById("typingHint");
+  if (hintEl) hintEl.classList.add("hidden");
 }
 
 /**

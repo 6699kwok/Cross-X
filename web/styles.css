@@ -519,6 +519,20 @@ button.agent-slot-chip.is-removable {
   transition: border-color 0.3s ease, box-shadow 0.3s ease;
 }
 
+/* ── Typing hint ─────────────────────────────────────────────────────────── */
+.cx-typing-hint {
+  font-size: 11.5px;
+  color: #6b7280;
+  padding: 4px 12px 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 18px;
+  transition: opacity 0.15s;
+  animation: fadeInScale 0.15s ease;
+}
+.cx-typing-hint.hidden { display: none; }
+
 
 .chat-input input,
 .chat-input textarea {
