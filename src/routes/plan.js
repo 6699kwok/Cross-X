@@ -1251,7 +1251,7 @@ function createPlanRouter({
       "Connection": "keep-alive",
       "X-Accel-Buffering": "no",
     });
-    const emitDetail = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (_) {} };
+    const emitDetail = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (e) { console.warn("[plan/detail] SSE write failed — client likely disconnected:", e.message); } };
 
     const result = await openAIRequest({
       apiKey, model: OPENAI_MODEL, baseUrl,
