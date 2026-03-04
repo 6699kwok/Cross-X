@@ -140,7 +140,8 @@ async function alipayRefund({ tradeNo, outRequestNo, refundAmount, refundReason 
   }
 
   let AlipaySdk;
-  try { AlipaySdk = require("alipay-sdk").default || require("alipay-sdk"); } catch {
+  try { AlipaySdk = require("alipay-sdk").default || require("alipay-sdk"); } catch (e) {
+    console.warn("[merchants/alipay] alipay-sdk not installed — refund mocked:", e.message);
     return { refundId: `NOLIB_ALI_${outRequestNo}`, status: "mock_no_sdk", expectedAt: new Date().toISOString() };
   }
 
@@ -177,7 +178,8 @@ async function stripeRefund({ chargeId, amount, reason }) {
   }
 
   let Stripe;
-  try { Stripe = require("stripe"); } catch {
+  try { Stripe = require("stripe"); } catch (e) {
+    console.warn("[merchants/stripe] stripe not installed — refund mocked:", e.message);
     return { refundId: `NOLIB_STRIPE`, status: "mock_no_sdk", expectedAt: new Date().toISOString() };
   }
 

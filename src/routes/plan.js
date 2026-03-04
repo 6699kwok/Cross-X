@@ -16,7 +16,6 @@
 
 const { openAIRequest } = require("../ai/openai");
 const { captureExample } = require("../training/collector");
-const { recordOutcome }  = require("../ai/promptOptimizer");
 const { recordSignal: recordProfileSignal } = require("../session/profile");
 const { DETAIL_SYSTEM_PROMPT_TEMPLATE, BOUNDARY_MARKER } = require("../planner/prompts");
 const { safeParseJson } = require("../planner/mock");
