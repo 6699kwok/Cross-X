@@ -240,10 +240,40 @@ function validateUserToken(req) {
   return verifyUserToken(token);
 }
 
+// ── WeChat OAuth ───────────────────────────────────────────────────────────────
+
+/**
+ * Create or login a user via WeChat openid.
+ * userId is prefixed with usr_wx_ to distinguish from phone-auth users.
+ * @param {string} openid   — WeChat openid (stable per-app identifier)
+ * @param {string} [nickname]
+ * @returns {{ userId, displayName, isNew, openidHash }}
+ */
+function createOrLoginUserByOpenid(openid, nickname = "") {
+  if (!openid || typeof openid !== "string") throw new Error("invalid_openid");
+  const openidHash = crypto.createHash("sha256").update(openid).digest("hex");
+  const userId     = `usr_wx_${openidHash.slice(0, 16)}`;
+  const now        = new Date().toISOString();
+
+  const db = _db();
+  const existing = db.getUserAuth(userId);
+  if (existing) {
+    db.upsertUserAuth({ userId, phoneHash: `wx_${openidHash.slice(0, 8)}`, displayName: existing.display_name, lastLogin: now });
+    return { userId, displayName: existing.display_name, isNew: false, openidHash };
+  }
+
+  const name = (nickname || "").trim().slice(0, 30) || `微信用户${openidHash.slice(0, 4)}`;
+  db.upsertUserAuth({ userId, phoneHash: `wx_${openidHash.slice(0, 8)}`, displayName: name, createdAt: now, lastLogin: now });
+  try { db.updateUser(userId, { id: userId }); } catch {}
+
+  return { userId, displayName: name, isNew: true, openidHash };
+}
+
 module.exports = {
   generateOtp,
   verifyOtp,
   createOrLoginUser,
+  createOrLoginUserByOpenid,
   issueUserToken,
   verifyUserToken,
   extractUserToken,

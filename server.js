@@ -7285,13 +7285,59 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/hotel/search/list") {
       const body = await readBody(req);
+      const _hotelCity = body.cityName || body.city || "";
+      const _hotelBudget = body.budget || body.maxPrice || null;
+
+      // ── Try real Amap hotel data first (when API key configured) ────────────
+      if (AMAP_API_KEY && _hotelCity) {
+        try {
+          const _amapHotels = await Promise.race([
+            queryAmapHotels(_hotelCity, _hotelBudget ? Number(_hotelBudget) / (
+              Math.max(1, Math.round((new Date(body.checkOutDate) - new Date(body.checkInDate)) / 86400000)) || 1
+            ) : null),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("amap_timeout")), 5000)),
+          ]);
+          if (_amapHotels && _amapHotels.length >= 2) {
+            // Return Amap results in the same shape as mock
+            const _checkIn  = body.checkInDate  || new Date().toISOString().slice(0, 10);
+            const _checkOut = body.checkOutDate || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+            return writeJson(res, 200, {
+              cityCode: body.cityCode || _hotelCity,
+              cityName: _hotelCity,
+              checkInDate: _checkIn,
+              checkOutDate: _checkOut,
+              pageNum: 1,
+              pageSize: _amapHotels.length,
+              total: _amapHotels.length,
+              source: "amap_live",
+              list: _amapHotels.map((h, i) => ({
+                hotelId:       `AMAP_${i}_${encodeURIComponent(h.name).slice(0, 16)}`,
+                hotelName:     h.name,
+                hotelAddress:  h.address || "",
+                starRating:    h.tier === "premium" ? 5 : h.tier === "balanced" ? 4 : 3,
+                lowestPrice:   h.price_per_night || 0,
+                commentScore:  h.rating || 4.0,
+                canBook:       true,
+                imageUrl:      h.hero_image || "",
+                ctripBookingUrl: h.booking_url || `https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(h.name)}`,
+                tel:           h.tel || "",
+                source:        "amap",
+              })),
+            });
+          }
+        } catch (_amapErr) {
+          console.warn("[hotel/search] Amap fallback:", _amapErr.message);
+        }
+      }
+
+      // ── Fall back to mock catalog with Ctrip deep-links ──────────────────────
       const result = searchHotelsCore({
         cityCode: body.cityCode,
         checkInDate: body.checkInDate,
         checkOutDate: body.checkOutDate,
         pageNum: body.pageNum || 1,
         pageSize: body.pageSize || 10,
-        budget: body.budget || body.maxPrice || null,
+        budget: _hotelBudget,
         starRating: body.starRating || body.star || null,
         keyword: body.keyword || "",
         guestNum: body.guestNum || body.guest || 1,
@@ -7304,6 +7350,7 @@ const server = http.createServer(async (req, res) => {
         pageNum: result.pageNum,
         pageSize: result.pageSize,
         total: result.total,
+        source: "mock",
         list: result.list.map((item) => ({
           hotelId: item.hotelId,
           hotelName: item.hotelName,
@@ -7314,6 +7361,7 @@ const server = http.createServer(async (req, res) => {
           canBook: item.canBook,
           bestRoom: item.bestRoom || null,
           imageUrl: item.imageUrl || "",
+          ctripBookingUrl: `https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(item.hotelName)}`,
         })),
       });
     }
@@ -7658,6 +7706,105 @@ const server = http.createServer(async (req, res) => {
       return writeJson(res, 200, { ok: true });
     }
 
+    // GET /api/auth/wechat — redirect to WeChat OAuth authorization page
+    if (req.method === "GET" && pathname === "/api/auth/wechat") {
+      const _wxAppId = process.env.WECHAT_APP_ID;
+      if (!_wxAppId) return writeJson(res, 503, { error: "wechat_not_configured" });
+
+      const _wxBase    = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
+      const _wxRedirect = encodeURIComponent(`${_wxBase}/api/auth/wechat/callback`);
+      // CSRF state: HMAC-SHA256(timestamp, secret) — verified on callback
+      const _wxTs   = Date.now().toString();
+      const _wxSig  = require("crypto").createHmac("sha256", _tokenSecret())
+        .update(`wechat_state:${_wxTs}`).digest("hex").slice(0, 16);
+      const _wxState = `${_wxTs}.${_wxSig}`;
+
+      const _wxUrl = `https://open.weixin.qq.com/connect/oauth2/authorize` +
+        `?appid=${_wxAppId}` +
+        `&redirect_uri=${_wxRedirect}` +
+        `&response_type=code` +
+        `&scope=snsapi_userinfo` +
+        `&state=${encodeURIComponent(_wxState)}` +
+        `#wechat_redirect`;
+
+      res.writeHead(302, { Location: _wxUrl });
+      return res.end();
+    }
+
+    // GET /api/auth/wechat/callback?code=...&state=... — exchange code, issue token
+    if (req.method === "GET" && pathname === "/api/auth/wechat/callback") {
+      const _wxAppId  = process.env.WECHAT_APP_ID;
+      const _wxSecret = process.env.WECHAT_APP_SECRET;
+      const _wxBase   = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
+
+      if (!_wxAppId || !_wxSecret) return writeJson(res, 503, { error: "wechat_not_configured" });
+
+      const _wxParams = new URL(`http://x${req.url}`).searchParams;
+      const _wxCode   = _wxParams.get("code");
+      const _wxState  = _wxParams.get("state") || "";
+
+      // Validate CSRF state (ts.sig, allow 10-min window)
+      const [_wxTs, _wxSigIn] = _wxState.split(".");
+      const _wxTsNum = parseInt(_wxTs, 10);
+      const _wxSigExpected = require("crypto").createHmac("sha256", _tokenSecret())
+        .update(`wechat_state:${_wxTs}`).digest("hex").slice(0, 16);
+      const _wxStateOk = _wxSigIn && _wxSigIn === _wxSigExpected &&
+        !isNaN(_wxTsNum) && (Date.now() - _wxTsNum) < 10 * 60 * 1000;
+      if (!_wxStateOk) {
+        res.writeHead(302, { Location: `${_wxBase}/?auth_error=invalid_state` });
+        return res.end();
+      }
+
+      if (!_wxCode || _wxCode === "authdeny") {
+        res.writeHead(302, { Location: `${_wxBase}/?auth_error=denied` });
+        return res.end();
+      }
+
+      try {
+        // Step 1: exchange code for access_token + openid
+        const _wxTokenUrl = `https://api.weixin.qq.com/sns/oauth2/access_token` +
+          `?appid=${_wxAppId}&secret=${_wxSecret}&code=${_wxCode}&grant_type=authorization_code`;
+        const _wxTokenResp = await new Promise((resolve, reject) => {
+          const _https = require("https");
+          _https.get(_wxTokenUrl, (r) => {
+            let d = "";
+            r.on("data", (c) => { d += c; });
+            r.on("end", () => { try { resolve(JSON.parse(d)); } catch { reject(new Error("parse_error")); } });
+          }).on("error", reject);
+        });
+
+        if (_wxTokenResp.errcode) throw new Error(`wx_token: ${_wxTokenResp.errmsg}`);
+        const { access_token, openid } = _wxTokenResp;
+
+        // Step 2: fetch user info (nickname, headimgurl)
+        const _wxInfoUrl = `https://api.weixin.qq.com/sns/userinfo` +
+          `?access_token=${access_token}&openid=${openid}&lang=zh_CN`;
+        const _wxInfo = await new Promise((resolve, reject) => {
+          const _https = require("https");
+          _https.get(_wxInfoUrl, (r) => {
+            let d = "";
+            r.on("data", (c) => { d += c; });
+            r.on("end", () => { try { resolve(JSON.parse(d)); } catch { reject(new Error("parse_error")); } });
+          }).on("error", reject);
+        });
+
+        const nickname  = (_wxInfo.nickname || "").slice(0, 30);
+        const { createOrLoginUserByOpenid, issueUserToken } = require("./src/services/user_auth");
+        const { userId, displayName, isNew, openidHash } = createOrLoginUserByOpenid(openid, nickname);
+        const token = issueUserToken(userId, `wx_${openidHash.slice(0, 8)}`);
+
+        console.info(`[auth] WeChat login: ${userId} (${displayName}) isNew=${isNew}`);
+        // Redirect to frontend with token in URL fragment (never in server logs)
+        res.writeHead(302, { Location: `${_wxBase}/?wx_token=${encodeURIComponent(token)}&wx_name=${encodeURIComponent(displayName)}` });
+        return res.end();
+
+      } catch (_wxErr) {
+        console.error("[auth] WeChat callback error:", _wxErr.message);
+        res.writeHead(302, { Location: `${_wxBase}/?auth_error=wechat_failed` });
+        return res.end();
+      }
+    }
+
     // POST /api/admin/login — exchange master key for signed admin token
     if (req.method === "POST" && pathname === "/api/admin/login") {
       const body = await readBody(req);
@@ -7929,6 +8076,7 @@ const server = http.createServer(async (req, res) => {
                 : ["SMS_PROVIDER (set to aliyun or tencent)"],
           };
         })(),
+        wechat_oauth: Boolean(process.env.WECHAT_APP_ID && process.env.WECHAT_APP_SECRET),
         liveReadiness: {
           ready: gaodeKeyPresent && partnerHubReady,
           missing: [
@@ -10747,9 +10895,20 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
 
         await delay(400);
 
-        // H_SEARCH: mock hotel search
+        // H_SEARCH: real hotel search via Amap (fallback to mock)
         emit({ type: "status", code: "H_SEARCH", label: `正在检索${cityResolved}优质酒店...` });
-        await delay(900);
+        let _amapHotelTiers = null;
+        if (AMAP_API_KEY) {
+          try {
+            _amapHotelTiers = await Promise.race([
+              queryAmapHotels(cityResolved, budget ? Math.round(budget / Math.max(1, days) * 0.45) : null),
+              new Promise((_, rej) => setTimeout(() => rej(new Error("amap_timeout")), 5000)),
+            ]);
+          } catch (_hErr) {
+            console.warn("[pipeline/H_SEARCH] Amap fallback:", _hErr.message);
+          }
+        }
+        await delay(300);
 
         // T_CALC: mock transport calculation
         emit({ type: "status", code: "T_CALC", label: "核算接机与市内交通费..." });
@@ -10759,8 +10918,22 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         emit({ type: "status", code: "B_CHECK", label: `预算校验中（目标 ¥${Number(budget).toLocaleString()}）...` });
         await delay(600);
 
-        // Build complete three-tier plan with NO empty fields
+        // Build complete three-tier plan — overlay real Amap hotels if available
         const plans = mockBuildThreeTierPlans({ city: cityResolved, budget, pax, days });
+        if (_amapHotelTiers && _amapHotelTiers.length === 3) {
+          const _tiers = ["opt_c", "opt_b", "opt_a"]; // budget → balanced → premium
+          _amapHotelTiers.forEach((h, i) => {
+            const _opt = plans.options && plans.options[i];
+            if (_opt) {
+              _opt.hotel_name          = `${h.name}（${h.district || cityResolved}）`;
+              _opt.hotel_price_per_night = h.price_per_night || _opt.hotel_price_per_night;
+              _opt.hotel_real_address  = h.address || "";
+              _opt.hotel_ctrip_url     = h.booking_url || `https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(h.name)}`;
+              _opt.hotel_source        = "amap";
+              if (h.hero_image) _opt.hotel_image = h.hero_image;
+            }
+          });
+        }
 
         emit({ type: "final", ...plans });
         res.end();
@@ -11575,7 +11748,10 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       // ── Plus subscription gate (bypassed in dev/sandbox mode) ─────────────
       const _devMode = !process.env.ALIPAY_APP_ID && !process.env.WECHAT_MCH_ID && !process.env.STRIPE_SECRET_KEY;
       if (!_devMode) {
-        const _gateUser = db.users?.[userId] || db.users?.demo;
+        // Use getUser() directly — db.users proxy only resolves "demo", not real userId
+        const _gateUser = (userId !== "demo" && userId !== "anon")
+          ? getUser(userId)
+          : db.users?.demo;
         if (!_gateUser?.plusSubscription?.active) {
           return writeJson(res, 402, {
             error:   "plus_required",

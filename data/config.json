@@ -2,15 +2,15 @@
   "featureFlags": {
     "plusConcierge": {
       "enabled": true,
-      "rollout": 100
+      "rollout": 50
     },
     "manualFallback": {
       "enabled": true,
       "rollout": 100
     },
     "liveTranslation": {
-      "enabled": true,
-      "rollout": 100
+      "enabled": false,
+      "rollout": 0
     }
   },
   "mcpContracts": {

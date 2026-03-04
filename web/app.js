@@ -16133,6 +16133,32 @@ function _applyAuthUi(loggedIn, displayName) {
 }
 
 async function _initAuthState() {
+  // Handle WeChat OAuth callback: ?wx_token=...&wx_name=...
+  const _urlP = new URLSearchParams(window.location.search);
+  const _wxToken = _urlP.get("wx_token");
+  const _wxName  = _urlP.get("wx_name");
+  const _authErr = _urlP.get("auth_error");
+  if (_wxToken) {
+    // Verify the token with server, then log in
+    try {
+      const _r = await fetch("/api/auth/me", { headers: { Authorization: `Bearer ${_wxToken}` } });
+      if (_r.ok) {
+        const _d = await _r.json();
+        if (_d.ok) {
+          _onLoginSuccess(_wxToken, _d.userId, _d.displayName || _wxName || "微信用户");
+        }
+      }
+    } catch { /* ignore */ }
+    // Clean URL
+    const _clean = window.location.pathname;
+    history.replaceState({}, "", _clean);
+    return;
+  }
+  if (_authErr) {
+    notify(`微信登录失败：${_authErr}`, "error");
+    history.replaceState({}, "", window.location.pathname);
+  }
+
   const token = _getAuthToken();
   if (!token) { _applyAuthUi(false); return; }
   try {
@@ -16232,12 +16258,32 @@ function _showLoginModal() {
         <div class="cx-modal-error hidden" id="cxLoginErr2"></div>
         <div class="cx-modal-dev-hint hidden" id="cxLoginDevHint" style="font-size:11px;color:#6366f1;margin-top:6px;font-family:monospace;text-align:center;"></div>
       </div>
+      <div class="cx-modal-divider" id="cxLoginWxSection">
+        <span>或</span>
+      </div>
+      <button class="cx-modal-btn cx-modal-btn-wechat" id="cxLoginWechat">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:6px"><path d="M8.69 11.52c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm4.62 0c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm2.71 5.13c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zm3.14 0c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zM12 2C6.48 2 2 6.04 2 11c0 2.96 1.54 5.6 3.96 7.36L5.1 21l3.06-1.53C9.34 19.81 10.64 20 12 20c5.52 0 10-4.04 10-9s-4.48-9-10-9zm6.15 13.7c-.57 1.25-1.75 2.08-3.12 2.38-.32.07-.65.1-.99.1-1.39 0-2.68-.47-3.69-1.24l-2.17 1.08.53-2.02C7.27 15.03 6.5 13.08 6.5 11c0-3.87 2.91-7 6.5-7s6.5 3.13 6.5 7c0 1.7-.56 3.27-1.35 4.7z"/></svg>
+        微信登录
+      </button>
     </div>`;
   document.body.appendChild(modal);
 
   const close = () => modal.remove();
   document.getElementById("cxLoginClose").onclick    = close;
   document.getElementById("cxLoginBackdrop").onclick = close;
+
+  // WeChat OAuth button — check if configured, then redirect
+  const _wxBtn = document.getElementById("cxLoginWechat");
+  if (_wxBtn) {
+    // Check if WeChat OAuth is available (server configured)
+    fetch("/api/system/providers").then(r => r.json()).then(d => {
+      const _wxAvail = d && d.wechat_oauth;
+      if (!_wxAvail) {
+        _wxBtn.parentElement.style.display = "none"; // hide divider + button
+      }
+    }).catch(() => { if (_wxBtn.parentElement) _wxBtn.parentElement.style.display = "none"; });
+    _wxBtn.onclick = () => { window.location.href = "/api/auth/wechat"; };
+  }
 
   const phoneInput = document.getElementById("cxLoginPhone");
   const codeInput  = document.getElementById("cxLoginCode");

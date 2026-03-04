@@ -6847,6 +6847,10 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
   text-align:center; padding:4px; text-decoration:underline; }
 .cx-modal-link:hover { color:#3b82f6; }
 .cx-modal-error { color:#ef4444; font-size:12px; padding:4px 0; }
+.cx-modal-divider { display:flex; align-items:center; gap:10px; color:#94a3b8; font-size:12px; margin:4px 0; }
+.cx-modal-divider::before,.cx-modal-divider::after { content:""; flex:1; height:1px; background:#e2e8f0; }
+.cx-modal-btn-wechat { background:#07c160; display:flex; align-items:center; justify-content:center; }
+.cx-modal-btn-wechat:hover { background:#06ad56; }
 .user-pill { background:#dbeafe; color:#1d4ed8; font-weight:600; cursor:default; }
 
 /* Me tab profile card */
