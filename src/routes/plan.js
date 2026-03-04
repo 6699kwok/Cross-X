@@ -297,6 +297,7 @@ function createPlanRouter({
     // [S3] PII scrub: strip phone/email/ID/card BEFORE any LLM call or session write
     const rawMessage = String(body.message || "").trim();
     if (!rawMessage) return writeJson(res, 400, { error: "message required" });
+    if (rawMessage.length > 4000) return writeJson(res, 400, { error: "Message too long (max 4000 chars)" });
     const message = scrubPii(rawMessage);
 
     // ── [S2] Rate limiting — runs before session/LLM to prevent resource exhaustion ──
@@ -331,7 +332,9 @@ function createPlanRouter({
     const cityRaw         = String(body.city || db.users.demo.city || "Shanghai");
     const city            = cityRaw.split("·")[0].trim() || "Shanghai";
     const constraints     = body.constraints && typeof body.constraints === "object" ? body.constraints : {};
-    const conversationHistory = Array.isArray(body.conversationHistory) ? body.conversationHistory : [];
+    const conversationHistory = Array.isArray(body.conversationHistory)
+      ? body.conversationHistory.filter((m) => m && typeof m.role === "string" && typeof m.content === "string")
+      : [];
 
     // [C4] Cross-session preference profile — keyed by deviceId from client localStorage
     const _RAW_DID = String(body.deviceId || "").trim();
@@ -361,7 +364,12 @@ function createPlanRouter({
       "X-Accel-Buffering": "no",
     });
 
-    const emit  = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
+    let _emitDead = false;
+    const emit  = (data) => {
+      if (_emitDead) return;
+      try { res.write(`data: ${JSON.stringify(data)}\n\n`); }
+      catch (e) { _emitDead = true; console.warn("[plan/coze] SSE write failed — client likely disconnected:", e.message); }
+    };
     const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
     // ── QUICK ACTION bypass ─────────────────────────────────────────────────
@@ -592,7 +600,7 @@ function createPlanRouter({
 
     // Normalise budget to a numeric string for enrichment calls (callCozeWorkflow, agent tools)
     const budgetVal = constraints.budget
-      ? String(constraints.budget).replace(/[^0-9]/g, "") || constraints.budget
+      ? String(constraints.budget).replace(/[^0-9]/g, "")
       : "";
 
     try {

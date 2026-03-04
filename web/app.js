@@ -4845,10 +4845,11 @@ async function runStepTool(step, context) {
       const city  = encodeURIComponent(slots.city || "");
       if (place && city) {
         const r = await fetch(`/api/agent/route?city=${city}&place=${place}`);
+        if (!r.ok) throw new Error(`route_${r.status}`);
         const data = await r.json();
         if (data.ok && data.etaMin) routeInfo = { ...data, eta: data.etaMin, source: "amap_live" };
       }
-    } catch (_) { /* fall back */ }
+    } catch (routeErr) { console.warn("[agent/proof] route API failed:", routeErr.message); }
     if (!routeInfo) routeInfo = routeMock(ctx.slots || {}, ctx.candidate || null, `${ctx.seedKey}|route`);
     const proof = proofGenerateMock(ctx.slots || {}, ctx.option || {}, ctx.runId || "run", routeInfo);
     return { ...proof, route: routeInfo };
