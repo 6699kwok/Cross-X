@@ -91,8 +91,21 @@ async function applyPlanPatch({
   model,
   timeoutMs = 20000,
 }) {
-  // Truncate existing plan to stay within token budget (~2000 input tokens)
-  const planJson = JSON.stringify(existingPlan, null, 2).slice(0, 3500);
+  // Compact existing plan — strip image_url fields (bloat) to fit more content in context
+  const compact = JSON.parse(JSON.stringify(existingPlan));
+  if (compact.days) {
+    compact.days = compact.days.map((d) => ({
+      ...d,
+      activities: (d.activities || []).map(({ image_url, ...a }) => a),
+      meals:      (d.meals      || []).map(({ image_url, ...m }) => m),
+    }));
+  }
+  if (compact.hotel) delete compact.hotel.hero_image;
+  const _compactFull = JSON.stringify(compact);
+  if (_compactFull.length > 6000) {
+    console.warn(`[updater] plan JSON truncated: ${_compactFull.length} → 6000 chars — LLM may lose tail content`);
+  }
+  const planJson = _compactFull.slice(0, 6000); // compact JSON, more content
 
   const userContent = [
     `修改指令: ${message}`,
@@ -109,9 +122,9 @@ async function applyPlanPatch({
     systemPrompt: PATCH_SYSTEM_PROMPT,
     userContent,
     temperature: 0.3,
-    maxTokens:   2500,
+    maxTokens:   3600,  // up from 2500 — plan JSON can be 3000+ tokens for 5+ day plans
     jsonMode:    true,
-    timeoutMs,
+    timeoutMs:   Math.max(timeoutMs, 30000), // need extra time for larger output
   });
 
   if (!result.ok || !result.text) {

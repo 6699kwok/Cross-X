@@ -144,6 +144,58 @@ function buildPrePlan({ message, city, constraints, intentAxis = "travel" }) {
   };
 }
 
+// ── buildPrePlanFromIntent — LLM-driven pre-plan (uses detectIntentLLM output) ─
+/**
+ * Builds pre-plan params from LLM intentResult (already computed upstream).
+ * This is the AI-native replacement for the regex-based buildPrePlan().
+ * Falls back gracefully to constraints/defaults when LLM fields are absent.
+ *
+ * @param {object} intentResult  Output of detectIntentLLM() — may be from "llm" or "regex" source
+ * @param {string} city          City hint from session/URL
+ * @param {object} constraints   Constraint object merged from body params
+ * @param {string} intentAxis    "travel"|"food"|"activity"|"stay"
+ */
+function buildPrePlanFromIntent({ intentResult = {}, city, constraints, intentAxis = "travel" }) {
+  const dest = intentResult.destination || constraints.destination || city || "Shanghai";
+  const days = intentResult.duration_days
+    || Number(constraints.duration || constraints.days || (intentAxis === "food" ? 1 : 3));
+  const pax  = intentResult.pax
+    || Number(constraints.pax || constraints.party_size || 2);
+
+  // Budget: LLM budget_per_day × days × pax → total; fallback to formula
+  let budget = Number(constraints.budget || 0);
+  if (!budget && intentResult.budget_per_day) budget = intentResult.budget_per_day * days * pax;
+  if (!budget) budget = intentAxis === "food" ? pax * 150 : pax * days * 800;
+
+  // Food preference from LLM-extracted prefs
+  const prefs = intentResult.preferences || {};
+  let foodPref = constraints.food_preference || "\u65e0\u7279\u6b8a\u8981\u6c42";
+  if (prefs.veg)   foodPref = "\u7d20\u98df";
+  if (prefs.halal) foodPref = "\u6e05\u771f";
+
+  const specialNeeds = intentResult.special_needs || constraints._specialNeeds || [];
+
+  return {
+    destination: dest, duration_days: days, pax,
+    total_budget: budget, interests: [],
+    food_preference: foodPref,
+    special_needs: specialNeeds,
+    language_needs: false, trip_purpose: "\u89c2\u5149\u6e38\u89c8",
+    is_update: false, is_multi_city: false,
+    itinerary: [{ city: dest, days }],
+    allocation: {
+      accommodation: Math.round(budget * 0.40),
+      transport:     Math.round(budget * 0.12),
+      meals:         Math.round(budget * 0.25),
+      activities:    Math.round(budget * 0.15),
+      misc:          Math.round(budget * 0.08),
+    },
+    budget_assessment: "\u5408\u7406",
+    trade_off: "\u9884\u7b97\u5408\u7406\uff0c\u65e0\u9700\u53d6\u820d",
+    _source: intentResult._source === "llm" ? "llm" : "regex",
+  };
+}
+
 // ── buildInventoryContext — Coze item_list → named shop/attraction inventory ──
 /**
  * Converts Coze item_list (real restaurant/attraction arrays) into a structured
@@ -380,8 +432,13 @@ async function generateCrossXResponse({
   // mislead the Card Generator into generating origin-city content.
   const otaHotels = {};
   await Promise.all(destCities.map(async (c) => {
-    const realHotels = _queryHotels ? await _queryHotels(c, budgetPerNight) : null;
-    otaHotels[c] = realHotels || mockCtripHotels(c, budgetPerNight);
+    try {
+      const realHotels = _queryHotels ? await _queryHotels(c, budgetPerNight) : null;
+      otaHotels[c] = realHotels || mockCtripHotels(c, budgetPerNight);
+    } catch (hotelErr) {
+      console.warn(`[pipeline] hotel query failed for ${c} → mock:`, hotelErr.message);
+      otaHotels[c] = mockCtripHotels(c, budgetPerNight);
+    }
   }));
 
   const realApiData = JSON.stringify({ routing: lbsResults, hotels: otaHotels }, null, 2);
@@ -572,11 +629,14 @@ ${planSummaries || `推荐酒店: ${hotelName}，总价¥${totalPrice}`}
       }
     }
 
-    // Store in session for follow-up Q&A
-    if (_sessionItinerary && constraints._clientIp) {
-      _sessionItinerary.set(constraints._clientIp, {
-        card_data: cardData.card_data, dest, storedAt: Date.now(),
-      });
+    // Store in session for follow-up Q&A (prefer deviceId over IP to avoid NAT collisions)
+    if (_sessionItinerary) {
+      const _itinKey = constraints._deviceId || constraints._clientIp;
+      if (_itinKey) {
+        _sessionItinerary.set(_itinKey, {
+          card_data: cardData.card_data, dest, storedAt: Date.now(),
+        });
+      }
     }
     return { ok: true, structured: cardData };
   }
@@ -598,6 +658,7 @@ module.exports = {
   configure,
   isComplexItinerary,
   buildPrePlan,
+  buildPrePlanFromIntent,
   buildInventoryContext,
   buildResourceContext,
   generateCrossXResponse,
