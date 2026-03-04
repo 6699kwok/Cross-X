@@ -86,11 +86,17 @@ function isBoundaryRejection(structured) {
 // Detects prompt injection and off-topic code-generation requests BEFORE any LLM
 // call, session lookup, or RAG query. Short-circuits ALL downstream processing.
 const INJECTION_PATTERNS = [
+  // Prompt override attempts
   /忽略.{0,10}(前面|上面|之前|系统).{0,10}指令/,
-  /扮演.{0,10}(另一个|其他|不同).{0,10}AI/,
-  /帮(我|你)写.{0,6}(代码|脚本|程序)/,
-  /爬取.{0,10}(网站|数据|携程|美团)/,
-  /DAN|jailbreak|prompt injection/i,
+  /扮演.{0,10}(另一个|其他|不同).{0,10}(AI|助手|角色)/,
+  // Code/script generation — widened wildcard {0,6}→{0,20}, added 编写/生成/爬虫
+  /帮(我|你)(写|编写|生成).{0,20}(代码|脚本|程序|爬虫)/,
+  // Standalone scraper/bot creation without 帮我 prefix (CN + EN triggers)
+  /(?:写个?|创建|生成|开发|write|create|build|make|generate).{0,20}(?:爬虫|spider|crawler|scraper)/i,
+  // Web scraping verbs
+  /爬取.{0,10}(网站|数据|携程|美团|信息)/,
+  // English jailbreak keywords
+  /DAN|jailbreak|prompt.{0,5}inject/i,
 ];
 function isInjectionAttack(text) {
   if (!text) return false;
