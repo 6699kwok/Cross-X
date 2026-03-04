@@ -13,6 +13,7 @@
 const fs   = require("fs");
 const path = require("path");
 const { openAIRequest } = require("../ai/openai");
+const { enc, dec } = require("../crypto/fieldEncrypt");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const PROFILE_FILE    = path.join(__dirname, "../../data/user_profiles.json");
@@ -32,8 +33,9 @@ function _load() {
   _loaded = true;
   try {
     if (!fs.existsSync(PROFILE_FILE)) return;
-    const raw  = fs.readFileSync(PROFILE_FILE, "utf8");
-    const data = JSON.parse(raw);
+    const raw  = fs.readFileSync(PROFILE_FILE, "utf8").trim();
+    if (!raw) return; // empty file — treat as no profiles
+    const data = JSON.parse(dec(raw) || raw);
     const now  = Date.now();
     for (const [id, profile] of Object.entries(data)) {
       if (profile.expiresAt && profile.expiresAt < now) continue; // skip expired
@@ -54,14 +56,45 @@ function _flush() {
   _flushTimer = null;
   const obj = {};
   for (const [id, profile] of _profiles) obj[id] = profile;
-  fs.promises.writeFile(PROFILE_FILE, JSON.stringify(obj, null, 2), "utf8")
-    .catch((e) => console.warn("[profile] flush error:", e.message));
+  const content = enc(JSON.stringify(obj, null, 2));
+  if (!content || content === "null") return;
+  // Atomic write: tmp → rename, prevents 0-byte corruption on crash
+  const tmp = PROFILE_FILE + ".tmp";
+  // Retry once after 500ms on failure to handle transient I/O errors
+  const tryWrite = (retriesLeft) =>
+    fs.promises.writeFile(tmp, content, "utf8")
+      .then(() => fs.promises.rename(tmp, PROFILE_FILE))
+      .catch((e) => {
+        if (retriesLeft > 0) {
+          console.warn("[profile] Flush failed, retrying in 500ms:", e.message);
+          return new Promise((r) => setTimeout(r, 500)).then(() => tryWrite(retriesLeft - 1));
+        }
+        console.error("[profile] Flush failed permanently — profiles may be lost on restart:", e.message);
+      });
+  tryWrite(1); // 1 retry = 2 total attempts
+}
+
+// Synchronous flush for process exit — async I/O won't complete after process.exit()
+function _flushSync() {
+  try {
+    const obj = {};
+    for (const [id, profile] of _profiles) obj[id] = profile;
+    const content = enc(JSON.stringify(obj, null, 2));
+    if (!content || content === "null") return;
+    const dir = require("path").dirname(PROFILE_FILE);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = PROFILE_FILE + ".tmp";
+    fs.writeFileSync(tmp, content, "utf8");
+    fs.renameSync(tmp, PROFILE_FILE);
+  } catch (e) {
+    try { console.warn("[profile] sync flush failed:", e.message); } catch {}
+  }
 }
 
 // Flush on shutdown
-process.once("SIGTERM", _flush);
-process.once("SIGINT",  _flush);
-process.once("exit",    _flush);
+process.once("SIGTERM", _flushSync);
+process.once("SIGINT",  _flushSync);
+process.once("exit",    _flushSync);
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -104,10 +137,10 @@ function saveProfile(deviceId, prefs, city = null, profileSummary = null) {
     expiresAt: 0,
   };
 
-  // Merge preferences — booleans accumulate; truthy wins
+  // Merge preferences — both true and false propagate (bidirectional)
   const merged = { ...existing.preferences };
   for (const [k, v] of Object.entries(prefs)) {
-    if (v === true) merged[k] = true;
+    if (typeof v === "boolean") merged[k] = v;
   }
 
   // Append city (deduplicated, capped)
@@ -156,4 +189,24 @@ async function generateProfileSummary(prefs, { apiKey, model, baseUrl } = {}) {
   }
 }
 
-module.exports = { loadProfile, saveProfile, generateProfileSummary };
+/**
+ * Record a micro-preference signal for a device.
+ * Increments a numeric score in profile.preferences[key] by `delta` (default 1).
+ * Scores are clamped to [0, 10]. Profile is persisted asynchronously.
+ *
+ * @param {string} deviceId
+ * @param {string} key      - preference key, e.g. "luxury_preference", "food_focus"
+ * @param {number} [delta=1] - amount to increment (negative to decrement)
+ */
+function recordSignal(deviceId, key, delta = 1) {
+  if (!deviceId || !key) return;
+  _load();
+  const profile = _profiles.get(deviceId);
+  if (!profile) return; // no profile to update
+  const current = typeof profile.preferences[key] === "number" ? profile.preferences[key] : 0;
+  profile.preferences[key] = Math.min(10, Math.max(0, current + delta));
+  profile.updatedAt = Date.now();
+  _scheduleFlush();
+}
+
+module.exports = { loadProfile, saveProfile, generateProfileSummary, recordSignal };
