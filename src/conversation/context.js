@@ -49,9 +49,21 @@ function extractPreferences(message) {
   return prefs;
 }
 
+// Mutually exclusive preference pairs — setting one clears the other.
+// E.g. user says "family trip" then "actually going solo" → solo wins, couple cleared.
+const PREF_CONFLICTS = {
+  solo:         ["couple"],
+  couple:       ["solo"],
+  pace_slow:    ["pace_packed"],
+  pace_packed:  ["pace_slow"],
+  budget_low:   ["budget_high"],
+  budget_high:  ["budget_low"],
+};
+
 /**
  * Merge incoming preferences into existing; party_size always overwrites,
- * booleans accumulate (once true, stay true).
+ * booleans accumulate (once true, stay true) EXCEPT conflicting pairs which
+ * are cleared when their opponent is newly set.
  * @param {object} existing   Stored prefs (may be null/undefined)
  * @param {object} incoming   From current message
  * @returns {object}          Merged prefs object
@@ -62,7 +74,11 @@ function mergePreferences(existing, incoming) {
     if (k === "party_size") {
       base.party_size = v; // always overwrite
     } else if (v === true) {
-      base[k] = true;      // accumulate booleans
+      base[k] = true;
+      // Clear conflicting flags so contradictory signals don't accumulate
+      for (const conflict of (PREF_CONFLICTS[k] || [])) {
+        delete base[conflict];
+      }
     }
   }
   return base;

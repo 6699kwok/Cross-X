@@ -134,8 +134,16 @@ async function amapRoutingWithFallback(fromCity, toCity) {
 
 // ─── Sichuan Attraction Knowledge Base (1650 records from RAG project CSVs) ───
 let _sichuanAttractions = null;
+// Preload asynchronously at startup — avoids ~100ms readFileSync blocking the
+// first search request. Falls back to sync read if a request arrives before
+// the async load completes (very unlikely after normal server startup time).
+fs.promises.readFile(path.join(__dirname, "lib/knowledge/sichuan-attractions.json"), "utf-8")
+  .then((data) => { _sichuanAttractions = JSON.parse(data); console.log("[kb] sichuan-attractions preloaded"); })
+  .catch(() => { _sichuanAttractions = {}; });
+
 function getSichuanAttractions() {
   if (!_sichuanAttractions) {
+    // Sync fallback: only reached if async hasn't finished (sub-second race at startup)
     try {
       _sichuanAttractions = JSON.parse(
         fs.readFileSync(path.join(__dirname, "lib/knowledge/sichuan-attractions.json"), "utf-8")

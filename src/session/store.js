@@ -30,6 +30,7 @@
 const crypto = require("crypto");
 const fs     = require("fs");
 const path   = require("path");
+const { enc, dec } = require("../crypto/fieldEncrypt");
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const DEFAULT_TTL_MS  = 4 * 60 * 60 * 1000;   // 4 hours
@@ -48,8 +49,9 @@ const _store = new Map();
 (function _loadFromDisk() {
   try {
     if (!fs.existsSync(SESSIONS_FILE)) return;
-    const raw  = fs.readFileSync(SESSIONS_FILE, "utf8");
-    const saved = JSON.parse(raw);
+    const raw  = fs.readFileSync(SESSIONS_FILE, "utf8").trim();
+    if (!raw) return; // empty file — treat as no sessions
+    const saved = JSON.parse(dec(raw) || raw);
     const now   = Date.now();
     let loaded  = 0;
     for (const [id, entry] of Object.entries(saved)) {
@@ -74,18 +76,45 @@ function _scheduleFlush() {
 
 function _flushNow() {
   _flushTimer = null;
-  if (!fs.existsSync(DATA_DIR)) {
-    try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-  }
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
   const obj = Object.fromEntries(_store);
-  fs.promises.writeFile(SESSIONS_FILE, JSON.stringify(obj), "utf8")
-    .catch((e) => console.warn("[session/store] Flush failed:", e.message));
+  const content = enc(JSON.stringify(obj));
+  if (!content || content === "null") return; // never write empty/corrupt content
+  // Write to tmp file first, then rename (atomic write prevents truncation on crash)
+  const tmp = SESSIONS_FILE + ".tmp";
+  // Retry once after 500ms on failure to handle transient I/O errors
+  const tryWrite = (retriesLeft) =>
+    fs.promises.writeFile(tmp, content, "utf8")
+      .then(() => fs.promises.rename(tmp, SESSIONS_FILE))
+      .catch((e) => {
+        if (retriesLeft > 0) {
+          console.warn("[session/store] Flush failed, retrying in 500ms:", e.message);
+          return new Promise((r) => setTimeout(r, 500)).then(() => tryWrite(retriesLeft - 1));
+        }
+        console.error("[session/store] Flush failed permanently — sessions may be lost on restart:", e.message);
+      });
+  tryWrite(1); // 1 retry = 2 total attempts
+}
+
+// Synchronous flush for process exit — async I/O won't complete after process.exit()
+function _flushSync() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const obj = Object.fromEntries(_store);
+    const content = enc(JSON.stringify(obj));
+    if (!content || content === "null") return;
+    const tmp = SESSIONS_FILE + ".tmp";
+    fs.writeFileSync(tmp, content, "utf8");
+    fs.renameSync(tmp, SESSIONS_FILE);
+  } catch (e) {
+    try { console.warn("[session/store] Sync flush failed:", e.message); } catch {}
+  }
 }
 
 // Flush on clean shutdown
-process.on("exit",    _flushNow);
-process.on("SIGTERM", () => { _flushNow(); process.exit(0); });
-process.on("SIGINT",  () => { _flushNow(); process.exit(0); });
+process.on("exit",    _flushSync);
+process.on("SIGTERM", () => { _flushSync(); process.exit(0); });
+process.on("SIGINT",  () => { _flushSync(); process.exit(0); });
 
 // ── Periodic GC ───────────────────────────────────────────────────────────────
 const _gc = setInterval(() => {
@@ -108,14 +137,15 @@ function generateSessionId() {
 }
 
 // ── CRUD ──────────────────────────────────────────────────────────────────────
-function createSession(initialData = {}, ttlMs = DEFAULT_TTL_MS) {
+function createSession(initialData = {}, ttlMs = DEFAULT_TTL_MS, boundDeviceId = null) {
   const id  = generateSessionId();
   const now = Date.now();
   _store.set(id, {
-    data:      { ...initialData },
-    createdAt: now,
-    updatedAt: now,
-    expiresAt: now + ttlMs,
+    data:           { ...initialData },
+    createdAt:      now,
+    updatedAt:      now,
+    expiresAt:      now + ttlMs,
+    _boundDeviceId: boundDeviceId || null,
   });
   _scheduleFlush();
   return id;
@@ -128,6 +158,29 @@ function getSession(sessionId) {
   if (entry.expiresAt <= Date.now()) {
     _store.delete(sessionId);
     _scheduleFlush();
+    return null;
+  }
+  return entry.data;
+}
+
+/**
+ * Get session data, but only if the session is bound to the given deviceId.
+ * Returns null if not found, expired, or deviceId mismatch.
+ * @param {string} sessionId
+ * @param {string|null} deviceId
+ */
+function getSessionForDevice(sessionId, deviceId) {
+  if (!sessionId) return null;
+  const entry = _store.get(sessionId);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    _store.delete(sessionId);
+    _scheduleFlush();
+    return null;
+  }
+  // Enforce device binding if the session was created with one
+  if (entry._boundDeviceId && entry._boundDeviceId !== deviceId) {
+    console.warn("[session/store] DeviceId mismatch — rejecting session lookup");
     return null;
   }
   return entry.data;
@@ -179,6 +232,10 @@ function getStoreStats() {
 function scrubPii(text) {
   if (typeof text !== "string") return text;
   return text
+    // International E.164: +[1-3 digit country code] [7-15 digits, optional separators]
+    // Must come before CN mobile to avoid double-replacing +86 prefixed numbers.
+    .replace(/\+\d{1,3}[\s.\-]?\(?\d{1,4}\)?[\s.\-]?\d{2,4}[\s.\-]?\d{2,4}[\s.\-]?\d{0,4}/g, "[PHONE]")
+    // CN domestic mobile: 1[3-9] + 9 digits (no international prefix)
     .replace(/(?<!\d)1[3-9]\d{9}(?!\d)/g, "[PHONE]")
     .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[EMAIL]")
     .replace(/[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]/g, "[ID_NUMBER]")
@@ -191,6 +248,7 @@ module.exports = {
   generateSessionId,
   createSession,
   getSession,
+  getSessionForDevice,
   setSession,
   patchSession,
   touchSession,
