@@ -10836,7 +10836,7 @@ async function loadTrips() {
   }
   let data;
   try {
-    data = await api("/api/trips");
+    data = await api("/api/trips?limit=50&offset=0");
   } catch (err) {
     if (skeleton) skeleton.clear(el.tripList);
     el.tripList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载行程失败，请稍后重试。", "Failed to load trips. Please try again.", "旅程の読み込みに失敗しました。", "트립을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadTrips()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
@@ -10880,7 +10880,30 @@ async function loadTrips() {
     `;
     })
     .join("");
+  // Show "load more" if there are more trips beyond current page
+  if (data.total > state.tripPlans.length) {
+    el.tripList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" onclick="loadMoreTrips(${state.tripPlans.length})">${pickText(`加载更多（共${data.total}条）`, `Load more (${data.total} total)`, `もっと見る（計${data.total}件）`, `더 보기 (총 ${data.total}개)`)}</button></div>`);
+  }
   renderActiveTripHint();
+  motion.bindPressables(el.tripList);
+}
+
+async function loadMoreTrips(offset) {
+  let data;
+  try { data = await api(`/api/trips?limit=50&offset=${offset}`); } catch { return; }
+  const more = Array.isArray(data.trips) ? data.trips : [];
+  state.tripPlans = [...state.tripPlans, ...more];
+  // Remove load-more button and re-render
+  const lm = el.tripList && el.tripList.querySelector(".cx-load-more");
+  if (lm) lm.remove();
+  // Append new cards + new load-more if needed
+  more.forEach(trip => {
+    const isActive = trip.id === state.activeTripId;
+    el.tripList.insertAdjacentHTML("beforeend", `<article class="card ${isActive ? "lane-recommended" : ""}"><h3>${escapeHtml(trip.title)}</h3><div>${escapeHtml(trip.city || "-")}</div><div><span class="status-badge ${escapeHtml(trip.status || "active")}">${escapeHtml(localizeStatus(trip.status || "active"))}</span></div><div class="actions"><button class="secondary" data-action="activate-trip" data-trip="${escapeHtml(trip.id)}">${pickText("设为当前行程","Set Active","有効化","활성화")}</button><button class="secondary" data-action="open-trip-detail" data-trip="${escapeHtml(trip.id)}">${pickText("行程详情","Detail","詳細","상세")}</button></div></article>`);
+  });
+  if (data.total > state.tripPlans.length) {
+    el.tripList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" onclick="loadMoreTrips(${state.tripPlans.length})">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
+  }
   motion.bindPressables(el.tripList);
 }
 
@@ -10949,7 +10972,7 @@ async function loadOrders() {
   }
   let data;
   try {
-    data = await api("/api/orders");
+    data = await api("/api/orders?limit=50&offset=0");
   } catch (err) {
     if (skeleton && el.ordersList) skeleton.clear(el.ordersList);
     if (el.ordersList) el.ordersList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载订单失败，请稍后重试。", "Failed to load orders. Please try again.", "注文の読み込みに失敗しました。", "주문을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadOrders()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
@@ -10985,6 +11008,24 @@ async function loadOrders() {
     `,
     )
     .join("");
+  if (data.total > data.orders.length) {
+    el.ordersList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" onclick="loadMoreOrders(${data.orders.length})">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
+  }
+  motion.bindPressables(el.ordersList);
+}
+
+async function loadMoreOrders(offset) {
+  let data;
+  try { data = await api(`/api/orders?limit=50&offset=${offset}`); } catch { return; }
+  const lm = el.ordersList && el.ordersList.querySelector(".cx-load-more");
+  if (lm) lm.remove();
+  (data.orders || []).forEach(o => {
+    if (store) store.dispatch({ type: "SET_ORDERS", orders: [...(store.getState().orders || []), o] });
+    el.ordersList.insertAdjacentHTML("beforeend", `<article class="card"><h3>${escapeHtml(o.provider)}</h3><div>${new Date(o.createdAt).toLocaleString()}</div><div><span class="status-badge ${escapeHtml(o.status)}">${escapeHtml(localizeStatus(o.status))}</span></div><div class="actions"><button class="secondary" data-action="open-order-detail" data-order="${o.id}">${pickText("订单详情","Order Detail","注文詳細","주문 상세")}</button>${["confirmed","delivered","refund_requested","refunded"].includes(o.status) ? `<a class="secondary cx-receipt-btn" href="/api/orders/${escapeHtml(o.id)}/receipt?download=1" target="_blank" rel="noopener">${pickText("下载收据","Download Receipt","領収書","영수증")}</a>` : ""}</div></article>`);
+  });
+  if (data.total > offset + (data.orders || []).length) {
+    el.ordersList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" onclick="loadMoreOrders(${offset + (data.orders || []).length})">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
+  }
   motion.bindPressables(el.ordersList);
 }
 

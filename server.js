@@ -7699,10 +7699,23 @@ const server = http.createServer(async (req, res) => {
       const offset = Number(_aasp.get("offset") || 0);
       const kind   = _aasp.get("kind")   || "";
       const who    = _aasp.get("who")    || "";
+      const format = _aasp.get("format") || "json";
       let logs = [...(db.auditLogs || [])].reverse();
       if (kind) logs = logs.filter((l) => l.kind && l.kind.startsWith(kind));
       if (who)  logs = logs.filter((l) => l.who  && l.who.includes(who));
-      return writeJson(res, 200, { ok: true, total: logs.length, logs: logs.slice(offset, offset + limit) });
+      const page = logs.slice(offset, offset + limit);
+      if (format === "csv") {
+        const _csvEsc = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
+        const header = "ts,kind,who,what,taskId\n";
+        const rows = page.map((l) => [l.ts || l.at, l.kind, l.who, l.what, l.taskId].map(_csvEsc).join(",")).join("\n");
+        res.writeHead(200, {
+          "Content-Type": "text/csv; charset=utf-8",
+          "Content-Disposition": `attachment; filename="crossx-audit-${new Date().toISOString().slice(0,10)}.csv"`,
+        });
+        res.end(header + rows);
+        return;
+      }
+      return writeJson(res, 200, { ok: true, total: logs.length, logs: page });
     }
 
     // ── Admin: feature flag management ────────────────────────────────────────
@@ -10311,9 +10324,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/user/preferences") {
       const body = await readBody(req);
-      const { validateUserToken } = require("./src/services/user_auth");
-      const authedPayload = validateUserToken(req);
-      const userId = authedPayload ? authedPayload.sub : (extractDeviceId(req, body) || "demo");
+      const userId = _whoFromReq(req) !== "anon" ? _whoFromReq(req) : (extractDeviceId(req, body) || "anon");
       const updatedUser = updateUser(userId, {
         language:   body.language,
         city:       body.city,
@@ -10330,9 +10341,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/user/location") {
       const body = await readBody(req);
-      const { validateUserToken: _vut } = require("./src/services/user_auth");
-      const _locPayload = _vut(req);
-      const _locUserId  = _locPayload ? _locPayload.sub : (extractDeviceId(req, body) || "demo");
+      const _locUserId = _whoFromReq(req) !== "anon" ? _whoFromReq(req) : (extractDeviceId(req, body) || "anon");
       const lat = toNumberOrNull(body.lat !== undefined ? body.lat : body.latitude);
       const lng = toNumberOrNull(body.lng !== undefined ? body.lng : body.longitude);
       if (lat === null || lng === null) {
@@ -10371,10 +10380,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/user/location") {
-      const { validateUserToken: _vutLoc } = require("./src/services/user_auth");
-      const _locGetPayload = _vutLoc(req);
-      const _locGetId = _locGetPayload ? _locGetPayload.sub : (extractDeviceId(req, {}) || "demo");
-      const _locUser = getUser(_locGetId) || getUser("demo");
+      const _locGetId = _whoFromReq(req) !== "anon" ? _whoFromReq(req) : (extractDeviceId(req, {}) || null);
+      const _locUser = _locGetId ? getUser(_locGetId) : null;
       return writeJson(res, 200, {
         city: _locUser?.city || "Shanghai",
         location: _locUser?.location || { lat: null, lng: null, accuracy: null, updatedAt: null, source: "none" },
@@ -10383,9 +10390,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/user/view-mode") {
       const body = await readBody(req);
-      const { validateUserToken: _vutVm } = require("./src/services/user_auth");
-      const _vmPayload = _vutVm(req);
-      const _vmUserId  = _vmPayload ? _vmPayload.sub : (extractDeviceId(req, body) || "demo");
+      const _vmUserId = _whoFromReq(req) !== "anon" ? _whoFromReq(req) : (extractDeviceId(req, body) || "anon");
       const mode = body && body.mode === "admin" ? "admin" : "user";
       updateUser(_vmUserId, { viewMode: mode });
       audit.append({
@@ -10699,7 +10704,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         railId:   railId || "alipay_cn",
         amount:   order.totalCost,
         currency: order.currency || "CNY",
-        userId:   order.userId || "demo",
+        userId:   order.userId || _whoFromReq(req),
         taskId:   orderId,
       });
       if (!charge.ok) {
@@ -11419,7 +11424,15 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     if (req.method === "POST" && pathname === "/api/payments/charge") {
       const body = await readBody(req);
       const { railId = "alipay_cn", amount = 0, currency = "CNY", taskId = "" } = body;
-      const userId = _whoFromReq(req) || String(body.userId || "demo");
+      const userId = _whoFromReq(req) !== "anon" ? _whoFromReq(req) : String(body.userId || "anon");
+      // Validate amount
+      const _chargeAmt = Number(amount);
+      if (!Number.isFinite(_chargeAmt) || _chargeAmt <= 0) {
+        return writeJson(res, 400, { error: "invalid_amount", message: "Amount must be a positive number." });
+      }
+      if (_chargeAmt > 100_000) {
+        return writeJson(res, 400, { error: "amount_exceeds_limit", message: "Single charge may not exceed ¥100,000." });
+      }
 
       // ── Plus subscription gate (bypassed in dev/sandbox mode) ─────────────
       const _devMode = !process.env.ALIPAY_APP_ID && !process.env.WECHAT_MCH_ID && !process.env.STRIPE_SECRET_KEY;
@@ -11435,7 +11448,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       }
 
       try {
-        const chargePromise = paymentRails.charge({ railId, amount: Number(amount), currency, userId, taskId });
+        const chargePromise = paymentRails.charge({ railId, amount: _chargeAmt, currency, userId, taskId });
         const timeoutPromise = new Promise((_, rej) => setTimeout(() => rej(new Error("charge_timeout")), 12000));
         const result = await Promise.race([chargePromise, timeoutPromise]);
         return writeJson(res, 200, result);

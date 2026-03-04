@@ -1111,6 +1111,68 @@
     } catch (err) {
       if (!err.needsLogin) console.warn("[admin/analytics] load failed:", err.message);
     }
+    loadFeatureFlags().catch(() => {});
+  }
+
+  // ── Feature Flags ──────────────────────────────────────────────────────────
+  async function loadFeatureFlags() {
+    const el_flags = document.getElementById("flagsList");
+    if (!el_flags) return;
+    try {
+      const data = await api("/api/system/flags");
+      const flags = data.flags || data || {};
+      if (!Object.keys(flags).length) {
+        el_flags.innerHTML = `<span style="font-size:12px;color:var(--text-secondary,#64748b)">No flags set.</span>`;
+        return;
+      }
+      el_flags.innerHTML = Object.entries(flags).map(([k, v]) =>
+        `<span style="display:inline-flex;align-items:center;gap:4px;background:var(--surface,#f8fafc);border:1px solid var(--border,#e2e8f0);border-radius:6px;padding:3px 8px;font-size:12px">
+          <b>${escapeHtml(k)}</b><span style="color:${v ? "#10b981" : "#ef4444"}">${escapeHtml(String(v))}</span>
+          <button onclick="deleteFeatureFlag('${escapeHtml(k)}')" title="Delete" style="background:none;border:none;cursor:pointer;color:#94a3b8;font-size:14px;line-height:1;padding:0 2px">&times;</button>
+        </span>`
+      ).join("");
+    } catch (err) {
+      if (el_flags) el_flags.innerHTML = `<span style="font-size:12px;color:#ef4444">${escapeHtml(err.message)}</span>`;
+    }
+  }
+
+  async function setFeatureFlag(key, value) {
+    if (!key) return;
+    await api("/api/system/flags", { method: "POST", body: JSON.stringify({ [key]: value }) });
+    loadFeatureFlags();
+  }
+
+  window.deleteFeatureFlag = async function(flagName) {
+    try {
+      await api(`/api/admin/flags/${encodeURIComponent(flagName)}`, { method: "DELETE" });
+      loadFeatureFlags();
+    } catch (err) { notify(err.message, "error"); }
+  };
+
+  // Wire flag set button
+  const _flagSetBtn = document.getElementById("flagSetBtn");
+  if (_flagSetBtn) {
+    _flagSetBtn.addEventListener("click", async () => {
+      const keyEl = document.getElementById("flagKeyInput");
+      const valEl = document.getElementById("flagValInput");
+      const key = (keyEl && keyEl.value.trim()) || "";
+      const val = valEl ? valEl.value === "true" : true;
+      if (!key) { notify("Flag name required", "warning"); return; }
+      await setFeatureFlag(key, val);
+      if (keyEl) keyEl.value = "";
+    });
+  }
+
+  // Wire audit CSV export button
+  const _flagExportBtn = document.getElementById("flagExportAuditBtn");
+  if (_flagExportBtn) {
+    _flagExportBtn.addEventListener("click", () => {
+      const url = "/api/admin/audit?format=csv&limit=500";
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `crossx-audit-${new Date().toISOString().slice(0,10)}.csv`;
+      a.click();
+    });
   }
 
   async function loadBoard(showLoading = false) {
