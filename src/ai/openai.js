@@ -12,6 +12,8 @@
 let _defaultModel   = "gpt-4o-mini";
 let _defaultBaseUrl = "https://api.openai.com/v1";
 
+const OPENAI_MAX_RETRIES = 3; // 1 initial + 2 retries
+
 // ── Retry helper ──────────────────────────────────────────────────────────
 /** Returns true for HTTP status codes that are safe to retry. */
 function _isRetryable(status) {
@@ -61,8 +63,7 @@ async function openAIRequest({
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
   });
 
-  const MAX_ATTEMPTS = 3; // 1 initial + 2 retries
-  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 0; attempt < OPENAI_MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       await new Promise((r) => setTimeout(r, _backoffMs(attempt)));
     }
@@ -78,7 +79,7 @@ async function openAIRequest({
       });
 
       if (!resp.ok) {
-        if (_isRetryable(resp.status) && attempt < MAX_ATTEMPTS - 1) {
+        if (_isRetryable(resp.status) && attempt < OPENAI_MAX_RETRIES - 1) {
           console.warn(`[openAIRequest] HTTP ${resp.status}, retrying (attempt ${attempt + 1})`);
           continue;
         }
@@ -151,9 +152,8 @@ async function openAIStream({
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
   });
 
-  const MAX_STREAM_ATTEMPTS = 3;
   let resp;
-  for (let attempt = 0; attempt < MAX_STREAM_ATTEMPTS; attempt++) {
+  for (let attempt = 0; attempt < OPENAI_MAX_RETRIES; attempt++) {
     if (attempt > 0) {
       await new Promise((r) => setTimeout(r, _backoffMs(attempt)));
     }
@@ -168,7 +168,7 @@ async function openAIStream({
         body,
         signal: AbortSignal.timeout(timeoutMs),
       });
-      if (!resp.ok && _isRetryable(resp.status) && attempt < MAX_STREAM_ATTEMPTS - 1) {
+      if (!resp.ok && _isRetryable(resp.status) && attempt < OPENAI_MAX_RETRIES - 1) {
         console.warn(`[openAIStream] HTTP ${resp.status}, retrying (attempt ${attempt + 1})`);
         continue;
       }
@@ -219,7 +219,7 @@ async function openAIStream({
         if (delta.content) {
           textAccum += delta.content;
           if (onChunk) {
-            try { onChunk(delta.content); } catch {}
+            try { onChunk(delta.content); } catch (e) { console.warn("[openAIStream] onChunk error:", e.message); }
           }
         }
 

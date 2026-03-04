@@ -136,14 +136,14 @@ async function fetchFxRates() {
   if (_cache.fx.data && now - _cache.fx.ts < FX_TTL) return _cache.fx.data;
 
   if (!key) {
-    _cache.fx.data = { ...MOCK_RATES };
+    _cache.fx.data = { ...MOCK_RATES, _source: "mock" };
     _cache.fx.ts   = now;
     return _cache.fx.data;
   }
 
   try {
     // One call returns ALL currencies — much more efficient than 6 parallel calls
-    const res  = await fetch(`${JUHE_FX_URL}?key=${key}&from=CNY`, {
+    const res  = await fetch(`${JUHE_FX_URL}?key=${encodeURIComponent(key)}&from=CNY`, {
       signal: AbortSignal.timeout(5000),
     });
     const json = await res.json();
@@ -165,11 +165,11 @@ async function fetchFxRates() {
       }
     });
 
-    _cache.fx.data = rates;
+    _cache.fx.data = { ...rates, _source: "live" };
     _cache.fx.ts   = now;
-    return rates;
+    return _cache.fx.data;
   } catch {
-    _cache.fx.data = { ...MOCK_RATES };
+    _cache.fx.data = { ...MOCK_RATES, _source: "mock" };
     _cache.fx.ts   = now;
     return _cache.fx.data;
   }
