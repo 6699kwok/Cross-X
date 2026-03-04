@@ -2628,7 +2628,7 @@ async function callOpenAIChatReply({ message, language, city, constraints, recom
 // ── Claude subprocess (claude -p) ─────────────────────────────────────────
 // Uses the locally installed claude CLI to answer — bypasses proxy restrictions.
 // Works when server.js runs as a standalone process (not inside a claude session).
-const CLAUDE_BIN = process.env.CLAUDE_BIN || "/Users/kwok/.local/bin/claude";
+const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude"; // rely on PATH; set CLAUDE_BIN env for non-standard installs
 let CLAUDE_SUB_TIMEOUT_MS = 25000;
 
 function callClaudeSubprocess({ message, language, city, constraints, recommendation, conversationHistory }) {
