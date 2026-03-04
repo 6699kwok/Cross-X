@@ -41,6 +41,9 @@
           <span class="lang-caret">▾</span>
         </label>
         <button class="ghost-danger" id="emergencyBtn">Emergency</button>
+        <button class="pill" id="loginBtn">登录</button>
+        <span class="pill user-pill hidden" id="userNameTag">旅行者</span>
+        <button class="pill ghost-danger hidden" id="logoutBtn">退出</button>
       </div>
     </header>
 
@@ -415,6 +418,18 @@
               </label>
               <button type="submit">Update MCP Policy</button>
             </form>
+          </article>
+
+          <article class="card admin-only">
+            <h3>🧠 LLM Training &amp; Capability</h3>
+            <div id="trainingSummary" class="list"></div>
+            <div class="actions" style="flex-wrap:wrap;gap:6px">
+              <button class="secondary" id="runBenchmarkBtn">Run Benchmark (20 queries)</button>
+              <a id="exportTrainingLink" class="secondary" style="display:inline-flex;align-items:center;padding:6px 12px;text-decoration:none;border:1px solid #ccc;border-radius:6px;font-size:13px" href="/api/training/export" download>Export JSONL</a>
+            </div>
+            <div id="benchmarkResult" class="list" style="margin-top:8px"></div>
+            <h4 style="margin:12px 0 4px;font-size:13px;color:#555">🔬 Prompt A/B Experiments</h4>
+            <div id="promptAbStats" class="list"></div>
           </article>
 
           <article class="card admin-only">

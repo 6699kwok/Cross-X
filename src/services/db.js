@@ -291,6 +291,17 @@ CREATE TABLE IF NOT EXISTS capability_benchmarks (
 CREATE INDEX IF NOT EXISTS idx_cap_bench_run_id ON capability_benchmarks(run_id);
 `);
 
+// ── User Auth table (phone OTP login accounts) ───────────────────────────────
+sqliteDb.exec(`
+  CREATE TABLE IF NOT EXISTS users_auth (
+    user_id      TEXT PRIMARY KEY,
+    phone_hash   TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    last_login   TEXT
+  )
+`);
+
 // ── GDPR + Security: extend users table (idempotent ALTER TABLE) ─────────────
 for (const col of [
   "ALTER TABLE users ADD COLUMN consent_version TEXT NOT NULL DEFAULT ''",
@@ -1254,6 +1265,43 @@ function getReceipt(orderId) {
   return sqliteDb.prepare("SELECT * FROM receipts WHERE order_id=? ORDER BY created_at DESC LIMIT 1").get(orderId) || null;
 }
 
+// ── users_auth table (phone-based auth) ──────────────────────────────────────
+sqliteDb.exec(`
+  CREATE TABLE IF NOT EXISTS users_auth (
+    user_id      TEXT PRIMARY KEY,
+    phone_hash   TEXT UNIQUE NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    last_login   TEXT
+  )
+`);
+
+const _stmtGetUserAuth    = sqliteDb.prepare("SELECT * FROM users_auth WHERE user_id = ?");
+const _stmtGetUserAuthByHash = sqliteDb.prepare("SELECT * FROM users_auth WHERE phone_hash = ?");
+const _stmtUpsertUserAuth = sqliteDb.prepare(`
+  INSERT INTO users_auth (user_id, phone_hash, display_name, created_at, last_login)
+  VALUES (@userId, @phoneHash, @displayName, @createdAt, @lastLogin)
+  ON CONFLICT(user_id) DO UPDATE SET
+    display_name = COALESCE(NULLIF(excluded.display_name,''), users_auth.display_name),
+    last_login   = excluded.last_login
+`);
+
+function getUserAuth(userId) {
+  return _stmtGetUserAuth.get(userId) || null;
+}
+function getUserAuthByHash(phoneHash) {
+  return _stmtGetUserAuthByHash.get(phoneHash) || null;
+}
+function upsertUserAuth({ userId, phoneHash, displayName = "", createdAt, lastLogin }) {
+  _stmtUpsertUserAuth.run({
+    userId,
+    phoneHash,
+    displayName: String(displayName || "").slice(0, 30),
+    createdAt: createdAt || new Date().toISOString(),
+    lastLogin:  lastLogin || new Date().toISOString(),
+  });
+}
+
 // ── Exports ────────────────────────────────────────────────────────────────
 module.exports = {
   sqliteDb, db: legacyDb, legacyDb,
@@ -1285,4 +1333,5 @@ module.exports = {
   upsertTrainingExample, updateTrainingExampleScore, getTrainingExamples, getTrainingExampleBySession,
   upsertPromptExperiment, getPromptExperiments,
   appendCapabilityBenchmark, getBenchmarkRuns,
+  getUserAuth, getUserAuthByHash, upsertUserAuth,
 };

@@ -15777,4 +15777,183 @@ async function _postConsent(purposes, granted) {
   });
 }
 
+// ── User Auth State ───────────────────────────────────────────────────────────
+const AUTH_TOKEN_KEY   = "cx_user_token";
+const AUTH_USERID_KEY  = "cx_user_id";
+const AUTH_NAME_KEY    = "cx_user_name";
+
+function _getAuthToken()   { try { return localStorage.getItem(AUTH_TOKEN_KEY) || null; } catch { return null; } }
+function _getAuthUserId()  { try { return localStorage.getItem(AUTH_USERID_KEY) || null; } catch { return null; } }
+function _getAuthName()    { try { return localStorage.getItem(AUTH_NAME_KEY) || null; } catch { return null; } }
+
+function _saveAuthState(token, userId, displayName) {
+  try {
+    localStorage.setItem(AUTH_TOKEN_KEY,  token);
+    localStorage.setItem(AUTH_USERID_KEY, userId);
+    localStorage.setItem(AUTH_NAME_KEY,   displayName);
+  } catch { /* storage disabled */ }
+}
+
+function _clearAuthState() {
+  try {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    localStorage.removeItem(AUTH_USERID_KEY);
+    localStorage.removeItem(AUTH_NAME_KEY);
+  } catch { /* storage disabled */ }
+}
+
+function _applyAuthUi(loggedIn, displayName) {
+  const loginBtn    = document.getElementById("loginBtn");
+  const logoutBtn   = document.getElementById("logoutBtn");
+  const userNameTag = document.getElementById("userNameTag");
+  if (!loginBtn) return;
+  if (loggedIn) {
+    loginBtn.classList.add("hidden");
+    userNameTag.textContent = displayName || "旅行者";
+    userNameTag.classList.remove("hidden");
+    logoutBtn.classList.remove("hidden");
+  } else {
+    loginBtn.classList.remove("hidden");
+    userNameTag.classList.add("hidden");
+    logoutBtn.classList.add("hidden");
+  }
+}
+
+async function _initAuthState() {
+  const token = _getAuthToken();
+  if (!token) { _applyAuthUi(false); return; }
+  try {
+    const r = await fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) { _clearAuthState(); _applyAuthUi(false); return; }
+    const data = await r.json();
+    if (data.ok) {
+      _saveAuthState(token, data.userId, data.displayName);
+      _applyAuthUi(true, data.displayName);
+    } else {
+      _clearAuthState(); _applyAuthUi(false);
+    }
+  } catch { _applyAuthUi(false); }
+}
+
+function _onLoginSuccess(token, userId, displayName) {
+  _saveAuthState(token, userId, displayName);
+  _applyAuthUi(true, displayName);
+  notify(`欢迎回来，${displayName}！`, "success");
+}
+
+function _onLogout() {
+  _clearAuthState();
+  _applyAuthUi(false);
+  fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
+  notify("已退出登录", "info");
+}
+
+// ── Login Modal ───────────────────────────────────────────────────────────────
+function _showLoginModal() {
+  const existing = document.getElementById("cx-login-modal");
+  if (existing) existing.remove();
+
+  const modal = document.createElement("div");
+  modal.id = "cx-login-modal";
+  modal.innerHTML = `
+    <div class="cx-modal-backdrop" id="cxLoginBackdrop"></div>
+    <div class="cx-modal-panel" role="dialog" aria-modal="true" aria-label="\u767b\u5f55 CrossX">
+      <button class="cx-modal-close" id="cxLoginClose" aria-label="\u5173\u95ed">\u00d7</button>
+      <h2 class="cx-modal-title">登录 / 注册</h2>
+      <div id="cxLoginStep1">
+        <label class="cx-modal-label">手机号</label>
+        <input class="cx-modal-input" type="tel" id="cxLoginPhone" placeholder="13800138000" maxlength="15" autocomplete="tel" />
+        <button class="cx-modal-btn" id="cxLoginSendOtp">发送验证码</button>
+        <div class="cx-modal-error hidden" id="cxLoginErr1"></div>
+      </div>
+      <div id="cxLoginStep2" class="hidden">
+        <label class="cx-modal-label">验证码（6位）</label>
+        <input class="cx-modal-input cx-otp-input" type="text" id="cxLoginCode" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
+        <label class="cx-modal-label" style="margin-top:10px">昵称（可选）</label>
+        <input class="cx-modal-input" type="text" id="cxLoginName" placeholder="旅行者" maxlength="20" />
+        <button class="cx-modal-btn" id="cxLoginVerify">确认登录</button>
+        <button class="cx-modal-link" id="cxLoginResend">重新发送</button>
+        <div class="cx-modal-error hidden" id="cxLoginErr2"></div>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+
+  const close = () => modal.remove();
+  document.getElementById("cxLoginClose").onclick    = close;
+  document.getElementById("cxLoginBackdrop").onclick = close;
+
+  const phoneInput = document.getElementById("cxLoginPhone");
+  const codeInput  = document.getElementById("cxLoginCode");
+  const step1      = document.getElementById("cxLoginStep1");
+  const step2      = document.getElementById("cxLoginStep2");
+  const err1       = document.getElementById("cxLoginErr1");
+  const err2       = document.getElementById("cxLoginErr2");
+
+  let _currentPhone = "";
+
+  async function sendOtp() {
+    const phone = phoneInput.value.trim();
+    if (!phone) { err1.textContent = "请输入手机号"; err1.classList.remove("hidden"); return; }
+    err1.classList.add("hidden");
+    const btn = document.getElementById("cxLoginSendOtp");
+    btn.disabled = true; btn.textContent = "发送中…";
+    try {
+      const r = await fetch("/api/auth/send-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone }),
+      });
+      const data = await r.json();
+      if (!data.ok) { err1.textContent = data.error || "发送失败，请稍后重试"; err1.classList.remove("hidden"); btn.disabled = false; btn.textContent = "发送验证码"; return; }
+      _currentPhone = phone;
+      // Dev mode: auto-fill the OTP
+      if (data.dev_code) { codeInput.value = data.dev_code; }
+      step1.classList.add("hidden");
+      step2.classList.remove("hidden");
+      codeInput.focus();
+    } catch { err1.textContent = "网络错误，请重试"; err1.classList.remove("hidden"); btn.disabled = false; btn.textContent = "发送验证码"; }
+  }
+
+  async function verifyOtp() {
+    const code = codeInput.value.trim();
+    const name = document.getElementById("cxLoginName").value.trim();
+    if (!code || code.length !== 6) { err2.textContent = "请输入6位验证码"; err2.classList.remove("hidden"); return; }
+    err2.classList.add("hidden");
+    const btn = document.getElementById("cxLoginVerify");
+    btn.disabled = true; btn.textContent = "验证中…";
+    try {
+      const r = await fetch("/api/auth/verify-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone: _currentPhone, code, displayName: name }),
+      });
+      const data = await r.json();
+      if (!data.ok) {
+        const msg = data.error === "wrong_code" ? `验证码错误（剩余${data.attemptsLeft || 0}次）` : (data.error === "expired" ? "验证码已过期，请重新发送" : data.error || "验证失败");
+        err2.textContent = msg; err2.classList.remove("hidden"); btn.disabled = false; btn.textContent = "确认登录"; return;
+      }
+      modal.remove();
+      _onLoginSuccess(data.token, data.userId, data.displayName);
+    } catch { err2.textContent = "网络错误，请重试"; err2.classList.remove("hidden"); btn.disabled = false; btn.textContent = "确认登录"; }
+  }
+
+  document.getElementById("cxLoginSendOtp").onclick = sendOtp;
+  document.getElementById("cxLoginVerify").onclick   = verifyOtp;
+  document.getElementById("cxLoginResend").onclick   = () => { step2.classList.add("hidden"); step1.classList.remove("hidden"); phoneInput.focus(); };
+  phoneInput.onkeydown = (e) => { if (e.key === "Enter") sendOtp(); };
+  codeInput.onkeydown  = (e) => { if (e.key === "Enter") verifyOtp(); };
+  phoneInput.focus();
+}
+
+// Wire up header auth buttons
+(function _bindAuthButtons() {
+  const loginBtn  = document.getElementById("loginBtn");
+  const logoutBtn = document.getElementById("logoutBtn");
+  if (loginBtn)  loginBtn.onclick  = _showLoginModal;
+  if (logoutBtn) logoutBtn.onclick = _onLogout;
+})();
+
+// Check auth state on page load
+_initAuthState();
+
 init();

@@ -42,7 +42,7 @@ const {
 } = require("./src/services/geo");
 const { loadProfile } = require("./src/session/profile");
 const { mockAmapRouting } = require("./src/planner/mock");
-const { db, DATA_DIR, DB_FILE, ensureDataDir, nowIso, saveDb, lifecyclePush, insertTrip, getRecentTrips, appendAuditLog, upsertReceipt, getReceipt, upsertOrder: upsertOrderSqlite } = require("./src/services/db");
+const { db, DATA_DIR, DB_FILE, ensureDataDir, nowIso, saveDb, lifecyclePush, insertTrip, getRecentTrips, appendAuditLog, upsertReceipt, getReceipt, upsertOrder: upsertOrderSqlite, getUser, updateUser } = require("./src/services/db");
 const sessionItinerary = new Map(); // 2h TTL session context, keyed by client IP
 const WEATHER_CACHE    = new Map(); // city → {ts, data}, 1h TTL
 const WEATHER_TTL_MS   = 60 * 60 * 1000;
@@ -7530,6 +7530,69 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // ── User Auth Routes (/api/auth/*) ─────────────────────────────────────
+
+    // POST /api/auth/send-otp — send OTP to phone number
+    if (req.method === "POST" && pathname === "/api/auth/send-otp") {
+      const { generateOtp } = require("./src/services/user_auth");
+      const body   = await readBody(req);
+      const result = generateOtp(String(body.phone || ""));
+      if (!result.ok) {
+        return writeJson(res, 400, { error: result.reason, retryAfterSec: result.retryAfterSec });
+      }
+      return writeJson(res, 200, {
+        ok: true,
+        message: "OTP sent",
+        ...(result.devCode ? { dev_code: result.devCode } : {}),
+      });
+    }
+
+    // POST /api/auth/verify-otp — verify OTP → issue user token
+    if (req.method === "POST" && pathname === "/api/auth/verify-otp") {
+      const { verifyOtp, createOrLoginUser, issueUserToken, _normalizePhone, _hashPhone } = require("./src/services/user_auth");
+      const body = await readBody(req);
+      const phone = String(body.phone || "");
+      const code  = String(body.code  || "");
+
+      const otpResult = verifyOtp(phone, code);
+      if (!otpResult.ok) {
+        return writeJson(res, 401, {
+          error:         otpResult.reason,
+          attemptsLeft:  otpResult.attemptsLeft,
+        });
+      }
+
+      const normalized    = _normalizePhone(phone);
+      const displayName   = String(body.displayName || "").trim().slice(0, 30);
+      const { userId, displayName: name, isNew } = createOrLoginUser(normalized, displayName);
+      const phoneHash     = _hashPhone(normalized);
+      const token         = issueUserToken(userId, phoneHash);
+
+      return writeJson(res, 200, { ok: true, token, userId, displayName: name, isNew });
+    }
+
+    // GET /api/auth/me — return user info from token
+    if (req.method === "GET" && pathname === "/api/auth/me") {
+      const { validateUserToken } = require("./src/services/user_auth");
+      const { getUserAuth } = require("./src/services/db");
+      const payload = validateUserToken(req);
+      if (!payload) return writeJson(res, 401, { error: "unauthorized" });
+      const user = getUserAuth(payload.sub);
+      if (!user) return writeJson(res, 404, { error: "user_not_found" });
+      return writeJson(res, 200, {
+        ok:          true,
+        userId:      user.user_id,
+        displayName: user.display_name,
+        role:        "user",
+        createdAt:   user.created_at,
+      });
+    }
+
+    // POST /api/auth/logout — stateless; client clears token
+    if (req.method === "POST" && pathname === "/api/auth/logout") {
+      return writeJson(res, 200, { ok: true });
+    }
+
     // POST /api/admin/login — exchange master key for signed admin token
     if (req.method === "POST" && pathname === "/api/admin/login") {
       const body = await readBody(req);
@@ -10040,34 +10103,28 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/user/preferences") {
       const body = await readBody(req);
-      const user = db.users.demo;
-      user.language = body.language || user.language;
-      user.city = body.city || user.city;
-      user.preferences = {
-        ...user.preferences,
-        ...(body.preferences || {}),
-      };
-      if (body.savedPlaces && typeof body.savedPlaces === "object") {
-        user.savedPlaces = {
-          ...(user.savedPlaces || {}),
-          ...body.savedPlaces,
-        };
-      }
-      audit.append({
-        kind: "user",
-        who: "demo",
-        what: "user.preferences.updated",
-        taskId: null,
-        toolInput: body,
-        toolOutput: { language: user.language, preferences: user.preferences, savedPlaces: user.savedPlaces },
+      const { validateUserToken } = require("./src/services/user_auth");
+      const authedPayload = validateUserToken(req);
+      const userId = authedPayload ? authedPayload.sub : (extractDeviceId(req, body) || "demo");
+      const updatedUser = updateUser(userId, {
+        language:   body.language,
+        city:       body.city,
+        preferences: body.preferences,
+        savedPlaces: body.savedPlaces,
       });
-      saveDb();
-      return writeJson(res, 200, { ok: true, user });
+      audit.append({
+        kind: "user", who: userId, what: "user.preferences.updated",
+        taskId: null, toolInput: body,
+        toolOutput: { language: updatedUser?.language, preferences: updatedUser?.preferences },
+      });
+      return writeJson(res, 200, { ok: true, user: updatedUser });
     }
 
     if (req.method === "POST" && pathname === "/api/user/location") {
       const body = await readBody(req);
-      const user = db.users.demo;
+      const { validateUserToken: _vut } = require("./src/services/user_auth");
+      const _locPayload = _vut(req);
+      const _locUserId  = _locPayload ? _locPayload.sub : (extractDeviceId(req, body) || "demo");
       const lat = toNumberOrNull(body.lat !== undefined ? body.lat : body.latitude);
       const lng = toNumberOrNull(body.lng !== undefined ? body.lng : body.longitude);
       if (lat === null || lng === null) {
@@ -10082,53 +10139,51 @@ const server = http.createServer(async (req, res) => {
       const provinceZh = String(inferred.provinceZh || cityZh);
       const district = String(inferred.district || "");
       const districtZh = String(inferred.districtZh || "");
-      user.city = city;
-      user.cityZh = cityZh;
-      user.province = province;
-      user.provinceZh = provinceZh;
-      user.district = district;
-      user.districtZh = districtZh;
-      user.location = {
-        lat: Number(lat.toFixed(6)),
-        lng: Number(lng.toFixed(6)),
-        accuracy: accuracy === null ? null : Number(accuracy.toFixed(1)),
-        updatedAt: nowIso(),
-        source: body.source || "browser_geolocation",
-        geocodeSource: process.env.GAODE_KEY || process.env.AMAP_KEY ? "amap" : "fallback_lookup",
+      const _locData = {
+        city, cityZh, province, provinceZh, district, districtZh,
+        location: {
+          lat: Number(lat.toFixed(6)),
+          lng: Number(lng.toFixed(6)),
+          accuracy: accuracy === null ? null : Number(accuracy.toFixed(1)),
+          updatedAt: nowIso(),
+          source: body.source || "browser_geolocation",
+          geocodeSource: process.env.GAODE_KEY || process.env.AMAP_KEY ? "amap" : "fallback_lookup",
+        },
       };
+      updateUser(_locUserId, _locData);
       audit.append({
         kind: "user",
-        who: "demo",
+        who: _locUserId,
         what: "user.location.updated",
         taskId: null,
         toolInput: { lat, lng, accuracy, source: body.source || "browser_geolocation" },
-        toolOutput: { city, cityZh, province, provinceZh, district, districtZh, location: user.location },
+        toolOutput: { city, cityZh, province, provinceZh, district, districtZh },
       });
-      saveDb();
-      return writeJson(res, 200, { ok: true, city, cityZh, province, provinceZh, district, districtZh, location: user.location });
+      return writeJson(res, 200, { ok: true, city, cityZh, province, provinceZh, district, districtZh, location: _locData.location });
     }
 
     if (req.method === "GET" && pathname === "/api/user/location") {
-      const user = db.users.demo;
+      const { validateUserToken: _vutLoc } = require("./src/services/user_auth");
+      const _locGetPayload = _vutLoc(req);
+      const _locGetId = _locGetPayload ? _locGetPayload.sub : (extractDeviceId(req, {}) || "demo");
+      const _locUser = getUser(_locGetId) || getUser("demo");
       return writeJson(res, 200, {
-        city: user.city || "Shanghai",
-        location: user.location || { lat: null, lng: null, accuracy: null, updatedAt: null, source: "none" },
+        city: _locUser?.city || "Shanghai",
+        location: _locUser?.location || { lat: null, lng: null, accuracy: null, updatedAt: null, source: "none" },
       });
     }
 
     if (req.method === "POST" && pathname === "/api/user/view-mode") {
       const body = await readBody(req);
+      const { validateUserToken: _vutVm } = require("./src/services/user_auth");
+      const _vmPayload = _vutVm(req);
+      const _vmUserId  = _vmPayload ? _vmPayload.sub : (extractDeviceId(req, body) || "demo");
       const mode = body && body.mode === "admin" ? "admin" : "user";
-      db.users.demo.viewMode = mode;
+      updateUser(_vmUserId, { viewMode: mode });
       audit.append({
-        kind: "user",
-        who: "demo",
-        what: "user.view_mode.updated",
-        taskId: null,
-        toolInput: body,
-        toolOutput: { mode },
+        kind: "user", who: _vmUserId, what: "user.view_mode.updated",
+        taskId: null, toolInput: body, toolOutput: { mode },
       });
-      saveDb();
       return writeJson(res, 200, { ok: true, mode });
     }
 
