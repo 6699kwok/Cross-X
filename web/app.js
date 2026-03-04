@@ -4705,7 +4705,7 @@ async function runStepTool(step, context) {
       if (data.ok && Array.isArray(data.candidates) && data.candidates.length) {
         search = { candidates: data.candidates, source: data.source };
       }
-    } catch (_) { /* network error → mock */ }
+    } catch (searchErr) { console.warn("[agent/search] API failed → mock:", searchErr.message); }
     if (!search) search = searchOptionsMock(ctx.slots || {}, ctx.intent || "eat");
     const candidate = findCandidateForPlanOption(ctx.option, search, ctx.seedKey);
     return {
@@ -4741,7 +4741,7 @@ async function runStepTool(step, context) {
             candidate = { ...candidate, available: d.available, queueMin: d.queueEstimateMin, amount: d.price || candidate.amount };
           }
         }
-      } catch (_) { /* use mock fallback */ }
+      } catch (availErr) { console.warn("[agent/check] availability API failed → mock:", availErr.message); }
     }
     const check = checkConstraintsMock(ctx.slots || {}, candidate, stepKey);
     return {
@@ -4774,7 +4774,7 @@ async function runStepTool(step, context) {
             candidate = { ...candidate, amount: d.confirmedAmount || candidate.amount };
           }
         }
-      } catch (_) { /* use mock fallback */ }
+      } catch (lockErr) { console.warn("[agent/lock] reservation API failed → mock:", lockErr.message); }
     }
     const reserve = reserveMock(ctx.slots || {}, candidate, `${ctx.seedKey}|lock`, (ctx.option && ctx.option.key) || "main");
     return {
@@ -4827,7 +4827,7 @@ async function runStepTool(step, context) {
         };
       }
       // charge failed (rail blocked / compliance) — fall through to mock
-    } catch (_) { /* network error — fall through to mock */ }
+    } catch (payErr) { console.warn("[agent/pay] payment API failed → mock:", payErr.message); }
     // Fallback: mock pass so demo path stays reliable
     return {
       ok: true,
@@ -5125,7 +5125,7 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
         result.receiptUrl = d.receiptUrl;
         rerenderAgentFlowCards();
       }
-    } catch (_) {}
+    } catch (receiptErr) { console.warn("[agent/receipt] receipt URL fetch failed:", receiptErr.message); }
   })();
 }
 
@@ -5327,7 +5327,7 @@ function evaluateAgentConversation(options = {}) {
           }
         }
       }
-    } catch (_) { /* LLM unavailable → keep rule-based plan */ }
+    } catch (llmErr) { console.warn("[agent/smart-plan] LLM unavailable → keeping rule-based plan:", llmErr.message); }
     if (backupTimer) clearTimeout(backupTimer);
     if (state.agentConversation.smartLoading) {
       state.agentConversation.smartLoading = false;
@@ -11858,7 +11858,7 @@ function bindActions() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ railId: state.agentConversation.paymentRail || "alipay_cn" }),
         });
-      } catch (_) { /* non-blocking */ }
+      } catch (railErr) { console.warn("[agent/pay-rail] rail select failed (non-blocking):", railErr.message); }
       await runAgentExecution(optionKey, forceFail);
       return;
     }
@@ -14695,7 +14695,7 @@ async function cxProcessPayment(btn) {
     });
     const json = await resp.json();
     if (json.ok) orderRef = json.ref;
-  } catch { /* graceful degradation */ }
+  } catch (orderErr) { console.warn("[booking] order/create failed → using client-side ref:", orderErr.message); }
 
   // Client-side fallback ref if backend unreachable
   if (!orderRef) orderRef = "CXS-" + Date.now().toString(36).slice(-5).toUpperCase();
@@ -14713,7 +14713,7 @@ async function cxProcessPayment(btn) {
       const sr = await fetch(`/api/order/status?ref=${encodeURIComponent(orderRef)}`);
       const sj = await sr.json();
       if (sj.status === "confirmed") break;
-    } catch {}
+    } catch (pollErr) { console.warn("[booking] order/status poll failed:", pollErr.message); }
   }
   clearInterval(ticker);
 

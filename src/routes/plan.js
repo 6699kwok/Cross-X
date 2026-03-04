@@ -329,12 +329,14 @@ function createPlanRouter({
 
     const { apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, keyHealth: OPENAI_KEY_HEALTH, baseUrl: OPENAI_BASE_URL } = getOpenAIConfig();
     const language        = normalizeLang(body.language || db.users.demo.language || "ZH");
-    const cityRaw         = String(body.city || db.users.demo.city || "Shanghai");
-    const city            = cityRaw.split("·")[0].trim() || "Shanghai";
+    const cityRaw         = String(body.city || db.users.demo.city || "");
+    const city            = cityRaw.split("·")[0].trim() || (console.warn("[plan/coze] city missing — defaulting to Shanghai"), "Shanghai");
     const constraints     = body.constraints && typeof body.constraints === "object" ? body.constraints : {};
-    const conversationHistory = Array.isArray(body.conversationHistory)
-      ? body.conversationHistory.filter((m) => m && typeof m.role === "string" && typeof m.content === "string")
-      : [];
+    const _rawHistory = Array.isArray(body.conversationHistory) ? body.conversationHistory : [];
+    const conversationHistory = _rawHistory.filter((m) => m && typeof m.role === "string" && typeof m.content === "string");
+    if (_rawHistory.length > 0 && conversationHistory.length === 0) {
+      console.warn("[plan/coze] conversationHistory had", _rawHistory.length, "items but all failed validation — context lost");
+    }
 
     // [C4] Cross-session preference profile — keyed by deviceId from client localStorage
     const _RAW_DID = String(body.deviceId || "").trim();
@@ -599,6 +601,14 @@ function createPlanRouter({
     if (complex) console.log("[plan/coze] Complex itinerary — using full Planner LLM");
 
     // Normalise budget to a numeric string for enrichment calls (callCozeWorkflow, agent tools)
+    // Clamp to a sane range (100 – 500000 CNY) to prevent extreme values reaching the LLM.
+    if (constraints.budget) {
+      const _b = Number(String(constraints.budget).replace(/[^0-9]/g, ""));
+      if (!Number.isFinite(_b) || _b < 100 || _b > 500000) {
+        console.warn("[plan/coze] budget out of range — ignored:", constraints.budget);
+        delete constraints.budget;
+      }
+    }
     const budgetVal = constraints.budget
       ? String(constraints.budget).replace(/[^0-9]/g, "")
       : "";
