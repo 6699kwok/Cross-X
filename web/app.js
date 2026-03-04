@@ -2348,7 +2348,7 @@ function autoResizeChatInput() {
 function updateChatSendState() {
   if (!el.chatSendBtn || !el.chatInput) return;
   const value = String(el.chatInput.value || "").trim();
-  el.chatSendBtn.disabled = value.length === 0;
+  el.chatSendBtn.disabled = value.length === 0 || !!state._planStreamActive;
 }
 
 function updateContextSummary() {
@@ -3993,11 +3993,11 @@ function rerenderAgentFlowCards() {
   if (mode === "replanning") {
     const _failCode = state.agentConversation.lastFailureCode || "";
     const _replanTipMap = {
-      queue_too_long:       pickText("检测到排队过长，正在切换无需排队的备选方案\u2026", "Queue too long — switching to a no-wait backup\u2026", "", ""),
-      budget_overflow:      pickText("预算超限，正在调整为更优惠的备选方案\u2026", "Over budget — adjusting to a more affordable backup\u2026", "", ""),
-      resource_unavailable: pickText("资源暂时不可用，正在重新规划备选路线\u2026", "Resource unavailable — replanning a backup route\u2026", "", ""),
+      queue_too_long:       pickText("检测到排队过长，正在切换无需排队的备选方案\u2026", "Queue too long — switching to a no-wait backup\u2026", "\u5f85\u6a5f\u6642\u9593\u304c\u9577\u3059\u304e\u307e\u3059\u2014\u5f85\u3061\u306a\u3057\u306e\u4ee3\u66ff\u6848\u306b\u5207\u308a\u66ff\u3048\u4e2d\u2026", "\ub300\uae30\uac00 \ub108\ubb34 \uae41\ub2c8\ub2e4 \u2014 \ub300\uae30 \uc5c6\ub294 \ub300\uc548\uc73c\ub85c \uc804\ud658 \uc911\u2026"),
+      budget_overflow:      pickText("预算超限，正在调整为更优惠的备选方案\u2026", "Over budget — adjusting to a more affordable backup\u2026", "\u4e88\u7b97\u8d85\u904e\u2014\u3088\u308a\u5b89\u3044\u4ee3\u66ff\u6848\u306b\u8abf\u6574\u4e2d\u2026", "\uc608\uc0b0 \ucd08\uacfc \u2014 \ub354 \uc800\ub834\ud55c \ub300\uc548\uc73c\ub85c \uc870\uc815 \uc911\u2026"),
+      resource_unavailable: pickText("资源暂时不可用，正在重新规划备选路线\u2026", "Resource unavailable — replanning a backup route\u2026", "\u30ea\u30bd\u30fc\u30b9\u304c\u4e00\u6642\u7684\u306b\u5229\u7528\u4e0d\u53ef\u2014\u4ee3\u66ff\u30eb\u30fc\u30c8\u3092\u518d\u8a08\u753b\u4e2d\u2026", "\ub9ac\uc18c\uc2a4\ub97c \uc77c\uc2dc\uc801\uc73c\ub85c \uc0ac\uc6a9\ud560 \uc218 \uc5c6\uc74c \u2014 \ub300\uccb4 \uacbd\ub85c \uc7ac\uacc4\ud68d \uc911\u2026"),
     };
-    const _replanTip = _replanTipMap[_failCode] || pickText("正在根据失败原因切换备选方案\u2026", "Switching to backup based on failure\u2026", "", "");
+    const _replanTip = _replanTipMap[_failCode] || pickText("正在根据失败原因切换备选方案\u2026", "Switching to backup based on failure\u2026", "\u5931\u6557\u539f\u56e0\u306b\u57fa\u3065\u304d\u4ee3\u66ff\u6848\u306b\u5207\u308a\u66ff\u3048\u4e2d\u2026", "\uc2e4\ud328 \uc6d0\uc778\uc5d0 \ub530\ub77c \ub300\uc548\uc73c\ub85c \uc804\ud658 \uc911\u2026");
     renderTaskPanel(
       el.planCardsSection,
       `<div class="cx-replan-status">
@@ -4279,13 +4279,13 @@ function renderAgentConfirmCard(optionKey = "main") {
   // Backup reason banner — shown when confirm follows an auto-replan failure
   const _backupFailCode = optionKey === "backup" ? (state.agentConversation.lastFailureCode || "") : "";
   const _backupReasonMap = {
-    queue_too_long:       pickText("排队过长", "queue too long", "", ""),
-    budget_overflow:      pickText("预算超限", "over budget", "", ""),
-    resource_unavailable: pickText("资源不可用", "resource unavailable", "", ""),
+    queue_too_long:       pickText("排队过长", "queue too long", "\u5f85\u6a5f\u6642\u9593\u304c\u9577\u3059\u304e\u307e\u3059", "\ub300\uae30\uac00 \ub108\ubb34 \uae41\ub2c8\ub2e4"),
+    budget_overflow:      pickText("预算超限", "over budget", "\u4e88\u7b97\u8d85\u904e", "\uc608\uc0b0 \ucd08\uacfc"),
+    resource_unavailable: pickText("资源不可用", "resource unavailable", "\u30ea\u30bd\u30fc\u30b9\u4e0d\u53ef", "\ub9ac\uc18c\uc2a4 \uc0ac\uc6a9 \ubd88\uac00"),
   };
-  const _backupReason = _backupFailCode ? (_backupReasonMap[_backupFailCode] || pickText("执行受阻", "execution blocked", "", "")) : "";
+  const _backupReason = _backupFailCode ? (_backupReasonMap[_backupFailCode] || pickText("执行受阻", "execution blocked", "\u5b9f\u884c\u30d6\u30ed\u30c3\u30af", "\uc2e4\ud589 \ucc28\ub2e8\ub428")) : "";
   const _backupBanner = _backupReason
-    ? `<div class="cx-backup-reason-banner">\uD83D\uDD04 ${pickText(`主方案因「${_backupReason}」失败，已为您切换备选方案`, `Primary failed (${_backupReason}) — switched to backup`, "", "")}</div>`
+    ? `<div class="cx-backup-reason-banner">\uD83D\uDD04 ${pickText(`主方案因「${_backupReason}」失败，已为您切换备选方案`, `Primary failed (${_backupReason}) — switched to backup`, `\u30e1\u30a4\u30f3\u30d7\u30e9\u30f3\u304c\u300c${_backupReason}\u300d\u3067\u5931\u6557\u2014\u4ee3\u66ff\u6848\u306b\u5207\u308a\u66ff\u3048\u307e\u3057\u305f`, `\uba54\uc778 \ud50c\ub79c\uc774 \u300c${_backupReason}\u300d\uc73c\ub85c \uc2e4\ud328\u2014\ub300\uc548\uc73c\ub85c \uc804\ud658\ud588\uc2b5\ub2c8\ub2e4`)}</div>`
     : "";
   const total = Number(option.amount || 0);
   const serviceFee = Math.max(6, Math.round(total * 0.08));
@@ -4716,7 +4716,7 @@ async function runStepTool(step, context) {
       const slots = ctx.slots || {};
       const r = await fetch("/api/agent/search", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ..._authHeaders() },
         body: JSON.stringify({
           city: slots.city || "",
           intent: ctx.intent || slots.intent || "eat",
@@ -4750,7 +4750,7 @@ async function runStepTool(step, context) {
         const _slots = ctx.slots || {};
         const r = await fetch("/api/agent/check", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ..._authHeaders() },
           body: JSON.stringify({
             candidateId: candidate.id || candidate.place || "",
             party_size: _slots.party_size || 2,
@@ -4780,7 +4780,7 @@ async function runStepTool(step, context) {
       try {
         const r = await fetch("/api/agent/reserve", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ..._authHeaders() },
           body: JSON.stringify({
             candidateId: candidate.id || candidate.place || "",
             place: candidate.place || "",
@@ -5138,7 +5138,7 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
       const _s = state.agentConversation.slots || {};
       const r = await fetch("/api/agent/proof", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ..._authHeaders() },
         body: JSON.stringify({
           orderId: result.orderId,
           place: result.place,
@@ -7228,7 +7228,7 @@ async function _startTravelExecution(cacheKey, confirmCardEl) {
   try {
     const proofResp = await fetch("/api/agent/proof", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ..._authHeaders() },
       body: JSON.stringify({
         orderId,
         place: plan.hotel?.name || cardData.destination || "",
@@ -7379,7 +7379,7 @@ window._applySensitivityPatch = async function(patch, barId) {
   try {
     const resp = await fetch("/api/plan/refine", {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ..._authHeaders() },
       body: JSON.stringify({ sessionId, patch }),
     });
     const data = await resp.json();
@@ -7412,7 +7412,7 @@ async function _tryDeltaPatch(message) {
   try {
     const resp = await fetch("/api/plan/refine", {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ..._authHeaders() },
       body: JSON.stringify({
         sessionId: state._lastSessionId,
         message,
@@ -7712,7 +7712,7 @@ function renderPaymentPanel(opt) {
         <span class="payment-btn-icon">✓</span>
         ${pickText("确认方案 · 开始预订", "Confirm & Book","プランを確認・予約", "플랜 확인 · 예약")}
       </button>
-      <p class="payment-disclaimer">${pickText("点击各平台按钮查看实时价格 · Cross X 不收取预订手续费", "Tap platform buttons to check live prices · No booking fee", "", "")}</p>
+      <p class="payment-disclaimer">${pickText("点击各平台按钮查看实时价格 · Cross X 不收取预订手续费", "Tap platform buttons to check live prices · No booking fee", "\u5404\u30d7\u30e9\u30c3\u30c8\u30d5\u30a9\u30fc\u30e0\u3067\u6599\u91d1\u3092\u78ba\u8a8d \u00b7 \u4e88\u7d04\u624b\u6570\u6599\u306a\u3057", "\uac01 \ud50c\ub7ab\ud3fc\uc5d0\uc11c \uc2e4\uc2dc\uac04 \uac00\uaca9 \ud655\uc778 \u00b7 \uc608\uc57d \uc218\uc218\ub8cc \uc5c6\uc74c")}</p>
     </div>`;
 }
 
@@ -8258,7 +8258,7 @@ function refreshPlanCardLanguage() {
   const headers = article.querySelectorAll(".plan-section-header");
   if (headers[0]) headers[0].textContent = pickText("选择你的方案","Choose Your Plan","プランを選ぶ","플랜 선택");
   const disc = article.querySelector(".payment-disclaimer");
-  if (disc) disc.textContent = pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "");
+  if (disc) disc.textContent = pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "\u78ba\u8a8d\u3059\u308b\u3068 Cross X \u304c\u5168\u4e88\u7d04\u3092\u30ed\u30c3\u30af\u3057\u307e\u3059 \u00b7 \u624b\u6570\u6599\u306a\u3057", "\ud655\uc778\ud558\uba74 Cross X\uac00 \ubaa8\ub4e0 \uc608\uc57d\uc744 \uc78a\uae08\uc778\uc2b5\ub2c8\ub2e4 \u00b7 \uc218\uc218\ub8cc \uc5c6\uc74c");
 
   // Step 4: unblur (double rAF ensures transition plays every time)
   requestAnimationFrame(() => requestAnimationFrame(() => planList.classList.remove("cx-smooth-refresh")));
@@ -8442,7 +8442,7 @@ function renderCardData(cd, spokenText) {
         ${_buildRatingBar(cardId, cd)}
         <div class="cx-sbar-mount" id="cx-sbar-mount-${cardId}"></div>
         <div style="text-align:center;margin:6px 0 2px"><button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 \u5206\u4eab\u884c\u7a0b</button></div>
-        <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "")}</p>
+        <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "\u78ba\u8a8d\u3059\u308b\u3068 Cross X \u304c\u5168\u4e88\u7d04\u3092\u30ed\u30c3\u30af\u3057\u307e\u3059 \u00b7 \u624b\u6570\u6599\u306a\u3057", "\ud655\uc778\ud558\uba74 Cross X\uac00 \ubaa8\ub4e0 \uc608\uc57d\uc744 \uc78a\uae08\uc778\uc2b5\ub2c8\ub2e4 \u00b7 \uc218\uc218\ub8cc \uc5c6\uc74c")}</p>
       </article>
     `);
     // Post-render: typewriter + coupon fetch + smooth scroll to card
@@ -8676,7 +8676,7 @@ function renderCardData(cd, spokenText) {
         确认行程 · 开始预订 ¥${escapeHtml(totalFmt)}
       </button>
       <div style="text-align:center;margin:8px 0 2px"><button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 \u5206\u4eab\u884c\u7a0b</button></div>
-      <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "")}</p>
+      <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "\u78ba\u8a8d\u3059\u308b\u3068 Cross X \u304c\u5168\u4e88\u7d04\u3092\u30ed\u30c3\u30af\u3057\u307e\u3059 \u00b7 \u624b\u6570\u6599\u306a\u3057", "\ud655\uc778\ud558\uba74 Cross X\uac00 \ubaa8\ub4e0 \uc608\uc57d\uc744 \uc78a\uae08\uc778\uc2b5\ub2c8\ub2e4 \u00b7 \uc218\uc218\ub8cc \uc5c6\uc74c")}</p>
     </article>
   `);
   if (spokenText) speakAssistantMessage(spokenText);
@@ -9082,7 +9082,7 @@ async function initPlanMap(cardId) {
   try {
     const gr = await fetch("/api/geocode-places", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ..._authHeaders() },
       body: JSON.stringify({ places: names, city }),
     });
     const gd = await gr.json();
@@ -9741,10 +9741,10 @@ function handleAgentPaymentConfirm(btn) {
     document.querySelectorAll(".itinerary-option-card").forEach((c) => c.classList.remove("card-selected"));
     card.classList.add("card-selected");
   }
-  btn.textContent = pickText("✓ 方案已确认 · 请逐一完成预订", "✓ Confirmed", "", "");
+  btn.textContent = pickText("✓ 方案已确认 · 请逐一完成预订", "✓ Confirmed", "\u2713 \u30d7\u30e9\u30f3\u78ba\u5b9a \u00b7 \u5404\u30d7\u30e9\u30c3\u30c8\u30d5\u30a9\u30fc\u30e0\u3067\u4e88\u7d04\u3092\u5b8c\u4e86", "\u2713 \ud50c\ub79c \ud655\uc815 \u00b7 \uac01 \ud50c\ub7ab\ud3fc\uc5d0\uc11c \uc608\uc57d \uc644\ub8cc");
   btn.disabled = true;
   btn.style.background = "var(--color-success, #22c55e)";
-  addMessage(pickText(`已选「${optTag}」方案！依次点击各平台按钮完成预订。`, `"${optTag}" confirmed! Tap each platform button.`, "", ""), "agent");
+  addMessage(pickText(`已选「${optTag}」方案！依次点击各平台按钮完成预订。`, `"${optTag}" confirmed! Tap each platform button.`, `\u300c${optTag}\u300d\u30d7\u30e9\u30f3\u3092\u9078\u629e\u3057\u307e\u3057\u305f\uff01\u5404\u30d7\u30e9\u30c3\u30c8\u30d5\u30a9\u30fc\u30e0\u30dc\u30bf\u30f3\u3092\u9806\u306b\u30af\u30ea\u30c3\u30af\u3057\u3066\u304f\u3060\u3055\u3044\u3002`, `\u300c${optTag}\u300d \ud50c\ub79c\uc744 \uc120\ud0dd\ud588\uc2b5\ub2c8\ub2e4! \uac01 \ud50c\ub7ab\ud3fc \ubc84\ud2bc\uc744 \uc21c\uc11c\ub300\ub85c \ud074\ub9ad\ud558\uc138\uc694.`), "agent");
 }
 
 function parseSmartActionPayload(raw) {
@@ -11445,7 +11445,7 @@ async function loadAuditLogs() {
 
 async function loadDashboard() {
   if (!el.kpiSummary || !el.flagsSummary) return;
-  const [kpiData, funnelData, prdData, revenueData, mcpSlaData, flagsData, evaluatedData, mcpPolicyData] = await Promise.all([
+  const [kpiData, funnelData, prdData, revenueData, mcpSlaData, flagsData, evaluatedData, mcpPolicyData, analyticsData] = await Promise.all([
     api("/api/dashboard/kpi"),
     api("/api/dashboard/funnel"),
     api("/api/dashboard/prd-coverage"),
@@ -11454,6 +11454,7 @@ async function loadDashboard() {
     api("/api/system/flags"),
     api("/api/system/flags/evaluate?userId=demo"),
     api("/api/system/mcp-policy"),
+    api("/api/admin/analytics").catch(() => null),
   ]);
 
   const ns = kpiData.kpi.northStar;
@@ -11471,6 +11472,13 @@ async function loadDashboard() {
       <div class="status">Tasks: ${totals.tasks} · Orders: ${totals.orders} · Settlements: ${totals.settlements || 0}</div>
       <div class="status">Reconciliation runs: ${totals.reconciliationRuns || 0}</div>
     </article>
+    ${analyticsData ? `<article class="card">
+      <h3>User Activity</h3>
+      <div>DAU: <strong>${analyticsData.users.dau}</strong> · WAU: <strong>${analyticsData.users.wau}</strong> · MAU: <strong>${analyticsData.users.mau}</strong></div>
+      <div class="status">Total events: ${analyticsData.events.total} · Orders last 24h: ${analyticsData.orders.last24h}</div>
+      <div class="status">Revenue total: ${analyticsData.orders.revenueTotal} CNY · Trips: ${analyticsData.trips.total}</div>
+      <div class="status">Top events: ${Object.entries(analyticsData.events.byKind).sort(([,a],[,b])=>b-a).slice(0,5).map(([k,v])=>`${k}(${v})`).join(' · ')}</div>
+    </article>` : ''}
   `;
 
   if (el.funnelSummary) {
@@ -12100,7 +12108,7 @@ function bindActions() {
       try {
         await fetch("/api/payments/rails/select", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ..._authHeaders() },
           body: JSON.stringify({ railId: state.agentConversation.paymentRail || "alipay_cn" }),
         });
       } catch (railErr) { console.warn("[agent/pay-rail] rail select failed (non-blocking):", railErr.message); }
@@ -13499,10 +13507,12 @@ function bindActions() {
 function bindInput() {
   el.chatForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (state._planStreamActive) return;
     const text = el.chatInput.value.trim();
     if (!text) return;
     el.chatInput.value = "";
     autoResizeChatInput();
+    state._planStreamActive = true;
     updateChatSendState();
     _hideTypingHint();
     try {
@@ -13510,6 +13520,9 @@ function bindInput() {
       await createTaskFromText(text);
     } catch (err) {
       addMessage(pickText(`创建任务失败：${err.message}`, `Failed to create task: ${err.message}`, `タスク作成失敗: ${err.message}`, `작업 생성 실패: ${err.message}`));
+    } finally {
+      state._planStreamActive = false;
+      updateChatSendState();
     }
   });
 
@@ -14406,6 +14419,23 @@ async function init() {
       .catch(() => {});
   }, 1500);
 
+  // Mock-degradation banner: warn admin users when providers are in mock mode
+  setTimeout(() => {
+    if (state.viewMode !== "admin") return;
+    api("/api/system/providers").then((prov) => {
+      const mockProviders = [];
+      if (prov.gaode && !prov.gaode.enabled) mockProviders.push("Gaode");
+      if (prov.partnerHub && !prov.partnerHub.enabled) mockProviders.push("PartnerHub");
+      if (prov.sms && !prov.sms.live) mockProviders.push("SMS");
+      if (mockProviders.length) {
+        notify(
+          `[Admin] Mock mode active: ${mockProviders.join(", ")} — data is simulated`,
+          "warning",
+        );
+      }
+    }).catch(() => {});
+  }, 2000);
+
   // Force-remove stale service workers that can pin old JS/CSS.
   if ("serviceWorker" in navigator) {
     try {
@@ -14968,7 +14998,7 @@ async function cxProcessPayment(btn) {
   try {
     const resp = await fetch("/api/order/create", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ..._authHeaders() },
       body: JSON.stringify({
         plan: { id: chosenPlan.id, tag: chosenPlan.tag },
         destination,
@@ -16112,6 +16142,7 @@ async function _initAuthState() {
     if (data.ok) {
       _saveAuthState(token, data.userId, data.displayName);
       _applyAuthUi(true, data.displayName);
+      _loadServerFavorites().catch(() => {});
     } else {
       _clearAuthState(); _applyAuthUi(false);
     }
@@ -16122,9 +16153,51 @@ function _onLoginSuccess(token, userId, displayName) {
   _saveAuthState(token, userId, displayName);
   _applyAuthUi(true, displayName);
   notify(`欢迎回来，${displayName}！`, "success");
+  // Sync local favorites to server account
+  _syncFavoritesToAccount(token).catch(() => {});
+}
+
+async function _syncFavoritesToAccount(token) {
+  try {
+    const local = JSON.parse(localStorage.getItem(_FAV_KEY) || "[]");
+    if (!local.length) return;
+    await fetch("/api/user/favorites", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ items: local }),
+    });
+  } catch { /* sync failure is non-fatal */ }
+}
+
+async function _loadServerFavorites() {
+  const token = _getAuthToken();
+  if (!token) return;
+  try {
+    const r = await fetch("/api/user/favorites", { headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data.ok || !Array.isArray(data.items) || !data.items.length) return;
+    // Merge server favorites into local state (deduplicate by name)
+    const existing = new Set((state.favorites || []).map(f => f.title || f.destination));
+    const toMerge = data.items
+      .filter(item => !existing.has(item.name))
+      .map(item => ({
+        cardId: `srv_${item.id || Date.now()}`,
+        destination: item.city || item.name || "",
+        title: item.name || item.city || "Plan",
+        dur: 3, pax: 1,
+        savedAt: new Date(item.savedAt || Date.now()).getTime(),
+      }));
+    if (toMerge.length) {
+      state.favorites = [...(state.favorites || []), ...toMerge];
+      _saveFavorites();
+      _renderFavoritesSection();
+    }
+  } catch { /* non-fatal */ }
 }
 
 function _onLogout() {
+  if (!window.confirm(pickText("确认退出登录？", "Confirm logout?", "\u30ed\u30b0\u30a2\u30a6\u30c8\u3057\u307e\u3059\u304b\uff1f", "\ub85c\uadf8\uc544\uc6c3\ud558\uc2dc\uac00\uc694?"))) return;
   _clearAuthState();
   _applyAuthUi(false);
   fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
@@ -16174,12 +16247,32 @@ function _showLoginModal() {
   const err2       = document.getElementById("cxLoginErr2");
 
   let _currentPhone = "";
+  let _otpCooldownTimer = null;
+
+  function _startOtpCooldown(btn) {
+    let secs = 60;
+    btn.disabled = true;
+    btn.textContent = `重新发送 (${secs}s)`;
+    if (_otpCooldownTimer) clearInterval(_otpCooldownTimer);
+    _otpCooldownTimer = setInterval(() => {
+      secs -= 1;
+      if (secs <= 0) {
+        clearInterval(_otpCooldownTimer);
+        _otpCooldownTimer = null;
+        btn.disabled = false;
+        btn.textContent = "重新发送";
+      } else {
+        btn.textContent = `重新发送 (${secs}s)`;
+      }
+    }, 1000);
+  }
 
   async function sendOtp() {
     const phone = phoneInput.value.trim();
     if (!phone) { err1.textContent = "请输入手机号"; err1.classList.remove("hidden"); return; }
     err1.classList.add("hidden");
     const btn = document.getElementById("cxLoginSendOtp");
+    if (btn.disabled) return;
     btn.disabled = true; btn.textContent = "发送中…";
     try {
       const r = await fetch("/api/auth/send-otp", {
@@ -16190,6 +16283,7 @@ function _showLoginModal() {
       const data = await r.json();
       if (!data.ok) { err1.textContent = data.error || "发送失败，请稍后重试"; err1.classList.remove("hidden"); btn.disabled = false; btn.textContent = "发送验证码"; return; }
       _currentPhone = phone;
+      _startOtpCooldown(btn);
       step1.classList.add("hidden");
       step2.classList.remove("hidden");
       // Dev mode: auto-fill code and show hint

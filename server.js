@@ -46,6 +46,19 @@ const { db, DATA_DIR, DB_FILE, ensureDataDir, nowIso, saveDb, lifecyclePush, ins
 const sessionItinerary = new Map(); // 2h TTL session context, keyed by client IP
 const WEATHER_CACHE    = new Map(); // city → {ts, data}, 1h TTL
 const WEATHER_TTL_MS   = 60 * 60 * 1000;
+const SESSION_ITIN_TTL = 2 * 60 * 60 * 1000; // 2h
+
+// GC: purge expired sessionItinerary and WEATHER_CACHE entries every 30 min
+const _sessionGc = setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of sessionItinerary) {
+    if (now - (v.storedAt || 0) > SESSION_ITIN_TTL) sessionItinerary.delete(k);
+  }
+  for (const [k, v] of WEATHER_CACHE) {
+    if (now - (v.ts || 0) > WEATHER_TTL_MS) WEATHER_CACHE.delete(k);
+  }
+}, 30 * 60 * 1000);
+if (_sessionGc.unref) _sessionGc.unref();
 
 // ── WMO weather code (Open-Meteo) → emoji + label ────────────────────────────
 function mapWeatherCode(code) {
@@ -4274,10 +4287,11 @@ function applyTaskRuntimePolicy(task) {
   task.plan.confirm.guarantee.freeCancelWindowMin = Number(task.plan.confirm.guarantee.freeCancelWindowMin || 10);
   task.plan.confirm.guarantee.refundEta = task.plan.confirm.guarantee.refundEta || "T+1 to T+3";
   task.plan.confirm.guarantee.policyNote = task.plan.confirm.cancelPolicy;
+  const _authDomain = (user && user.authDomain) || {};
   task.plan.confirm.guarantee.riskControl = [
-    `Single limit ${user.authDomain.singleLimit} CNY`,
-    `Daily limit ${user.authDomain.dailyLimit} CNY`,
-    user.authDomain.noPinEnabled ? "No-PIN enabled within limits" : "No-PIN disabled",
+    `Single limit ${_authDomain.singleLimit ?? 50000} CNY`,
+    `Daily limit ${_authDomain.dailyLimit ?? 200000} CNY`,
+    _authDomain.noPinEnabled ? "No-PIN enabled within limits" : "No-PIN disabled",
   ];
   if (vipFastLane) {
     task.plan.confirm.alternative = "Use standard lane without concierge add-on";
@@ -6296,7 +6310,7 @@ const paymentRails = createPaymentRailManager({
 const tools = createToolRegistry({ connectors, payments: paymentRails });
 const confirmPolicy = createConfirmPolicy({
   getSingleLimit() {
-    return db.users.demo.authDomain.singleLimit;
+    return db.users?.demo?.authDomain?.singleLimit ?? 50000;
   },
 });
 const orchestrator = createOrchestrator({ tools, audit });
@@ -7150,34 +7164,49 @@ function _escHtml(s) {
 
 const _RAIL_LABELS = { alipay_cn: "支付宝", wechat_cn: "微信支付", card_delegate: "委托代付卡" };
 
-function buildReceiptHtml({ orderId, place, city, area, intent, amount, railId, transactionId, executedAt }) {
+function buildReceiptHtml({ orderId, place, city, area, intent, amount, railId, transactionId, executedAt, buyerName, bookingRef, notes }) {
   const railLabel = _RAIL_LABELS[railId] || String(railId || "支付宝");
   const locationStr = [area, city].filter(Boolean).join(" · ");
-  const intentMap = { eat: "餐饮", stay: "住宿", play: "娱乐", shop: "购物", other: "其他" };
+  const intentMap = { eat: "餐饮", stay: "住宿", play: "娱乐", shop: "购物", travel: "出行", other: "其他" };
   const intentLabel = intentMap[intent] || String(intent || "出行");
-  return `<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>CrossX 收据</title>
-<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:40px auto;padding:20px 24px;color:#1e293b}
+  const issuedAt = new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+  const execAt = new Date(executedAt || Date.now()).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" });
+  // Serial: last 8 chars of orderId + timestamp suffix
+  const serial = `RCP-${String(orderId).slice(-8).toUpperCase()}-${Date.now().toString(36).slice(-4).toUpperCase()}`;
+  return `<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><title>CrossX 收据 ${_escHtml(serial)}</title>
+<style>body{font-family:system-ui,sans-serif;max-width:520px;margin:40px auto;padding:20px 24px;color:#1e293b}
 .logo{font-size:22px;font-weight:700;color:#6366f1;letter-spacing:.01em}
-.sub{font-size:12px;color:#64748b;margin-bottom:24px;margin-top:2px}
+.sub{font-size:12px;color:#64748b;margin-bottom:4px;margin-top:2px}
+.serial{font-size:11px;color:#94a3b8;margin-bottom:20px;font-family:monospace}
 table{width:100%;border-collapse:collapse;margin:16px 0}
 td{padding:9px 4px;border-bottom:1px solid #f1f5f9;font-size:14px}
-td:first-child{color:#64748b;width:42%}td:last-child{font-weight:500}
-.total td{font-size:16px;font-weight:700;border-top:2px solid #e2e8f0;border-bottom:none;padding-top:14px}
-.footer{font-size:11px;color:#94a3b8;text-align:center;margin-top:28px;padding-top:16px;border-top:1px solid #f1f5f9}
+td:first-child{color:#64748b;width:42%}td:last-child{font-weight:500;word-break:break-all}
+.total td{font-size:17px;font-weight:700;border-top:2px solid #e2e8f0;border-bottom:none;padding-top:14px}
+.notes{font-size:12px;color:#475569;background:#f8fafc;padding:10px 12px;border-radius:6px;margin:12px 0;line-height:1.5}
+.footer{font-size:11px;color:#94a3b8;text-align:center;margin-top:28px;padding-top:16px;border-top:1px solid #f1f5f9;line-height:1.6}
 </style></head><body>
-<div class="logo">CrossX</div>
-<div class="sub">AI 旅行执行助手 · 收据凭证</div>
+<div class="logo">CrossX ✦</div>
+<div class="sub">AI 旅行执行助手 · 电子收据</div>
+<div class="serial">凭证编号：${_escHtml(serial)}</div>
 <table>
 <tr><td>订单号</td><td>${_escHtml(orderId)}</td></tr>
-<tr><td>商家</td><td>${_escHtml(place)}</td></tr>
-${locationStr ? `<tr><td>城市</td><td>${_escHtml(locationStr)}</td></tr>` : ""}
-<tr><td>出行意图</td><td>${_escHtml(intentLabel)}</td></tr>
+${bookingRef ? `<tr><td>预订参考号</td><td>${_escHtml(bookingRef)}</td></tr>` : ""}
+<tr><td>商家 / 服务方</td><td>${_escHtml(place || "—")}</td></tr>
+${locationStr ? `<tr><td>城市 / 区域</td><td>${_escHtml(locationStr)}</td></tr>` : ""}
+<tr><td>服务类型</td><td>${_escHtml(intentLabel)}</td></tr>
+${buyerName ? `<tr><td>消费者</td><td>${_escHtml(buyerName)}</td></tr>` : ""}
 <tr><td>支付方式</td><td>${_escHtml(railLabel)}</td></tr>
-${transactionId ? `<tr><td>交易参考</td><td>${_escHtml(transactionId)}</td></tr>` : ""}
-<tr><td>执行时间</td><td>${_escHtml(new Date(executedAt || Date.now()).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" }))}</td></tr>
-<tr class="total"><td>实付金额</td><td>¥ ${_escHtml(String(amount))} CNY</td></tr>
+${transactionId ? `<tr><td>交易流水号</td><td>${_escHtml(transactionId)}</td></tr>` : ""}
+<tr><td>服务执行时间</td><td>${_escHtml(execAt)}</td></tr>
+<tr><td>凭证出具时间</td><td>${_escHtml(issuedAt)}</td></tr>
+<tr class="total"><td>实付金额</td><td>¥ ${_escHtml(String(Number(amount).toFixed(2)))} CNY</td></tr>
 </table>
-<div class="footer">此收据由 CrossX 自动生成 · 仅供参考 · Generated by CrossX AI Agent</div>
+${notes ? `<div class="notes">📝 备注：${_escHtml(notes)}</div>` : ""}
+<div class="footer">
+  此收据由 CrossX AI Agent 自动生成，仅供消费参考。<br>
+  如有争议请在 7 日内联系客服：support@crossx.ai<br>
+  Generated by CrossX · AI Travel Execution Platform
+</div>
 </body></html>`;
 }
 
@@ -7786,6 +7815,64 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === "GET" && pathname === "/api/admin/analytics") {
+      if (!requireAdmin(req, res)) return;
+      const { getMetricEventCount } = require("./src/services/db");
+      const events = db.metricEvents; // from SQLite via Proxy
+      const now = Date.now();
+      const day1 = now - 86400000;
+      const day7 = now - 7 * 86400000;
+      const day30 = now - 30 * 86400000;
+
+      // Events by kind
+      const byKind = {};
+      for (const e of events) {
+        byKind[e.kind] = (byKind[e.kind] || 0) + 1;
+      }
+
+      // Unique users (distinct userId) in windows
+      const _usersSet1d  = new Set(events.filter(e => new Date(e.at).getTime() > day1).map(e => e.userId).filter(Boolean));
+      const _usersSet7d  = new Set(events.filter(e => new Date(e.at).getTime() > day7).map(e => e.userId).filter(Boolean));
+      const _usersSet30d = new Set(events.filter(e => new Date(e.at).getTime() > day30).map(e => e.userId).filter(Boolean));
+
+      // Daily event counts for last 7 days
+      const dailyMap = {};
+      for (const e of events) {
+        const t = new Date(e.at).getTime();
+        if (t < day7) continue;
+        const day = new Date(t).toISOString().slice(0, 10);
+        dailyMap[day] = (dailyMap[day] || 0) + 1;
+      }
+      const daily = Object.entries(dailyMap).sort(([a], [b]) => a.localeCompare(b)).map(([date, count]) => ({ date, count }));
+
+      // Orders and trips from SQLite
+      const allOrders = Object.values(db.orders || {});
+      const recentOrders1d = allOrders.filter(o => new Date(o.createdAt || 0).getTime() > day1);
+
+      return writeJson(res, 200, {
+        ok: true,
+        generatedAt: nowIso(),
+        events: {
+          total: events.length,
+          byKind,
+          daily,
+        },
+        users: {
+          dau: _usersSet1d.size,
+          wau: _usersSet7d.size,
+          mau: _usersSet30d.size,
+        },
+        orders: {
+          total: allOrders.length,
+          last24h: recentOrders1d.length,
+          byStatus: allOrders.reduce((acc, o) => { acc[o.status] = (acc[o.status] || 0) + 1; return acc; }, {}),
+          revenueTotal: allOrders.reduce((s, o) => s + Number(o.price || 0), 0).toFixed(2),
+        },
+        trips: { total: Object.keys(db.tripPlans || {}).length },
+        tasks: { total: Object.keys(db.tasks || {}).length },
+      });
+    }
+
     if (req.method === "POST" && pathname === "/api/metrics/events") {
       const body = await readBody(req);
       const _METRIC_KINDS = new Set(["ui_event","plan_view","plan_interact","booking","payment","search","voice","error","session_start","session_end","tab_switch","preference_save","login","logout","favorite"]);
@@ -7827,6 +7914,21 @@ const server = http.createServer(async (req, res) => {
           total: contracts.totalContracts,
           enforced: contracts.enforcedContracts,
         },
+        sms: (() => {
+          const _smsProv = (process.env.SMS_PROVIDER || "").toLowerCase();
+          const _aliyunReady = Boolean(process.env.ALIYUN_SMS_ACCESS_KEY_ID && process.env.ALIYUN_SMS_ACCESS_KEY_SECRET && process.env.ALIYUN_SMS_SIGN_NAME && process.env.ALIYUN_SMS_TEMPLATE_CODE);
+          const _tencentReady = Boolean(process.env.TENCENT_SMS_APP_ID && process.env.TENCENT_SMS_APP_KEY && process.env.TENCENT_SMS_TEMPLATE_ID);
+          const _live = (_smsProv === "aliyun" && _aliyunReady) || (_smsProv === "tencent" && _tencentReady);
+          return {
+            provider: _smsProv || "mock",
+            live: _live,
+            requiredEnv: _smsProv === "aliyun"
+              ? ["ALIYUN_SMS_ACCESS_KEY_ID", "ALIYUN_SMS_ACCESS_KEY_SECRET", "ALIYUN_SMS_SIGN_NAME", "ALIYUN_SMS_TEMPLATE_CODE"]
+              : _smsProv === "tencent"
+                ? ["TENCENT_SMS_APP_ID", "TENCENT_SMS_APP_KEY", "TENCENT_SMS_TEMPLATE_ID"]
+                : ["SMS_PROVIDER (set to aliyun or tencent)"],
+          };
+        })(),
         liveReadiness: {
           ready: gaodeKeyPresent && partnerHubReady,
           missing: [
@@ -8322,6 +8424,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const text = String(body.text || body.message || "").trim();
       if (!text) return writeJson(res, 400, { error: "text required" });
+      if (text.length > 2000) return writeJson(res, 400, { error: "text too long", max: 2000 });
       const language = normalizeLang(body.language || db.users.demo.language || "EN");
       const voice = String(body.voice || "").trim();
       const tts = await callOpenAITextToSpeech({ text, language, voice });
@@ -8339,6 +8442,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const text = String(body.text || "").trim();
       if (!text) return writeJson(res, 400, { error: "text required" });
+      if (text.length > 2000) return writeJson(res, 400, { error: "text too long", max: 2000 });
       const toLang = normalizeLang(body.toLang || "ZH");
       const langNames = { ZH: "Simplified Chinese", EN: "English", JA: "Japanese", KO: "Korean" };
       const targetName = langNames[toLang] || "Simplified Chinese";
@@ -8650,12 +8754,23 @@ const server = http.createServer(async (req, res) => {
       if (!body || typeof body !== "object") {
         return writeJson(res, 400, { error: "Invalid flags payload" });
       }
-      // Whitelist: only allow known flag keys (string/boolean/number) — prevent prototype pollution
-      const _ALLOWED_FLAG_TYPES = new Set(["string", "boolean", "number"]);
+      // Whitelist: allow primitives and flag-config objects { enabled, rollout, ... }
+      const _PROTO_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+      const _ALLOWED_PRIM = new Set(["string", "boolean", "number"]);
       const safeFlags = {};
       for (const [k, v] of Object.entries(body)) {
-        if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
-        if (_ALLOWED_FLAG_TYPES.has(typeof v)) safeFlags[k] = v;
+        if (_PROTO_KEYS.has(k)) continue;
+        if (_ALLOWED_PRIM.has(typeof v)) {
+          safeFlags[k] = v;
+        } else if (v && typeof v === "object" && !Array.isArray(v)) {
+          // Flag config object: sanitize each field
+          const safe = {};
+          for (const [fk, fv] of Object.entries(v)) {
+            if (_PROTO_KEYS.has(fk)) continue;
+            if (_ALLOWED_PRIM.has(typeof fv)) safe[fk] = fv;
+          }
+          safeFlags[k] = safe;
+        }
       }
       db.featureFlags = {
         ...db.featureFlags,
@@ -9006,7 +9121,9 @@ const server = http.createServer(async (req, res) => {
       const session = getSupportSessionById(sessionId);
       if (!session) return writeJson(res, 404, { error: "Session not found" });
       const body = await readBody(req);
-      setSupportSessionPresence(session, body.actor || "user", body.online !== false);
+      const _presenceActor = String(body.actor || "user");
+      if (!["user", "ops"].includes(_presenceActor)) return writeJson(res, 400, { error: "actor must be 'user' or 'ops'" });
+      setSupportSessionPresence(session, _presenceActor, body.online !== false);
       saveDb();
       return writeJson(res, 200, { ok: true, session: buildSupportSessionSummary(session) });
     }
@@ -9054,7 +9171,8 @@ const server = http.createServer(async (req, res) => {
       if (!session) return writeJson(res, 404, { error: "Session not found" });
       const body = await readBody(req);
       const ticket = findTicketBySessionId(session.id);
-      closeSupportSession(session, body.note || "Session closed");
+      const _closeNote = String(body.note || "Session closed").slice(0, 500);
+      closeSupportSession(session, _closeNote);
       if (ticket && body.resolveTicket !== false) {
         if (ticket.status === "open") {
           const progressed = applyTicketTransitionAndSync(ticket, "in_progress", `Ticket ${ticket.id} -> in_progress`);
@@ -9626,11 +9744,12 @@ const server = http.createServer(async (req, res) => {
           compliance: getRailCompliance(railId),
         });
       }
-      const user = db.users.demo;
-      user.paymentRail = { selected: railId };
+      const _railWho = _whoFromReq(req);
+      const _railUser = (_railWho !== "anon" ? db.users[_railWho] : null) || db.users.demo;
+      _railUser.paymentRail = { selected: railId };
       audit.append({
         kind: "payment",
-        who: _whoFromReq(req),
+        who: _railWho,
         what: "payments.rail.selected",
         taskId: null,
         toolInput: body,
@@ -9961,6 +10080,11 @@ const server = http.createServer(async (req, res) => {
     // ── CrossX Consumer Plan Orders (checkout flow) ────────────────────────
     if (req.method === "POST" && pathname === "/api/order/create") {
       const body = await readBody(req);
+      const { plan, destination, method: _ocMethod, total } = body || {};
+      if (!plan || total === undefined || total === null) return writeJson(res, 400, { error: "plan and total required" });
+      const _ocTotal = Number(total);
+      if (!Number.isFinite(_ocTotal) || _ocTotal <= 0) return writeJson(res, 400, { error: "total must be a positive number" });
+      if (_ocTotal > 1_000_000) return writeJson(res, 400, { error: "total exceeds maximum allowed value" });
       const ts  = Date.now();
       const ref = "CXS-" + ts.toString(36).slice(-5).toUpperCase() + "-" + Math.random().toString(36).slice(2, 6).toUpperCase();
       if (!db.crossx_orders) db.crossx_orders = {};
@@ -9968,11 +10092,11 @@ const server = http.createServer(async (req, res) => {
         ref,
         userId: _whoFromReq(req),
         status: "pending",
-        method: String(body.method || "card"),
-        destination: String(body.destination || ""),
-        total: Number(body.total || 0),
-        planId: String(body.plan?.id || ""),
-        planTag: String(body.plan?.tag || ""),
+        method: String(_ocMethod || "card"),
+        destination: String(destination || ""),
+        total: _ocTotal,
+        planId: String(plan?.id || ""),
+        planTag: String(plan?.tag || ""),
         createdAt: new Date(ts).toISOString(),
         ip: req.socket?.remoteAddress || "default",
       };
@@ -9987,10 +10111,21 @@ const server = http.createServer(async (req, res) => {
       // Purge crossx_orders older than 30 min to prevent memory accumulation
       const _cxoNow = Date.now();
       for (const [k, o] of Object.entries(db.crossx_orders)) {
-        if (_cxoNow - new Date(o.createdAt).getTime() > 30 * 60 * 1000) delete db.crossx_orders[k];
+        const _cxoCreated = new Date(o.createdAt).getTime();
+        if (isNaN(_cxoCreated) || _cxoNow - _cxoCreated > 30 * 60 * 1000) delete db.crossx_orders[k];
       }
       const ord = db.crossx_orders[ref];
       if (!ord) return writeJson(res, 404, { error: "not_found" });
+      // Ownership check: anonymous callers may only see orders they created (IP or userId match)
+      const _statusWho = _whoFromReq(req);
+      const _ordOwner = ord.userId || "anon";
+      const _ipMatch = (req.socket?.remoteAddress || "") === (ord.ip || "");
+      if (_statusWho === "anon" && !_ipMatch && _ordOwner !== "anon") {
+        return writeJson(res, 403, { error: "forbidden" });
+      }
+      if (_statusWho !== "anon" && _ordOwner !== "anon" && _statusWho !== _ordOwner) {
+        return writeJson(res, 403, { error: "forbidden" });
+      }
       // Auto-confirm after 2.5 s (mock payment processing)
       if (ord.status === "pending") {
         const age = Date.now() - new Date(ord.createdAt).getTime();
@@ -10140,6 +10275,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/mini-program/release") {
       const body = await readBody(req);
+      if (body.note && String(body.note).length > 500) return writeJson(res, 400, { error: "note too long", max: 500 });
       const release = createMiniRelease({
         channel: body.channel,
         note: body.note,
@@ -10184,7 +10320,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/nearby/suggestions") {
-      const user = db.users.demo || {};
+      const _nearWho = _whoFromReq(req);
+      const user = (_nearWho !== "anon" ? db.users[_nearWho] : null) || db.users.demo || {};
       const language = normalizeLang(parsed.query.language || user.language || "EN");
       const L = (zh, en, ja, ko) => pickLang(language, zh, en, ja, ko);
       const cityRaw = String(parsed.query.city || user.city || "Shanghai").split("·")[0].trim() || "Shanghai";
@@ -10292,33 +10429,36 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/subscription/plus") {
       const _subActor = _whoFromReq(req);
-      const _subUser  = db.users[_subActor] || db.users.demo;
+      const _subUserId = (_subActor !== "anon" && _subActor !== "admin") ? _subActor : "demo";
+      const _subUser  = getUser(_subUserId) || getUser("demo");
 
       if (req.method === "GET") {
         return writeJson(res, 200, {
           ok: true,
-          plus: _subUser.plusSubscription || { active: false, plan: "none", benefits: [] },
+          plus: (_subUser && _subUser.plusSubscription) || { active: false, plan: "none", benefits: [] },
         });
       }
 
       if (req.method === "POST") {
+        if (_subUserId === "demo" && _subActor === "anon") return writeJson(res, 401, { error: "login_required" });
         const body = await readBody(req);
-        _subUser.plusSubscription = {
+        const newPlus = {
           active: body.active !== false,
           plan: body.plan || "monthly",
           benefits: ["7x24 human fallback", "Real-time translation", "Scarce resource concierge"],
           updatedAt: nowIso(),
         };
+        updateUser(_subUserId, { plusSubscription: newPlus });
         audit.append({
           kind: "subscription",
           who: _subActor,
           what: body.active !== false ? "plus.activated" : "plus.cancelled",
           taskId: null,
           toolInput: { active: body.active, plan: body.plan },
-          toolOutput: _subUser.plusSubscription,
+          toolOutput: newPlus,
         });
         saveDb();
-        return writeJson(res, 200, { ok: true, plus: _subUser.plusSubscription });
+        return writeJson(res, 200, { ok: true, plus: newPlus });
       }
     }
 
@@ -10400,9 +10540,36 @@ const server = http.createServer(async (req, res) => {
       return writeJson(res, 200, { ok: true, mode });
     }
 
+    // ── /api/user/favorites — Account-level plan favorites sync ──
+    if (pathname === "/api/user/favorites") {
+      const _favWho = _whoFromReq(req);
+      if (_favWho === "anon") return writeJson(res, 401, { error: "login_required" });
+      const { addFavorite, listFavorites } = require("./src/services/favorites");
+      if (req.method === "GET") {
+        return writeJson(res, 200, { ok: true, items: listFavorites(_favWho, {}) });
+      }
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        const items = Array.isArray(body.items) ? body.items : [];
+        let added = 0;
+        for (const item of items.slice(0, 100)) {
+          const r = addFavorite(_favWho, {
+            type: item.type || "plan",
+            name: item.title || item.destination || "Plan",
+            city: item.destination || null,
+            note: item.dur ? `${item.dur}d · pax ${item.pax || 1}` : null,
+          });
+          if (r.ok) added++;
+        }
+        return writeJson(res, 200, { ok: true, added, total: listFavorites(_favWho, {}).length });
+      }
+    }
+
     if (req.method === "GET" && pathname === "/api/trust/summary") {
+      const _trustWho = _whoFromReq(req);
+      const _trustUser = (_trustWho !== "anon" ? db.users[_trustWho] : null) || db.users.demo;
       return writeJson(res, 200, {
-        summary: buildUserTrustSummary(db.users.demo),
+        summary: buildUserTrustSummary(_trustUser),
       });
     }
 
@@ -10636,35 +10803,6 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       });
     }
 
-    // ── POST /api/order/create — Frontend alias for booking create ────────
-    if (req.method === "POST" && pathname === "/api/order/create") {
-      const body = await readBody(req);
-      const { plan, destination, method: payMethod, total } = body || {};
-      if (!plan || total === undefined || total === null) return writeJson(res, 400, { error: "plan and total required" });
-      const _totalNum = Number(total);
-      if (!Number.isFinite(_totalNum) || _totalNum <= 0) return writeJson(res, 400, { error: "total must be a positive number" });
-      if (_totalNum > 1_000_000) return writeJson(res, 400, { error: "total exceeds maximum allowed value" });
-      const { validateUserToken: _vutOc } = require("./src/services/user_auth");
-      const _ocUserId = (_vutOc(req) || {}).sub || extractDeviceId(req, body) || "guest";
-      const rand = () => Math.random().toString(36).slice(2, 6).toUpperCase();
-      const orderId = `CX-${Date.now().toString(36).toUpperCase()}-${rand()}`;
-      const now = nowIso();
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-      db.orders[orderId] = {
-        orderId, type: "itinerary", source: "itinerary_card",
-        optionId: String(plan.id || plan.tag || "unknown"),
-        totalCost: _totalNum, currency: "CNY",
-        status: "awaiting_payment", payMethod: payMethod || null,
-        destination: destination || null, userId: _ocUserId,
-        createdAt: now, expiresAt, planSnapshot: plan || null,
-      };
-      audit.append({ kind: "booking", who: _ocUserId, what: "booking.created", taskId: null,
-        toolInput: { optionId: plan.id, totalCost: total },
-        toolOutput: { orderId, status: "awaiting_payment" } });
-      saveDb();
-      return writeJson(res, 200, { ok: true, ref: orderId, orderId, status: "awaiting_payment", expiresAt });
-    }
-
     // ── POST /api/booking/confirm — Confirm payment & issue itinerary ─────
     if (req.method === "POST" && pathname === "/api/booking/confirm") {
       const body = await readBody(req);
@@ -10686,7 +10824,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
 
       return writeJson(res, 200, {
         status: "success", orderId, itineraryId,
-        msg: "支付成功！您的行程已确认，电子凭证已发送至您的邮箱。",
+        msg: "支付成功！您的行程已确认。",
       });
     }
 
@@ -11580,11 +11718,14 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
             place:         String(_autoOrder.place || _autoOrder.provider || ""),
             city:          String(_autoOrder.city || ""),
             area:          String(_autoOrder.area || ""),
-            intent:        String(_autoOrder.type || "eat"),
-            amount:        Number(_autoOrder.price || 0),
+            intent:        String(_autoOrder.type || _autoOrder.intentType || "eat"),
+            amount:        Number(_autoOrder.price || _autoOrder.totalPrice || 0),
             railId:        String((_autoOrder.proof && _autoOrder.proof.railId) || _autoOrder.paymentRail || "alipay_cn"),
-            transactionId: String((_autoOrder.proof && _autoOrder.proof.transactionId) || _autoOrder.id),
+            transactionId: String((_autoOrder.proof && _autoOrder.proof.transactionId) || _autoOrder.outOrderNo || _autoOrder.id),
             executedAt:    String(_autoOrder.updatedAt || _autoOrder.createdAt || new Date().toISOString()),
+            bookingRef:    (_autoOrder.proof && _autoOrder.proof.bookingRef) || (_autoOrder.proof && _autoOrder.proof.confirmationNo) || null,
+            buyerName:     (_autoOrder.proof && _autoOrder.proof.guestName) || null,
+            notes:         _autoOrder.notes || null,
           });
           upsertReceipt(String(orderId), "text/html", _autoHtml);
           row = getReceipt(String(orderId));
@@ -11662,6 +11803,8 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       }
       if (action === "cancel" && req.method === "POST") {
         const body = await readBody(req);
+        if (body.reason && String(body.reason).length > 500) return writeJson(res, 400, { error: "reason too long", max: 500 });
+        if (body.requestedBy && String(body.requestedBy).length > 100) return writeJson(res, 400, { error: "requestedBy too long", max: 100 });
         try {
           const result = fulfillment.cancelOrder(orderId, { reason: body.reason, requestedBy: body.requestedBy });
           return writeJson(res, 200, result);
