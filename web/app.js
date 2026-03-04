@@ -82,7 +82,6 @@ const state = {
   cozeData: null,
   agentConversation: {
     mode: "idle",
-    sessionId: `sess_${Date.now().toString(36)}`,
     sessionSeed: `${Date.now().toString(36)}_${Math.floor(Math.random() * 9e5 + 1e5).toString(36)}`,
     messages: [],
     slots: {
@@ -332,6 +331,9 @@ const el = {
   revenueSummary: document.getElementById("revenueSummary"),
   prdCoverageSummary: document.getElementById("prdCoverageSummary"),
   flagsSummary: document.getElementById("flagsSummary"),
+  trainingSummary: document.getElementById("trainingSummary"),
+  benchmarkResult: document.getElementById("benchmarkResult"),
+  runBenchmarkBtn: document.getElementById("runBenchmarkBtn"),
   flagsForm: document.getElementById("flagsForm"),
   mcpPolicyForm: document.getElementById("mcpPolicyForm"),
   solutionBoard: document.getElementById("solutionBoard"),
@@ -4467,10 +4469,22 @@ function renderAgentDeliverableCard(result) {
       </div>
       <button class="cx-dlv-nav-btn" data-action="agent-nav" data-nav-url="${escapeHtml(navUrl)}">\uD83D\uDDFA\uFE0F ${pickText("\u5BFC\u822A\u8FC7\u53BB \u00B7 Navigate", "Navigate \u00B7 \u5BFC\u822A", "\u30CA\u30D3\u3078 \u00B7 \u5C0E\u822A", "\uAE38\uC548\uB0B4 \u00B7 \u5C0E\u822A")}</button>
       <div class="cx-dlv-acts">
-        ${result.receiptUrl ? `<a class="cx-dlv-act" href="${escapeHtml(result.receiptUrl)}" target="_blank" rel="noopener">\uD83D\uDCC4 ${pickText("\u4E0B\u8F7D\u6536\u636E", "Receipt", "\u30EC\u30B7\u30FC\u30C8", "\uc601\uc218\uc99d")}</a>` : ""}
+        ${result.receiptUrl ? `<a class="cx-dlv-act" href="${escapeHtml(result.receiptUrl)}?download=1" download>\uD83D\uDCC4 ${pickText("\u4E0B\u8F7D\u51ED\u8BC1", "Download Receipt", "\u30EC\u30B7\u30FC\u30C8", "\uc601\uc218\uc99d \ub2e4\uc6b4\ub85c\ub4dc")}</a>` : ""}
         <button class="cx-dlv-act" data-action="agent-share-result">\uD83D\uDCE4 ${pickText("\u5206\u4EAB", "Share", "\u30B7\u30A7\u30A2", "\uACF5\uC720")}</button>
         <button class="cx-dlv-act" data-action="agent-request-execute" data-option="backup">\uD83D\uDD04 ${pickText("\u5907\u9009\u65B9\u6848", "Backup plan", "\u4EE3\u66FF\u6848", "\uB300\uC548")}</button>
       </div>
+      ${(() => {
+        const mcpCalls = state.currentTask?.mcpCalls || [];
+        if (!mcpCalls.length) return "";
+        const chainItems = mcpCalls.slice(0, 5).map(c => {
+          const op = escapeHtml(c.op || c.operation || "call");
+          const src = escapeHtml(c.source || c.provider || "");
+          const ms = c.latencyMs != null ? `${c.latencyMs}ms` : "";
+          const slaMet = c.slaMet === false ? `<span style="color:#ef4444">\u26A0</span>` : "";
+          return `<li class="cx-mcp-step">${slaMet}<span class="cx-mcp-op">${op}</span>${src ? ` · <span class="cx-mcp-src">${src}</span>` : ""}${ms ? ` · <span class="cx-mcp-ms">${ms}</span>` : ""}</li>`;
+        }).join("");
+        return `<details class="cx-mcp-chain"><summary>${pickText("查看操作链", "Operation chain", "操作チェーン", "작업 체인")} (${mcpCalls.length})</summary><ul class="cx-mcp-list">${chainItems}</ul></details>`;
+      })()}
     </div>`;
 
   // QR + vibrate only on first render (guard against rerender in completed mode)
@@ -4738,7 +4752,6 @@ async function runStepTool(step, context) {
   if (stepKey === "lock") {
     let candidate = ctx.candidate || null;
     let reservationId = null;
-    let confirmedAmount = null;
     if (candidate) {
       try {
         const r = await fetch("/api/agent/reserve", {
@@ -4758,7 +4771,6 @@ async function runStepTool(step, context) {
           const d = await r.json();
           if (d.ok) {
             reservationId = d.reservationId;
-            confirmedAmount = d.confirmedAmount;
             candidate = { ...candidate, amount: d.confirmedAmount || candidate.amount };
           }
         }
@@ -4781,16 +4793,37 @@ async function runStepTool(step, context) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ railId, amount, currency: "CNY", userId: deviceId }),
       });
+      // ── Plus subscription gate ─────────────────────────────────────────────
+      if (r.status === 402) {
+        const ge = await r.json().catch(() => ({}));
+        if (ge.error === "plus_required") {
+          document.getElementById("plusSubscribeBtn")
+            ?.scrollIntoView({ behavior: "smooth", block: "center" });
+          return {
+            ok: false, tool: "payment_gate", code: "plus_required",
+            reason: pickText("请先开通 Cross X Plus", "Cross X Plus required",
+                             "Cross X Plusが必要です", "Cross X Plus 필요"),
+          };
+        }
+      }
       const data = await r.json();
       if (data.ok) {
-        const railLabel = railId === "alipay_cn" ? "支付宝" : railId === "wechat_cn" ? "微信支付" : "委托代付卡";
+        const railLabel = railId === "alipay_cn" ? "\u652f\u4ed8\u5b9d" : railId === "wechat_cn" ? "\u5fae\u4fe1\u652f\u4ed8" : "\u59d4\u6258\u4ee3\u4ed8\u5361";
+        _startPaymentCountdown();
+        if (data.qrCode) {
+          addCard(`<article class="card cx-qr-card">
+    <div class="cx-qr-title">${pickText("\u626b\u7801\u652f\u4ed8", "Scan to Pay", "QR\u30b3\u30fc\u30c9\u3067\u652f\u6255\u3044", "QR\ucf54\ub4dc\ub85c \uacb0\uc81c")}</div>
+    <img class="cx-qr-img" src="${escapeHtml(data.qrCode)}" alt="QR Code" style="width:200px;height:200px;display:block;margin:12px auto;border-radius:8px;">
+    <div class="cx-qr-hint">${pickText("\u8bf7\u4f7f\u7528\u652f\u4ed8\u5b9d\u6216\u5fae\u4fe1\u626b\u7801\u5b8c\u6210\u652f\u4ed8", "Scan with Alipay or WeChat to complete payment", "Alipay\u307e\u305f\u306fWeChat\u3067\u30b9\u30ad\u30e3\u30f3", "Alipay \ub610\ub294 WeChat\uc73c\ub85c \uc2a4\uce94\ud558\uc138\uc694")}</div>
+  </article>`);
+        }
         return {
           ok: true,
           tool: "payment_rail",
           code: "ok",
           railId,
           transactionId: data.data && data.data.gatewayRef ? data.data.gatewayRef : `PAY-${Date.now().toString(36)}`,
-          reason: pickText(`${railLabel}支付成功 ¥${amount}`, `${railLabel} paid ¥${amount}`, `${railLabel}決済完了 ¥${amount}`, `${railLabel} 결제완료 ¥${amount}`),
+          reason: pickText(`${railLabel}\u652f\u4ed8\u6210\u529f \xA5${amount}`, `${railLabel} paid \xA5${amount}`, `${railLabel}\u6c7a\u6e08\u5b8c\u4e86 \xA5${amount}`, `${railLabel} \uacb0\uc81c\uc644\ub8cc \xA5${amount}`),
         };
       }
       // charge failed (rail blocked / compliance) — fall through to mock
@@ -4826,6 +4859,41 @@ async function runStepTool(step, context) {
     code: "ok",
     reason: pickText("步骤完成。", "Step completed.", "ステップ完了。", "단계 완료."),
   };
+}
+
+function _startPaymentCountdown(expiresInMs = 15 * 60 * 1000) {
+  const _countEl = document.createElement("div");
+  _countEl.className = "cx-pay-countdown";
+  _countEl.style.cssText = "text-align:center;font-size:13px;color:#6b7280;margin-top:8px;";
+  // Find the payment card or append to chatFeed
+  const _feed = document.getElementById("chatFeed") || document.body;
+  _feed.appendChild(_countEl);
+
+  let remaining = expiresInMs;
+  const _tick = setInterval(() => {
+    remaining -= 1000;
+    if (remaining <= 0) {
+      clearInterval(_tick);
+      _countEl.textContent = pickText("\u8ba2\u5355\u5df2\u8fc7\u671f", "Order expired", "\u6ce8\u6587\u304c\u671f\u9650\u5207\u308c", "\uc8fc\ubb38 \ub9cc\ub8cc");
+      _countEl.style.color = "#ef4444";
+      return;
+    }
+    const mins = Math.floor(remaining / 60000);
+    const secs = Math.floor((remaining % 60000) / 1000);
+    const urgentColor = remaining < 60000 ? "#ef4444" : remaining < 300000 ? "#f59e0b" : "#6b7280";
+    _countEl.style.color = urgentColor;
+    _countEl.textContent = pickText(
+      `\u8ba2\u5355\u6709\u6548\u671f\u5269\u4f59 ${mins}:${String(secs).padStart(2, "0")}`,
+      `Order expires in ${mins}:${String(secs).padStart(2, "0")}`,
+      `\u6ce8\u6587\u6709\u52b9\u671f\u9650 ${mins}:${String(secs).padStart(2, "0")}`,
+      `\uc8fc\ubb38 \ub9cc\ub8cc\uae4c\uc9c0 ${mins}:${String(secs).padStart(2, "0")}`
+    );
+    // Warning at 5 min
+    if (remaining === 5 * 60 * 1000) {
+      addMessage(pickText("\u26a0\ufe0f \u8ba2\u5355\u5c06\u57285\u5206\u949f\u540e\u8fc7\u671f\uff0c\u8bf7\u5c3d\u5feb\u5b8c\u6210\u652f\u4ed8", "\u26a0\ufe0f Order expires in 5 minutes!", "\u26a0\ufe0f \u6ce8\u6587\u304c5\u5206\u5f8c\u306b\u671f\u9650\u5207\u308c\u306b\u306a\u308a\u307e\u3059", "\u26a0\ufe0f \uc8fc\ubb38\uc774 5\ubd84 \ud6c4 \ub9cc\ub8cc\ub429\ub2c8\ub2e4"), "agent");
+    }
+  }, 1000);
+  return _tick; // return timer ref so caller can clearInterval on success
 }
 
 async function autoReplanAfterFailure(run, detail) {
@@ -5226,7 +5294,7 @@ function evaluateAgentConversation(options = {}) {
           const trimmed = line.trim();
           if (!trimmed.startsWith("data:")) continue;
           let evt;
-          try { evt = JSON.parse(trimmed.slice(5).trim()); } catch { continue; }
+          try { evt = JSON.parse(trimmed.slice(5).trim()); } catch (_e) { console.warn("[plan/stream] SSE parse error:", _e.message, trimmed.slice(5, 60)); continue; }
           if (state.agentConversation.mode !== "planning") continue;
           const cp = state.agentConversation.currentPlan;
           if (evt.field === "summary" && cp) {
@@ -6487,13 +6555,28 @@ function applyReplanTemplate(templateId) {
 }
 
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "API error");
-  return data;
+  const { _timeout = 20000, signal: callerSignal, ...fetchOptions } = options;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), _timeout);
+  // Allow callers to pass their own signal; abort if either triggers
+  if (callerSignal) {
+    callerSignal.addEventListener("abort", () => ctrl.abort(), { once: true });
+  }
+  try {
+    const res = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      signal: ctrl.signal,
+      ...fetchOptions,
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "API error");
+    return data;
+  } catch (err) {
+    if (err.name === "AbortError") throw new Error("Request timed out");
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function trackEvent(kind, meta = {}, taskId = null) {
@@ -6962,9 +7045,15 @@ function _travelShouldFail(plan, cardData) {
 }
 
 function _planOptionSelect(cardId, idx) {
+  // Guard against double-tap / rapid click — disable all select buttons on first click
+  const cardEl = document.getElementById(cardId);
+  if (cardEl?.dataset.planSubmitted) return;
+  if (cardEl) {
+    cardEl.dataset.planSubmitted = "1";
+    cardEl.querySelectorAll(".cx-lc-cta--select").forEach((b) => { b.disabled = true; });
+  }
   // Prefer data attributes from the rendered card (supports multiple cards in chat)
   let cd = null;
-  const cardEl = document.getElementById(cardId);
   if (cardEl) {
     try {
       const plans = JSON.parse(cardEl.dataset.plans || "null");
@@ -6973,7 +7062,7 @@ function _planOptionSelect(cardId, idx) {
         destination: cardEl.dataset.destination || "",
         duration_days: Number(cardEl.dataset.duration || 3),
       };
-    } catch {}
+    } catch (_e) { console.warn("[planSelect] card data parse failed, using state fallback:", _e.message); }
   }
   cd = cd || state._lastCardData;
   if (!cd?.plans?.[idx]) { openPlanDetail(cardId, idx); return; }
@@ -7090,20 +7179,53 @@ async function _startTravelExecution(cacheKey, confirmCardEl) {
     return;
   }
 
+  // Generate persistent receipt (non-blocking)
+  let receiptUrl = null;
+  const orderId = executeResult?.order?.id || `cxtd_${execId}`;
+  // Show loading state while generating receipt; capture returned element for removal
+  const _proofLoadingMsg = addMessage(pickText("\u6b63\u5728\u751f\u6210\u6536\u636e...", "Generating receipt...", "\u9818\u53ce\u66f8\u3092\u751f\u6210\u4e2d...", "\uc601\uc218\uc99d \uc0dd\uc131 \uc911..."), "agent");
+  try {
+    const proofResp = await fetch("/api/agent/proof", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        orderId,
+        place: plan.hotel?.name || cardData.destination || "",
+        city: cardData.destination || "",
+        intent: "travel",
+        amount: Number(plan.total_price || 0),
+        railId: state._selectedRailId || "alipay_cn",
+        transactionId: executeResult?.order?.proof?.paymentRef || "",
+      }),
+    });
+    const proofData = await proofResp.json();
+    if (proofData.ok) receiptUrl = proofData.receiptUrl ? proofData.receiptUrl + "?download=1" : null;
+    // Remove loading message on completion
+    _proofLoadingMsg?.remove();
+  } catch (e) {
+    console.warn("[proof] receipt generation failed:", e && e.message);
+    // Remove loading message and show user-visible error
+    _proofLoadingMsg?.remove();
+    addMessage(pickText("\u6536\u636e\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5", "Failed to generate receipt, please try again", "\u9818\u53ce\u66f8\u306e\u751f\u6210\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002\u5f8c\u307b\u3069\u304a\u8a66\u3057\u304f\u3060\u3055\u3044", "\uc601\uc218\uc99d \uc0dd\uc131\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4. \ub098\uc911\uc5d0 \ub2e4\uc2dc \uc2dc\ub3c4\ud558\uc138\uc694"), "agent");
+  }
+
   if (executeResult?.order) {
     renderDeliverable(executeResult.order);
   } else {
-    renderTravelDeliverable(plan, cardData);
+    renderTravelDeliverable(plan, cardData, receiptUrl);
   }
   setTimeout(() => _renderPostBookingFollowUp(plan, cardData), 600);
 }
 
-function renderTravelDeliverable(plan, cardData) {
+function renderTravelDeliverable(plan, cardData, receiptUrl) {
   const ref = "CX-" + Math.random().toString(36).slice(2, 8).toUpperCase();
   const hotel = escapeHtml(plan.hotel?.name || "\u5DF2\u786E\u8BA4\u9152\u5E97");
   const dest = escapeHtml(cardData.destination || "");
   const dur = cardData.duration_days || 3;
   const price = Number(plan.total_price || 0).toLocaleString();
+  // Amap navigation deep-link (opens Amap app or web)
+  const amapQuery = encodeURIComponent(plan.hotel?.name || cardData.destination || "");
+  const amapNavUrl = `https://uri.amap.com/search?keyword=${amapQuery}&sourceApplication=crossx`;
   // Confetti emoji burst for visual celebration
   const confettiEl = `<div class="cx-td-confetti" aria-hidden="true">
     ${"🎉🌟✨🎊🎈".split("").map((e, i) =>
@@ -7115,12 +7237,12 @@ function renderTravelDeliverable(plan, cardData) {
       ${confettiEl}
       <div class="cx-td-header">\u2713 \u9884\u8BA2\u6210\u529F</div>
       <div class="cx-td-ref">\u884C\u7A0B\u7F16\u53F7 <span class="cx-td-refcode">${escapeHtml(ref)}</span></div>
-      <div class="cx-td-row">\u{1F4CD} ${dest} &nbsp;\u00B7&nbsp; ${dur}\u5929</div>
-      <div class="cx-td-row">\u{1F3E8} ${hotel}</div>
-      <div class="cx-td-row">\u{1F4B0} \u603B\u8BA1 \uFFE5${price}</div>
+      <div class="cx-td-row">\uD83D\uDCCD ${dest} &nbsp;\u00B7&nbsp; ${dur}\u5929</div>
+      <div class="cx-td-row">\uD83C\uDFE8 ${hotel}</div>
+      <div class="cx-td-row">\uD83D\uDCB0 \u603B\u8BA1 \uFFE5${price}</div>
       <div class="cx-td-actions">
-        <button class="cx-td-btn">\u67E5\u770B\u5B8C\u6574\u884C\u7A0B</button>
-        <button class="cx-td-btn cx-td-btn--sec">\u5206\u4EAB\u884C\u7A0B</button>
+        <a class="cx-td-btn" href="${escapeHtml(amapNavUrl)}" target="_blank" rel="noopener">\uD83D\uDDFA\uFE0F \u9AD8\u5FB7\u5BFC\u822A</a>
+        ${receiptUrl ? `<a class="cx-td-btn cx-td-btn--sec" href="${escapeHtml(receiptUrl)}" download>\uD83D\uDCC4 \u4E0B\u8F7D\u51ED\u8BC1</a>` : `<button class="cx-td-btn cx-td-btn--sec">\u5206\u4EAB\u884C\u7A0B</button>`}
       </div>
     </article>
   `);
@@ -7180,12 +7302,96 @@ function _buildRefineBar(cd) {
   </div>`;
 }
 
+/**
+ * Render a sensitivity/budget-flexibility bar below the plan card.
+ * Lets users request ±20% budget alternatives via delta-patch.
+ */
+function _renderSensitivityBar(cd, cardId) {
+  const sessionId = state._lastSessionId;
+  const dest = cd.destination || "";
+  const barId = `cx-sbar-${cardId}`;
+
+  const pills = [
+    { label: "\u9884\u7B97\u00B120%", patch: { budget: "\u00B120%" }, desc: "3\u4E2A\u65B9\u6848" },
+    { label: "\u66F4\u9AD8\u5957\u9910", patch: { quality: "premium" }, desc: "\u5347\u7EA7\u4F53\u9A8C" },
+    { label: "\u6700\u4F18\u6027\u4EF7", patch: { quality: "budget" }, desc: "\u7701\u9177\u9996\u9009" },
+  ];
+
+  const pillsHtml = pills.map(p => `
+    <button class="cx-sbar-pill" onclick="_applySensitivityPatch(${JSON.stringify(p.patch)},'${barId}')">
+      ${escapeHtml(p.label)}<span class="cx-sbar-desc">${escapeHtml(p.desc)}</span>
+    </button>`).join("");
+
+  const bar = document.createElement("div");
+  bar.className = "cx-sensitivity-bar";
+  bar.id = barId;
+  bar.innerHTML = `<span class="cx-sbar-label">\u70B9\u51FB\u5757\u901F\u8C03\u6574\uFF1A</span>${pillsHtml}`;
+  return bar;
+}
+
+window._applySensitivityPatch = async function(patch, barId) {
+  const sessionId = state._lastSessionId;
+  if (!sessionId) return;
+  const barEl = document.getElementById(barId);
+  if (barEl) { barEl.style.opacity = "0.5"; barEl.style.pointerEvents = "none"; }
+  try {
+    const resp = await fetch("/api/plan/refine", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sessionId, patch }),
+    });
+    const data = await resp.json();
+    if (resp.ok && data.changedCards) {
+      const patched = Object.assign({}, state._lastCardData, data.changedCards || {});
+      renderCardData(patched, JSON.stringify(patch));
+    }
+  } catch (_e) {
+    console.warn("[sensitivityPatch] request failed:", _e.message);
+    notify(pickText("调整失败，请稍后重试。", "Adjustment failed. Please retry.", "調整に失敗しました。", "조정에 실패했습니다."), "error");
+  }
+  if (barEl) { barEl.style.opacity = ""; barEl.style.pointerEvents = ""; }
+};
+
 function _sendPlanRefine(text, inputEl) {
   const t = String(text || "").trim();
   if (!t) return;
   if (inputEl) inputEl.value = "";
   if (el.chatInput) el.chatInput.value = "";
-  createTaskFromText(t);
+  // Use delta-patch if session + card data are available (fast partial update)
+  if (state._lastSessionId && state._lastCardData) {
+    _tryDeltaPatch(t).catch(() => createTaskFromText(t));
+  } else {
+    createTaskFromText(t);
+  }
+}
+
+async function _tryDeltaPatch(message) {
+  _showTypingBubble && _showTypingBubble();
+  try {
+    const resp = await fetch("/api/plan/refine", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sessionId: state._lastSessionId,
+        message,
+        currentCardData: state._lastCardData,
+      }),
+    });
+    const data = await resp.json();
+    _removeTypingBubble && _removeTypingBubble();
+    if (!resp.ok || !data.patchApplied) throw new Error("patch not applied");
+    const patched = Object.assign({}, state._lastCardData, data.changedCards || {});
+    renderCardData(patched, message);
+    addMessage(pickText(
+      `已按「${message}」调整方案 ✓`,
+      `Plan refined: "${message}" ✓`,
+      `「${message}」でプランを調整しました ✓`,
+      `"${message}"으로 조정 완료 ✓`
+    ), "agent");
+  } catch {
+    _removeTypingBubble && _removeTypingBubble();
+    createTaskFromText(message);
+  }
 }
 
 function renderSmartReplyCard(smart) {
@@ -7701,15 +7907,10 @@ function renderClarifyCard(structured) {
 
   // B2: "duration" from requirement-gate maps to "duration_days" in SLOT_CHIPS
   const SLOT_ALIAS = { duration: "duration_days" };
-  const slotsToShow = missing.length > 0 ? missing : ["budget"];
-  const chipGroups = slotsToShow
+  // Only show chips for actually-missing slots; empty missing_slots → text-input-only card
+  const chipGroups = missing
     .map((slot) => ({ slot, group: SLOT_CHIPS[SLOT_ALIAS[slot] || slot] }))
     .filter(({ group }) => Boolean(group));
-
-  if (!chipGroups.length) {
-    addMessage(questionText, "agent");
-    return;
-  }
 
   // B2: Unified layout — chips are quick-fill shortcuts; text input for free-form response
   const groupsHtml = chipGroups.map(({ slot, group }) => {
@@ -7762,24 +7963,65 @@ function renderClarifyCard(structured) {
   `);
 }
 
-// B2: Fill clarify text input from chip click (quick-select shortcut)
+// B2: Chip click — auto-submit immediately (no manual "发送" step needed)
 function _clarifyChipFill(btn, value) {
-  // Visual: mark this chip selected, deselect siblings in same group
+  const card = btn.closest(".clarify-card");
+  if (card?.dataset.submitted) return; // guard against double-tap
+  if (card) card.dataset.submitted = "1";
+  // Visual: mark chip selected before UI transitions away
   btn.closest(".clarify-chips").querySelectorAll(".clarify-chip")
     .forEach((b) => b.classList.remove("cx-chip--selected"));
   btn.classList.add("cx-chip--selected");
-  // Fill the text input in this card
-  const input = btn.closest(".clarify-card")?.querySelector(".b2-clarify-input");
-  if (input) { input.value = value; input.focus(); }
+  // Disable whole card to prevent further interaction
+  card?.querySelectorAll("button, input").forEach((el) => { el.disabled = true; });
+  createTaskFromText(value);
 }
 
 // B2: Send clarify text input value as user message
 function _clarifySend(cardEl) {
+  if (cardEl?.dataset.submitted) return; // guard against double-submit
   const input = cardEl?.querySelector(".b2-clarify-input");
   const text = input?.value?.trim();
   if (!text) return;
-  input.value = "";
+  if (cardEl) cardEl.dataset.submitted = "1";
+  cardEl?.querySelectorAll("button, input").forEach((el) => { el.disabled = true; });
   createTaskFromText(text);
+}
+
+// ── Plan Rating Widget ─────────────────────────────────────────────────────────
+function _buildRatingBar(cardId, cd) {
+  const dest = escapeHtml(cd.destination || "");
+  const dur  = cd.duration_days || 0;
+  const stars = [1,2,3,4,5].map(i =>
+    `<button class="cx-star" data-star="${i}" aria-label="${i} star"
+       onclick="submitPlanRating('${cardId}',${i},'${dest}',${dur},this)">★</button>`
+  ).join("");
+  return `<div class="cx-rating-bar" id="rbar-${cardId}">
+    <span class="cx-rating-label">${pickText("方案满意吗？","Rate this plan","評価する","평가하기")}</span>
+    <div class="cx-star-row">${stars}</div>
+  </div>`;
+}
+
+async function submitPlanRating(cardId, rating, destination, durationDays, btn) {
+  const wrap = btn && btn.closest(".cx-rating-bar");
+  if (!wrap || wrap.dataset.rated) return;
+  wrap.dataset.rated = "1";
+  const stars = wrap.querySelectorAll(".cx-star");
+  stars.forEach((s, i) => { s.classList.toggle("cx-star--on", i < rating); s.disabled = true; });
+  const deviceId = typeof getDeviceId === "function" ? getDeviceId() : "demo";
+  try {
+    await fetch("/api/plan/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ planId: cardId, deviceId, rating: Number(rating), destination, durationDays: Number(durationDays) || 0 }),
+    });
+  } catch {}
+  if (rating >= 4) {
+    const ty = document.createElement("span");
+    ty.className = "cx-rating-thanks";
+    ty.textContent = pickText("感谢反馈 ✨","Thanks! ✨","ありがとう ✨","감사합니다 ✨");
+    wrap.appendChild(ty);
+  }
 }
 
 // ── Shared list-card builder (called by renderCardData + refreshPlanCardLanguage) ──
@@ -8065,7 +8307,7 @@ function renderCardData(cd, spokenText) {
               <div class="act-drag-handle">\u22EE</div>
               <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
               <div class="act-body">
-                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue}${cozeTicket}</div>
+                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue}${cozeTicket}</div>
                 ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
                 ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
@@ -8150,6 +8392,8 @@ function renderCardData(cd, spokenText) {
         <div class="cx-plan-list">${planCards}</div>
         ${dayItineraryHtml}
         ${_buildRefineBar(cd)}
+        ${_buildRatingBar(cardId, cd)}
+        <div class="cx-sbar-mount" id="cx-sbar-mount-${cardId}"></div>
         <div style="text-align:center;margin:6px 0 2px"><button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 \u5206\u4eab\u884c\u7a0b</button></div>
         <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "", "")}</p>
       </article>
@@ -8165,6 +8409,9 @@ function renderCardData(cd, spokenText) {
         const analysisEl = articleEl.querySelector(".plan-analysis-text");
         if (analysisEl) animateAnalysisText(analysisEl, spokenText, 18);
       }
+      // Mount sensitivity bar (budget/quality flexibility pills)
+      const sbarMount = articleEl.querySelector(`#cx-sbar-mount-${cardId}`);
+      if (sbarMount) sbarMount.appendChild(_renderSensitivityBar(cd, cardId));
       // Fetch live coupon data for each plan's status bar
       const dest = cd.destination || "";
       if (dest) {
@@ -8263,7 +8510,7 @@ function renderCardData(cd, spokenText) {
             <div class="act-drag-handle">\u22EE</div>
             <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
             <div class="act-body">
-              <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue2}${cozeTicket2}</div>
+              <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue2}${cozeTicket2}</div>
               ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
               ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
               ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
@@ -8469,6 +8716,23 @@ function toggleDayEdit(btn) {
 function deleteActivity(btn) {
   const row = btn.closest(".act-row");
   if (!row) return;
+  // Two-tap confirmation: first tap shows "确认?" state, second tap deletes
+  if (!btn.dataset.confirmDelete) {
+    btn.dataset.confirmDelete = "1";
+    const origText = btn.textContent;
+    btn.textContent = pickText("确认?", "Sure?", "確認?", "확인?");
+    btn.style.background = "var(--color-danger, #ef4444)";
+    btn.style.color = "#fff";
+    const reset = setTimeout(() => {
+      btn.textContent = origText;
+      btn.style.background = "";
+      btn.style.color = "";
+      delete btn.dataset.confirmDelete;
+    }, 2000);
+    btn.dataset.confirmResetTimer = reset;
+    return;
+  }
+  clearTimeout(Number(btn.dataset.confirmResetTimer));
   // Also remove an immediately preceding transit strip if any
   const prev = row.previousElementSibling;
   row.style.maxHeight = row.offsetHeight + "px";
@@ -8950,7 +9214,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
               <div class="act-drag-handle">\u22EE</div>
               <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
               <div class="act-body">
-                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${cozeQueue3}${cozeTicket3}</div>
+                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue3}${cozeTicket3}</div>
                 ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
                 ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
@@ -9002,15 +9266,39 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         </div>`;
       }).join("");
 
-    // Fetch days batch and render; appends more tabs/panels if subsequent batch
+    // Fetch days batch via SSE stream and render; appends more tabs/panels if subsequent batch
     const fetchDetailBatch = async (startDay) => {
       try {
-        const result = await api("/api/plan/detail", {
+        // Detail endpoint now streams SSE — read until "batch" event arrives
+        const _detailResp = await fetch("/api/plan/detail", {
           method: "POST",
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ message, language, city, constraints, planSummary, startDay }),
         });
+        if (!_detailResp.ok) throw new Error(`HTTP ${_detailResp.status}`);
+        const _detailReader = _detailResp.body.getReader();
+        const _detailDec = new TextDecoder();
+        let _detailBuf = "";
+        let result = null;
+        try {
+          while (true) {
+            const { done, value } = await _detailReader.read();
+            if (done) break;
+            _detailBuf += _detailDec.decode(value, { stream: true });
+            const _lines = _detailBuf.split("\n");
+            _detailBuf = _lines.pop();
+            for (const _ln of _lines) {
+              if (!_ln.startsWith("data:")) continue;
+              try {
+                const _ev = JSON.parse(_ln.slice(5).trim());
+                if (_ev.type === "batch") result = _ev;
+                if (_ev.type === "error") throw new Error(_ev.error || "detail stream error");
+              } catch (_pe) { if (_pe.message.includes("detail stream")) throw _pe; }
+            }
+          }
+        } finally { _detailReader.releaseLock(); }
 
-        if (!result.ok || !Array.isArray(result.days) || !result.days.length) {
+        if (!result || !Array.isArray(result.days) || !result.days.length) {
           const loadEl = itinerarySec.querySelector(".plan-detail-loading");
           if (loadEl) loadEl.innerHTML =
             `<span style="color:#ef4444">${pickText("行程详情加载失败，请重试","Failed to load itinerary","日程の読み込みに失敗","일정 로드 실패")}</span>`;
@@ -9559,6 +9847,13 @@ async function createTaskFromText(text) {
   }
   _currentPlanAbortController = new AbortController();
   const _planStreamSignal = _currentPlanAbortController.signal;
+  // U2: Safety guard — auto-abort if stream takes >180s (prevents infinite spinner)
+  const _planStreamGuardTimer = setTimeout(() => {
+    if (_currentPlanAbortController && _currentPlanAbortController.signal === _planStreamSignal) {
+      console.warn("[plan] 180s guard triggered — aborting hung stream");
+      _currentPlanAbortController.abort();
+    }
+  }, 180000);
   setLoopProgress("intent");
   if (!Array.isArray(state.agentConversation.messages)) state.agentConversation.messages = [];
   // Build history from PREVIOUS turns only, BEFORE pushing current user message
@@ -9592,9 +9887,11 @@ async function createTaskFromText(text) {
   };
   state.selectedConstraints = mergedConstraints;
   // ── Use SSE streaming plan builder for all chat queries ──────────────────
-  let _thinkingStream = null;
-  let _planSkeleton   = null;
-  let _thinkingPanel  = null;
+  let _thinkingStream   = null;
+  let _planSkeleton     = null;
+  let _thinkingPanel    = null;
+  let _lastEventLabel   = "";  // most recent status label from server
+  let _eventStickyUntil = 0;  // show _lastEventLabel until this timestamp (ms)
   smartReplyPromise = (async () => {
     _thinkingStream = renderThinkingStream();
     _planSkeleton   = renderPlanSkeleton();
@@ -9615,8 +9912,11 @@ async function createTaskFromText(text) {
           const stepCode  = TOOL_STEP_MAP[_toolName] || code;  // map agent tool → step id
           appendThinkingStep(_thinkingStream, stepCode, label);
           const fn = REALTIME_THINKING_MAP[_toolName];
-          applyThinkingIndicatorState(true,
-            fn ? fn(_dest, _foodKw) : label || pickText("AI 处理中...", "AI processing...", "AI 処理中...", "AI 처리 중..."));
+          const _evText = fn ? fn(_dest, _foodKw) : label || pickText("AI 处理中...", "AI processing...", "AI 処理中...", "AI 처리 중...");
+          // Sticky: show real server label for 3s, prevents rotation from overwriting it
+          _lastEventLabel   = _evText;
+          _eventStickyUntil = Date.now() + 3000;
+          applyThinkingIndicatorState(true, _evText);
         },
         onThinking: (chunk) => {
           if (!_thinkingPanel) _thinkingPanel = createThinkingPanel();
@@ -9626,17 +9926,11 @@ async function createTaskFromText(text) {
         onIntentPreview: (ev) => _renderIntentPreview(ev, _thinkingStream),
       });
     } catch (e) {
-      if (e && e.name === "AbortError") return null; // new message sent — silently discard
-      notify(
-        pickText(
-          "AI 回复加载失败，已使用本地方案。",
-          "AI reply failed, using local fallback.",
-          "AI返答失敗、ローカル案を使用します。",
-          "AI 응답 실패, 로컬 대체안 사용 중.",
-        ),
-        "warning",
-      );
-      return null;
+      if (e && e.name === "AbortError") {
+        teardownThinkingUI(_thinkingStream, _planSkeleton); // clean up immediately on abort
+        return null;
+      }
+      return { type: "error", msg: null }; // let existing error handler render the card
     }
   })();
   syncChipSelectionFromConstraints();
@@ -9667,12 +9961,24 @@ async function createTaskFromText(text) {
     pickText("搜索候选方案...", "Searching candidate options...", "候補を検索中...", "후보를 검색 중..."),
     pickText("生成定制化建议...", "Generating tailored suggestions...", "カスタム提案を生成中...", "맞춤 제안 생성 중..."),
   ];
-  let thinkingPhaseIdx = 0;
-  setThinkingIndicator(true, thinkingPhases[0]);
+  const _waitStart = Date.now();
+  setThinkingIndicator(true, thinkingPhases[0]); // intent-aware opening phrase
   const thinkingRotateTimer = setInterval(() => {
-    thinkingPhaseIdx = (thinkingPhaseIdx + 1) % thinkingPhases.length;
-    applyThinkingIndicatorState(true, thinkingPhases[thinkingPhaseIdx]);
-  }, 1500);
+    if (Date.now() < _eventStickyUntil && _lastEventLabel) {
+      // Real server event arrived recently — keep it visible (don't overwrite)
+      applyThinkingIndicatorState(true, _lastEventLabel);
+    } else {
+      const _elapsedS = Math.round((Date.now() - _waitStart) / 1000);
+      if (_elapsedS < 9) {
+        // First 9s: cycle through intent-aware opening phrases (1 per 3s)
+        applyThinkingIndicatorState(true, thinkingPhases[Math.floor(_elapsedS / 3) % thinkingPhases.length]);
+      } else {
+        // After 9s: show elapsed time so user knows exactly how long they've waited
+        applyThinkingIndicatorState(true,
+          pickText(`已用时 ${_elapsedS}s`, `${_elapsedS}s`, `${_elapsedS}s 経過`, `${_elapsedS}s 경과`));
+      }
+    }
+  }, 1000);
   try {
     const data = await api("/api/tasks", {
       method: "POST",
@@ -9726,12 +10032,24 @@ async function createTaskFromText(text) {
         replyContent = smart.spoken_text || "";
       } else if (smart.response_type === "options_card") {
         // Render 3-tier itinerary cards
-        renderItineraryOptionsCard(smart);
-        // Follow-up suggestion chips
-        if (Array.isArray(smart.follow_up_suggestions) && smart.follow_up_suggestions.length) {
-          _renderFollowUpChips(smart.follow_up_suggestions);
+        const _cardRendered = renderItineraryOptionsCard(smart);
+        if (!_cardRendered) {
+          // empty options — no matching plan generated
+          const _noResult = pickText(
+            "抱歉，暂时没有找到合适的方案，请换一个目的地或调整一下要求试试。",
+            "No matching plan found. Try a different destination or adjust your requirements.",
+            "プランが見つかりませんでした。目的地や条件を変えてみてください。",
+            "맞는 플랜을 찾지 못했습니다. 목적지나 요구사항을 조정해 보세요.",
+          );
+          addMessage(_noResult, "agent");
+          replyContent = _noResult;
+        } else {
+          // Follow-up suggestion chips
+          if (Array.isArray(smart.follow_up_suggestions) && smart.follow_up_suggestions.length) {
+            _renderFollowUpChips(smart.follow_up_suggestions);
+          }
+          replyContent = smart.spoken_text || "";
         }
-        replyContent = smart.spoken_text || "";
       } else if (smart.response_type === "clarify") {
         // ── STRICT: clarify ONLY renders chips, never alongside an error
         renderClarifyCard(smart);
@@ -9756,6 +10074,16 @@ async function createTaskFromText(text) {
         // Legacy /api/chat/reply fallback (backward compat)
         renderSmartReplyCard(smart);
         replyContent = smart.reply;
+      } else {
+        // Unhandled response type — show generic error rather than silent blank
+        const _unhandledMsg = pickText(
+          "抱歉，生成方案时遇到问题，请稍后重试。",
+          "Sorry, something went wrong. Please try again.",
+          "プランの生成中に問題が発生しました。後でもう一度お試しください。",
+          "플랜 생성 중 문제가 발생했습니다. 나중에 다시 시도해 주세요.",
+        );
+        addMessage(_unhandledMsg, "agent");
+        replyContent = _unhandledMsg;
       }
       if (replyContent) {
         if (!Array.isArray(state.agentConversation.messages)) state.agentConversation.messages = [];
@@ -9776,9 +10104,12 @@ async function createTaskFromText(text) {
     await Promise.all([loadChatSolutionStrip(data.task.id), loadSolutionBoard(data.task.id)]);
     return data.task;
   } finally {
+    clearTimeout(_planStreamGuardTimer);  // U2: clear the 180s safety guard
     clearInterval(thinkingRotateTimer);
     setThinkingIndicator(false);
     _removeTypingBubble(_typingBubble);  // ensure cleanup on abort/error
+    teardownThinkingUI(_thinkingStream, _planSkeleton); // safe no-op if already cleaned up at line 9883
+    collapseThinkingPanel(_thinkingPanel);
     // P2: release abort controller when stream finishes (normally or by abort)
     if (_currentPlanAbortController && _currentPlanAbortController.signal === _planStreamSignal) {
       _currentPlanAbortController = null;
@@ -9872,31 +10203,51 @@ async function confirmAndExecute(taskId, options = {}) {
     const ok = opts.skipSecondFactor
       ? true
       : modal && typeof modal.confirm === "function"
-        ? await modal.confirm({
-            title: pickText("高额二次验证", "High-Amount Verification","高額認証", "고액 인증"),
-            body: `
-              <div style="text-align:center;padding:8px 0;">
+        ? await new Promise(resolve => {
+            // TOTP 2FA modal — user enters 6-digit code from authenticator app
+            const overlay = document.createElement("div");
+            overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:9999";
+            overlay.innerHTML = `
+              <div style="background:#fff;border-radius:12px;padding:28px 32px;width:320px;box-shadow:0 8px 32px rgba(0,0,0,.18);text-align:center">
                 <div style="font-size:32px;margin-bottom:8px;">🔐</div>
-                <div>${pickText("支付金额", "Payment amount","支払金額", "결제 금액")}: <strong>${amount} CNY</strong></div>
-                <div class="status">${pickText("超出免密额度", "Exceeds No-PIN threshold","無PIN閾値を超過", "No-PIN 한도 초과")}: ${firstCheck.threshold} CNY</div>
-                <div class="status" style="margin-top:8px;">${pickText("请用 Face ID / 指纹 / PIN 确认此笔支付。", "Please confirm with Face ID / Fingerprint / PIN.", "Face ID / 指紋 / PIN で認証してください。", "Face ID / 지문 / PIN으로 확인해 주세요.")}</div>
-              </div>
-            `,
-            confirmText: pickText("确认支付", "Confirm Payment","支払い確認", "결제 확인"),
-            cancelText: pickText("取消", "Cancel","キャンセル", "취소"),
+                <div style="font-weight:600;margin-bottom:4px">${pickText("高额二次验证", "High-Amount Verification", "高額認証", "고액 인증")}</div>
+                <div style="font-size:13px;color:#64748b;margin-bottom:12px">${pickText("支付金额", "Amount", "支払金額", "금액")}: <strong>${amount} CNY</strong></div>
+                <input id="cx-totp-input" type="tel" inputmode="numeric" maxlength="6" placeholder="6位验证码"
+                  style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:22px;text-align:center;letter-spacing:6px;margin-bottom:8px"/>
+                <div id="cx-totp-err" style="color:#ef4444;font-size:12px;min-height:16px;margin-bottom:8px"></div>
+                <div style="display:flex;gap:8px">
+                  <button id="cx-totp-cancel" style="flex:1;padding:10px;border:1px solid #ddd;border-radius:8px;background:#f8fafc;cursor:pointer">${pickText("取消", "Cancel", "キャンセル", "취소")}</button>
+                  <button id="cx-totp-confirm" style="flex:1;padding:10px;background:#1a1a1a;color:#fff;border:none;border-radius:8px;cursor:pointer">${pickText("确认支付", "Confirm", "支払い確認", "결제 확인")}</button>
+                </div>
+              </div>`;
+            document.body.appendChild(overlay);
+            const inp = overlay.querySelector("#cx-totp-input");
+            const errEl = overlay.querySelector("#cx-totp-err");
+            overlay.querySelector("#cx-totp-cancel").onclick = () => { overlay.remove(); resolve(null); };
+            overlay.querySelector("#cx-totp-confirm").onclick = () => {
+              const v = inp.value.trim();
+              if (!/^\d{6}$/.test(v)) { errEl.textContent = pickText("请输入6位数字", "Enter 6-digit code", "6桁を入力", "6자리 입력"); return; }
+              overlay.remove(); resolve(v);
+            };
+            inp.addEventListener("keydown", e => { if (e.key === "Enter") overlay.querySelector("#cx-totp-confirm").click(); });
+            setTimeout(() => inp.focus(), 50);
           })
-        : window.confirm(`${pickText("高额验证", "High-amount verify","高額認証", "고액 인증")}: ${amount} CNY. ${pickText("确认？", "Confirm?","確認？", "확인?")}`);
-    if (!ok) {
+        : (() => {
+            const code = window.prompt(`${pickText("高额验证", "High-amount verify", "高額認証", "고액 인증")}: ${amount} CNY\n${pickText("请输入6位验证码", "Enter 6-digit code", "6桁コードを入力", "6자리 코드 입력")}:`);
+            return code && /^\d{6}$/.test(code.trim()) ? code.trim() : null;
+          })();
+    const totpCode = ok;  // ok is now the TOTP string (or null if cancelled)
+    if (!totpCode) {
       addMessage(pickText("高额二次确认已取消支付。", "Payment canceled at high-amount verification.","高額確認で支払いをキャンセルしました。", "고액 확인 단계에서 결제가 취소되었습니다."));
       await trackEvent("high_amount_rejected", { amount }, taskId);
       return { ok: false, reason: "second_factor_rejected" };
     }
     const secondCheck = await api("/api/payments/verify-intent", {
       method: "POST",
-      body: JSON.stringify({ amount, secondFactor: opts.skipSecondFactor ? "voice-ok" : "faceid-ok" }),
+      body: JSON.stringify({ amount, secondFactor: opts.skipSecondFactor ? "dev-bypass" : totpCode }),
     });
     if (!secondCheck.verified) {
-      addMessage(pickText("二次验证失败。", "Second-factor verification failed.","二段階認証に失敗しました。", "2차 인증에 실패했습니다."));
+      addMessage(pickText("验证码错误，支付已取消。", "Invalid code — payment canceled.","コードエラー — 支払いをキャンセルしました。", "코드 오류 — 결제가 취소되었습니다."));
       await trackEvent("high_amount_verify_failed", { amount }, taskId);
       return { ok: false, reason: "second_factor_failed" };
     }
@@ -10250,16 +10601,21 @@ function renderDrawerTab() {
 }
 
 async function openTaskDetail(taskId) {
-  const [detailData, recommendationData] = await Promise.all([
-    api(`/api/tasks/${taskId}/detail`),
-    api(buildRecommendationPath(taskId)),
-  ]);
-  state.currentTaskDetail = detailData.detail;
-  state.currentTaskRecommendation = recommendationData.recommendation || null;
-  state.currentSubtab = "overview";
-  el.drawerTitle.textContent = `${tTerm("task")} · ${taskId}`;
-  renderDrawerTab();
-  openDrawer();
+  try {
+    const [detailData, recommendationData] = await Promise.all([
+      api(`/api/tasks/${taskId}/detail`),
+      api(buildRecommendationPath(taskId)),
+    ]);
+    state.currentTaskDetail = detailData.detail;
+    state.currentTaskRecommendation = recommendationData.recommendation || null;
+    state.currentSubtab = "overview";
+    el.drawerTitle.textContent = `${tTerm("task")} · ${taskId}`;
+    renderDrawerTab();
+    openDrawer();
+  } catch (_e) {
+    console.error("[drawer] openTaskDetail failed:", _e.message);
+    notify(pickText("加载任务详情失败，请重试。", "Failed to load task details. Please retry.", "タスクの読み込みに失敗しました。", "작업 로드에 실패했습니다."), "error");
+  }
 }
 
 function readCostMid(costRange) {
@@ -10983,6 +11339,65 @@ async function loadDashboard() {
     </article>
   `);
   el.flagsSummary.innerHTML = flagCards.join("");
+
+  // ── Training Stats ──────────────────────────────────────────────────────
+  if (el.trainingSummary) {
+    try {
+      const tsData = await api("/api/training/stats");
+      const ts = tsData.stats || {};
+      const sd = ts.scoreDistrib || {};
+      const bySrc = (ts.bySource || []).map(r => `${r.source}: ${r.n} (avg ${r.avg_quality})`).join(" · ");
+      const topC  = (ts.topCities || []).slice(0, 5).map(r => `${r.destination}(${r.n})`).join(" · ");
+      el.trainingSummary.innerHTML = `
+        <article class="card">
+          <div>Total examples: <strong>${ts.total || 0}</strong> · Exportable (≥${ts.exportThreshold}): <strong>${ts.exportable || 0}</strong></div>
+          <div class="status">Score breakdown: 🌟 Excellent(≥0.8): ${sd.excellent || 0} · ✅ Good: ${sd.good || 0} · ⚠️ Fair: ${sd.fair || 0} · ❌ Poor: ${sd.poor || 0}</div>
+          <div class="status">By source: ${bySrc || "—"}</div>
+          <div class="status">Top cities: ${topC || "—"}</div>
+        </article>`;
+    } catch { el.trainingSummary.innerHTML = `<article class="card"><div class="status">Training stats unavailable</div></article>`; }
+
+    // Benchmark run button
+    if (el.runBenchmarkBtn && !el.runBenchmarkBtn._hooked) {
+      el.runBenchmarkBtn._hooked = true;
+      el.runBenchmarkBtn.addEventListener("click", async () => {
+        if (el.benchmarkResult) el.benchmarkResult.innerHTML = `<article class="card"><div class="status">Running 20-query benchmark… (~20s)</div></article>`;
+        el.runBenchmarkBtn.disabled = true;
+        try {
+          const bData = await api("/api/training/benchmark");
+          const emoji = bData.passed ? "✅" : "⚠️";
+          const rows = (bData.results || []).filter(r => r.score < 0.7).map(r =>
+            `<li>${escapeHtml(r.id)}: <em>${escapeHtml(r.query)}</em> → axis=${escapeHtml(r.actual?.axis || "?")} dest=${escapeHtml(r.actual?.destination || "?")} score=${r.score}</li>`
+          ).join("");
+          if (el.benchmarkResult) el.benchmarkResult.innerHTML = `
+            <article class="card">
+              <div>${emoji} Benchmark: <strong>${bData.passRate}%</strong> pass rate (${bData.passCount}/${bData.totalCases}) · avg score ${bData.avgScore}</div>
+              ${rows ? `<div class="status">Failed cases:</div><ul class="steps">${rows}</ul>` : ""}
+            </article>`;
+        } catch (e) {
+          if (el.benchmarkResult) el.benchmarkResult.innerHTML = `<article class="card"><div class="status">Benchmark error: ${escapeHtml(String(e.message || e))}</div></article>`;
+        } finally { el.runBenchmarkBtn.disabled = false; }
+      });
+    }
+
+    // ── Prompt A/B Stats ────────────────────────────────────────────────────
+    const promptStatsEl = document.getElementById("promptAbStats");
+    if (promptStatsEl) {
+      try {
+        const psData = await api("/api/training/prompt-stats");
+        const experiments = psData.experiments || [];
+        if (experiments.length === 0) {
+          promptStatsEl.innerHTML = `<article class="card"><div class="status">No prompt experiments recorded yet.</div></article>`;
+        } else {
+          const rows = experiments.map(exp => {
+            const winTag = exp.win_rate_pct >= 60 ? `<span class="cx-badge cx-badge--green">WINNING</span>` : "";
+            return `<li><strong>${escapeHtml(exp.prompt_id)}</strong> › ${escapeHtml(exp.variant_id)}: ${exp.wins}W/${exp.losses}L — win rate <strong>${exp.win_rate_pct}%</strong> ${winTag}</li>`;
+          }).join("");
+          promptStatsEl.innerHTML = `<article class="card"><ul class="steps">${rows}</ul></article>`;
+        }
+      } catch { promptStatsEl.innerHTML = `<article class="card"><div class="status">Prompt stats unavailable</div></article>`; }
+    }
+  }
 
   if (el.flagsForm) {
     el.flagsForm.plusConciergeRollout.value = Number((flagsData.flags.plusConcierge && flagsData.flags.plusConcierge.rollout) || 0);
@@ -13674,8 +14089,17 @@ function exposeAgentDebugInterface() {
 }
 
 async function init() {
+  // GDPR: show consent banner before any tracking (Art. 7)
+  _checkGdprConsent();
   // Restore conversation history and slots from previous session (up to 4h)
   restoreConversationState();
+  // Restore plan session ID so delta-patch and session badge work after page reload
+  const _restoredSessionId = loadPlanSessionId();
+  if (_restoredSessionId) {
+    state._lastSessionId = _restoredSessionId;
+    // Show badge after DOM is ready (renderSessionBadge needs chatForm to exist)
+    setTimeout(() => renderSessionBadge(true), 0);
+  }
 
   if (IS_USER_PORTAL) {
     document.body.classList.add("consumer-app");
@@ -13815,6 +14239,14 @@ async function init() {
       attributeFilter: ["class", "aria-hidden"],
     });
   }
+
+  // Offline detection — notify user when network is lost/restored
+  window.addEventListener("offline", () => {
+    notify(pickText("网络已断开，请检查连接。", "You're offline. Check your connection.", "オフラインです。接続を確認してください。", "오프라인 상태입니다. 연결을 확인하세요."), "warning");
+  });
+  window.addEventListener("online", () => {
+    notify(pickText("网络已恢复。", "Connection restored.", "接続が回復しました。", "연결이 복원되었습니다."), "success");
+  });
 
   window.addEventListener("beforeunload", () => {
     if (state.chatNoticeTicker) {
@@ -14553,6 +14985,7 @@ function getDeviceId() {
 
 function savePlanSessionId(id) {
   if (!id) return;
+  state._lastSessionId = id; // enable delta-patch in _tryDeltaPatch
   try { localStorage.setItem(CX_PLAN_SESSION_KEY, JSON.stringify({ id, savedAt: Date.now() })); } catch {}
 }
 
@@ -15054,22 +15487,40 @@ async function _loadProfileGreeting() {
   addMessage(greeting, "agent");
 }
 
-// E1: Post-booking proactive follow-up suggestions
-function _renderPostBookingFollowUp(plan, cardData) {
-  const dest = cardData.destination || "";
-  const destText = escapeHtml(dest);
-  const suggestions = [
-    { icon: "\u{1F3AB}", text: "\u9884\u8ba2\u666f\u70b9\u95e8\u7968", query: `\u5e2e\u6211\u9884\u8ba2${dest}\u7684\u666f\u70b9\u95e8\u7968` },
-    { icon: "\u{1F374}", text: "\u63a8\u8350\u5468\u8fb9\u7f8e\u98df",  query: `${dest}\u5468\u8fb9\u7f8e\u98df\u63a8\u8350` },
-    { icon: "\u2708\uFE0F",  text: "\u67e5\u8be2\u8fd4\u7a0b\u4ea4\u901a", query: `${dest}\u8fd4\u7a0b\u8def\u7ebf\u601d\u8def` },
-    { icon: "\u{1F5FA}\uFE0F", text: "\u89c4\u5212\u65b0\u884c\u7a0b",   query: "\u51fa\u53d1\u65b0\u6b21\u65c5\u884c" },
-  ];
+// E1: Post-booking proactive follow-up suggestions (real API + fallback)
+async function _renderPostBookingFollowUp(plan, cardData) {
+  const dest     = cardData.destination || "";
+  const deviceId = typeof getDeviceId === "function" ? getDeviceId() : "demo";
+
+  // Fetch personalized suggestions from /api/proactive
+  let suggestions = [];
+  try {
+    const data = await fetch(`/api/proactive?deviceId=${encodeURIComponent(deviceId)}`).then(r => r.json());
+    if (data.ok && Array.isArray(data.suggestions) && data.suggestions.length >= 2) {
+      suggestions = data.suggestions.slice(0, 4).map(s => ({
+        icon:  s.icon  || "\u{1F4A1}",
+        text:  s.text  || s.label || String(s),
+        query: s.query || s.text  || s.label || String(s),
+      }));
+    }
+  } catch {}
+
+  // Fallback to context-aware destination chips
+  if (!suggestions.length) {
+    suggestions = [
+      { icon: "\u{1F3AB}", text: pickText("\u9884\u8ba2\u666f\u70b9\u95e8\u7968","Book Tickets","チケット予約","\ud2f0\ucf13 \uc608\uc57d"), query: `\u5e2e\u6211\u9884\u8ba2${dest}\u7684\u666f\u70b9\u95e8\u7968` },
+      { icon: "\u{1F374}", text: pickText("\u63a8\u8350\u5468\u8fb9\u7f8e\u98df","Nearby Food",  "\u5468\u8fba\u30b0\u30eb\u30e1","\uc8fc\ubcc0 \ub9db\uc9d1"),  query: `${dest}\u5468\u8fb9\u7f8e\u98df\u63a8\u8350` },
+      { icon: "\u2708\uFE0F",  text: pickText("\u67e5\u8be2\u8fd4\u7a0b\u4ea4\u901a","Return Route","\u5e30\u308a\u4ea4\u901a",    "\uadc0\uad6d \uad50\ud1b5"),  query: `${dest}\u8fd4\u7a0b\u8def\u7ebf\u601d\u8def` },
+      { icon: "\u{1F5FA}\uFE0F", text: pickText("\u89c4\u5212\u65b0\u884c\u7a0b","New Trip",    "\u65b0\u65c5\u7a0b",            "\uc0c8 \uc5ec\ud589"),         query: "\u51fa\u53d1\u65b0\u6b21\u65c5\u884c" },
+    ];
+  }
+
   const chipsHtml = suggestions.map(s =>
     `<button class="cx-pb-chip" onclick="createTaskFromText(${JSON.stringify(s.query)})">${s.icon} ${escapeHtml(s.text)}</button>`
   ).join("");
   addCard(`
     <article class="card cx-pb-card">
-      <div class="cx-pb-title">AI \u4e0b\u4e00\u6b65\u5efa\u8bae</div>
+      <div class="cx-pb-title">AI ${pickText("\u4e0b\u4e00\u6b65\u5efa\u8bae","Next Steps","\u6b21\u306e\u30b9\u30c6\u30c3\u30d7","\ub2e4\uc74c \ub2e8\uacc4")}</div>
       <div class="cx-pb-chips">${chipsHtml}</div>
     </article>
   `);
@@ -15264,6 +15715,65 @@ async function _loadTripHistoryChip() {
       </div>
     `);
   } catch (_) { /* non-critical */ }
+}
+
+// ── GDPR Consent Banner ───────────────────────────────────────────────────────
+
+const CX_GDPR_KEY = "cx_gdpr_v1";
+
+/**
+ * Check if GDPR consent has been recorded. If not, inject a bottom banner.
+ * Called early in init() before any analytics/personalization is enabled.
+ */
+function _checkGdprConsent() {
+  try {
+    if (localStorage.getItem(CX_GDPR_KEY)) return; // already consented
+  } catch (_) {
+    return; // localStorage blocked (private mode edge case)
+  }
+
+  const banner = document.createElement("div");
+  banner.id = "cx-gdpr-banner";
+  banner.innerHTML = `
+    <div class="cx-gdpr-box">
+      <div class="cx-gdpr-text">
+        <strong>隐私提示 / Privacy Notice</strong>
+        CrossX 使用设备偏好数据为您提供个性化旅行规划服务。
+        <a href="/privacy" target="_blank" rel="noopener">查看隐私政策 / Privacy Policy</a>
+      </div>
+      <div class="cx-gdpr-actions">
+        <button id="cx-gdpr-min" class="cx-gdpr-btn cx-gdpr-btn-min">仅必要 / Essential only</button>
+        <button id="cx-gdpr-all" class="cx-gdpr-btn cx-gdpr-btn-all">接受全部 / Accept all</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(banner);
+
+  const accept = (purposes) => {
+    try {
+      localStorage.setItem(CX_GDPR_KEY, JSON.stringify({ v: "1.0", t: Date.now(), purposes }));
+    } catch (_) {}
+    _postConsent(purposes, true).catch(() => {});
+    banner.remove();
+  };
+
+  const btnAll = document.getElementById("cx-gdpr-all");
+  const btnMin = document.getElementById("cx-gdpr-min");
+  if (btnAll) btnAll.addEventListener("click", () => accept(["essential", "personalization", "analytics"]));
+  if (btnMin) btnMin.addEventListener("click", () => accept(["essential"]));
+}
+
+/**
+ * POST consent decision to /api/privacy/consent for GDPR Art. 7 audit trail.
+ */
+async function _postConsent(purposes, granted) {
+  const did = getDeviceId();
+  if (!did) return;
+  await fetch("/api/privacy/consent", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Device-Id": did },
+    body: JSON.stringify({ deviceId: did, granted, purposes, consentVersion: "1.0" }),
+  });
 }
 
 init();

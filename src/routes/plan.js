@@ -3,17 +3,26 @@
  * src/routes/plan.js
  * Plan route handlers — extracted from server.js
  *
- * P0: Coze parallel race ABOLISHED — OpenAI-only pipeline.
- * P1: Session state (UUID-isolated), UPDATE intent routing, safety hard-stop.
+ * Execution order (every request):
+ *   Rate limit → PII scrub → Input Guard → RAG/casual → Full generation:
+ *     LangGraph (primary) → Coze Bot (opt-in, COZE_BOT_ENABLED=true) → Agent loop → Pipeline fallback
+ *
+ * Note: The former "Coze parallel race" (simultaneous Coze+OpenAI) was removed.
+ * callCozeWorkflow remains active as an enrichment data source for the agent loop.
+ * callCozeBotStreaming remains as an opt-in deep-reasoning path (豆包, ~160s).
  *
  * External dependencies injected via createPlanRouter() factory.
  */
 
 const { openAIRequest } = require("../ai/openai");
-const { DETAIL_SYSTEM_PROMPT_TEMPLATE } = require("../planner/prompts");
+const { captureExample } = require("../training/collector");
+const { recordOutcome }  = require("../ai/promptOptimizer");
+const { recordSignal: recordProfileSignal } = require("../session/profile");
+const { DETAIL_SYSTEM_PROMPT_TEMPLATE, BOUNDARY_MARKER } = require("../planner/prompts");
 const { safeParseJson } = require("../planner/mock");
-const { isComplexItinerary, buildPrePlan, generateCrossXResponse, buildResourceContext } = require("../planner/pipeline");
+const { isComplexItinerary, buildPrePlan, buildPrePlanFromIntent, generateCrossXResponse, buildResourceContext } = require("../planner/pipeline");
 const { extractPreferences, mergePreferences, buildContextSummary, pruneHistory } = require("../conversation/context");
+const { addTurn, getTurns, buildContextPrefix } = require("../session/conversation");
 const { runAgentLoop } = require("../agent/loop");
 const { detectIntentLLM } = require("../ai/intent");
 const { needsDiscovery, runDiscovery } = require("../planner/discovery");
@@ -21,7 +30,7 @@ const { callLangGraph } = require("../services/langgraph");
 
 // ── P1 session + security modules ─────────────────────────────────────────────
 const {
-  createSession, getSession, patchSession, touchSession,
+  createSession, getSession, getSessionForDevice, patchSession, touchSession,
   scrubPii, DEFAULT_TTL_MS,
 } = require("../session/store");
 
@@ -32,9 +41,35 @@ const { loadProfile, saveProfile, generateProfileSummary } = require("../session
 const PREF_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const { looksLikeUpdate, applyPlanPatch } = require("../session/updater");
 
-// ── Safety hard-stop: must match the fixed template in BUSINESS_BOUNDARY_BLOCK ─
-// (src/planner/prompts.js → BUSINESS_BOUNDARY_BLOCK)
-const BOUNDARY_MARKER = "专注于旅行规划的 AI 助手";
+// ── Device ID validation (module-level for performance — not recreated per request) ──
+const DEVICE_ID_RE = /^cx_[a-f0-9]{32}$/;
+
+// ── S2: Request rate limiter — prevents session/memory exhaustion attacks ─────
+// Tracks hits per key (deviceId or IP) in a rolling 60s window.
+// Max 20 plan requests per key per minute; keys auto-expire after 2 minutes idle.
+const _rlMap = new Map(); // key → { count, windowStart }
+const RL_WINDOW_MS  = 60_000;
+const RL_MAX_HITS   = 20;
+const RL_EXPIRY_MS  = 120_000;
+setInterval(() => {
+  const cutoff = Date.now() - RL_EXPIRY_MS;
+  for (const [k, v] of _rlMap) { if (v.windowStart < cutoff) _rlMap.delete(k); }
+}, 60_000).unref();
+
+function isRateLimited(key) {
+  const now = Date.now();
+  let rec = _rlMap.get(key);
+  if (!rec || now - rec.windowStart > RL_WINDOW_MS) {
+    rec = { count: 1, windowStart: now };
+    _rlMap.set(key, rec);
+    return false;
+  }
+  rec.count++;
+  return rec.count > RL_MAX_HITS;
+}
+
+// BOUNDARY_MARKER imported from src/planner/prompts.js — single source of truth.
+// isBoundaryRejection() uses it to detect LLM refusals without hardcoding the string here.
 
 /**
  * Returns true if the LLM response is a business boundary refusal.
@@ -185,20 +220,23 @@ const FOLLOW_UP_SUGGESTIONS = {
  * @returns {Promise<string>}
  */
 async function buildConversationalClarify(apiKey, model, baseUrl, effectiveMessage, missingSlots, language) {
-  const slotLabels = {
-    destination: language === "ZH" ? "目的地城市" : "destination city",
-    duration:    language === "ZH" ? "行程天数"   : "trip duration",
-    budget:      language === "ZH" ? "预算"       : "budget",
-  };
-  const slotsText = missingSlots.map((s) => slotLabels[s] || s).join("，");
+  if (!apiKey) return null;
 
-  if (!apiKey || language !== "ZH") return null; // only ZH conversational; EN uses hardcoded
+  // Per-language slot labels for user-visible text in the fallback prompt
+  const SLOT_LABELS = {
+    ZH: { destination: "\u76ee\u7684\u5730\u57ce\u5e02", duration: "\u884c\u7a0b\u5929\u6570",   budget: "\u9884\u7b97" },
+    EN: { destination: "destination city",               duration: "trip duration",               budget: "budget" },
+    JA: { destination: "\u76ee\u7684\u5730",             duration: "\u65c5\u884c\u65e5\u6570",   budget: "\u4e88\u7b97" },
+    KO: { destination: "\ubaa9\uc801\uc9c0",             duration: "\uc5ec\ud589 \uc77c\uc218",  budget: "\uc608\uc0b0" },
+  };
+  const labels = SLOT_LABELS[language] || SLOT_LABELS.EN;
+  const slotsText = missingSlots.map((s) => labels[s] || s).join(language === "ZH" ? "\u3001" : ", ");
 
   try {
     const r = await openAIRequest({
       apiKey, model, baseUrl,
-      systemPrompt: "\u4f60\u662f\u70ed\u60c5\u7684\u65c5\u884c\u52a9\u624b\u3002\u7528\u4e00\u53e5\u53e3\u8bed\u95ee\u51fa\u7f3a\u5c11\u7684\u4fe1\u606f\uff0c\u7981\u6b62\u7528\u201c\u60a8\u597d\u201d\uff0c\u7981\u6b62\u8bf4\u201c\u6211\u9700\u8981\u201d\uff0c\u76f4\u63a5\u95ee\u3002\u5185\u5bb9\u5c3120\u5b57\u5185\u3002\u53ea\u8f93\u51fa\u95ee\u53e5\uff0c\u4e0d\u8981\u4efb\u4f55\u89e3\u91ca\u3002",
-      userContent: `\u7528\u6237\u8bf4\uff1a${effectiveMessage}\n\u8fd8\u9700\u8981\u95ee\uff1a${slotsText}`,
+      systemPrompt: `You are CrossX travel AI. A user sent an incomplete travel request. Ask ONE short clarifying question in the SAME language as the user (detect from their message). Missing: ${missingSlots.join(", ")}. Keep it under 20 words. No preamble.`,
+      userContent: `User said: ${effectiveMessage}\nMissing info: ${slotsText}`,
       temperature: 0.7, maxTokens: 60, jsonMode: false, timeoutMs: 3000,
     });
     if (r.ok && r.text) return r.text.trim().replace(/^["']|["']$/g, "");
@@ -234,7 +272,6 @@ async function buildConversationalClarify(apiKey, model, baseUrl, effectiveMessa
 function createPlanRouter({
   readBody, writeJson, normalizeLang, pickLang, db,
   getOpenAIConfig,
-  getCozeConfig,
   callCozeWorkflow,
   callCozeBotStreaming,
   detectQuickActionIntent, buildQuickActionResponse,
@@ -255,6 +292,13 @@ function createPlanRouter({
     const rawMessage = String(body.message || "").trim();
     if (!rawMessage) return writeJson(res, 400, { error: "message required" });
     const message = scrubPii(rawMessage);
+
+    // ── [S2] Rate limiting — runs before session/LLM to prevent resource exhaustion ──
+    const _rlKey = String(body.deviceId || req.socket?.remoteAddress || "anon").slice(0, 64);
+    if (isRateLimited(_rlKey)) {
+      console.warn("[plan/coze] Rate limited:", _rlKey.slice(0, 20));
+      return writeJson(res, 429, { error: "Too many requests. Please wait a moment." });
+    }
 
     // ── [Input Guard] Prompt injection / off-topic hard-stop ─────────────────
     // O(1) — runs BEFORE session lookup, RAG, or any LLM call. Zero tokens.
@@ -283,14 +327,17 @@ function createPlanRouter({
     const constraints     = body.constraints && typeof body.constraints === "object" ? body.constraints : {};
     const conversationHistory = Array.isArray(body.conversationHistory) ? body.conversationHistory : [];
 
-    // [P1] Session: resolve incoming sessionId and load existing data (if any)
-    const incomingSessionId = String(body.sessionId || "").trim();
-    const existingSession   = incomingSessionId ? getSession(incomingSessionId) : null;
-
     // [C4] Cross-session preference profile — keyed by deviceId from client localStorage
-    const deviceId    = String(body.deviceId || "").trim().slice(0, 64) || null;
+    const _RAW_DID = String(body.deviceId || "").trim();
+    const deviceId = DEVICE_ID_RE.test(_RAW_DID) ? _RAW_DID : null;
+    if (body.deviceId && !deviceId) console.warn("[plan] invalid deviceId format ignored:", _RAW_DID.slice(0, 20));
     const userProfile = deviceId ? loadProfile(deviceId) : null;
-    if (userProfile) console.log(`[profile] loaded deviceId=${deviceId.slice(0, 8)}… prefs=[${Object.keys(userProfile.preferences || {}).join(",")}] trips=${userProfile.tripCount}`);
+
+    // [P1] Session: resolve incoming sessionId and load existing data (if any)
+    // getSessionForDevice enforces device ownership — returns null on mismatch
+    const incomingSessionId = String(body.sessionId || "").trim();
+    const existingSession   = incomingSessionId ? getSessionForDevice(incomingSessionId, deviceId) : null;
+    if (userProfile) console.log(`[profile] loaded deviceId=${deviceId?.slice(0, 8)}… prefs=[${Object.keys(userProfile.preferences || {}).join(",")}] trips=${userProfile.tripCount}`);
 
     // [Context] Restore stored preferences + history; merge with browser state
     // Layer order (lowest → highest priority): profile → session → incoming turn
@@ -330,7 +377,7 @@ function createPlanRouter({
         "正在理解您的问题...", "Understanding your question...",
         "ご質問を理解中...", "질문을 이해하는 중...") });
       await delay(150);
-      const chatText = await callCasualChat({ message, language, city });
+      const chatText = await callCasualChat({ message, language, city, history: mergedHistory });
       emit({ type: "final", response_type: "chat", spoken_text: chatText, source: "chat" });
       res.end();
       return;
@@ -346,7 +393,7 @@ function createPlanRouter({
 
       let ragAnswer = null;
       let ragSource = "fallback";
-      const clientIpRag = req.socket?.remoteAddress || req.connection?.remoteAddress || "default";
+      const clientIpRag = deviceId || req.socket?.remoteAddress || req.connection?.remoteAddress || "default";
 
       // 1. Python RAG service (Sichuan ChromaDB)
       const pythonRag = await callPythonRagService(message, `crossx-${Date.now()}`);
@@ -376,25 +423,34 @@ function createPlanRouter({
           }
 
           if (!ragAnswer) {
-            ragAnswer = `根据景点数据库找到以下相关景点：\n\n${localAttractions.slice(0, 3).map((a) =>
-              `📍 **${a.name}**（${a.city}，⭐${a.rating}）\n🕐 ${a.hours || "请查询官方"}\n🎟 ${a.ticket || "请查询门票"}\n📝 ${a.intro.slice(0, 100)}`
-            ).join("\n\n")}`;
+            ragAnswer = `根据景点数据库找到以下相关景点：\n\n${localAttractions.slice(0, 3).map((a) => {
+              const hours  = String(a.hours  || "请查询官方").trim() || "请查询官方";
+              const ticket = String(a.ticket || "请查询门票").trim() || "请查询门票";
+              const intro  = (a.intro ? String(a.intro) : "暂无介绍").slice(0, 100);
+              const rating = Number.isFinite(a.rating) ? `，⭐${a.rating}` : "";
+              return `📍 **${a.name}**（${a.city}${rating}）\n🕐 ${hours}\n🎟 ${ticket}\n📝 ${intro}`;
+            }).join("\n\n")}`;
             ragSource = "local-kb";
           }
         }
       }
 
-      // 3. CrossX general RAG engine
+      // 3. CrossX general RAG engine — capped at 12s to prevent SSE hang
       if (!ragAnswer && OPENAI_API_KEY) {
         try {
           const prevItin = sessionItinerary.get(clientIpRag);
           const itinCtx  = prevItin && (Date.now() - prevItin.storedAt < 7200000)
             ? `\n\n[已生成的行程方案参考]:\n${JSON.stringify(prevItin.card_data, null, 2).slice(0, 1800)}`
             : "";
-          const ragResult = await ragEngine.retrieveAndGenerate({
-            query: message + itinCtx, audience: "b2c", language,
-            openaiApiKey: OPENAI_API_KEY, topK: 4,
-          });
+          const _ragTimeout = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("RAG timeout")), 12000));
+          const ragResult = await Promise.race([
+            ragEngine.retrieveAndGenerate({
+              query: message + itinCtx, audience: "b2c", language,
+              openaiApiKey: OPENAI_API_KEY, topK: 4,
+            }),
+            _ragTimeout,
+          ]);
           if (ragResult.ragUsed && ragResult.answer) {
             ragAnswer = ragResult.answer;
             ragSource = "crossx-rag";
@@ -409,7 +465,7 @@ function createPlanRouter({
           const itinCtx  = prevItin && (Date.now() - prevItin.storedAt < 7200000)
             ? `\n\n[用户已生成行程供参考，目的地: ${prevItin.dest || ""}]:\n${JSON.stringify(prevItin.card_data, null, 2).slice(0, 1200)}`
             : "";
-          const chatRes = await callCasualChat({ message: message + itinCtx, language, city });
+          const chatRes = await callCasualChat({ message: message + itinCtx, language, city, history: mergedHistory });
           ragAnswer = chatRes?.ok ? chatRes.text : (typeof chatRes === "string" ? chatRes : null);
           if (ragAnswer) ragSource = "openai-chat";
         } catch (e) { console.warn("[plan/coze/rag/fallback]", e.message); }
@@ -457,6 +513,11 @@ function createPlanRouter({
             preferences: storedPrefs,
             history: updateHistory,
           });
+          // Record turns for multi-turn context (addTurn reads from session — must call after patchSession)
+          try { addTurn(incomingSessionId, { role: "user", content: message }); } catch (_e) { console.warn("[plan] addTurn failed:", _e.message); }
+          if (patchResult.spokenText) {
+            try { addTurn(incomingSessionId, { role: "assistant", content: patchResult.spokenText }); } catch (_e) { console.warn("[plan] addTurn failed:", _e.message); }
+          }
           emit({
             type: "final",
             response_type: "options_card",
@@ -500,8 +561,9 @@ function createPlanRouter({
     // Stage progress timer — visual feedback while OpenAI runs (~20-40s)
     (async () => {
       const cd = (ms) => new Promise((r) => {
-        const t = setTimeout(r, ms);
-        const check = setInterval(() => {
+        let check; // declared before setTimeout so the closure always captures it
+        const t = setTimeout(() => { clearInterval(check); r(); }, ms);
+        check = setInterval(() => {
           if (planDone) { clearTimeout(t); clearInterval(check); r(); }
         }, 300);
       });
@@ -522,7 +584,7 @@ function createPlanRouter({
     const complex = isComplexItinerary(message);
     if (complex) console.log("[plan/coze] Complex itinerary — using full Planner LLM");
 
-    // Extract budget for Coze parameters
+    // Normalise budget to a numeric string for enrichment calls (callCozeWorkflow, agent tools)
     const budgetVal = constraints.budget
       ? String(constraints.budget).replace(/[^0-9]/g, "") || constraints.budget
       : "";
@@ -574,10 +636,20 @@ function createPlanRouter({
       }
 
       // Merge LLM-extracted params into constraints (without overwriting explicit user values)
-      if (intentResult.destination  && !constraints.destination) constraints.destination = intentResult.destination;
-      if (intentResult.duration_days && !constraints.duration)   constraints.duration    = intentResult.duration_days;
-      if (intentResult.pax > 2       && !constraints.pax)        constraints.pax         = intentResult.pax;
-      if (intentResult.special_needs?.length)                     constraints._specialNeeds = intentResult.special_needs;
+      // Validate each field before merging to prevent garbage values entering the pipeline
+      if (intentResult.destination && !constraints.destination) {
+        const _dest = String(intentResult.destination).replace(/[<>"'`\n\r]/g, "").trim();
+        if (_dest.length > 0 && _dest.length <= 50) constraints.destination = _dest;
+      }
+      if (intentResult.duration_days && !constraints.duration) {
+        const _days = Number(intentResult.duration_days);
+        if (Number.isInteger(_days) && _days >= 1 && _days <= 365) constraints.duration = _days;
+      }
+      if (intentResult.pax > 2 && !constraints.pax) {
+        const _pax = Number(intentResult.pax);
+        if (Number.isInteger(_pax) && _pax >= 1 && _pax <= 50) constraints.pax = _pax;
+      }
+      if (intentResult.special_needs?.length) constraints._specialNeeds = intentResult.special_needs;
 
       // C3: Use LLM-extracted preferences when available; fallback to regex.
       const incomingPrefs = (intentResult._source === "llm" && Object.keys(intentResult.preferences || {}).length)
@@ -589,12 +661,39 @@ function createPlanRouter({
 
       // C4: Prepend semantic traveler portrait (LLM-generated, from cross-session profile)
       const profileSummary = userProfile?.profileSummary || null;
+      // E2: Multi-turn context prefix from conversation history
+      const priorTurns = getTurns(incomingSessionId, 8);
+      const turnPrefix = buildContextPrefix(priorTurns);
+      // Record this user turn for future multi-turn context
+      if (incomingSessionId) {
+        try { addTurn(incomingSessionId, { role: "user", content: effectiveMessage, intent: intentResult }); } catch (_e) { console.warn("[plan] addTurn failed:", _e.message); }
+      }
       const fullContext = [
         profileSummary ? `【旅行者画像】${profileSummary}` : "",
         contextSummary,
+        turnPrefix,
       ].filter(Boolean).join("\n");
 
-      const prePlan = complex ? null : buildPrePlan({ message: effectiveMessage, city, constraints, intentAxis });
+      // E5: Micro-preference signals from intent detection (non-blocking)
+      if (deviceId && intentResult) {
+        try {
+          if (intentAxis === "food") recordProfileSignal(deviceId, "food_focus", 1);
+          if (intentAxis === "stay") recordProfileSignal(deviceId, "stay_focus", 1);
+          if (intentAxis === "activity") recordProfileSignal(deviceId, "activity_focus", 1);
+          const prefs = intentResult.preferences || {};
+          if (prefs.luxury_hotel || prefs.luxury || /豪华|五星|高端|luxury|premium/i.test(effectiveMessage))
+            recordProfileSignal(deviceId, "luxury_preference", 1);
+          if (prefs.budget || /便宜|省钱|经济|预算|budget|cheap/i.test(effectiveMessage))
+            recordProfileSignal(deviceId, "budget_preference", 1);
+          if ((intentResult.duration_days || 0) >= 7) recordProfileSignal(deviceId, "long_trip_preference", 1);
+          if ((intentResult.pax || 1) >= 4) recordProfileSignal(deviceId, "group_travel_preference", 1);
+        } catch (_e) { console.warn("[plan] profile signal failed:", _e.message); }
+      }
+
+      // AI-native: use LLM intentResult (already computed above) to build pre-plan params.
+      // buildPrePlanFromIntent() uses detectIntentLLM() output directly, eliminating the
+      // regex fast-path. Falls back gracefully when LLM fields are absent.
+      const prePlan = complex ? null : buildPrePlanFromIntent({ intentResult, city, constraints, intentAxis });
 
       // P8.8: Requirement gate — travel plans need explicit duration + destination.
       // Uses LLM-extracted params first; emits clarify with 0 LLM tokens when slots missing.
@@ -609,6 +708,7 @@ function createPlanRouter({
           gateSessionId = createSession(
             { pendingClarify: { originalMessage: effectiveMessage, missingSlots }, language, city, preferences: mergedPrefs },
             DEFAULT_TTL_MS,
+            deviceId,
           );
         }
         const slotLabels = {
@@ -675,7 +775,7 @@ function createPlanRouter({
         if (discoverySessionId && getSession(discoverySessionId)) {
           patchSession(discoverySessionId, discoveryPayload);
         } else {
-          discoverySessionId = createSession(discoveryPayload, DEFAULT_TTL_MS);
+          discoverySessionId = createSession(discoveryPayload, DEFAULT_TTL_MS, deviceId);
         }
 
         emit({
@@ -734,7 +834,8 @@ function createPlanRouter({
           if (outSessionId && getSession(outSessionId)) {
             patchSession(outSessionId, _sessionPayload);
           } else {
-            outSessionId = createSession(_sessionPayload, DEFAULT_TTL_MS);
+            outSessionId = createSession(_sessionPayload, DEFAULT_TTL_MS, deviceId);
+            try { addTurn(outSessionId, { role: "user", content: effectiveMessage, intent: intentResult }); } catch (_e) { console.warn("[plan] addTurn failed:", _e.message); }
           }
           if (outSessionId && Object.keys(mergedPrefs).length > 0) {
             touchSession(outSessionId, PREF_TTL_MS);
@@ -818,7 +919,8 @@ function createPlanRouter({
           if (outSessionId && getSession(outSessionId)) {
             patchSession(outSessionId, _sessionPayload);
           } else {
-            outSessionId = createSession(_sessionPayload, DEFAULT_TTL_MS);
+            outSessionId = createSession(_sessionPayload, DEFAULT_TTL_MS, deviceId);
+            try { addTurn(outSessionId, { role: "user", content: effectiveMessage, intent: intentResult }); } catch (_e) { console.warn("[plan] addTurn failed:", _e.message); }
           }
           if (outSessionId && Object.keys(mergedPrefs).length > 0) {
             touchSession(outSessionId, PREF_TTL_MS);
@@ -853,6 +955,23 @@ function createPlanRouter({
             coze_data:     null,
             follow_up_suggestions: _followUp,
           });
+          // Record assistant turn for multi-turn context
+          if (outSessionId) {
+            try { addTurn(outSessionId, { role: "assistant", content: botResult.spoken_text || _botCard.title || "" }); } catch (_e) { console.warn("[plan] addTurn failed:", _e.message); }
+          }
+          // Capture training example (async, non-blocking)
+          setImmediate(() => {
+            try {
+              captureExample({
+                deviceId: deviceId || "unknown",
+                sessionId: outSessionId || null,
+                userMessage: message,
+                assistantResponse: JSON.stringify(_botCard),
+                intent: intentResult,
+                source: "coze",
+              });
+            } catch (_e) { console.warn("[plan] captureExample failed:", _e.message); }
+          });
           res.end();
           return;
         }
@@ -867,7 +986,7 @@ function createPlanRouter({
       };
       let result = await runAgentLoop({
         message: effectiveMessage, language, city,
-        constraints: { ...constraints, _clientIp: clientIp },
+        constraints: { ...constraints, _clientIp: clientIp, _deviceId: deviceId },
         contextSummary: fullContext,
         history: mergedHistory,
         apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
@@ -876,12 +995,12 @@ function createPlanRouter({
         emit,
       });
 
-      // Agent path: attach enrichmentData collected from tool results for detail view
+      // Attach tool-collected enrichment data so the detail endpoint can use it
       if (result.ok && result.enrichmentData) {
         result._cozeEnrichment = result.enrichmentData;
       }
 
-      // Fallback: agent loop parse failure → original 3-node pipeline with Coze pre-enrichment.
+      // Fallback: agent loop parse failure → 3-node OpenAI pipeline with workflow enrichment.
       if (!result.ok) {
         console.warn("[plan/coze] Agent loop failed — falling back to pipeline");
         // Use destination city (from intent extraction) for enrichment, not departure city
@@ -891,7 +1010,7 @@ function createPlanRouter({
         const resourceContext = buildResourceContext(cozeEnrichment, city, effectiveMessage, constraints, intentAxis);
         result = await generateCrossXResponse({
           message: effectiveMessage, language, city,
-          constraints: { ...constraints, _clientIp: clientIp },
+          constraints: { ...constraints, _clientIp: clientIp, _deviceId: deviceId },
           conversationHistory,
           apiKey: OPENAI_API_KEY, model: OPENAI_MODEL, baseUrl: OPENAI_BASE_URL,
           prePlan,
@@ -906,7 +1025,7 @@ function createPlanRouter({
         });
         result._cozeEnrichment = cozeEnrichment;
 
-        // Photo injection for fallback path — coze enrichment item_list → activities/meals
+        // Photo injection for fallback path — workflow enrichment item_list → activities/meals
         if (result.ok && result.structured?.card_data?.days) {
           const photoMap = new Map();
           for (const item of (cozeEnrichment?.item_list || [])) {
@@ -974,10 +1093,13 @@ function createPlanRouter({
             preferences: mergedPrefs,
             history: updatedHistory,
           };
-          if (outSessionId && getSession(outSessionId)) {
+          const _sessionExists = outSessionId && getSession(outSessionId);
+          if (_sessionExists) {
             patchSession(outSessionId, sessionPayload);
           } else {
-            outSessionId = createSession(sessionPayload, DEFAULT_TTL_MS);
+            outSessionId = createSession(sessionPayload, DEFAULT_TTL_MS, deviceId);
+            // Turn 1: session didn't exist when addTurn was called — record it now
+            try { addTurn(outSessionId, { role: "user", content: effectiveMessage, intent: intentResult }); } catch (_e) { console.warn("[plan] addTurn failed:", _e.message); }
           }
           // Extend TTL to 7 days when user has accumulated preferences — cross-day memory
           if (outSessionId && Object.keys(mergedPrefs).length > 0) {
@@ -1016,6 +1138,23 @@ function createPlanRouter({
           sessionId: outSessionId || null,
           coze_data: result._cozeEnrichment || null,   // present on fallback path; null on agent path
           follow_up_suggestions: followUpSuggestions,
+        });
+        // Record assistant turn for multi-turn context
+        if (outSessionId && s.spoken_text) {
+          try { addTurn(outSessionId, { role: "assistant", content: s.spoken_text }); } catch (_e) { console.warn("[plan] addTurn failed:", _e.message); }
+        }
+        // Capture training example (async, non-blocking)
+        setImmediate(() => {
+          try {
+            captureExample({
+              deviceId: deviceId || "unknown",
+              sessionId: outSessionId || null,
+              userMessage: message,
+              assistantResponse: JSON.stringify(s.card_data || {}),
+              intent: intentResult,
+              source: "openai",
+            });
+          } catch (_e) { console.warn("[plan] captureExample failed:", _e.message); }
         });
       } else {
         emit({
@@ -1081,6 +1220,15 @@ function createPlanRouter({
       return writeJson(res, 400, { ok: false, error: "Input rejected by security guard" });
     }
 
+    // Switch to SSE so each batch is streamed to the frontend as it completes
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+    const emitDetail = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch (_) {} };
+
     const result = await openAIRequest({
       apiKey, model: OPENAI_MODEL, baseUrl,
       systemPrompt, userContent,
@@ -1091,18 +1239,24 @@ function createPlanRouter({
     const parsed = safeParseJson(result.text);
     if (!parsed || !Array.isArray(parsed.days) || !parsed.days.length) {
       console.warn("[plan/detail] Failed to parse days, raw:", result.text?.slice(0, 200));
-      return writeJson(res, 500, { ok: false, error: "Failed to generate itinerary detail" });
+      emitDetail({ type: "error", error: "Failed to generate itinerary detail" });
+      res.end();
+      return;
     }
 
     console.log(`[plan/detail] Generated days ${startDay}-${endDay} (${parsed.days.length} days) for ${dest}`);
-    return writeJson(res, 200, {
-      ok: true,
+    // Emit the batch immediately as it is ready
+    emitDetail({
+      type: "batch",
       days: parsed.days,
+      batchIndex: 0,
+      totalBatches: 1,
       arrival_note: parsed.arrival_note || "",
       hasMore,
       nextStartDay: hasMore ? endDay + 1 : null,
-      totalDays,
     });
+    emitDetail({ type: "done", totalDays });
+    res.end();
   }
 
   return { handleCoze, handleDetail };

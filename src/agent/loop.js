@@ -31,9 +31,20 @@ function buildAgentFinalSystemPrompt(language) {
     : " Rules: 1)names must come from tool results, no hallucination. 2)hotel.hero_image=\"\". 3)activity image_url from tool result real_photo_url. 4)note/label max 15 chars. 5)plans must have budget/balanced/premium tiers.");
 }
 
-const MAX_TOOL_ROUNDS   = 2;   // cap at 2 rounds — tools are fast, diminishing returns after
 const TOOL_ROUND_TOKENS = 600; // small — LLM only decides which tools to call
 // FINAL_ROUND_TOKENS is now computed per-request based on trip duration (see runAgentLoop).
+
+/**
+ * Adaptive agent rounds based on intent complexity.
+ * Simple single-city queries → 2 rounds. Complex multi-city or long trips → 5 rounds.
+ */
+function getAdaptiveRounds(intent) {
+  if (!intent) return 2;
+  const { multi_city, duration_days, constraints = [] } = intent;
+  if (multi_city || duration_days >= 11) return 5;
+  if (Array.isArray(constraints) && constraints.length >= 3) return 4;
+  return 2;
+}
 
 // ── System prompt builder ─────────────────────────────────────────────────────
 function buildSystemPrompt({ language, contextSummary, city, constraints, intentAxis }) {
@@ -64,9 +75,16 @@ function buildSystemPrompt({ language, contextSummary, city, constraints, intent
     parts.push("\n\u672c\u6b21\u610f\u56fe\u4e3a\u666f\u70b9\u6d3b\u52a8\uff0c\u65e0\u9700\u8c03\u7528 search_hotels\u3002");
   }
 
-  if (city)                    parts.push(`\n\u7528\u6237\u51fa\u53d1\u57ce\u5e02: ${city}`);
-  if (constraints?.party_size) parts.push(`\n\u4eba\u6570: ${constraints.party_size}\u4eba`);
-  if (constraints?.budget)     parts.push(`\n\u9884\u7b97\u7ebf\u7d22: \xA5${constraints.budget}`);
+  if (city)                    parts.push(`\n\u7528\u6237\u51fa\u53d1\u57ce\u5e02: ${String(city).replace(/[\n\r<>"']/g, "").slice(0, 30)}`);
+  // Sanitize user-supplied constraint values before injecting into system prompt
+  if (constraints?.party_size) {
+    const _pax = Number(constraints.party_size);
+    if (Number.isInteger(_pax) && _pax > 0 && _pax <= 100) parts.push(`\n\u4eba\u6570: ${_pax}\u4eba`);
+  }
+  if (constraints?.budget) {
+    const _budget = String(constraints.budget).replace(/[^0-9\u4e07\u5343\u767e\-]/g, "").slice(0, 20);
+    if (_budget) parts.push(`\n\u9884\u7b97\u7ebf\u7d22: \xA5${_budget}`);
+  }
   return parts.filter(Boolean).join("");
 }
 
@@ -154,6 +172,8 @@ async function runAgentLoop({
 
   // ── Phase 1: Streaming tool-call rounds ──────────────────────────────────
   let toolRound = 0;
+  const MAX_TOOL_ROUNDS = getAdaptiveRounds(constraints);
+  console.log(`[agent] Adaptive rounds: ${MAX_TOOL_ROUNDS} (based on complexity)`);
   const collectedToolResults = {};   // name → last result, for enrichmentData on return
 
   while (toolRound < MAX_TOOL_ROUNDS) {
@@ -196,9 +216,16 @@ async function runAgentLoop({
     });
 
     // ── Parallel tool execution ─────────────────────────────────────────────
+    // Each tool is individually guarded — one failure must not abort the whole round.
     await Promise.all(tool_calls.map(async (tc) => {
       if (emit) try { emit({ type: "tool_call", tool_name: tc.name }); } catch {}
-      const result = await executeTool(tc.name, tc.arguments, deps);
+      let result;
+      try {
+        result = await executeTool(tc.name, tc.arguments, deps);
+      } catch (toolErr) {
+        console.warn(`[agent] tool_error: ${tc.name} →`, toolErr.message);
+        result = { error: toolErr.message, _source: "error" };
+      }
       collectedToolResults[tc.name] = result;   // keep last result per tool name
       console.log(`[agent] tool_result: ${tc.name} → ${JSON.stringify(result).slice(0, 140)}`);
       // Note: push is not thread-safe in theory, but JS is single-threaded so fine
@@ -219,10 +246,20 @@ async function runAgentLoop({
     }
   }
 
-  // ── Phase 2: Final card generation — non-streaming, jsonMode:true ─────────
+  // ── Phase 2: Final card generation — streaming jsonMode (up to 60s) ─────────
   // Advance timeline: T_CALC (routes calculated) → B_CHECK (budget check starting)
   if (emit) try { emit({ type: "status", code: "T_CALC", label: "" }); } catch {}
   if (emit) try { emit({ type: "status", code: "B_CHECK", label: "" }); } catch {}
+
+  // Heartbeat: emit a status update every 8s so frontend knows we're alive during long generation.
+  // Cleared immediately when openAIStream resolves.
+  const _hbLabels = language === "ZH"
+    ? ["整合行程数据...", "生成三档方案对比...", "优化景点顺序...", "最终预算校验..."]
+    : ["Integrating data...", "Building 3 plan tiers...", "Optimising route order...", "Final budget check..."];
+  let _hbIdx = 0;
+  const _finalHeartbeat = emit ? setInterval(() => {
+    try { emit({ type: "status", code: "B_CHECK", label: _hbLabels[_hbIdx++ % _hbLabels.length] }); } catch {}
+  }, 8000) : null;
 
   // Reconstruct a flat userContent from all messages after system prompt.
   // This lets us call openAIRequest (which supports jsonMode) cleanly.
@@ -235,24 +272,24 @@ async function runAgentLoop({
       const d = JSON.parse(jsonStr);
       const lines = [];
       if (d.city)   lines.push(`城市:${d.city}`);
-      // hotels — keep name+tier+price only
+      // hotels — keep name+tier+price+rating; 5 options so LLM can span budget/mid/luxury tiers
       if (Array.isArray(d.hotels) && d.hotels.length) {
-        lines.push("酒店:" + d.hotels.slice(0, 3).map((h) =>
-          `${h.name}(${h.tier||""}¥${h.price_per_night||h.price||"?"})`).join("|"));
+        lines.push("酒店:" + d.hotels.slice(0, 5).map((h) =>
+          `${h.name}(${h.tier||""}¥${h.price_per_night||h.price||"?"}${h.rating ? " ★"+h.rating : ""})`).join("|"));
       }
-      // restaurants
+      // restaurants — 6 for variety
       if (Array.isArray(d.restaurants) && d.restaurants.length) {
-        lines.push("餐厅:" + d.restaurants.slice(0, 4).map((r) =>
+        lines.push("餐厅:" + d.restaurants.slice(0, 6).map((r) =>
           `${r.name}(¥${r.avg_price||"?"},${r.queue_min != null ? r.queue_min+"min" : ""})${r.real_photo_url ? " photo:"+r.real_photo_url : ""}`).join("|"));
       }
-      // attractions
+      // attractions — 6
       if (Array.isArray(d.attractions) && d.attractions.length) {
-        lines.push("景点:" + d.attractions.slice(0, 5).map((a) =>
+        lines.push("景点:" + d.attractions.slice(0, 6).map((a) =>
           `${a.name}(¥${a.ticket_price||a.avg_price||"?"},${a.open_hours||""})${a.real_photo_url ? " photo:"+a.real_photo_url : ""}`).join("|"));
       }
-      // item_list (enrichment)
+      // item_list (enrichment) — 6
       if (Array.isArray(d.item_list) && d.item_list.length) {
-        lines.push("项目:" + d.item_list.slice(0, 5).map((i) =>
+        lines.push("项目:" + d.item_list.slice(0, 6).map((i) =>
           `${i.name}${i.avg_price ? "(¥"+i.avg_price+")" : ""}${i.real_photo_url ? " photo:"+i.real_photo_url : ""}`).join("|"));
       }
       // route
@@ -327,6 +364,7 @@ async function runAgentLoop({
       if (emit) try { emit({ type: "thinking", text: chunk }); } catch {}
     },
   });
+  if (_finalHeartbeat) clearInterval(_finalHeartbeat); // stop heartbeat immediately
 
   if (!finalResult.ok || !finalResult.text) {
     console.warn("[agent] Final streaming failed");
