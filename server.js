@@ -3575,10 +3575,10 @@ function migrateLoadedData() {
           note: "Created by Cross X workflow.",
         },
         {
-          state: order.status === "canceled" ? "refunded" : "completed",
-          label: order.status === "canceled" ? "Refund completed" : "Order completed",
+          state: (order.status === "canceled" || order.status === "cancelled") ? "refunded" : "completed",
+          label: (order.status === "canceled" || order.status === "cancelled") ? "Refund completed" : "Order completed",
           at: order.updatedAt || order.createdAt || nowIso(),
-          note: order.status === "canceled" ? "Refund issued." : "Proof delivered.",
+          note: (order.status === "canceled" || order.status === "cancelled") ? "Refund issued." : "Proof delivered.",
         },
       ];
       mutated = true;
@@ -3893,7 +3893,7 @@ function runSettlementBatch() {
   for (const order of orders) {
     if (!order || !order.id) continue;
     if (hasSettlementForOrder(order.id)) continue;
-    if (!(order.status === "confirmed" || order.status === "completed" || order.status === "canceled" || order.status === "refunded")) continue;
+    if (!(order.status === "confirmed" || order.status === "completed" || order.status === "canceled" || order.status === "cancelled" || order.status === "refunded")) continue;
     const rec = createSettlementRecord(order);
     db.settlements.push(rec);
     created.push(rec);
@@ -4494,7 +4494,7 @@ function runReconciliationBatch() {
 function buildRevenueSummary() {
   const orders = Object.values(db.orders || {});
   const paidOrders = orders.filter(
-    (o) => o.status === "confirmed" || o.status === "completed" || o.status === "canceled" || o.status === "refunded",
+    (o) => o.status === "confirmed" || o.status === "completed" || o.status === "canceled" || o.status === "cancelled" || o.status === "refunded",
   );
   const gross = paidOrders.reduce((sum, o) => sum + Number(o.price || 0), 0);
   const net = paidOrders.reduce((sum, o) => sum + Number((o.pricing && o.pricing.netPrice) || 0), 0);
@@ -7313,6 +7313,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/hotel/order/create") {
       const body = await readBody(req);
+      const _hotelPhone = String(body.contactPhone || "").trim();
+      if (!_hotelPhone) return writeJson(res, 400, { error: "contactPhone is required for hotel booking" });
       const outOrderNo = String(body.outOrderNo || buildHotelOutOrderNo()).trim();
       const existed = Object.values(db.orders || {}).find((item) => item.outOrderNo && String(item.outOrderNo) === outOrderNo);
       if (existed) {
@@ -7378,7 +7380,7 @@ const server = http.createServer(async (req, res) => {
         },
         guestList: Array.isArray(body.guestList) ? body.guestList.slice(0, 6) : [],
         contactName: String(body.contactName || "Guest"),
-        contactPhone: String(body.contactPhone || ""),
+        contactPhone: String(body.contactPhone || "").trim(),
         arrivalTime: String(body.arrivalTime || "18:00"),
         orderStatus,
         status: orderStatus,
@@ -7505,13 +7507,17 @@ const server = http.createServer(async (req, res) => {
       if (!order) return writeJson(res, 404, { error: "order_not_found" });
       if (order.type !== "hotel") return writeJson(res, 400, { error: "not_hotel_order" });
       const cancelReason = String(body.cancelReason || "user_request").slice(0, 120);
-      if (["cancelled", "refunded"].includes(String(order.orderStatus || "").toLowerCase())) {
+      const _hotelStatus = String(order.orderStatus || order.status || "").toLowerCase();
+      if (["cancelled", "canceled", "refunded"].includes(_hotelStatus)) {
         return writeJson(res, 200, {
           cancelSuccess: true,
           orderStatus: order.orderStatus,
           refundAmount: Number(order.refundAmount || 0),
           refundDesc: order.refundDesc || "Already canceled",
         });
+      }
+      if (["delivered", "completed", "checked_in"].includes(_hotelStatus)) {
+        return writeJson(res, 409, { error: "order_not_cancellable", status: _hotelStatus, message: "Cannot cancel an order that is already delivered or completed." });
       }
       order.orderStatus = "cancelled";
       order.status = "cancelled";
@@ -7769,7 +7775,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/metrics/events") {
       const body = await readBody(req);
-      const _evKind   = String(body.kind   || "ui_event").slice(0, 64);
+      const _METRIC_KINDS = new Set(["ui_event","plan_view","plan_interact","booking","payment","search","voice","error","session_start","session_end","tab_switch","preference_save","login","logout","favorite"]);
+      const _evKindRaw = String(body.kind || "ui_event").slice(0, 64);
+      const _evKind = _METRIC_KINDS.has(_evKindRaw) ? _evKindRaw : "ui_event";
       const _evUserId = String(body.userId || "guest").replace(/[^a-zA-Z0-9_\-.:]/g, "").slice(0, 64);
       const _evTaskId = body.taskId ? String(body.taskId).replace(/[^a-zA-Z0-9_\-.]/g, "").slice(0, 64) : null;
       const _evMeta   = body.meta && typeof body.meta === "object" && !Array.isArray(body.meta)
@@ -9837,11 +9845,15 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/trips") {
       const _tripsActor = _whoFromReq(req);
-      const trips = Object.values(db.tripPlans || {})
+      const _tripsQp = Object.fromEntries(new URL(req.url, "http://x").searchParams);
+      const _tripsLimit = Math.min(Math.max(1, Number(_tripsQp.limit) || 50), 200);
+      const _tripsOffset = Math.max(0, Number(_tripsQp.offset) || 0);
+      const _allTrips = Object.values(db.tripPlans || {})
         .filter((trip) => trip.userId === _tripsActor || trip.userId === "demo" || _tripsActor === "anon")
         .map((trip) => buildTripSummary(trip))
         .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
-      return writeJson(res, 200, { trips });
+      const trips = _allTrips.slice(_tripsOffset, _tripsOffset + _tripsLimit);
+      return writeJson(res, 200, { trips, total: _allTrips.length, limit: _tripsLimit, offset: _tripsOffset });
     }
 
     if (req.method === "POST" && pathname === "/api/trips") {
@@ -9925,8 +9937,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/orders") {
-      const orders = Object.values(db.orders).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      return writeJson(res, 200, { orders });
+      const _ordQp = Object.fromEntries(new URL(req.url, "http://x").searchParams);
+      const _ordLimit  = Math.min(Math.max(1, Number(_ordQp.limit)  || 50), 200);
+      const _ordOffset = Math.max(0, Number(_ordQp.offset) || 0);
+      const _allOrders = Object.values(db.orders).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+      const orders = _allOrders.slice(_ordOffset, _ordOffset + _ordLimit);
+      return writeJson(res, 200, { orders, total: _allOrders.length, limit: _ordLimit, offset: _ordOffset });
     }
 
     // ── CrossX Consumer Plan Orders (checkout flow) ────────────────────────
@@ -9955,6 +9971,11 @@ const server = http.createServer(async (req, res) => {
       const ref = String(parsed.query.ref || "");
       if (!ref) return writeJson(res, 400, { error: "missing_ref" });
       if (!db.crossx_orders) db.crossx_orders = {};
+      // Purge crossx_orders older than 30 min to prevent memory accumulation
+      const _cxoNow = Date.now();
+      for (const [k, o] of Object.entries(db.crossx_orders)) {
+        if (_cxoNow - new Date(o.createdAt).getTime() > 30 * 60 * 1000) delete db.crossx_orders[k];
+      }
       const ord = db.crossx_orders[ref];
       if (!ord) return writeJson(res, 404, { error: "not_found" });
       // Auto-confirm after 2.5 s (mock payment processing)
@@ -10000,10 +10021,13 @@ const server = http.createServer(async (req, res) => {
       const orderId = pathname.split("/")[3];
       const order = db.orders[orderId];
       if (!order) return writeJson(res, 404, { error: "Order not found" });
-      if (order.status === "canceled" || order.status === "refunded") {
+      if (order.status === "cancelled" || order.status === "canceled" || order.status === "refunded") {
         const payload = { ok: true, order, refunded: false };
         writeIdempotent(req, pathname, payload);
         return writeJson(res, 200, payload);
+      }
+      if (order.status === "delivered" || order.status === "completed") {
+        return writeJson(res, 409, { error: "order_not_cancellable", status: order.status, message: "Cannot cancel an order that has already been delivered or completed." });
       }
       const body = await readBody(req);
       order.status = "cancelled";
@@ -10611,7 +10635,10 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     if (req.method === "POST" && pathname === "/api/order/create") {
       const body = await readBody(req);
       const { plan, destination, method: payMethod, total } = body || {};
-      if (!plan || !total) return writeJson(res, 400, { error: "plan and total required" });
+      if (!plan || total === undefined || total === null) return writeJson(res, 400, { error: "plan and total required" });
+      const _totalNum = Number(total);
+      if (!Number.isFinite(_totalNum) || _totalNum <= 0) return writeJson(res, 400, { error: "total must be a positive number" });
+      if (_totalNum > 1_000_000) return writeJson(res, 400, { error: "total exceeds maximum allowed value" });
       const { validateUserToken: _vutOc } = require("./src/services/user_auth");
       const _ocUserId = (_vutOc(req) || {}).sub || extractDeviceId(req, body) || "guest";
       const rand = () => Math.random().toString(36).slice(2, 6).toUpperCase();
@@ -10621,7 +10648,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       db.orders[orderId] = {
         orderId, type: "itinerary", source: "itinerary_card",
         optionId: String(plan.id || plan.tag || "unknown"),
-        totalCost: Number(total), currency: "CNY",
+        totalCost: _totalNum, currency: "CNY",
         status: "awaiting_payment", payMethod: payMethod || null,
         destination: destination || null, userId: _ocUserId,
         createdAt: now, expiresAt, planSnapshot: plan || null,

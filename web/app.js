@@ -10753,6 +10753,12 @@ function _restoreNearFilter() {
   } catch {}
 }
 
+function _clearNearFilters() {
+  if (el.nearFilterForm) el.nearFilterForm.reset();
+  try { localStorage.removeItem(_NEAR_FILTER_KEY); } catch {}
+  loadNearSuggestions();
+}
+
 async function loadNearSuggestions() {
   _restoreNearFilter();
   if (skeleton && el.nearList) {
@@ -10777,7 +10783,7 @@ async function loadNearSuggestions() {
   };
   const visible = state.nearItems.filter((item) => fitNearFilters(item, activeFilter));
   if (!visible.length) {
-    el.nearList.innerHTML = `<article class="card">${pickText("当前筛选下没有结果。", "No nearby result under current filters.","現在のフィルターに一致する結果はありません。", "현재 필터 조건에 맞는 결과가 없습니다.")}</article>`;
+    el.nearList.innerHTML = `<article class="card"><p>${pickText("当前筛选下没有结果。", "No nearby result under current filters.","現在のフィルターに一致する結果はありません。", "현재 필터 조건에 맞는 결과가 없습니다.")}</p><div class="actions"><button onclick="_clearNearFilters()">${pickText("清除筛选", "Clear Filters", "フィルターをリセット", "필터 초기화")}</button></div></article>`;
     renderNearMap(null, data.mapPreview || null);
     return;
   }
@@ -10828,7 +10834,14 @@ async function loadTrips() {
   if (skeleton && !el.tripList.children.length) {
     skeleton.render(el.tripList, { count: 2, lines: 4 });
   }
-  const data = await api("/api/trips");
+  let data;
+  try {
+    data = await api("/api/trips");
+  } catch (err) {
+    if (skeleton) skeleton.clear(el.tripList);
+    el.tripList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载行程失败，请稍后重试。", "Failed to load trips. Please try again.", "旅程の読み込みに失敗しました。", "트립을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadTrips()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    return;
+  }
   if (skeleton) skeleton.clear(el.tripList);
   state.tripPlans = Array.isArray(data.trips) ? data.trips : [];
   if (store) store.dispatch({ type: "SET_ERROR", error: null });
@@ -10934,7 +10947,14 @@ async function loadOrders() {
   if (skeleton && el.ordersList && !el.ordersList.children.length) {
     skeleton.render(el.ordersList, { count: 2, lines: 4 });
   }
-  const data = await api("/api/orders");
+  let data;
+  try {
+    data = await api("/api/orders");
+  } catch (err) {
+    if (skeleton && el.ordersList) skeleton.clear(el.ordersList);
+    if (el.ordersList) el.ordersList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载订单失败，请稍后重试。", "Failed to load orders. Please try again.", "注文の読み込みに失敗しました。", "주문을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadOrders()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    return;
+  }
   if (skeleton && el.ordersList) skeleton.clear(el.ordersList);
   if (store) store.dispatch({ type: "SET_ORDERS", orders: data.orders || [] });
   if (!data.orders.length) {
@@ -13552,9 +13572,22 @@ function bindInput() {
       : `alipays://platformapi/startapp?appId=20000067&url=${encodeURIComponent("https://crossx.ai/pay?ref=" + Date.now())}`;
     if (el.payQrImg) {
       el.payQrImg.alt = isWeChat ? "WeChat Pay QR" : "Alipay QR";
+      el.payQrImg.onerror = () => {
+        // QR generation failed — show text fallback
+        el.payQrImg.style.display = "none";
+        const errDiv = el.payQrSection.querySelector(".cx-qr-fallback") || (() => {
+          const d = document.createElement("div");
+          d.className = "cx-qr-fallback";
+          d.style.cssText = "padding:16px;text-align:center;color:var(--color-error,#e53935);font-size:13px;";
+          el.payQrSection.insertBefore(d, el.payQrImg.nextSibling);
+          return d;
+        })();
+        errDiv.textContent = pickText("二维码生成失败，请刷新重试", "QR code generation failed, please refresh", "QRコードの生成に失敗しました", "QR 코드 생성 실패, 새로고침 해주세요");
+      };
       if (window.QRCode) {
         QRCode.toDataURL(deeplink, { width: 180, margin: 1 }, (err, url) => {
           if (!err && el.payQrImg) el.payQrImg.src = url;
+          else if (err && el.payQrImg) el.payQrImg.onerror();
         });
       } else {
         el.payQrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&color=000000&bgcolor=ffffff&data=${encodeURIComponent(deeplink)}&format=svg`;
@@ -14075,7 +14108,13 @@ function bindForms() {
     });
   }
 
-  el.prefForm.addEventListener("change", () => { state._prefsDirty = true; });
+  el.prefForm.addEventListener("change", () => {
+    state._prefsDirty = true;
+    // Show unsaved indicator on the submit button
+    const submitBtn = el.prefForm.querySelector("[type=submit]");
+    if (submitBtn && !submitBtn.dataset.origText) submitBtn.dataset.origText = submitBtn.textContent;
+    if (submitBtn) submitBtn.textContent = (submitBtn.dataset.origText || pickText("保存偏好", "Save Preferences", "設定を保存", "설정 저장")) + " *";
+  });
 
   el.prefForm.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -14100,6 +14139,9 @@ function bindForms() {
         }),
       });
       state._prefsDirty = false;
+      // Remove unsaved indicator
+      const _prefSubmitBtn = el.prefForm.querySelector("[type=submit]");
+      if (_prefSubmitBtn && _prefSubmitBtn.dataset.origText) { _prefSubmitBtn.textContent = _prefSubmitBtn.dataset.origText; delete _prefSubmitBtn.dataset.origText; }
       notify(pickText("\u504f\u597d\u8bbe\u7f6e\u5df2\u4fdd\u5b58\u3002", "Preferences saved.", "\u8a2d\u5b9a\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f\u3002", "\ud658\uacbd\uc124\uc815\uc744 \uc800\uc7a5\ud588\uc2b5\ub2c8\ub2e4."), "success");
       await loadAuditLogs();
     } catch (err) {
