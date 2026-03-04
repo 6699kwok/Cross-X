@@ -6848,3 +6848,37 @@ body.single-dialog-mode .conversation-aura[data-mode="idle"] {
 .cx-modal-link:hover { color:#3b82f6; }
 .cx-modal-error { color:#ef4444; font-size:12px; padding:4px 0; }
 .user-pill { background:#dbeafe; color:#1d4ed8; font-weight:600; cursor:default; }
+
+/* Me tab profile card */
+.me-profile-card { padding: 16px 20px; }
+.me-profile-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.me-avatar { width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg,#6366f1,#8b5cf6);
+  color: #fff; font-size: 17px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; letter-spacing: 0.5px; }
+.me-profile-info { flex: 1; min-width: 0; }
+.me-profile-name { font-size: 16px; font-weight: 700; color: var(--text-primary,#1e293b);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.me-profile-sub { font-size: 12px; color: var(--text-secondary,#64748b); margin-top: 2px; }
+.me-stats { display: flex; gap: 18px; }
+.me-stat { display: flex; flex-direction: column; align-items: center; gap: 1px; }
+.me-stat-val { font-size: 20px; font-weight: 700; color: var(--primary,#6366f1); line-height: 1; }
+.me-stat-label { font-size: 11px; color: var(--text-secondary,#64748b); }
+
+/* Favorites heart button on plan cards */
+.cx-fav-btn { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,.32); border: none;
+  color: #fff; font-size: 20px; width: 34px; height: 34px; border-radius: 50%; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; transition: background .15s, transform .12s;
+  line-height: 1; padding: 0; }
+.cx-fav-btn:hover { background: rgba(0,0,0,.55); transform: scale(1.12); }
+.plan-card-hero { position: relative; }
+
+/* Favorites section in Me tab */
+.cx-fav-card { padding: 12px 16px; }
+.cx-fav-card-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.cx-fav-card-info { flex: 1; min-width: 0; }
+.cx-fav-card-title { font-size: 14px; font-weight: 600; color: var(--text-primary,#1e293b);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 2px; }
+.cx-fav-remove { font-size: 12px; padding: 4px 10px; flex-shrink: 0; }
+
+/* Refine bar label */
+.cx-pr-label { font-size: 12px; color: var(--text-secondary,#64748b); margin-bottom: 6px; font-weight: 500; }

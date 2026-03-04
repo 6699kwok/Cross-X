@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "test": "node --test tests/*.test.js",
     "build": "node -e \"console.log('build: static node app, no compile step')\"",
     "start": "PORT=8787 HOST=127.0.0.1 node server.js",
     "start:8787": "PORT=8787 HOST=127.0.0.1 node server.js",
@@ -19,6 +20,7 @@
   },
   "dependencies": {
     "alipay-sdk": "^4.14.0",
+    "better-sqlite3": "^12.6.2",
     "qrcode": "^1.5.4"
   }
 }

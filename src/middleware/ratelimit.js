@@ -5,7 +5,7 @@
  * Factory pattern allows tests to inject custom limits and isolated state.
  */
 
-const DEFAULT_LIMITS = { llm: 10, agent: 30 };
+const DEFAULT_LIMITS = { llm: 10, agent: 30, auth: 5 };
 const DEFAULT_WINDOW = 60_000;
 
 function createRateLimiter({
@@ -32,7 +32,9 @@ function createRateLimiter({
         ? "llm"
         : pathname.startsWith("/api/agent/") || pathname === "/api/payments/charge"
           ? "agent"
-          : null;
+          : pathname === "/api/auth/send-otp" || pathname === "/api/auth/verify-otp"
+            ? "auth"
+            : null;
     if (!tier) return null;
 
     const key = `${getIp(req)}:${tier}`;

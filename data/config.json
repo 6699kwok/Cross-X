@@ -1,0 +1,107 @@
+{
+  "featureFlags": {
+    "plusConcierge": {
+      "enabled": true,
+      "rollout": 100
+    },
+    "manualFallback": {
+      "enabled": true,
+      "rollout": 100
+    },
+    "liveTranslation": {
+      "enabled": true,
+      "rollout": 100
+    }
+  },
+  "mcpContracts": {
+    "gaode_or_fallback": {
+      "id": "gaode_or_fallback",
+      "provider": "Gaode LBS",
+      "external": true,
+      "slaMs": 2200,
+      "enforced": true
+    },
+    "partner_hub_queue": {
+      "id": "partner_hub_queue",
+      "provider": "Partner Hub Queue API",
+      "external": true,
+      "slaMs": 1800,
+      "enforced": true
+    },
+    "partner_hub_booking": {
+      "id": "partner_hub_booking",
+      "provider": "Partner Hub Booking API",
+      "external": true,
+      "slaMs": 2500,
+      "enforced": true
+    },
+    "partner_hub_traffic": {
+      "id": "partner_hub_traffic",
+      "provider": "Partner Hub Traffic API",
+      "external": true,
+      "slaMs": 1800,
+      "enforced": true
+    },
+    "partner_hub_transport": {
+      "id": "partner_hub_transport",
+      "provider": "Partner Hub Transport API",
+      "external": true,
+      "slaMs": 2500,
+      "enforced": true
+    },
+    "payment_rail": {
+      "id": "payment_rail",
+      "provider": "ACT Rail Gateway",
+      "external": true,
+      "slaMs": 3200,
+      "enforced": true
+    }
+  },
+  "mcpPolicy": {
+    "enforceSla": false,
+    "simulateBreachRate": 0
+  },
+  "paymentCompliance": {
+    "policy": {
+      "blockUncertifiedRails": true,
+      "requireFraudScreen": true
+    },
+    "rails": {
+      "alipay_cn": {
+        "certified": true,
+        "kycPassed": true,
+        "pciDss": true,
+        "riskTier": "low",
+        "enabled": true
+      },
+      "wechat_cn": {
+        "certified": true,
+        "kycPassed": true,
+        "pciDss": true,
+        "riskTier": "medium",
+        "enabled": true
+      },
+      "card_delegate": {
+        "certified": true,
+        "kycPassed": true,
+        "pciDss": true,
+        "riskTier": "high",
+        "enabled": true
+      }
+    }
+  },
+  "miniProgram": {
+    "version": "0.1.0",
+    "channels": {
+      "alipay": {
+        "status": "ready",
+        "pathPrefix": "pages/"
+      },
+      "wechat": {
+        "status": "ready",
+        "pathPrefix": "pages/"
+      }
+    },
+    "releases": []
+  }
+}

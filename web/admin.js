@@ -126,6 +126,27 @@
       taskStatus_failed: "失败",
       taskStatus_canceled: "已取消",
       taskStatus_support: "人工处理中",
+      analyticsHeading: "业务指标",
+      kpiClosedLoop: "闭环完成率",
+      kpiTasks: "总任务",
+      kpiCompleted: "已完成",
+      kpiFailed: "失败",
+      kpiOrders: "总订单",
+      kpiSupportTickets: "支持工单",
+      kpiMcpSla: "MCP 合规率",
+      kpiMcpCalls: "MCP 总调用",
+      funnelLabel: "转化漏斗",
+      funnelIntent: "意图提交",
+      funnelPlanned: "规划完成",
+      funnelConfirmed: "已确认",
+      funnelPaid: "已支付",
+      funnelDelivered: "已交付",
+      revHeading: "收入总览 (CNY)",
+      revGross: "总收入",
+      revNet: "净收入",
+      revMarkup: "加价收益",
+      revRefunds: "退款",
+      revOrders: "付款订单",
     },
     EN: {
       title: "Cross X Ops Console",
@@ -239,6 +260,27 @@
       taskStatus_failed: "Failed",
       taskStatus_canceled: "Canceled",
       taskStatus_support: "Support",
+      analyticsHeading: "Business KPIs",
+      kpiClosedLoop: "Closed-loop Rate",
+      kpiTasks: "Total Tasks",
+      kpiCompleted: "Completed",
+      kpiFailed: "Failed",
+      kpiOrders: "Total Orders",
+      kpiSupportTickets: "Support Tickets",
+      kpiMcpSla: "MCP SLA Rate",
+      kpiMcpCalls: "MCP Total Calls",
+      funnelLabel: "Conversion Funnel",
+      funnelIntent: "Intent",
+      funnelPlanned: "Planned",
+      funnelConfirmed: "Confirmed",
+      funnelPaid: "Paid",
+      funnelDelivered: "Delivered",
+      revHeading: "Revenue Summary (CNY)",
+      revGross: "Gross",
+      revNet: "Net",
+      revMarkup: "Markup",
+      revRefunds: "Refunds",
+      revOrders: "Paid Orders",
     },
     JA: {
       title: "Cross X Ops Console",
@@ -484,6 +526,7 @@
     liveChunks: [],
     liveRecording: false,
     liveRecordingStartedAt: 0,
+    analytics: null,
   };
 
   const el = {
@@ -529,6 +572,11 @@
     drawerTitle: document.getElementById("opsDrawerTitle"),
     drawerBody: document.getElementById("opsDrawerBody"),
     closeDrawerBtn: document.getElementById("closeOpsDrawerBtn"),
+    analyticsHeading: document.getElementById("analyticsHeading"),
+    analyticsUpdatedText: document.getElementById("analyticsUpdatedText"),
+    analyticsKpiGrid: document.getElementById("analyticsKpiGrid"),
+    analyticsFunnelRow: document.getElementById("analyticsFunnelRow"),
+    analyticsRevenueGrid: document.getElementById("analyticsRevenueGrid"),
   };
 
   function normalizeLanguage(language) {
@@ -580,11 +628,83 @@
     return Number.isFinite(n) ? n : 0;
   }
 
+  // ── Admin Auth ─────────────────────────────────────────────────────────────
+  let _adminToken = null;
+  try { _adminToken = localStorage.getItem("cx_admin_tk") || null; } catch {}
+
+  function _saveToken(tok) {
+    _adminToken = tok;
+    try { if (tok) localStorage.setItem("cx_admin_tk", tok); else localStorage.removeItem("cx_admin_tk"); } catch {}
+  }
+
+  function _showLoginModal() {
+    // Remove any existing modal
+    const old = document.getElementById("cx-admin-login-modal");
+    if (old) old.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "cx-admin-login-modal";
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:9999";
+    overlay.innerHTML = `
+      <div style="background:#fff;border-radius:12px;padding:28px 32px;width:340px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+        <h3 style="margin:0 0 6px;font-size:18px">Admin Login</h3>
+        <p style="margin:0 0 16px;font-size:13px;color:#666">请输入管理员密钥</p>
+        <input id="cx-admin-key-input" type="password" placeholder="Admin Key"
+          style="width:100%;box-sizing:border-box;padding:10px 12px;border:1px solid #ddd;border-radius:8px;font-size:14px;margin-bottom:12px"/>
+        <div id="cx-admin-login-err" style="color:#d32f2f;font-size:13px;min-height:18px;margin-bottom:8px"></div>
+        <button id="cx-admin-login-btn"
+          style="width:100%;padding:10px;background:#1a1a1a;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer">
+          登录
+        </button>
+      </div>`;
+    document.body.appendChild(overlay);
+
+    const input = overlay.querySelector("#cx-admin-key-input");
+    const btn   = overlay.querySelector("#cx-admin-login-btn");
+    const errEl = overlay.querySelector("#cx-admin-login-err");
+
+    async function doLogin() {
+      const key = input.value.trim();
+      if (!key) { errEl.textContent = "请输入密钥"; return; }
+      btn.disabled = true; btn.textContent = "验证中…";
+      try {
+        const res = await fetch("/api/admin/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ key }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.token) {
+          _saveToken(data.token);
+          overlay.remove();
+          // Reload board with fresh token
+          loadBoard(true).catch(() => {});
+        } else {
+          errEl.textContent = data.error || "密钥错误，请重试";
+          btn.disabled = false; btn.textContent = "登录";
+        }
+      } catch {
+        errEl.textContent = "网络错误，请重试";
+        btn.disabled = false; btn.textContent = "登录";
+      }
+    }
+
+    btn.addEventListener("click", doLogin);
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+    setTimeout(() => input.focus(), 50);
+  }
+
   async function api(path, options) {
-    const res = await fetch(path, {
-      headers: { "Content-Type": "application/json" },
-      ...options,
-    });
+    const headers = { "Content-Type": "application/json" };
+    if (_adminToken) headers["Authorization"] = `Bearer ${_adminToken}`;
+    const res = await fetch(path, { headers, ...options });
+    if (res.status === 401) {
+      _saveToken(null);
+      _showLoginModal();
+      const err = new Error("unauthorized");
+      err.needsLogin = true;
+      throw err;
+    }
     const payload = await res.json().catch(() => ({}));
     if (!res.ok) {
       const message = payload && payload.error ? payload.error : `HTTP ${res.status}`;
@@ -635,6 +755,8 @@
     if (el.liveCloseBtn) el.liveCloseBtn.textContent = t("liveCloseSession");
     if (el.liveSendBtn) el.liveSendBtn.textContent = t("liveSend");
     if (el.liveRoomInput) el.liveRoomInput.placeholder = t("liveInputPlaceholder");
+    if (el.analyticsHeading) el.analyticsHeading.textContent = t("analyticsHeading");
+    if (state.analytics) renderAnalytics();
   }
 
   function renderSummary() {
@@ -899,6 +1021,96 @@
     if (el.pendingList) el.pendingList.innerHTML = "";
     if (el.activeList) el.activeList.innerHTML = "";
     if (el.resolvedList) el.resolvedList.innerHTML = "";
+  }
+
+  function renderAnalytics() {
+    const a = state.analytics;
+    if (!a) return;
+
+    if (el.analyticsHeading) el.analyticsHeading.textContent = t("analyticsHeading");
+    if (el.analyticsUpdatedText) el.analyticsUpdatedText.textContent = formatDateTime(new Date().toISOString());
+
+    // ── KPI grid ─────────────────────────────────────────────────────────────
+    if (el.analyticsKpiGrid) {
+      const kpi = a.kpi || {};
+      const totals = kpi.totals || {};
+      const ns = kpi.northStar || {};
+      const sla = a.sla || {};
+      const closedLoopPct = ns.value !== undefined ? (ns.value * 100).toFixed(1) + "%" : "-";
+      const slaRate = sla.metRate !== undefined ? (sla.metRate * 100).toFixed(1) + "%" : "-";
+      const kpiStats = [
+        { label: t("kpiClosedLoop"),    value: closedLoopPct },
+        { label: t("kpiTasks"),         value: asNumber(totals.tasks) },
+        { label: t("kpiCompleted"),     value: asNumber(totals.completed) },
+        { label: t("kpiFailed"),        value: asNumber(totals.failed) },
+        { label: t("kpiOrders"),        value: asNumber(totals.orders) },
+        { label: t("kpiSupportTickets"),value: asNumber(totals.supportTickets) },
+        { label: t("kpiMcpSla"),        value: slaRate },
+        { label: t("kpiMcpCalls"),      value: asNumber(sla.total) },
+      ];
+      el.analyticsKpiGrid.innerHTML = kpiStats
+        .map((s) => `<article class="ops-kpi"><span class="label">${escapeHtml(s.label)}</span><span class="value">${escapeHtml(String(s.value))}</span></article>`)
+        .join("");
+    }
+
+    // ── Funnel ────────────────────────────────────────────────────────────────
+    if (el.analyticsFunnelRow) {
+      const f = a.funnel || {};
+      const stages = [
+        { label: t("funnelIntent"),    value: f.intentSubmitted || 0 },
+        { label: t("funnelPlanned"),   value: f.planned         || 0 },
+        { label: t("funnelConfirmed"), value: f.confirmed       || 0 },
+        { label: t("funnelPaid"),      value: f.paid            || 0 },
+        { label: t("funnelDelivered"), value: f.delivered       || 0 },
+      ];
+      const maxVal = Math.max(1, ...stages.map((s) => s.value));
+      el.analyticsFunnelRow.innerHTML = `
+        <div style="font-size:12px;font-weight:600;color:var(--text-secondary,#64748b);margin-bottom:6px">${escapeHtml(t("funnelLabel"))}</div>
+        <div style="display:flex;gap:6px;align-items:flex-end;flex-wrap:wrap">
+          ${stages.map((s, i) => {
+            const pct = Math.max(12, Math.round((s.value / maxVal) * 60));
+            const arrow = i < stages.length - 1 ? `<span style="align-self:center;color:#94a3b8;font-size:16px">›</span>` : "";
+            return `<div style="display:flex;align-items:center;gap:4px">
+              <div style="text-align:center">
+                <div style="background:var(--primary,#6366f1);border-radius:4px;width:56px;height:${pct}px;display:flex;align-items:flex-end;justify-content:center;padding-bottom:3px">
+                  <span style="color:#fff;font-size:11px;font-weight:700">${escapeHtml(String(s.value))}</span>
+                </div>
+                <div style="font-size:10px;color:var(--text-secondary,#64748b);margin-top:3px;width:56px">${escapeHtml(s.label)}</div>
+              </div>${arrow}</div>`;
+          }).join("")}
+        </div>`;
+    }
+
+    // ── Revenue grid ──────────────────────────────────────────────────────────
+    if (el.analyticsRevenueGrid) {
+      const rev = a.revenue || {};
+      const fmt = (n) => n !== undefined ? "¥" + Number(n).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : "-";
+      const revStats = [
+        { label: t("revGross"),   value: fmt(rev.gross) },
+        { label: t("revNet"),     value: fmt(rev.net) },
+        { label: t("revMarkup"),  value: fmt(rev.markup) },
+        { label: t("revRefunds"), value: fmt(rev.refunds) },
+        { label: t("revOrders"),  value: asNumber(rev.orders) },
+      ];
+      el.analyticsRevenueGrid.innerHTML = `
+        <div style="font-size:12px;font-weight:600;color:var(--text-secondary,#64748b);margin-bottom:6px;grid-column:1/-1">${escapeHtml(t("revHeading"))}</div>
+        ${revStats.map((s) => `<article class="ops-kpi"><span class="label">${escapeHtml(s.label)}</span><span class="value">${escapeHtml(String(s.value))}</span></article>`).join("")}`;
+    }
+  }
+
+  async function loadAnalytics() {
+    try {
+      const [kpi, funnel, revenue, sla] = await Promise.all([
+        api("/api/dashboard/kpi"),
+        api("/api/dashboard/funnel"),
+        api("/api/dashboard/revenue"),
+        api("/api/dashboard/mcp-sla"),
+      ]);
+      state.analytics = { kpi, funnel, revenue, sla };
+      renderAnalytics();
+    } catch (err) {
+      if (!err.needsLogin) console.warn("[admin/analytics] load failed:", err.message);
+    }
   }
 
   async function loadBoard(showLoading = false) {
@@ -1568,14 +1780,20 @@
     await loadBuild();
     bindEvents();
     motion.bindPressables(document);
+    // Show login modal immediately if no token; otherwise attempt board load
+    if (!_adminToken) {
+      _showLoginModal();
+      return;
+    }
     try {
-      await loadBoard(true);
+      await Promise.all([loadBoard(true), loadAnalytics()]);
     } catch (err) {
-      notify(t("loadError", { msg: err.message }), "error");
+      if (!err.needsLogin) notify(t("loadError", { msg: err.message }), "error");
     }
     if (state.refreshTicker) clearInterval(state.refreshTicker);
     state.refreshTicker = setInterval(() => {
       loadBoard(false).catch(() => {});
+      loadAnalytics().catch(() => {});
     }, Math.max(12000, motion.safeDuration(15000)));
     window.addEventListener("beforeunload", () => {
       if (state.refreshTicker) clearInterval(state.refreshTicker);

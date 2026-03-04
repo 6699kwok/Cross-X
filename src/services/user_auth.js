@@ -62,7 +62,7 @@ function _hashPhone(phone) {
  * @param {string} phone
  * @returns {{ ok: boolean, reason?: string, devCode?: string }}
  */
-function generateOtp(phone) {
+async function generateOtp(phone) {
   const normalized = _normalizePhone(phone);
   if (!normalized) return { ok: false, reason: "invalid_phone" };
 
@@ -75,13 +75,20 @@ function generateOtp(phone) {
   const code = String(Math.floor(100000 + Math.random() * 900000));
   _otpStore.set(normalized, { code, expiresAt: Date.now() + OTP_TTL_MS, attempts: 0, locked: false });
 
-  const isDev = !process.env.SMS_PROVIDER;
-  if (isDev) {
-    console.log(`[user_auth] DEV OTP for ${normalized.slice(0, 3)}****${normalized.slice(-4)}: ${code}`);
+  // Send OTP via SMS provider (or console log in dev mode)
+  const provider = (process.env.SMS_PROVIDER || "").toLowerCase();
+  const isDevMode = !provider || provider === "mock";
+  try {
+    const { sendOtp } = require("./sms");
+    await sendOtp(normalized, code);
+  } catch (smsErr) {
+    console.error("[user_auth] SMS send failed:", smsErr.message);
+    // Still return ok:true — operator monitors server logs; OTP is in memory
+    return { ok: true, smsError: smsErr.message, ...(isDevMode ? { devCode: code } : {}) };
   }
-  // TODO: if SMS_PROVIDER set, call SMS gateway here (Tencent Cloud / Aliyun)
 
-  return { ok: true, ...(isDev ? { devCode: code } : {}) };
+  // In dev/mock mode, return code in response for testing (no real SMS sent)
+  return { ok: true, ...(isDevMode ? { devCode: code } : {}) };
 }
 
 /**

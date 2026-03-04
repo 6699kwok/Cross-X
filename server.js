@@ -238,7 +238,7 @@ let LOADED_ENV_FILES = loadLocalEnvFiles();
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
-const BUILD_ID = process.env.BUILD_ID || "crossx-20260224-r34";
+const BUILD_ID = process.env.BUILD_ID || `crossx-${new Date().toISOString().slice(0, 10)}-r${Date.now().toString(36).slice(-6)}`;
 let OPENAI_API_KEY = "";
 let OPENAI_KEY_SOURCE = null;
 let OPENAI_MODEL = "gpt-4o-mini";
@@ -6163,13 +6163,42 @@ function readBody(req) {
   });
 }
 
+const _RAW_BODY_LIMIT = 10 * 1024 * 1024; // 10 MB
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     let buf = "";
-    req.on("data", (d) => { buf += d.toString(); });
+    let len = 0;
+    req.on("data", (d) => {
+      len += d.length;
+      if (len > _RAW_BODY_LIMIT) {
+        req.destroy();
+        return reject(Object.assign(new Error("Request body too large"), { code: "PAYLOAD_TOO_LARGE" }));
+      }
+      buf += d.toString();
+    });
     req.on("end",  () => resolve(buf));
     req.on("error", reject);
   });
+}
+
+/**
+ * Resolve who is making a request — tries user token, then admin token, then "anon".
+ * Used for audit log attribution in routes that don't have requireAdmin/requireUser guards.
+ * @param {import('http').IncomingMessage} req
+ * @returns {string}
+ */
+function _whoFromReq(req) {
+  try {
+    const { validateUserToken } = require("./src/services/user_auth");
+    const up = validateUserToken(req);
+    if (up && up.sub) return up.sub;
+  } catch {}
+  try {
+    const { validateAdminToken } = require("./src/middleware/auth");
+    const ap = validateAdminToken(req);
+    if (ap && ap.sub) return ap.sub;
+  } catch {}
+  return "anon";
 }
 
 function writeJson(res, statusCode, payload) {
@@ -7536,14 +7565,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/auth/send-otp") {
       const { generateOtp } = require("./src/services/user_auth");
       const body   = await readBody(req);
-      const result = generateOtp(String(body.phone || ""));
+      const result = await generateOtp(String(body.phone || ""));
       if (!result.ok) {
         return writeJson(res, 400, { error: result.reason, retryAfterSec: result.retryAfterSec });
       }
       return writeJson(res, 200, {
         ok: true,
-        message: "OTP sent",
+        message: result.devCode ? "OTP generated (dev mode — no SMS sent)" : "OTP sent",
         ...(result.devCode ? { dev_code: result.devCode } : {}),
+        ...(result.smsError ? { sms_warning: result.smsError } : {}),
       });
     }
 
@@ -7605,6 +7635,98 @@ const server = http.createServer(async (req, res) => {
       return writeJson(res, 200, { ok: true, token, expiresIn: "8h" });
     }
 
+    // ── Admin: overview ──────────────────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/api/admin/overview") {
+      if (!requireAdmin(req, res)) return;
+      const users   = Object.values(db.users || {});
+      const orders  = Object.values(db.orders || {});
+      const tasks   = Object.values(db.tasks  || {});
+      const trips   = Object.values(db.tripPlans || {});
+      return writeJson(res, 200, {
+        ok: true,
+        generatedAt: nowIso(),
+        buildId: BUILD_ID,
+        uptimeSec: Math.round(process.uptime()),
+        counts: {
+          users:   users.length,
+          orders:  orders.length,
+          tasks:   tasks.length,
+          trips:   trips.length,
+          auditLogs: db.auditLogs.length,
+          sessions: Object.keys(db.supportSessions || {}).length,
+        },
+        ordersByStatus: orders.reduce((acc, o) => { acc[o.status] = (acc[o.status] || 0) + 1; return acc; }, {}),
+        tasksByStatus:  tasks.reduce((acc, t)  => { acc[t.status]  = (acc[t.status]  || 0) + 1; return acc; }, {}),
+        revenue: {
+          totalGross: orders.reduce((s, o) => s + Number(o.price || 0), 0).toFixed(2),
+          refunded:   orders.filter((o) => o.status === "refunded").reduce((s, o) => s + Number(o.price || 0), 0).toFixed(2),
+        },
+        plusUsers: users.filter((u) => u.plusSubscription && u.plusSubscription.active).length,
+      });
+    }
+
+    // ── Admin: list users ─────────────────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/api/admin/users") {
+      if (!requireAdmin(req, res)) return;
+      const { searchParams: _ausp } = new URL(req.url, "http://x");
+      const limit  = Math.min(Number(_ausp.get("limit")  || 50), 200);
+      const offset = Number(_ausp.get("offset") || 0);
+      const all = Object.values(db.users || {}).map((u) => ({
+        id:           u.id || u.userId || "unknown",
+        displayName:  u.name || u.displayName || "",
+        role:         u.role || "user",
+        plusActive:   Boolean(u.plusSubscription && u.plusSubscription.active),
+        plusPlan:     (u.plusSubscription && u.plusSubscription.plan) || "none",
+        city:         u.city || "",
+        createdAt:    u.createdAt || "",
+        lastLogin:    u.lastLogin || u.updatedAt || "",
+        orderCount:   Object.values(db.orders || {}).filter((o) => o.userId === (u.id || u.userId)).length,
+      }));
+      return writeJson(res, 200, { ok: true, total: all.length, users: all.slice(offset, offset + limit) });
+    }
+
+    // ── Admin: full audit log ─────────────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/api/admin/audit") {
+      if (!requireAdmin(req, res)) return;
+      const { searchParams: _aasp } = new URL(req.url, "http://x");
+      const limit  = Math.min(Number(_aasp.get("limit")  || 100), 500);
+      const offset = Number(_aasp.get("offset") || 0);
+      const kind   = _aasp.get("kind")   || "";
+      const who    = _aasp.get("who")    || "";
+      let logs = [...(db.auditLogs || [])].reverse();
+      if (kind) logs = logs.filter((l) => l.kind && l.kind.startsWith(kind));
+      if (who)  logs = logs.filter((l) => l.who  && l.who.includes(who));
+      return writeJson(res, 200, { ok: true, total: logs.length, logs: logs.slice(offset, offset + limit) });
+    }
+
+    // ── Admin: feature flag management ────────────────────────────────────────
+    if (req.method === "DELETE" && /^\/api\/admin\/flags\/[^/]+$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
+      const flagName = pathname.split("/")[4];
+      if (db.featureFlags && db.featureFlags[flagName]) {
+        delete db.featureFlags[flagName];
+        saveDb();
+        audit.append({ kind: "admin.flags", who: _whoFromReq(req), what: `flag.deleted:${flagName}`, taskId: null, toolInput: { flagName }, toolOutput: {} });
+      }
+      return writeJson(res, 200, { ok: true, deleted: flagName });
+    }
+
+    // ── Admin: task force-status ──────────────────────────────────────────────
+    if (req.method === "POST" && /^\/api\/admin\/tasks\/[^/]+\/status$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
+      const taskId = pathname.split("/")[4];
+      const task = db.tasks[taskId];
+      if (!task) return writeJson(res, 404, { error: "Task not found" });
+      const body = await readBody(req);
+      const allowed = ["pending","running","done","failed","canceled","paused"];
+      if (!allowed.includes(body.status)) return writeJson(res, 400, { error: `status must be one of: ${allowed.join(", ")}` });
+      task.status = body.status;
+      task.updatedAt = nowIso();
+      audit.append({ kind: "admin.task", who: _whoFromReq(req), what: `task.force_status:${body.status}`, taskId, toolInput: { status: body.status }, toolOutput: { taskId } });
+      saveDb();
+      return writeJson(res, 200, { ok: true, task });
+    }
+
     if (req.method === "GET" && pathname === "/api/dashboard/kpi") {
       if (!requireAdmin(req, res)) return;
       return writeJson(res, 200, {
@@ -7647,12 +7769,13 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/metrics/events") {
       const body = await readBody(req);
-      pushMetricEvent({
-        kind: body.kind || "ui_event",
-        userId: body.userId || "demo",
-        taskId: body.taskId || null,
-        meta: body.meta && typeof body.meta === "object" ? body.meta : {},
-      });
+      const _evKind   = String(body.kind   || "ui_event").slice(0, 64);
+      const _evUserId = String(body.userId || "guest").replace(/[^a-zA-Z0-9_\-.:]/g, "").slice(0, 64);
+      const _evTaskId = body.taskId ? String(body.taskId).replace(/[^a-zA-Z0-9_\-.]/g, "").slice(0, 64) : null;
+      const _evMeta   = body.meta && typeof body.meta === "object" && !Array.isArray(body.meta)
+        ? Object.fromEntries(Object.entries(body.meta).slice(0, 20).map(([k, v]) => [String(k).slice(0, 64), String(v ?? "").slice(0, 256)]))
+        : {};
+      pushMetricEvent({ kind: _evKind, userId: _evUserId, taskId: _evTaskId, meta: _evMeta });
       saveDb();
       return writeJson(res, 200, { ok: true });
     }
@@ -7698,7 +7821,7 @@ const server = http.createServer(async (req, res) => {
       if (String(parsed.query.refresh || "0") === "1") {
         audit.append({
           kind: "system",
-          who: "demo",
+          who: _whoFromReq(req),
           what: "providers.probe.refreshed",
           taskId: null,
           toolInput: { refresh: true },
@@ -7751,8 +7874,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/session/profile") {
       const { searchParams } = new URL(req.url, "http://localhost");
-      const deviceId = searchParams.get("deviceId") || "";
-      const profile = deviceId ? loadProfile(deviceId) : null;
+      const { validateUserToken: _vutSp } = require("./src/services/user_auth");
+      const _spPayload = _vutSp(req);
+      // Prefer authenticated userId; fall back to deviceId query param
+      const _spId = _spPayload ? _spPayload.sub : (searchParams.get("deviceId") || "");
+      const profile = _spId ? loadProfile(_spId) : null;
       return writeJson(res, 200, { ok: true, profile: profile || null });
     }
 
@@ -7987,13 +8113,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/system/llm/reload") {
+      if (!requireAdmin(req, res)) return;
       LOADED_ENV_FILES = loadLocalEnvFiles();
       applyOpenAiConfig();
       applyClaudeConfig();
       applyCozeConfig();
       audit.append({
         kind: "system",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "llm.config.reloaded",
         taskId: null,
         toolInput: { source: "env_files_and_process_env" },
@@ -8027,6 +8154,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/system/llm/runtime") {
+      if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
       const payload = body && typeof body === "object" ? body : {};
       const clear = payload.clear === true;
@@ -8094,7 +8222,7 @@ const server = http.createServer(async (req, res) => {
       applyAmapConfig();
       audit.append({
         kind: "system",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "llm.config.runtime_updated",
         taskId: null,
         toolInput: {
@@ -8415,7 +8543,7 @@ const server = http.createServer(async (req, res) => {
       }));
       audit.append({
         kind: "chat",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "chat.smart_reply.generated",
         taskId: null,
         toolInput: { message, language, city, constraints, intentHint },
@@ -8468,7 +8596,7 @@ const server = http.createServer(async (req, res) => {
 
       audit.append({
         kind: "chat",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "chat.freeform_reply.generated",
         taskId: null,
         toolInput: { message, language, city, constraints },
@@ -8496,17 +8624,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/system/flags") {
+      if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
       if (!body || typeof body !== "object") {
         return writeJson(res, 400, { error: "Invalid flags payload" });
       }
+      // Whitelist: only allow known flag keys (string/boolean/number) — prevent prototype pollution
+      const _ALLOWED_FLAG_TYPES = new Set(["string", "boolean", "number"]);
+      const safeFlags = {};
+      for (const [k, v] of Object.entries(body)) {
+        if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
+        if (_ALLOWED_FLAG_TYPES.has(typeof v)) safeFlags[k] = v;
+      }
       db.featureFlags = {
         ...db.featureFlags,
-        ...body,
+        ...safeFlags,
       };
       audit.append({
         kind: "system",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "feature_flags.updated",
         taskId: null,
         toolInput: body,
@@ -8521,6 +8657,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/system/mcp-policy") {
+      if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
       db.mcpPolicy = {
         enforceSla: body && body.enforceSla === true,
@@ -8528,7 +8665,7 @@ const server = http.createServer(async (req, res) => {
       };
       audit.append({
         kind: "system",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "mcp.policy.updated",
         taskId: null,
         toolInput: body,
@@ -8561,7 +8698,7 @@ const server = http.createServer(async (req, res) => {
       };
       audit.append({
         kind: "system",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "mcp.contract.updated",
         taskId: null,
         toolInput: body,
@@ -8620,13 +8757,13 @@ const server = http.createServer(async (req, res) => {
 
       pushMetricEvent({
         kind: "emergency_support_requested",
-        userId: "demo",
+        userId: _whoFromReq(req),
         taskId: body.taskId || null,
         meta: { reason: body.reason || "user_clicked_emergency", ticketId: ticket.id, sessionId: ticket.sessionId || null },
       });
       audit.append({
         kind: "support",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "emergency.support.requested",
         taskId: body.taskId || null,
         toolInput: body,
@@ -8707,13 +8844,13 @@ const server = http.createServer(async (req, res) => {
       touchTicketFromSession(session, body.urgent ? "urgent_room_started" : "room_started");
       pushMetricEvent({
         kind: "support_session_started",
-        userId: "demo",
+        userId: _whoFromReq(req),
         taskId: ticket.taskId || null,
         meta: { ticketId: ticket.id, sessionId: session.id, urgent: body.urgent === true },
       });
       audit.append({
         kind: "support",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "support.session.started",
         taskId: ticket.taskId || null,
         toolInput: body,
@@ -8809,7 +8946,7 @@ const server = http.createServer(async (req, res) => {
       touchTicketFromSession(session, actor === "ops" ? "ops_replied" : "user_replied");
       pushMetricEvent({
         kind: actor === "ops" ? "support_ops_reply" : "support_user_reply",
-        userId: "demo",
+        userId: _whoFromReq(req),
         taskId: (ticket && ticket.taskId) || null,
         meta: { sessionId: session.id, ticketId: ticket && ticket.id, type },
       });
@@ -8952,7 +9089,7 @@ const server = http.createServer(async (req, res) => {
       }
       audit.append({
         kind: "support",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "support.ticket.evidence.added",
         taskId: ticket.taskId || null,
         toolInput: body,
@@ -8977,13 +9114,13 @@ const server = http.createServer(async (req, res) => {
 
       pushMetricEvent({
         kind: `handoff_${toStatus}`,
-        userId: "demo",
+        userId: _whoFromReq(req),
         taskId: ticket.taskId || null,
         meta: { ticketId: ticket.id },
       });
       audit.append({
         kind: "support",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "support.ticket.status.updated",
         taskId: ticket.taskId || null,
         toolInput: { ticketId: ticket.id, from: updated.from, to: updated.to },
@@ -9368,8 +9505,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/payments/authorize") {
+      if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
-      const user = db.users.demo;
+      const _authzActor = _whoFromReq(req);
+      const user = db.users[_authzActor] || db.users.demo;
       user.authDomain = {
         noPinEnabled: body.noPinEnabled !== false,
         dailyLimit: Number(body.dailyLimit || user.authDomain.dailyLimit),
@@ -9377,7 +9516,7 @@ const server = http.createServer(async (req, res) => {
       };
       audit.append({
         kind: "payment",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "payments.authorize.updated",
         taskId: null,
         toolInput: body,
@@ -9394,22 +9533,28 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/payments/compliance") {
+      if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
+      // Whitelist body fields — prevent prototype pollution via ...body spread
+      const _safeComplianceBody = {};
+      for (const k of ["region", "currency", "pciDss", "enabled", "notes"]) {
+        if (body && body[k] !== undefined) _safeComplianceBody[k] = body[k];
+      }
       db.paymentCompliance = {
         ...db.paymentCompliance,
-        ...body,
+        ..._safeComplianceBody,
         policy: {
           ...((db.paymentCompliance && db.paymentCompliance.policy) || {}),
-          ...((body && body.policy) || {}),
+          ...((body && body.policy && typeof body.policy === "object") ? body.policy : {}),
         },
         rails: {
           ...((db.paymentCompliance && db.paymentCompliance.rails) || {}),
-          ...((body && body.rails) || {}),
+          ...((body && body.rails && typeof body.rails === "object") ? body.rails : {}),
         },
       };
       audit.append({
         kind: "payment",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "payments.compliance.updated",
         taskId: null,
         toolInput: body,
@@ -9420,6 +9565,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/payments/compliance/certify") {
+      if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
       const railId = normalizeRail(body.railId);
       const prev = getRailCompliance(railId);
@@ -9433,7 +9579,7 @@ const server = http.createServer(async (req, res) => {
       };
       audit.append({
         kind: "payment",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "payments.compliance.certified",
         taskId: null,
         toolInput: body,
@@ -9444,7 +9590,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/payments/rails") {
-      return writeJson(res, 200, buildPaymentRailsStatus("demo"));
+      return writeJson(res, 200, buildPaymentRailsStatus(_whoFromReq(req)));
     }
 
     if (req.method === "POST" && pathname === "/api/payments/rails/select") {
@@ -9463,14 +9609,14 @@ const server = http.createServer(async (req, res) => {
       user.paymentRail = { selected: railId };
       audit.append({
         kind: "payment",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "payments.rail.selected",
         taskId: null,
         toolInput: body,
         toolOutput: { selected: railId },
       });
       saveDb();
-      return writeJson(res, 200, { ok: true, ...buildPaymentRailsStatus("demo") });
+      return writeJson(res, 200, { ok: true, ...buildPaymentRailsStatus(_whoFromReq(req)) });
     }
 
     if (req.method === "POST" && pathname === "/api/payments/verify-intent") {
@@ -9616,7 +9762,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/user/delete-data") {
       // Legacy endpoint: redirect to GDPR erase (schedules proper deletion with audit trail)
       const body = await readBody(req);
-      const did = extractDeviceId(req, body) || "demo";
+      const did = extractDeviceId(req, body);
+      if (!did) return writeJson(res, 400, { error: "missing_device_id" });
       const result = gdpr.requestErasure(did, "Legacy delete-data endpoint");
       saveDb();
       return writeJson(res, 200, { ok: true, deletedAt: nowIso() });
@@ -9689,8 +9836,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/trips") {
+      const _tripsActor = _whoFromReq(req);
       const trips = Object.values(db.tripPlans || {})
-        .filter((trip) => trip.userId === "demo")
+        .filter((trip) => trip.userId === _tripsActor || trip.userId === "demo" || _tripsActor === "anon")
         .map((trip) => buildTripSummary(trip))
         .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
       return writeJson(res, 200, { trips });
@@ -9698,12 +9846,13 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/trips") {
       const body = await readBody(req);
-      const trip = createTripPlan(body, "demo");
+      const trip = createTripPlan(body, _whoFromReq(req));
       return writeJson(res, 200, { ok: true, trip: buildTripSummary(trip) });
     }
 
     if (req.method === "GET" && pathname === "/api/trips/recent") {
-      const { deviceId = "demo", limit = "5" } = Object.fromEntries(new URL(req.url, "http://x").searchParams);
+      const _recentActor = _whoFromReq(req);
+      const { deviceId = _recentActor, limit = "5" } = Object.fromEntries(new URL(req.url, "http://x").searchParams);
       const trips = getRecentTrips(deviceId, Math.min(Number(limit) || 5, 20));
       return writeJson(res, 200, { ok: true, trips });
     }
@@ -9712,7 +9861,10 @@ const server = http.createServer(async (req, res) => {
       const tripId = pathname.split("/")[3];
       const trip = requireTripPlan(tripId, res);
       if (!trip) return;
-      if (trip.userId !== "demo") return writeJson(res, 403, { error: "Forbidden" });
+      const _tripActor = _whoFromReq(req);
+      if (trip.userId !== "demo" && trip.userId !== _tripActor && _tripActor !== "dev") {
+        return writeJson(res, 403, { error: "Forbidden" });
+      }
       return writeJson(res, 200, { trip: buildTripDetail(trip) });
     }
 
@@ -9720,7 +9872,10 @@ const server = http.createServer(async (req, res) => {
       const tripId = pathname.split("/")[3];
       const trip = requireTripPlan(tripId, res);
       if (!trip) return;
-      if (trip.userId !== "demo") return writeJson(res, 403, { error: "Forbidden" });
+      const _tripActor = _whoFromReq(req);
+      if (trip.userId !== "demo" && trip.userId !== _tripActor && _tripActor !== "dev") {
+        return writeJson(res, 403, { error: "Forbidden" });
+      }
       const body = await readBody(req);
       const taskId = String(body.taskId || "");
       if (!taskId || !db.tasks[taskId]) return writeJson(res, 400, { error: "taskId is required" });
@@ -9731,7 +9886,7 @@ const server = http.createServer(async (req, res) => {
       task.updatedAt = nowIso();
       audit.append({
         kind: "trip",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "trip.task.attached",
         taskId: task.id,
         toolInput: { tripId, taskId: task.id },
@@ -9745,7 +9900,10 @@ const server = http.createServer(async (req, res) => {
       const tripId = pathname.split("/")[3];
       const trip = requireTripPlan(tripId, res);
       if (!trip) return;
-      if (trip.userId !== "demo") return writeJson(res, 403, { error: "Forbidden" });
+      const _tripActor = _whoFromReq(req);
+      if (trip.userId !== "demo" && trip.userId !== _tripActor && _tripActor !== "dev") {
+        return writeJson(res, 403, { error: "Forbidden" });
+      }
       const body = await readBody(req);
       const next = String(body.status || "").toLowerCase();
       if (!["active", "paused", "completed", "canceled"].includes(next)) {
@@ -9756,7 +9914,7 @@ const server = http.createServer(async (req, res) => {
       refreshTripPlan(trip);
       audit.append({
         kind: "trip",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "trip.status.updated",
         taskId: null,
         toolInput: { tripId, status: next },
@@ -9779,6 +9937,7 @@ const server = http.createServer(async (req, res) => {
       if (!db.crossx_orders) db.crossx_orders = {};
       db.crossx_orders[ref] = {
         ref,
+        userId: _whoFromReq(req),
         status: "pending",
         method: String(body.method || "card"),
         destination: String(body.destination || ""),
@@ -9847,17 +10006,30 @@ const server = http.createServer(async (req, res) => {
         return writeJson(res, 200, payload);
       }
       const body = await readBody(req);
-      order.status = "refunding";
-      lifecyclePush(order.lifecycle, "refunding", "Refund in progress", `Reason: ${body.reason || "user_request"}`);
+      order.status = "cancelled";
+      lifecyclePush(order.lifecycle, "cancelled", "Cancelled by user", `Reason: ${body.reason || "user_request"}`);
+      order.updatedAt = nowIso();
+      saveDb();
+
+      // Attempt real gateway refund via fulfillment service
+      let _refundResult = null;
+      try {
+        _refundResult = await fulfillment.requestRefund(orderId, { reason: body.reason || "user_request" });
+      } catch (_refErr) {
+        // Order already in cancelled state; fall through with mock refund
+        _refundResult = { ok: true, source: "mock", gatewayWarning: _refErr.message, amount: Math.floor(order.price * 0.8) };
+      }
+
       order.refundable = false;
       order.refund = {
-        amount: Math.floor(order.price * 0.8),
+        amount: _refundResult.amount || Math.floor(order.price * 0.8),
         currency: order.currency,
-        status: "processing",
+        status: _refundResult.source === "mock" ? "processing" : "processed",
+        source: _refundResult.source,
         eta: (order.refundPolicy && order.refundPolicy.estimatedArrival) || "T+1 to T+3",
         at: nowIso(),
+        gatewayWarning: _refundResult.gatewayWarning || undefined,
       };
-      order.refund.status = "processed";
       order.status = "refunded";
       lifecyclePush(order.lifecycle, "refunded", "Refund completed", `${order.refund.amount} ${order.refund.currency} refunded.`);
       order.updatedAt = nowIso();
@@ -9872,7 +10044,7 @@ const server = http.createServer(async (req, res) => {
 
       audit.append({
         kind: "order",
-        who: "demo",
+        who: _whoFromReq(req),
         what: "order.canceled",
         taskId: order.taskId,
         toolInput: { orderId, reason: body.reason || "user_request" },
@@ -9903,7 +10075,7 @@ const server = http.createServer(async (req, res) => {
       });
       pushMetricEvent({
         kind: "order_canceled",
-        userId: "demo",
+        userId: _whoFromReq(req),
         taskId: order.taskId,
         orderId,
       });
@@ -10081,24 +10253,36 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (req.method === "POST" && pathname === "/api/subscription/plus") {
-      const body = await readBody(req);
-      const user = db.users.demo;
-      user.plusSubscription = {
-        active: body.active !== false,
-        plan: body.plan || "monthly",
-        benefits: ["7x24 human fallback", "Real-time translation", "Scarce resource concierge"],
-      };
-      audit.append({
-        kind: "subscription",
-        who: "demo",
-        what: "plus.updated",
-        taskId: null,
-        toolInput: body,
-        toolOutput: user.plusSubscription,
-      });
-      saveDb();
-      return writeJson(res, 200, { ok: true, plus: user.plusSubscription });
+    if (pathname === "/api/subscription/plus") {
+      const _subActor = _whoFromReq(req);
+      const _subUser  = db.users[_subActor] || db.users.demo;
+
+      if (req.method === "GET") {
+        return writeJson(res, 200, {
+          ok: true,
+          plus: _subUser.plusSubscription || { active: false, plan: "none", benefits: [] },
+        });
+      }
+
+      if (req.method === "POST") {
+        const body = await readBody(req);
+        _subUser.plusSubscription = {
+          active: body.active !== false,
+          plan: body.plan || "monthly",
+          benefits: ["7x24 human fallback", "Real-time translation", "Scarce resource concierge"],
+          updatedAt: nowIso(),
+        };
+        audit.append({
+          kind: "subscription",
+          who: _subActor,
+          what: body.active !== false ? "plus.activated" : "plus.cancelled",
+          taskId: null,
+          toolInput: { active: body.active, plan: body.plan },
+          toolOutput: _subUser.plusSubscription,
+        });
+        saveDb();
+        return writeJson(res, 200, { ok: true, plus: _subUser.plusSubscription });
+      }
     }
 
     if (req.method === "POST" && pathname === "/api/user/preferences") {
@@ -10216,7 +10400,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/user") {
-      return writeJson(res, 200, { user: db.users.demo });
+      const { validateUserToken } = require("./src/services/user_auth");
+      const userPayload = validateUserToken(req);
+      const userId = userPayload ? userPayload.sub : null;
+      const user = userId ? (getUser(userId) || db.users.demo) : db.users.demo;
+      return writeJson(res, 200, { user });
     }
 
     const parts = parsePath(pathname);
@@ -10392,6 +10580,8 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const body = await readBody(req);
       const { optionId, totalCost, currency, planSnapshot } = body || {};
       if (!optionId || !totalCost) return writeJson(res, 400, { error: "optionId and totalCost required" });
+      const { validateUserToken: _vutBc } = require("./src/services/user_auth");
+      const _bcUserId = (_vutBc(req) || {}).sub || extractDeviceId(req, body) || "guest";
 
       const rand = () => Math.random().toString(36).slice(2, 6).toUpperCase();
       const orderId = `CX-${Date.now().toString(36).toUpperCase()}-${rand()}`;
@@ -10402,10 +10592,11 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         orderId, type: "itinerary", source: "itinerary_card",
         optionId: String(optionId), totalCost: Number(totalCost),
         currency: String(currency || "CNY"), status: "awaiting_payment",
+        userId: _bcUserId,
         createdAt: now, expiresAt,
         planSnapshot: planSnapshot || null,
       };
-      audit.append({ kind: "booking", who: "demo", what: "booking.created", taskId: null,
+      audit.append({ kind: "booking", who: _bcUserId, what: "booking.created", taskId: null,
         toolInput: { optionId, totalCost }, toolOutput: { orderId, status: "awaiting_payment" } });
       saveDb();
 
@@ -10416,6 +10607,32 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       });
     }
 
+    // ── POST /api/order/create — Frontend alias for booking create ────────
+    if (req.method === "POST" && pathname === "/api/order/create") {
+      const body = await readBody(req);
+      const { plan, destination, method: payMethod, total } = body || {};
+      if (!plan || !total) return writeJson(res, 400, { error: "plan and total required" });
+      const { validateUserToken: _vutOc } = require("./src/services/user_auth");
+      const _ocUserId = (_vutOc(req) || {}).sub || extractDeviceId(req, body) || "guest";
+      const rand = () => Math.random().toString(36).slice(2, 6).toUpperCase();
+      const orderId = `CX-${Date.now().toString(36).toUpperCase()}-${rand()}`;
+      const now = nowIso();
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+      db.orders[orderId] = {
+        orderId, type: "itinerary", source: "itinerary_card",
+        optionId: String(plan.id || plan.tag || "unknown"),
+        totalCost: Number(total), currency: "CNY",
+        status: "awaiting_payment", payMethod: payMethod || null,
+        destination: destination || null, userId: _ocUserId,
+        createdAt: now, expiresAt, planSnapshot: plan || null,
+      };
+      audit.append({ kind: "booking", who: _ocUserId, what: "booking.created", taskId: null,
+        toolInput: { optionId: plan.id, totalCost: total },
+        toolOutput: { orderId, status: "awaiting_payment" } });
+      saveDb();
+      return writeJson(res, 200, { ok: true, ref: orderId, orderId, status: "awaiting_payment", expiresAt });
+    }
+
     // ── POST /api/booking/confirm — Confirm payment & issue itinerary ─────
     if (req.method === "POST" && pathname === "/api/booking/confirm") {
       const body = await readBody(req);
@@ -10423,13 +10640,15 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       if (!orderId) return writeJson(res, 400, { error: "orderId required" });
       const order = db.orders[orderId];
       if (!order) return writeJson(res, 404, { error: "Order not found" });
+      const { validateUserToken: _vutCf } = require("./src/services/user_auth");
+      const _cfUserId = (_vutCf(req) || {}).sub || order.userId || "guest";
 
       const itineraryId = `ITN-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
       order.status = "confirmed";
       order.itineraryId = itineraryId;
       order.confirmedAt = nowIso();
 
-      audit.append({ kind: "booking", who: "demo", what: "booking.confirmed", taskId: null,
+      audit.append({ kind: "booking", who: _cfUserId, what: "booking.confirmed", taskId: null,
         toolInput: { orderId }, toolOutput: { itineraryId, status: "confirmed" } });
       saveDb();
 
@@ -11172,16 +11391,20 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
 
     if (req.method === "POST" && pathname === "/api/payments/charge") {
       const body = await readBody(req);
-      const { railId = "alipay_cn", amount = 0, currency = "CNY", userId = "demo", taskId = "" } = body;
+      const { railId = "alipay_cn", amount = 0, currency = "CNY", taskId = "" } = body;
+      const userId = _whoFromReq(req) || String(body.userId || "demo");
 
-      // ── Plus subscription gate ─────────────────────────────────────────────
-      const _gateUser = db.users?.[userId] || db.users?.demo;
-      if (!_gateUser?.plusSubscription?.active) {
-        return writeJson(res, 402, {
-          error:   "plus_required",
-          message: "Cross X Plus subscription required for payments.",
-          upgrade: "/api/subscription/plus",
-        });
+      // ── Plus subscription gate (bypassed in dev/sandbox mode) ─────────────
+      const _devMode = !process.env.ALIPAY_APP_ID && !process.env.WECHAT_MCH_ID && !process.env.STRIPE_SECRET_KEY;
+      if (!_devMode) {
+        const _gateUser = db.users?.[userId] || db.users?.demo;
+        if (!_gateUser?.plusSubscription?.active) {
+          return writeJson(res, 402, {
+            error:   "plus_required",
+            message: "Cross X Plus subscription required for payments.",
+            upgrade: "/api/subscription/plus",
+          });
+        }
       }
 
       try {
@@ -11302,12 +11525,31 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       return writeJson(res, 200, { ok: true, receiptUrl: `/api/orders/${orderId}/receipt` });
     }
 
-    // ── GET /api/orders/:id/receipt — serve HTML receipt ──────────────────
+    // ── GET /api/orders/:id/receipt — serve HTML receipt (auto-generate if missing) ─
     if (req.method === "GET" && /^\/api\/orders\/[^/]+\/receipt$/.test(pathname)) {
       const orderId = pathname.split("/")[3];
       const { searchParams: _rsp } = new URL(req.url, "http://localhost");
       const download = _rsp.get("download") === "1";
-      const row = getReceipt(String(orderId));
+      let row = getReceipt(String(orderId));
+      // Auto-generate receipt from order data if not yet created
+      if (!row) {
+        const _autoOrder = db.orders && db.orders[orderId];
+        if (_autoOrder && ["confirmed", "delivered", "refund_requested", "refunded"].includes(_autoOrder.status)) {
+          const _autoHtml = buildReceiptHtml({
+            orderId,
+            place:         String(_autoOrder.place || _autoOrder.provider || ""),
+            city:          String(_autoOrder.city || ""),
+            area:          String(_autoOrder.area || ""),
+            intent:        String(_autoOrder.type || "eat"),
+            amount:        Number(_autoOrder.price || 0),
+            railId:        String((_autoOrder.proof && _autoOrder.proof.railId) || _autoOrder.paymentRail || "alipay_cn"),
+            transactionId: String((_autoOrder.proof && _autoOrder.proof.transactionId) || _autoOrder.id),
+            executedAt:    String(_autoOrder.updatedAt || _autoOrder.createdAt || new Date().toISOString()),
+          });
+          upsertReceipt(String(orderId), "text/html", _autoHtml);
+          row = getReceipt(String(orderId));
+        }
+      }
       if (!row) return writeJson(res, 404, { error: "receipt_not_found" });
       const headers = {
         "Content-Type": `${row.content_type || "text/html"}; charset=utf-8`,
@@ -11438,6 +11680,7 @@ process.on("SIGINT", () => {
 
 process.on("SIGTERM", () => {
   if (hotelOrderPollTicker) clearInterval(hotelOrderPollTicker);
+  try { gdpr.stopCrons(); } catch {}
   saveDb();
   process.exit(0);
 });

@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>隐私政策 / Privacy Policy — CrossX Travel</title>
+<style>
+  :root { --brand: #4f46e5; --text: #1a1a2e; --muted: #6b7280; --bg: #f9fafb; --card: #fff; --border: #e5e7eb; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); line-height: 1.7; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 40px 20px 80px; }
+  header { text-align: center; margin-bottom: 48px; padding-bottom: 24px; border-bottom: 2px solid var(--border); }
+  header h1 { font-size: 2rem; font-weight: 700; color: var(--brand); }
+  header p { color: var(--muted); margin-top: 8px; }
+  .badge { display: inline-block; background: #ecfdf5; color: #059669; font-size: 0.75rem; font-weight: 600; padding: 2px 10px; border-radius: 999px; margin-left: 10px; }
+  h2 { font-size: 1.2rem; font-weight: 700; color: var(--brand); margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  h3 { font-size: 1rem; font-weight: 600; margin: 20px 0 8px; }
+  p, li { font-size: 0.95rem; color: #374151; }
+  ul { margin: 8px 0 8px 24px; }
+  li { margin-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 0.88rem; }
+  th { background: #f3f4f6; text-align: left; padding: 8px 12px; border: 1px solid var(--border); font-weight: 600; }
+  td { padding: 8px 12px; border: 1px solid var(--border); vertical-align: top; }
+  .right-box { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px; margin: 12px 0; }
+  .right-box h3 { margin-top: 0; }
+  code { background: #f3f4f6; padding: 2px 6px; border-radius: 4px; font-size: 0.85em; font-family: "SF Mono", "Fira Code", monospace; }
+  .contact-card { background: #eff6ff; border-left: 4px solid var(--brand); padding: 16px 20px; border-radius: 0 8px 8px 0; margin: 20px 0; }
+  .toc { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px; margin-bottom: 32px; }
+  .toc ol { margin: 10px 0 0 20px; }
+  .toc a { color: var(--brand); text-decoration: none; font-size: 0.9rem; }
+  .toc a:hover { text-decoration: underline; }
+  footer { margin-top: 60px; padding-top: 24px; border-top: 1px solid var(--border); text-align: center; font-size: 0.85rem; color: var(--muted); }
+  .back-btn { display: inline-block; margin-bottom: 24px; color: var(--brand); text-decoration: none; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back-btn" href="/">&larr; 返回 CrossX / Back to CrossX</a>
+
+  <header>
+    <h1>CrossX 隐私政策 <span class="badge">GDPR 合规</span></h1>
+    <p>Privacy Policy &amp; Data Subject Rights Notice</p>
+    <p style="margin-top:6px;font-size:0.85rem;color:var(--muted)">版本 Version 1.0 &nbsp;|&nbsp; 生效日期 Effective: 2026-03-04</p>
+  </header>
+
+  <div class="toc">
+    <strong>目录 Contents</strong>
+    <ol>
+      <li><a href="#controller">数据控制者 Data Controller</a></li>
+      <li><a href="#data">我们处理的数据 Data We Process</a></li>
+      <li><a href="#basis">处理依据 Lawful Basis</a></li>
+      <li><a href="#retention">数据保留 Retention Periods</a></li>
+      <li><a href="#transfers">数据转移 International Transfers</a></li>
+      <li><a href="#rights">您的权利 Your Rights (Art. 15-21)</a></li>
+      <li><a href="#cookies">Cookie 与本地存储</a></li>
+      <li><a href="#security">安全措施 Security Measures</a></li>
+      <li><a href="#contact">联系我们 Contact &amp; DPO</a></li>
+    </ol>
+  </div>
+
+  <h2 id="controller">1. 数据控制者 / Data Controller</h2>
+  <p>CrossX Travel Technology Co., Ltd. 是根据 GDPR 第 4(7) 条定义的数据控制者。</p>
+  <p>CrossX Travel Technology Co., Ltd. ("CrossX") is the data controller as defined in GDPR Art. 4(7).</p>
+  <div class="contact-card">
+    <strong>数据保护官 / DPO:</strong> <a href="mailto:dpo@crossx.ai">dpo@crossx.ai</a><br/>
+    <strong>隐私咨询 / Privacy:</strong> <a href="mailto:privacy@crossx.ai">privacy@crossx.ai</a>
+  </div>
+
+  <h2 id="data">2. 我们处理的数据 / Data We Process</h2>
+  <table>
+    <tr><th>数据类别</th><th>Category</th><th>具体内容</th><th>来源</th></tr>
+    <tr><td>设备标识符</td><td>Device ID</td><td>随机 cx_device_id（存于 localStorage）</td><td>浏览器生成</td></tr>
+    <tr><td>旅行偏好</td><td>Preferences</td><td>预算、饮食、出行方式、无障碍需求</td><td>用户设置</td></tr>
+    <tr><td>位置信息</td><td>Location</td><td>近似城市（授权后）</td><td>Geolocation API</td></tr>
+    <tr><td>行程计划</td><td>Trip Plans</td><td>AI 生成方案及用户选择</td><td>AI 规划</td></tr>
+    <tr><td>支付信息</td><td>Payment</td><td>支付方式类型（不含卡号）</td><td>用户选择</td></tr>
+    <tr><td>使用分析</td><td>Analytics</td><td>功能使用事件（匿名）</td><td>自动记录</td></tr>
+    <tr><td>同意记录</td><td>Consent Log</td><td>同意时间/版本/目的（IP 哈希，非原始 IP）</td><td>同意系统</td></tr>
+  </table>
+  <p><strong>我们不收集：</strong>姓名、邮箱、手机号、护照、银行卡号。</p>
+  <p><strong>We do NOT collect:</strong> name, email, phone, passport, or card numbers.</p>
+
+  <h2 id="basis">3. 处理依据 / Lawful Basis (GDPR Art. 6)</h2>
+  <table>
+    <tr><th>处理活动</th><th>法律依据</th><th>Article</th></tr>
+    <tr><td>AI 行程规划（核心服务）</td><td>合同履行</td><td>Art. 6(1)(b)</td></tr>
+    <tr><td>旅行偏好个性化</td><td>用户同意</td><td>Art. 6(1)(a)</td></tr>
+    <tr><td>使用分析</td><td>用户同意</td><td>Art. 6(1)(a)</td></tr>
+    <tr><td>支付处理与结算记录</td><td>法律义务</td><td>Art. 6(1)(c)</td></tr>
+    <tr><td>安全审计日志</td><td>合法利益</td><td>Art. 6(1)(f)</td></tr>
+  </table>
+
+  <h2 id="retention">4. 数据保留期 / Retention Periods</h2>
+  <table>
+    <tr><th>数据类型</th><th>保留期</th></tr>
+    <tr><td>设备偏好 Device preferences</td><td>最后活跃后 30 天 / 30 days after last activity</td></tr>
+    <tr><td>行程计划 Trip plans</td><td>730 天（2 年）/ 730 days</td></tr>
+    <tr><td>支付记录 Payment records</td><td>730 天（法规要求）/ 730 days (legal)</td></tr>
+    <tr><td>安全审计日志 Audit logs</td><td>730 天 / 730 days</td></tr>
+    <tr><td>使用分析 Analytics events</td><td>90 天 / 90 days</td></tr>
+    <tr><td>同意记录 Consent logs</td><td>撤回后 1 年；授权记录永久 / 1yr after withdrawal; granted: permanent</td></tr>
+  </table>
+
+  <h2 id="transfers">5. 国际数据转移 / International Transfers</h2>
+  <table>
+    <tr><th>接收方</th><th>国家</th><th>目的</th><th>保障措施</th></tr>
+    <tr><td>OpenAI</td><td>美国 USA</td><td>AI 行程规划</td><td>标准合同条款 SCCs</td></tr>
+    <tr><td>Coze / ByteDance</td><td>中国 CN</td><td>行程丰富化（可选）</td><td>PIPL DPA</td></tr>
+    <tr><td>Amap / AutoNavi</td><td>中国 CN</td><td>地图与 POI</td><td>PIPL 服务协议</td></tr>
+    <tr><td>Stripe</td><td>美国 USA</td><td>境外支付（可选）</td><td>SCCs + PCI-DSS</td></tr>
+  </table>
+  <p>LLM 调用前自动进行 PII 脱敏（电话/邮箱/身份证/银行卡 → 占位符）。</p>
+
+  <h2 id="rights">6. 您的权利 / Your Rights (GDPR Art. 15-21)</h2>
+
+  <div class="right-box">
+    <h3>&#x1F4CB; 访问权 Right of Access (Art. 15 + Art. 20 Portability)</h3>
+    <p>获取我们持有的所有关于您的数据副本（JSON 格式）。</p>
+    <p><strong>行使方式:</strong> <code>GET /api/privacy/export</code>（需 <code>X-Device-Id</code> 请求头）</p>
+  </div>
+
+  <div class="right-box">
+    <h3>&#x1F5D1; 删除权 Right to Erasure / "Right to Be Forgotten" (Art. 17)</h3>
+    <p>请求删除所有个人数据（支付记录按法规保留）。请求提交后 <strong>30 天内</strong>执行。</p>
+    <p><strong>行使方式:</strong> <code>POST /api/privacy/erase</code></p>
+  </div>
+
+  <div class="right-box">
+    <h3>&#x1F6AB; 限制处理权 Right to Restrict Processing (Art. 18)</h3>
+    <p>暂停对您数据的处理（分析/个性化），同时保留数据。</p>
+    <p><strong>行使方式:</strong> <code>POST /api/privacy/restrict</code> | 撤销: <code>DELETE /api/privacy/restrict</code></p>
+  </div>
+
+  <div class="right-box">
+    <h3>&#x270F; 更正权 Right to Rectification (Art. 16)</h3>
+    <p>通过应用内设置随时更新您的旅行偏好和保存地点。</p>
+  </div>
+
+  <div class="right-box">
+    <h3>&#x1F514; 撤回同意 Withdraw Consent (Art. 7)</h3>
+    <p>随时撤回同意，不影响撤回前处理的合法性。</p>
+    <p><strong>行使方式:</strong> <code>POST /api/privacy/consent</code> 中设置 <code>"granted": false</code></p>
+  </div>
+
+  <p style="margin-top:16px">您有权向所在欧盟成员国的数据保护监管机构（DPA）投诉。中国境内用户可联系国家互联网信息办公室（CAC）。</p>
+
+  <h2 id="cookies">7. Cookie 与本地存储 / Local Storage</h2>
+  <p>CrossX <strong>不使用</strong>任何第三方 Cookie 或跟踪像素。仅使用浏览器 localStorage：</p>
+  <table>
+    <tr><th>键名 Key</th><th>用途 Purpose</th><th>过期 Expiry</th></tr>
+    <tr><td><code>cx_device_id</code></td><td>匿名设备标识符</td><td>永久（直至清除浏览器数据）</td></tr>
+    <tr><td><code>cx_gdpr_v1</code></td><td>隐私同意记录</td><td>永久</td></tr>
+    <tr><td><code>cx_session_*</code></td><td>当前会话上下文</td><td>4 小时</td></tr>
+    <tr><td><code>cx_profile_*</code></td><td>跨设备偏好缓存</td><td>30 天</td></tr>
+  </table>
+
+  <h2 id="security">8. 安全措施 / Security Measures</h2>
+  <ul>
+    <li><strong>传输加密:</strong> 所有 API 通信使用 TLS 1.2+</li>
+    <li><strong>数据最小化:</strong> LLM 调用前自动 PII 脱敏</li>
+    <li><strong>访问控制:</strong> RBAC 分区（b2c / b2b / admin）</li>
+    <li><strong>审计日志:</strong> 所有操作含 SHA-256 完整性哈希</li>
+    <li><strong>安全响应头:</strong> CSP、X-Frame-Options、X-Content-Type-Options、Referrer-Policy、Permissions-Policy</li>
+    <li><strong>输入防护:</strong> 8 种提示注入模式自动拦截</li>
+    <li><strong>速率限制:</strong> 每 IP 每分钟 10-30 次请求上限</li>
+    <li><strong>IP 哈希:</strong> 同意记录存储 SHA-256 IP 哈希，不存储原始 IP</li>
+  </ul>
+
+  <h2 id="contact">9. 联系我们 / Contact Us</h2>
+  <div class="contact-card">
+    <strong>数据保护官 DPO:</strong> <a href="mailto:dpo@crossx.ai">dpo@crossx.ai</a><br/>
+    <strong>隐私团队 Privacy Team:</strong> <a href="mailto:privacy@crossx.ai">privacy@crossx.ai</a><br/>
+    <strong>响应时间 Response time:</strong> 30 个日历天内 / Within 30 calendar days (GDPR Art. 12 §3)<br/>
+    <strong>监管机构 Lead DPA:</strong> CNIL (France) &mdash; <a href="https://www.cnil.fr" target="_blank" rel="noopener">www.cnil.fr</a>
+  </div>
+
+  <p>本政策自 2026 年 3 月 4 日起生效。重大变更将通过应用内通知提前 30 天告知。</p>
+  <p><em>This policy is effective from 4 March 2026. Material changes will be notified in-app at least 30 days in advance.</em></p>
+
+  <footer>
+    CrossX Travel Technology Co., Ltd. &nbsp;|&nbsp;
+    <a href="/api/privacy/notice" target="_blank">机器可读版本</a> &nbsp;|&nbsp;
+    <a href="/api/privacy/register" target="_blank">处理活动记录</a>
+  </footer>
+</div>
+</body>
+</html>

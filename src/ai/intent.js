@@ -71,11 +71,11 @@ async function detectIntentLLM(message, { apiKey, model, baseUrl } = {}) {
     const { ok, text } = await openAIRequest({
       apiKey, model, baseUrl,
       systemPrompt: INTENT_SYSTEM_PROMPT,
-      userContent: message.slice(0, 400), // cap to avoid token waste
+      userContent: message.slice(0, 800), // cap to avoid token waste
       temperature: 0.1,
-      maxTokens: 200,
+      maxTokens: 300,
       jsonMode: true,
-      timeoutMs: 2500,
+      timeoutMs: 4000,
     });
 
     if (!ok || !text) {

@@ -47,6 +47,9 @@ const state = {
   executionMockTimer: null,
   supportEtaTicker: null,
   chatNoticeTicker: null,
+  featureFlags: {},
+  favorites: [],
+  _prefsDirty: false,
   chatNoticeSince: "",
   supportRoom: {
     activeSessionId: "",
@@ -331,6 +334,14 @@ const el = {
   revenueSummary: document.getElementById("revenueSummary"),
   prdCoverageSummary: document.getElementById("prdCoverageSummary"),
   flagsSummary: document.getElementById("flagsSummary"),
+  meProfileCard: document.getElementById("meProfileCard"),
+  meAvatar: document.getElementById("meAvatar"),
+  meProfileName: document.getElementById("meProfileName"),
+  meProfileSub: document.getElementById("meProfileSub"),
+  meTripCount: document.getElementById("meTripCount"),
+  meOrderCount: document.getElementById("meOrderCount"),
+  meTripLabel: document.getElementById("meTripLabel"),
+  meOrderLabel: document.getElementById("meOrderLabel"),
   trainingSummary: document.getElementById("trainingSummary"),
   benchmarkResult: document.getElementById("benchmarkResult"),
   runBenchmarkBtn: document.getElementById("runBenchmarkBtn"),
@@ -474,10 +485,11 @@ function tUi(key, vars) {
   return i18n.t(state.uiLanguage, `ui.${key}`, vars);
 }
 
-function pickText(zh, en, ja, ko) {
+function pickText(zh, en, ja, ko, id) {
   if (state.uiLanguage === "ZH") return zh;
   if (state.uiLanguage === "JA") return ja || en;
   if (state.uiLanguage === "KO") return ko || en;
+  if (state.uiLanguage === "ID") return id || en;
   return en;
 }
 
@@ -1100,8 +1112,13 @@ function speakAssistantMessage(text) {
     if (!played) {
       try {
         await speakWithBrowserSynthesis(content);
+        played = true;
       } catch {
-        // ignore local synthesis failure
+        // both OpenAI TTS and browser synthesis failed
+        if (!state.voice._ttsWarnedOnce) {
+          state.voice._ttsWarnedOnce = true;
+          notify(pickText("语音播放暂不可用，请检查设备音量或浏览器权限。", "Voice playback unavailable — check device volume or browser permissions.", "音声再生できません。デバイス音量またはブラウザ権限を確認してください。", "음성 재생 불가 — 볼륨 또는 브라우저 권한을 확인하세요."), "warning");
+        }
       }
     }
   };
@@ -1155,6 +1172,12 @@ function renderVoiceControls() {
                 ? pickText("正在听你说话", "Listening", "聞き取り中", "듣는 중")
                 : pickText("语音输入", "Voice input", "音声入力", "음성 입력");
     const disabled = !state.voice.supported || (state.voice.processing && !state.voice.listening);
+    const disabledReason = !state.voice.supported
+      ? pickText("此浏览器不支持语音输入", "Voice input not supported in this browser", "このブラウザは音声入力非対応", "이 브라우저는 음성 입력을 지원하지 않습니다")
+      : (state.voice.processing && !state.voice.listening)
+        ? pickText("正在处理中，请稍候", "Processing, please wait", "処理中です、お待ちください", "처리 중입니다, 잠시 기다려주세요")
+        : null;
+    const titleText = disabledReason || label;
     if (taskComponents && taskComponents.VoiceButton) {
       taskComponents.VoiceButton.apply(el.voiceInputBtn, {
         state: voiceUiState,
@@ -1173,8 +1196,8 @@ function renderVoiceControls() {
       el.voiceInputBtn.classList.toggle("is-interrupted", voiceUiState === "interrupted");
       el.voiceInputBtn.classList.toggle("is-error", voiceUiState === "error");
       el.voiceInputBtn.innerHTML = `<span class="voice-stem" aria-hidden="true"></span><span class="sr-only">${escapeHtml(label)}</span>`;
-      el.voiceInputBtn.setAttribute("title", label);
-      el.voiceInputBtn.setAttribute("aria-label", label);
+      el.voiceInputBtn.setAttribute("title", titleText);
+      el.voiceInputBtn.setAttribute("aria-label", titleText);
     }
   }
   if (el.voiceReplyBtn) {
@@ -4701,6 +4724,7 @@ async function runStepTool(step, context) {
           preferences: slots.preferences || [],
         }),
       });
+      if (!r.ok) throw new Error(`search ${r.status}`);
       const data = await r.json();
       if (data.ok && Array.isArray(data.candidates) && data.candidates.length) {
         search = { candidates: data.candidates, source: data.source };
@@ -4790,7 +4814,7 @@ async function runStepTool(step, context) {
     try {
       const r = await fetch("/api/payments/charge", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ..._authHeaders() },
         body: JSON.stringify({ railId, amount, currency: "CNY", userId: deviceId }),
       });
       // ── Plus subscription gate ─────────────────────────────────────────────
@@ -4809,7 +4833,14 @@ async function runStepTool(step, context) {
       const data = await r.json();
       if (data.ok) {
         const railLabel = railId === "alipay_cn" ? "\u652f\u4ed8\u5b9d" : railId === "wechat_cn" ? "\u5fae\u4fe1\u652f\u4ed8" : "\u59d4\u6258\u4ee3\u4ed8\u5361";
-        _startPaymentCountdown();
+        const _payTick = _startPaymentCountdown();
+        // Mock mode: auto-confirm after 3.5 s so countdown doesn't linger
+        setTimeout(() => {
+          clearInterval(_payTick);
+          const countEl = document.querySelector(".cx-pay-countdown");
+          if (countEl) { countEl.textContent = pickText("\u652f\u4ed8\u6210\u529f \u2713", "Payment confirmed \u2713", "\u304a\u652f\u6255\u3044\u5b8c\u4e86 \u2713", "\uacb0\uc81c \uc644\ub8cc \u2713"); countEl.style.color = "#10b981"; }
+          if (typeof notify === "function") notify(pickText("\u652f\u4ed8\u6210\u529f\uff01", "Payment confirmed!", "\u304a\u652f\u6255\u3044\u5b8c\u4e86!", "\uacb0\uc81c \uc644\ub8cc!"), "success");
+        }, 3500);
         if (data.qrCode) {
           addCard(`<article class="card cx-qr-card">
     <div class="cx-qr-title">${pickText("\u626b\u7801\u652f\u4ed8", "Scan to Pay", "QR\u30b3\u30fc\u30c9\u3067\u652f\u6255\u3044", "QR\ucf54\ub4dc\ub85c \uacb0\uc81c")}</div>
@@ -5087,7 +5118,7 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
   const _tripSlots = state.agentConversation.slots || {};
   fetch("/api/agent/trips", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ..._authHeaders() },
     body: JSON.stringify({
       deviceId: getDeviceId ? getDeviceId() : "demo",
       city: _tripSlots.city || "",
@@ -5277,7 +5308,7 @@ function evaluateAgentConversation(options = {}) {
     try {
       const r = await fetch("/api/agent/llm-plan/stream", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ..._authHeaders() },
         body: JSON.stringify({ slots: convSlots, deviceId }),
         signal: AbortSignal.timeout ? AbortSignal.timeout(12000) : undefined,
       });
@@ -5525,7 +5556,7 @@ async function handleAgentConversationInput(text) {
   if (!state.agentConversation.warnedMissingLlm) {
     state.agentConversation.warnedMissingLlm = true;
     try {
-      const llm = await api("/api/system/llm-status");
+      const llm = await getLlmStatus();
       const configured = llm && llm.configured === true && llm.keyHealth && llm.keyHealth.looksValid === true;
       if (!configured) {
         addMessage(
@@ -6563,9 +6594,12 @@ async function api(path, options = {}) {
   if (callerSignal) {
     callerSignal.addEventListener("abort", () => ctrl.abort(), { once: true });
   }
+  // Auto-inject auth token when present
+  const _authToken = _getAuthToken ? _getAuthToken() : null;
+  const _authHeader = _authToken ? { Authorization: `Bearer ${_authToken}` } : {};
   try {
     const res = await fetch(path, {
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ..._authHeader },
       signal: ctrl.signal,
       ...fetchOptions,
     });
@@ -6580,11 +6614,17 @@ async function api(path, options = {}) {
   }
 }
 
+// Returns auth header for direct fetch() calls (mirrors api() helper auto-inject)
+function _authHeaders() {
+  const t = _getAuthToken ? _getAuthToken() : null;
+  return t ? { Authorization: `Bearer ${t}` } : {};
+}
+
 async function trackEvent(kind, meta = {}, taskId = null) {
   try {
     await api("/api/metrics/events", {
       method: "POST",
-      body: JSON.stringify({ kind, userId: "demo", taskId, meta }),
+      body: JSON.stringify({ kind, userId: _getAuthUserId ? (_getAuthUserId() || "guest") : "guest", taskId, meta }),
     });
   } catch {
     // no-op
@@ -7294,9 +7334,10 @@ function _buildRefineBar(cd) {
   ).join("");
 
   return `<div class="cx-plan-refine">
+    <div class="cx-pr-label">${pickText("\u8FDB\u4E00\u6B65\u8C03\u6574\u65B9\u6848\uFF1A", "Refine this plan:", "\u30D7\u30E9\u30F3\u3092\u8ABF\u6574\uFF1A", "\uD50C\uB79C \uC870\uC815:")}</div>
     <div class="cx-pr-chips">${chipsHtml}</div>
     <div class="cx-pr-input-row">
-      <input class="cx-pr-input" placeholder="${escapeHtml("\u7528\u81EA\u7136\u8BED\u8A00\u8C03\u6574\u65B9\u6848...")}"
+      <input class="cx-pr-input" placeholder="${escapeHtml("\u6216\u8F93\u5165\u81EA\u5B9A\u4E49\u8981\u6C42...")}"
         onkeydown="if(event.key==='Enter'&&!event.isComposing)_sendPlanRefine(this.value,this)">
       <button class="cx-pr-send" onclick="_sendPlanRefine(this.previousElementSibling.value,this.previousElementSibling)">\u8C03\u6574</button>
     </div>
@@ -8011,12 +8052,15 @@ async function submitPlanRating(cardId, rating, destination, durationDays, btn) 
   stars.forEach((s, i) => { s.classList.toggle("cx-star--on", i < rating); s.disabled = true; });
   const deviceId = typeof getDeviceId === "function" ? getDeviceId() : "demo";
   try {
-    await fetch("/api/plan/feedback", {
+    const _fr = await fetch("/api/plan/feedback", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ..._authHeaders() },
       body: JSON.stringify({ planId: cardId, deviceId, rating: Number(rating), destination, durationDays: Number(durationDays) || 0 }),
     });
-  } catch {}
+    if (!_fr.ok) throw new Error(`feedback ${_fr.status}`);
+  } catch (_fe) {
+    if (rating >= 4) notify(pickText("反馈已记录（离线）", "Feedback saved (offline)", "フィードバック保存済み（オフライン）", "피드백 저장됨 (오프라인)"), "info");
+  }
   if (rating >= 4) {
     const ty = document.createElement("span");
     ty.className = "cx-rating-thanks";
@@ -8377,6 +8421,8 @@ function renderCardData(cd, spokenText) {
           <div class="plan-card-hero-overlay">
             <h3 class="plan-card-title">${escapeHtml(cd.title || pickText("定制方案对比","Custom Plans","カスタムプラン","맞춤 플랜"))}</h3>
             ${dest || dur ? `<div class="plan-card-meta">📍 ${dest ? dest + "  ·  " : ""}${dur}${pickText("天","d","日","일")}${pax > 1 ? "  ·  " + pax + pickText("人","pax","名","명") : ""}</div>` : ""}
+            <button class="cx-fav-btn" title="${pickText("收藏","Save","お気に入り","저장")}"
+              onclick="_toggleFavorite('${cardId}',${JSON.stringify(cd.destination||"")},${JSON.stringify(cd.title||cd.destination||"")},${dur},${pax})">${(state.favorites||[]).some(f=>f.destination===(cd.destination||"")) ? "\u2665" : "\u2661"}</button>
           </div>
         </div>
         <div id="${cardId}-weather" class="cx-weather-strip cx-weather-strip--loading">⏳ 正在获取天气预报...</div>
@@ -10289,6 +10335,17 @@ async function confirmAndExecute(taskId, options = {}) {
 }
 
 function switchTab(tabName, options = {}) {
+  // Guard: warn if Me tab preferences have unsaved changes
+  if (state._prefsDirty && tabName !== "me" && !options.force
+      && el.tabPanels && el.tabPanels.me && el.tabPanels.me.classList.contains("active")) {
+    notify(pickText(
+      "\u504f\u597d\u8bbe\u7f6e\u6709\u672a\u4fdd\u5b58\u7684\u4fee\u6539\uff0c\u8bf7\u5148\u70b9\u51fb\u300c\u4fdd\u5b58\u504f\u597d\u300d\u3002",
+      "You have unsaved preference changes \u2014 please save first.",
+      "\u8a2d\u5b9a\u304c\u672a\u4fdd\u5b58\u3067\u3059\u3002\u5148\u306b\u300c\u8a2d\u5b9a\u3092\u4fdd\u5b58\u300d\u3092\u30af\u30ea\u30c3\u30af\u3057\u3066\u304f\u3060\u3055\u3044\u3002",
+      "\uc800\uc7a5\ub418\uc9c0 \uc54a\uc740 \uc124\uc815\uc774 \uc788\uc2b5\ub2c8\ub2e4 \u2014 \uba3c\uc800 \uc800\uc7a5\ud558\uc138\uc694."
+    ), "warning");
+    return;
+  }
   if (state.singleDialogMode && tabName !== "chat" && !options.force) {
     notify(
       pickText(
@@ -10672,8 +10729,34 @@ function renderNearMap(item, mapPreview) {
   `;
 }
 
+const _NEAR_FILTER_KEY = "cx_near_filter_v1";
+
+function _saveNearFilter() {
+  if (!el.nearFilterForm) return;
+  try {
+    const form = new FormData(el.nearFilterForm);
+    const saved = {};
+    for (const [k, v] of form.entries()) saved[k] = v;
+    localStorage.setItem(_NEAR_FILTER_KEY, JSON.stringify(saved));
+  } catch {}
+}
+
+function _restoreNearFilter() {
+  if (!el.nearFilterForm) return;
+  try {
+    const saved = JSON.parse(localStorage.getItem(_NEAR_FILTER_KEY) || "null");
+    if (!saved) return;
+    for (const [k, v] of Object.entries(saved)) {
+      const field = el.nearFilterForm.elements[k];
+      if (field) field.value = v;
+    }
+  } catch {}
+}
+
 async function loadNearSuggestions() {
-  if (skeleton && el.nearList && !state.nearItems.length) {
+  _restoreNearFilter();
+  if (skeleton && el.nearList) {
+    el.nearList.innerHTML = "";
     skeleton.render(el.nearList, { count: 2, lines: 4 });
   }
   const data = await api(buildNearbyPath());
@@ -10754,7 +10837,7 @@ async function loadTrips() {
     state.activeTripId = preferred ? preferred.id : "";
   }
   if (!state.tripPlans.length) {
-    el.tripList.innerHTML = `<article class="card">${pickText("暂无行程计划。先创建一个 Trip Plan。", "No trip plan yet. Create one first.","旅程プランはまだありません。まず作成してください。", "트립 플랜이 없습니다. 먼저 생성하세요.")}</article>`;
+    el.tripList.innerHTML = `<article class="card"><p>${pickText("暂无行程计划。", "No trip plan yet.", "旅程プランはありません。", "트립 플랜이 없습니다.")}</p><div class="actions"><button onclick="switchTab('chat')">${pickText("去规划第一个行程 →", "Start planning →", "旅程を計画する →", "여행 계획하기 →")}</button></div></article>`;
     renderActiveTripHint();
     return;
   }
@@ -10855,7 +10938,7 @@ async function loadOrders() {
   if (skeleton && el.ordersList) skeleton.clear(el.ordersList);
   if (store) store.dispatch({ type: "SET_ORDERS", orders: data.orders || [] });
   if (!data.orders.length) {
-    el.ordersList.innerHTML = `<article class="card">${pickText("暂无订单。", "No trips/orders yet.","注文はまだありません。", "주문이 아직 없습니다.")}</article>`;
+    el.ordersList.innerHTML = `<article class="card"><p>${pickText("暂无订单。", "No orders yet.", "注文はまだありません。", "주문이 아직 없습니다.")}</p><p class="status">${pickText("完成一次行程规划并确认预订后，订单将出现在这里。", "Complete a trip plan and confirm booking to see orders.", "旅程プランを完成させ予約を確定すると、ここに注文が表示されます。", "여행 계획 완료 후 예약을 확인하면 주문이 여기에 표시됩니다.")}</p><div class="actions"><button onclick="switchTab('chat')">${pickText("去规划行程 →", "Plan a trip →", "旅程を計画 →", "여행 계획하기 →")}</button></div></article>`;
     return;
   }
   el.ordersList.innerHTML = data.orders
@@ -10875,6 +10958,7 @@ async function loadOrders() {
           <button class="secondary" data-action="open-order-detail" data-order="${o.id}">${pickText("订单详情", "Order Detail","注文詳細", "주문 상세")}</button>
           <button class="secondary" data-action="open-task" data-task="${o.taskId}">${pickText("任务详情", "Task Detail","タスク詳細", "작업 상세")}</button>
           <button class="secondary" data-action="open-proof" data-order="${o.id}">${pickText("凭证", "Proof","証憑", "증빙")}</button>
+          ${["confirmed","delivered","refund_requested","refunded"].includes(o.status) ? `<a class="secondary cx-receipt-btn" href="/api/orders/${escapeHtml(o.id)}/receipt?download=1" target="_blank" rel="noopener">${pickText("下载收据", "Download Receipt","領収書", "영수증 다운로드")}</a>` : ""}
           <button class="secondary" data-action="cancel-order" data-order="${o.id}">${pickText("取消并退款", "Cancel & Refund","キャンセルと返金", "취소 및 환불")}</button>
         </div>
       </article>
@@ -10882,6 +10966,81 @@ async function loadOrders() {
     )
     .join("");
   motion.bindPressables(el.ordersList);
+}
+
+// ── LLM status cache (60s TTL) ────────────────────────────────────────────────
+let _llmStatusCache = null;
+let _llmStatusCacheAt = 0;
+const _LLM_STATUS_TTL = 60 * 1000;
+
+async function getLlmStatus() {
+  const now = Date.now();
+  if (_llmStatusCache && now - _llmStatusCacheAt < _LLM_STATUS_TTL) return _llmStatusCache;
+  try {
+    _llmStatusCache = await api("/api/system/llm-status");
+    _llmStatusCacheAt = Date.now();
+  } catch {
+    _llmStatusCache = null;
+  }
+  return _llmStatusCache;
+}
+
+// ── Favorites (收藏) ──────────────────────────────────────────────────────────
+const _FAV_KEY = "cx_favorites_v1";
+
+function _loadFavorites() {
+  try { state.favorites = JSON.parse(localStorage.getItem(_FAV_KEY) || "[]"); } catch { state.favorites = []; }
+  _renderFavoritesSection();
+}
+
+function _saveFavorites() {
+  try { localStorage.setItem(_FAV_KEY, JSON.stringify(state.favorites)); } catch {}
+}
+
+function _toggleFavorite(cardId, destination, title, dur, pax) {
+  const idx = state.favorites.findIndex(f => f.cardId === cardId || (destination && f.destination === destination));
+  const btn = document.querySelector(`#${CSS.escape(cardId)} .cx-fav-btn`);
+  if (idx >= 0) {
+    state.favorites.splice(idx, 1);
+    if (btn) { btn.textContent = "\u2661"; btn.title = pickText("\u6536\u85cf","\u2665 Save","\u304a\u6c17\u3092\u5165\u308a\u306b","\u2665 \uc800\uc7a5"); }
+    notify(pickText("\u5df2\u53d6\u6d88\u6536\u85cf", "Removed from favorites", "\u304a\u6c17\u306b\u5165\u308a\u3092\u89e3\u9664", "\uc990\uaca8\ucc3e\uae30 \uc81c\uac70"), "info");
+  } else {
+    state.favorites.unshift({ cardId, destination: destination || "", title: title || destination || "Plan", dur: dur || 3, pax: pax || 1, savedAt: Date.now() });
+    if (btn) { btn.textContent = "\u2665"; btn.title = pickText("\u5df2\u6536\u85cf", "Saved", "\u4fdd\u5b58\u6e08\u307f", "\uc800\uc7a5\ub428"); }
+    notify(pickText("\u5df2\u6536\u85cf\u65b9\u6848 \u2728", "Saved to favorites \u2728", "\u304a\u6c17\u306b\u5165\u308a\u306b\u8ffd\u52a0 \u2728", "\uc990\uaca8\ucc3e\uae30 \ucd94\uac00 \u2728"), "success");
+  }
+  _saveFavorites();
+  _renderFavoritesSection();
+}
+
+function _renderFavoritesSection() {
+  const listEl = document.getElementById("meFavsList");
+  if (!listEl) return;
+  const heading = document.getElementById("meFavsHeading");
+  if (heading) heading.textContent = pickText("\u6536\u85cf\u7684\u65b9\u6848", "Saved Plans", "\u304a\u6c17\u306b\u5165\u308a\u306e\u30d7\u30e9\u30f3", "\uc800\uc7a5\ub41c \ud50c\ub79c");
+
+  if (!state.favorites.length) {
+    listEl.innerHTML = `<p class="status">${pickText(
+      "\u6682\u65e0\u6536\u85cf\u3002\u5728\u65b9\u6848\u5361\u7247\u70b9\u51fb \u2661 \u5373\u53ef\u4fdd\u5b58\u3002",
+      "No saved plans. Tap \u2661 on any plan card to save.",
+      "\u304a\u6c17\u306b\u5165\u308a\u306a\u3057\u3002\u30d7\u30e9\u30f3\u30ab\u30fc\u30c9\u306e \u2661 \u3092\u30bf\u30c3\u30d7\u3057\u3066\u4fdd\u5b58\u3002",
+      "\uc800\uc7a5\ub41c \ud50c\ub79c\uc774 \uc5c6\uc2b5\ub2c8\ub2e4. \ud50c\ub79c \uce74\ub4dc\uc758 \u2661 \ub97c \ub208\ub7ec \uc800\uc7a5\ud558\uc138\uc694."
+    )}</p>`;
+    return;
+  }
+
+  listEl.innerHTML = state.favorites.map(f => `
+    <article class="card cx-fav-card">
+      <div class="cx-fav-card-row">
+        <div class="cx-fav-card-info">
+          <div class="cx-fav-card-title">${escapeHtml(f.title || f.destination || "Plan")}</div>
+          <div class="status">📍 ${escapeHtml(f.destination || "")} · ${f.dur || 3}${pickText("\u5929","d","\u65e5","\uc77c")} · ${f.pax || 1}${pickText("\u4eba","pax","\u540d","\uba85")}</div>
+          <div class="status">${new Date(f.savedAt || 0).toLocaleDateString()}</div>
+        </div>
+        <button class="cx-fav-remove secondary" onclick="_toggleFavorite(${JSON.stringify(f.cardId)}, ${JSON.stringify(f.destination || "")}, ${JSON.stringify(f.title || "")}, ${f.dur || 3}, ${f.pax || 1})">\u53d6\u6d88</button>
+      </div>
+    </article>
+  `).join("");
 }
 
 async function openMyOrdersQuickView(trigger = null) {
@@ -10982,7 +11141,7 @@ async function loadAuditLogs() {
     if (el.mcpList) skeleton.render(el.mcpList, { count: 2, lines: 3 });
     if (el.supportList) skeleton.render(el.supportList, { count: 2, lines: 3 });
   }
-  const [logsData, mcpData, supportData, userData, providerData, probeData, railsData, reconData, complianceData, contractsData, llmData] = await Promise.all([
+  const [logsData, mcpData, supportData, userData, providerData, probeData, railsData, reconData, complianceData, contractsData, llmData, plusData] = await Promise.all([
     api("/api/trust/audit-logs"),
     api("/api/trust/mcp-calls"),
     api("/api/support/tickets"),
@@ -10993,7 +11152,8 @@ async function loadAuditLogs() {
     api("/api/billing/reconciliation"),
     api("/api/payments/compliance"),
     api("/api/mcp/contracts"),
-    api("/api/system/llm-status").catch(() => null),
+    getLlmStatus().catch(() => null),
+    api("/api/subscription/plus").catch(() => null),
   ]);
   if (skeleton) {
     if (el.auditList) skeleton.clear(el.auditList);
@@ -11043,14 +11203,37 @@ async function loadAuditLogs() {
     el.compliancePolicyForm.requireFraudScreen.value = String(policy.requireFraudScreen !== false);
   }
 
-  el.plusStatus.textContent = userData.user.plusSubscription.active
-    ? pickText(
-        `方案：${userData.user.plusSubscription.plan}（已开通）`,
-        `Plan: ${userData.user.plusSubscription.plan} (ACTIVE)`,
-        `プラン: ${userData.user.plusSubscription.plan}（有効）`,
-        `플랜: ${userData.user.plusSubscription.plan} (활성)`,
-      )
-    : pickText("未订阅", "Not subscribed","未加入", "미구독");
+  const _plusInfo = (plusData && plusData.plus) || (userData.user && userData.user.plusSubscription) || {};
+  if (el.plusStatus) {
+    el.plusStatus.textContent = _plusInfo.active
+      ? pickText(
+          `方案：${_plusInfo.plan}（已开通）`,
+          `Plan: ${_plusInfo.plan} (ACTIVE)`,
+          `プラン: ${_plusInfo.plan}（有効）`,
+          `플랜: ${_plusInfo.plan} (활성)`,
+        )
+      : pickText("未订阅", "Not subscribed", "未加入", "미구독");
+  }
+
+  // ── Me tab profile card ────────────────────────────────────────────────────
+  if (el.meProfileCard) {
+    const _u = userData.user || {};
+    const _authName = _getAuthName ? _getAuthName() : null;
+    const _displayName = _authName || _u.displayName || _u.id || pickText("旅行者", "Traveler", "旅行者", "여행자");
+    const _initials = _displayName.replace(/\s+/g, "").slice(0, 2).toUpperCase() || "??";
+    const _city = _u.city || pickText("未设定", "Not set", "未設定", "미설정");
+    const _plus = (_plusInfo && _plusInfo.active) || (_u.plusSubscription && _u.plusSubscription.active);
+    if (el.meAvatar) el.meAvatar.textContent = _initials;
+    if (el.meProfileName) el.meProfileName.textContent = _displayName;
+    if (el.meProfileSub) el.meProfileSub.textContent = _city + (_plus ? " · Plus ✦" : "");
+    if (el.meTripLabel) el.meTripLabel.textContent = pickText("行程", "Trips", "旅行", "여행");
+    if (el.meOrderLabel) el.meOrderLabel.textContent = pickText("订单", "Orders", "注文", "주문");
+    el.meProfileCard.style.display = "";
+    // Async load counts (non-blocking)
+    api("/api/trips").then((d) => { if (el.meTripCount && Array.isArray(d.trips)) el.meTripCount.textContent = d.trips.length; }).catch(() => {});
+    api("/api/orders").then((d) => { if (el.meOrderCount && Array.isArray(d.orders)) el.meOrderCount.textContent = d.orders.length; }).catch(() => {});
+  }
+
   const gaodeLabel = providerData.gaode.enabled ? "Gaode LIVE" : "Gaode mock";
   const partnerLabel = providerData.partnerHub && providerData.partnerHub.enabled ? "PartnerHub external" : "PartnerHub mock";
   const contracts = contractsData.contracts || {};
@@ -11137,7 +11320,7 @@ async function loadAuditLogs() {
   }
 
   el.auditList.innerHTML = !logsData.logs.length
-    ? `<article class="card">${pickText("暂无日志。", "No logs.","ログはありません。", "로그가 없습니다.")}</article>`
+    ? `<article class="card"><p>${pickText("暂无操作日志。", "No audit logs yet.", "操作ログはありません。", "감사 로그가 없습니다.")}</p><p class="status">${pickText("完成一次行程规划或支付后，操作记录将显示在这里。", "Complete a trip plan or payment to start seeing logs here.", "旅程プランや支払いを完了すると、ここにログが表示されます。", "여행 계획 또는 결제를 완료하면 여기에 로그가 표시됩니다.")}</p><div class="actions"><button class="secondary" onclick="switchTab('chat')">${pickText("去规划行程", "Plan a trip", "旅程を計画する", "여행 계획하기")}</button></div></article>`
     : logsData.logs
         .map(
           (log) => `
@@ -11412,6 +11595,7 @@ async function loadDashboard() {
 }
 
 async function loadUserProfile() {
+  _loadFavorites();
   await Promise.all([loadAuditLogs(), loadDashboard(), loadSolutionBoard(), loadChatSolutionStrip(), loadMiniPackage()]);
 }
 
@@ -11739,7 +11923,7 @@ function bindActions() {
           body: JSON.stringify({ clear: true, persist: true }),
         });
         if (el.llmApiKeyInput) el.llmApiKeyInput.value = "";
-        const llm = await api("/api/system/llm-status");
+        const llm = await getLlmStatus();
         renderLlmRuntimeStatus(llm);
         notify(
           pickText("已清除运行时 OpenAI Key。", "Runtime OpenAI key cleared.","実行時 OpenAI キーを削除しました。", "런타임 OpenAI 키를 삭제했습니다."),
@@ -13095,6 +13279,10 @@ function bindActions() {
               body: JSON.stringify({ reason: String(reason || "user_request").slice(0, 120) }),
             });
             await trackEvent("order_canceled_by_user", { orderId: target.dataset.order, reason });
+            // Warn user if real gateway refund failed and mock was used
+            if (data.refund && data.refund.gatewayWarning) {
+              notify(pickText("退款已记录，但真实退款通道出错，请联系客服确认到账。", "Refund recorded but real gateway failed — contact support to confirm.", "返金を記録しましたが、ゲートウェイエラーが発生しました。サポートにご連絡ください。", "환불이 기록되었지만 실제 결제 게이트웨이 오류가 발생했습니다. 고객 서비스에 문의하세요."), "warning");
+            }
             addMessage(
               pickText(
                 `订单已取消，退款：${data.order.refund.amount} ${data.order.refund.currency}`,
@@ -13184,7 +13372,8 @@ function bindActions() {
           body: JSON.stringify({ active: true, plan: "monthly" }),
         });
         await trackEvent("plus_subscribed");
-        addMessage(pickText("Cross X Plus 已开通。", "Cross X Plus activated.", "Cross X Plus を有効化しました。", "Cross X Plus가 활성화되었습니다."));
+        notify(pickText("Cross X Plus 已开通 ✦", "Cross X Plus activated ✦", "Cross X Plus 有効化 ✦", "Cross X Plus 활성화 ✦"), "success");
+        addMessage(pickText("Cross X Plus 已开通，享有 7×24 人工兜底、实时翻译、稀缺资源礼宾服务。", "Cross X Plus activated. Enjoy 24/7 human fallback, live translation, and scarce resource concierge.", "Cross X Plus が有効になりました。24/7 人的フォールバック、リアルタイム翻訳、希少リソースコンシェルジュをご利用ください。", "Cross X Plus가 활성화되었습니다. 24/7 인적 폴백, 실시간 번역, 희귀 자원 컨시어지를 즐기세요."));
         await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
       } catch (err) {
         addMessage(pickText(`Plus 开通失败：${err.message}`, `Plus activation failed: ${err.message}`, `Plus 有効化失敗: ${err.message}`, `Plus 활성화 실패: ${err.message}`));
@@ -13549,6 +13738,7 @@ function bindInput() {
 
   if (el.nearFilterForm) {
     el.nearFilterForm.addEventListener("change", async () => {
+      _saveNearFilter();
       try {
         await loadNearSuggestions();
       } catch {
@@ -13885,6 +14075,8 @@ function bindForms() {
     });
   }
 
+  el.prefForm.addEventListener("change", () => { state._prefsDirty = true; });
+
   el.prefForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(el.prefForm);
@@ -13907,7 +14099,8 @@ function bindForms() {
           },
         }),
       });
-      addMessage(pickText("偏好设置已保存。", "Preferences saved.","設定を保存しました。", "환경설정을 저장했습니다."));
+      state._prefsDirty = false;
+      notify(pickText("\u504f\u597d\u8bbe\u7f6e\u5df2\u4fdd\u5b58\u3002", "Preferences saved.", "\u8a2d\u5b9a\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f\u3002", "\ud658\uacbd\uc124\uc815\uc744 \uc800\uc7a5\ud588\uc2b5\ub2c8\ub2e4."), "success");
       await loadAuditLogs();
     } catch (err) {
       addMessage(pickText(`偏好保存失败：${err.message}`, `Failed to save preferences: ${err.message}`, `設定保存に失敗: ${err.message}`, `환경설정 저장 실패: ${err.message}`));
@@ -13941,7 +14134,7 @@ function bindForms() {
             constraints: { budget: "mid", dietary: "halal" },
           }),
         });
-        const llm = await api("/api/system/llm-status");
+        const llm = await getLlmStatus();
         renderLlmRuntimeStatus(llm);
         const ok = probe && probe.source === "openai";
         if (!ok && probe && probe.fallbackReason) {
@@ -14122,6 +14315,13 @@ async function init() {
   setTimeout(() => silentAutoDetectLocation().catch(() => {}), 600);
   // P6: prefetch live FX rates from API gateway
   setTimeout(() => fetchGatewayFx().catch(() => {}), 1200);
+  // Feature flags: evaluate for current user and store in state
+  setTimeout(() => {
+    const _fuid = _getAuthUserId ? (_getAuthUserId() || getDeviceId()) : getDeviceId();
+    api(`/api/system/flags/evaluate?userId=${encodeURIComponent(_fuid || "guest")}`)
+      .then((d) => { if (d && typeof d === "object") { state.featureFlags = d; } })
+      .catch(() => {});
+  }, 1500);
 
   // Force-remove stale service workers that can pin old JS/CSS.
   if ("serviceWorker" in navigator) {
@@ -15056,7 +15256,7 @@ async function consumePlanStream({
 }) {
   const resp = await fetch("/api/plan/coze", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ..._authHeaders() },
     body: JSON.stringify({
       message, language, city, constraints, conversationHistory,
       sessionId: loadPlanSessionId(), // P2: auto-carry session memory
@@ -15496,7 +15696,7 @@ async function _renderPostBookingFollowUp(plan, cardData) {
   // Fetch personalized suggestions from /api/proactive
   let suggestions = [];
   try {
-    const data = await fetch(`/api/proactive?deviceId=${encodeURIComponent(deviceId)}`).then(r => r.json());
+    const data = await fetch(`/api/proactive?deviceId=${encodeURIComponent(deviceId)}`, { headers: _authHeaders() }).then(r => r.json());
     if (data.ok && Array.isArray(data.suggestions) && data.suggestions.length >= 2) {
       suggestions = data.suggestions.slice(0, 4).map(s => ({
         icon:  s.icon  || "\u{1F4A1}",
@@ -15698,7 +15898,7 @@ async function _loadTripHistoryChip() {
   if (state.agentConversation.messages.length > 0) return; // skip on restored sessions
   try {
     const deviceId = getDeviceId ? getDeviceId() : "demo";
-    const r = await fetch(`/api/trips/recent?deviceId=${encodeURIComponent(deviceId)}&limit=3`);
+    const r = await fetch(`/api/trips/recent?deviceId=${encodeURIComponent(deviceId)}&limit=3`, { headers: _authHeaders() });
     const data = await r.json();
     const trips = (data.ok && Array.isArray(data.trips)) ? data.trips : [];
     if (!trips.length) return;
@@ -15874,6 +16074,7 @@ function _showLoginModal() {
         <button class="cx-modal-btn" id="cxLoginVerify">确认登录</button>
         <button class="cx-modal-link" id="cxLoginResend">重新发送</button>
         <div class="cx-modal-error hidden" id="cxLoginErr2"></div>
+        <div class="cx-modal-dev-hint hidden" id="cxLoginDevHint" style="font-size:11px;color:#6366f1;margin-top:6px;font-family:monospace;text-align:center;"></div>
       </div>
     </div>`;
   document.body.appendChild(modal);
@@ -15906,10 +16107,14 @@ function _showLoginModal() {
       const data = await r.json();
       if (!data.ok) { err1.textContent = data.error || "发送失败，请稍后重试"; err1.classList.remove("hidden"); btn.disabled = false; btn.textContent = "发送验证码"; return; }
       _currentPhone = phone;
-      // Dev mode: auto-fill the OTP
-      if (data.dev_code) { codeInput.value = data.dev_code; }
       step1.classList.add("hidden");
       step2.classList.remove("hidden");
+      // Dev mode: auto-fill code and show hint
+      if (data.dev_code) {
+        codeInput.value = data.dev_code;
+        const devHint = document.getElementById("cxLoginDevHint");
+        if (devHint) { devHint.textContent = `[Dev] 验证码: ${data.dev_code}`; devHint.classList.remove("hidden"); }
+      }
       codeInput.focus();
     } catch { err1.textContent = "网络错误，请重试"; err1.classList.remove("hidden"); btn.disabled = false; btn.textContent = "发送验证码"; }
   }
