@@ -56,9 +56,10 @@ function verifyToken(token) {
   const expectedSig = _hmac(payloadB64);
   // Constant-time comparison — guard against length mismatch (tampered sigs)
   try {
-    const sigBuf      = Buffer.from(sig.length % 2 === 0 ? sig : sig + "0", "hex").slice(0, 32);
-    const expectedBuf = Buffer.from(expectedSig, "hex").slice(0, 32);
-    if (sigBuf.length !== expectedBuf.length) return null;
+    if (sig.length !== 64) return null; // HMAC-SHA256 is always 64 hex chars
+    const sigBuf      = Buffer.from(sig, "hex");
+    const expectedBuf = Buffer.from(expectedSig, "hex");
+    if (sigBuf.length !== 32 || expectedBuf.length !== 32) return null;
     if (!crypto.timingSafeEqual(sigBuf, expectedBuf)) return null;
   } catch {
     return null; // any buffer/crypto error → invalid token

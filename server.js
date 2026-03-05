@@ -10227,7 +10227,12 @@ const server = http.createServer(async (req, res) => {
       const _ordQp = Object.fromEntries(new URL(req.url, "http://x").searchParams);
       const _ordLimit  = Math.min(Math.max(1, Number(_ordQp.limit)  || 50), 200);
       const _ordOffset = Math.max(0, Number(_ordQp.offset) || 0);
-      const _allOrders = Object.values(db.orders).sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+      const _ordWho = _whoFromReq(req);
+      const { validateAdminToken } = require("./src/middleware/auth");
+      const _ordIsAdmin = Boolean(validateAdminToken(req));
+      const _allOrders = Object.values(db.orders)
+        .filter(o => _ordIsAdmin || o.userId === _ordWho)
+        .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
       const orders = _allOrders.slice(_ordOffset, _ordOffset + _ordLimit);
       return writeJson(res, 200, { orders, total: _allOrders.length, limit: _ordLimit, offset: _ordOffset });
     }
@@ -10620,17 +10625,32 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/user/preferences") {
       const body = await readBody(req);
       const userId = _whoFromReq(req) !== "anon" ? _whoFromReq(req) : (extractDeviceId(req, body) || "anon");
-      const updatedUser = updateUser(userId, {
-        language:   body.language,
-        city:       body.city,
-        preferences: body.preferences,
-        savedPlaces: body.savedPlaces,
-      });
+      const _prefPatch = {};
+      if (body.language   !== undefined) _prefPatch.language    = body.language;
+      if (body.city       !== undefined) _prefPatch.city        = body.city;
+      if (body.preferences !== undefined) _prefPatch.preferences = body.preferences;
+      if (body.savedPlaces !== undefined) _prefPatch.savedPlaces = body.savedPlaces;
+      const updatedUser = updateUser(userId, _prefPatch);
       audit.append({
         kind: "user", who: userId, what: "user.preferences.updated",
         taskId: null, toolInput: body,
         toolOutput: { language: updatedUser?.language, preferences: updatedUser?.preferences },
       });
+      return writeJson(res, 200, { ok: true, user: updatedUser });
+    }
+
+    if (req.method === "POST" && pathname === "/api/user/profile") {
+      const body = await readBody(req);
+      const _profWho = _whoFromReq(req);
+      if (_profWho === "anon") return writeJson(res, 401, { error: "unauthorized" });
+      const _profPatch = {};
+      if (typeof body.displayName === "string") _profPatch.displayName = body.displayName.trim().slice(0, 30);
+      if (typeof body.city       === "string") _profPatch.city        = body.city.trim().slice(0, 50);
+      if (typeof body.language   === "string") _profPatch.language    = body.language.trim().slice(0, 10);
+      if (!Object.keys(_profPatch).length) return writeJson(res, 200, { ok: true, user: null });
+      const updatedUser = updateUser(_profWho, _profPatch);
+      if (!updatedUser) return writeJson(res, 500, { error: "update_failed" });
+      audit.append({ kind: "user", who: _profWho, what: "user.profile.updated", taskId: null, toolInput: body, toolOutput: _profPatch });
       return writeJson(res, 200, { ok: true, user: updatedUser });
     }
 
@@ -10754,7 +10774,7 @@ const server = http.createServer(async (req, res) => {
       const { validateUserToken } = require("./src/services/user_auth");
       const userPayload = validateUserToken(req);
       const userId = userPayload ? userPayload.sub : null;
-      const user = userId ? (getUser(userId) || db.users.demo) : db.users.demo;
+      const user = userId ? (getUser(userId) || { id: userId }) : db.users.demo;
       return writeJson(res, 200, { user });
     }
 
@@ -11568,7 +11588,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     if (req.method === "POST" && pathname === "/api/wechat/notify") {
       const raw      = await readRawBody(req);
       let   payload;
-      try { payload = JSON.parse(raw); } catch { return res.end(JSON.stringify({ code: "FAIL", message: "parse error" })); }
+      try { payload = JSON.parse(raw); } catch { res.setHeader("Content-Type", "application/json"); return res.end(JSON.stringify({ code: "FAIL", message: "parse error" })); }
       const apiKeyV3 = String(process.env.WECHAT_API_KEY_V3 || "").trim();
       let   outTradeNo;
       if (apiKeyV3 && payload.resource) {

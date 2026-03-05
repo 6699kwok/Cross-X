@@ -342,6 +342,14 @@ const el = {
   meOrderCount: document.getElementById("meOrderCount"),
   meTripLabel: document.getElementById("meTripLabel"),
   meOrderLabel: document.getElementById("meOrderLabel"),
+  meEditProfileBtn: document.getElementById("meEditProfileBtn"),
+  meEditProfileHeading: document.getElementById("meEditProfileHeading"),
+  meEditProfileCard: document.getElementById("meEditProfileCard"),
+  meEditProfileForm: document.getElementById("meEditProfileForm"),
+  meEditName: document.getElementById("meEditName"),
+  meEditCity: document.getElementById("meEditCity"),
+  meEditProfileSave: document.getElementById("meEditProfileSave"),
+  meEditProfileCancel: document.getElementById("meEditProfileCancel"),
   trainingSummary: document.getElementById("trainingSummary"),
   benchmarkResult: document.getElementById("benchmarkResult"),
   runBenchmarkBtn: document.getElementById("runBenchmarkBtn"),
@@ -11293,6 +11301,50 @@ async function loadAuditLogs() {
     // Async load counts (non-blocking)
     api("/api/trips").then((d) => { if (el.meTripCount && Array.isArray(d.trips)) el.meTripCount.textContent = d.trips.length; }).catch(() => {});
     api("/api/orders").then((d) => { if (el.meOrderCount && Array.isArray(d.orders)) el.meOrderCount.textContent = d.orders.length; }).catch(() => {});
+
+    // ── Profile edit button / form ─────────────────────────────────────────
+    if (el.meEditProfileBtn && !el.meEditProfileBtn._bound) {
+      el.meEditProfileBtn._bound = true;
+      el.meEditProfileBtn.addEventListener("click", () => {
+        const _curUser = userData.user || {};
+        if (el.meEditName)  el.meEditName.value  = _curUser.displayName || "";
+        if (el.meEditCity)  el.meEditCity.value  = _curUser.city || "";
+        if (el.meEditProfileHeading) el.meEditProfileHeading.textContent = pickText("编辑资料", "Edit Profile", "プロフィール編集", "프로필 편집");
+        if (el.meEditProfileCard) el.meEditProfileCard.style.display = "";
+        if (el.meEditProfileBtn)  el.meEditProfileBtn.style.display  = "none";
+        if (el.meEditName) el.meEditName.focus();
+      });
+    }
+    if (el.meEditProfileCancel && !el.meEditProfileCancel._bound) {
+      el.meEditProfileCancel._bound = true;
+      el.meEditProfileCancel.addEventListener("click", () => {
+        if (el.meEditProfileCard) el.meEditProfileCard.style.display = "none";
+        if (el.meEditProfileBtn)  el.meEditProfileBtn.style.display  = "";
+      });
+    }
+    if (el.meEditProfileForm && !el.meEditProfileForm._bound) {
+      el.meEditProfileForm._bound = true;
+      el.meEditProfileForm.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const _name = (el.meEditName ? el.meEditName.value.trim() : "") || undefined;
+        const _city = (el.meEditCity ? el.meEditCity.value.trim() : "") || undefined;
+        const _saveBtn = el.meEditProfileSave;
+        if (_saveBtn) _saveBtn.disabled = true;
+        try {
+          const resp = await api("/api/user/profile", { method: "POST", body: JSON.stringify({ displayName: _name, city: _city }) });
+          if (resp.ok) {
+            if (_name) { try { localStorage.setItem(AUTH_NAME_KEY, _name); } catch {} if (el.meProfileName) el.meProfileName.textContent = _name; }
+            if (_city && el.meProfileSub) el.meProfileSub.textContent = _city + (el.meProfileSub.textContent.includes("Plus") ? " · Plus ✦" : "");
+            notify(pickText("资料已更新", "Profile updated", "プロフィール更新", "프로필 업데이트"), "success");
+            if (el.meEditProfileCard) el.meEditProfileCard.style.display = "none";
+            if (el.meEditProfileBtn)  el.meEditProfileBtn.style.display  = "";
+          } else {
+            notify(pickText("保存失败", "Save failed", "保存失敗", "저장 실패"), "error");
+          }
+        } catch { notify(pickText("网络错误", "Network error", "ネットワークエラー", "네트워크 오류"), "error"); }
+        finally { if (_saveBtn) _saveBtn.disabled = false; }
+      });
+    }
   }
 
   const gaodeLabel = providerData.gaode.enabled ? "Gaode LIVE" : "Gaode mock";

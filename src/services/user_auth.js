@@ -83,8 +83,13 @@ async function generateOtp(phone) {
     await sendOtp(normalized, code);
   } catch (smsErr) {
     console.error("[user_auth] SMS send failed:", smsErr.message);
-    // Still return ok:true — operator monitors server logs; OTP is in memory
-    return { ok: true, smsError: smsErr.message, ...(isDevMode ? { devCode: code } : {}) };
+    if (!isDevMode) {
+      // Production: discard OTP so it can't be brute-forced without delivery
+      _otpStore.delete(normalized);
+      return { ok: false, reason: "sms_failed" };
+    }
+    // Dev/mock: still return devCode for testing despite send error
+    return { ok: true, devCode: code };
   }
 
   // In dev/mock mode, return code in response for testing (no real SMS sent)
@@ -102,7 +107,7 @@ async function generateOtp(phone) {
 function verifyOtp(phone, submitted) {
   const normalized = _normalizePhone(phone);
   if (!normalized) return { ok: false, reason: "invalid_phone" };
-  if (!submitted || typeof submitted !== "string") return { ok: false, reason: "invalid_code" };
+  if (!submitted || typeof submitted !== "string" || submitted.length !== 6 || !/^\d{6}$/.test(submitted)) return { ok: false, reason: "invalid_code" };
 
   const entry = _otpStore.get(normalized);
   if (!entry) return { ok: false, reason: "no_otp" };
@@ -202,9 +207,10 @@ function verifyUserToken(token) {
   const expectedSig = _hmac(payloadB64);
 
   try {
-    const sigBuf      = Buffer.from(sig.length % 2 === 0 ? sig : sig + "0", "hex").slice(0, 32);
-    const expectedBuf = Buffer.from(expectedSig, "hex").slice(0, 32);
-    if (sigBuf.length !== expectedBuf.length) return null;
+    if (sig.length !== 64) return null; // HMAC-SHA256 is always 64 hex chars
+    const sigBuf      = Buffer.from(sig, "hex");
+    const expectedBuf = Buffer.from(expectedSig, "hex");
+    if (sigBuf.length !== 32 || expectedBuf.length !== 32) return null;
     if (!crypto.timingSafeEqual(sigBuf, expectedBuf)) return null;
   } catch {
     return null;

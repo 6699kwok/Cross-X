@@ -258,7 +258,24 @@
               <div class="me-stat"><span class="me-stat-val" id="meTripCount">—</span><span class="me-stat-label" id="meTripLabel">行程</span></div>
               <div class="me-stat"><span class="me-stat-val" id="meOrderCount">—</span><span class="me-stat-label" id="meOrderLabel">订单</span></div>
             </div>
+            <button class="cx-icon-btn" id="meEditProfileBtn" title="Edit profile" style="margin-left:8px">✏️</button>
           </div>
+        </article>
+        <!-- Profile edit inline form (hidden by default) -->
+        <article class="card" id="meEditProfileCard" style="display:none">
+          <h3 id="meEditProfileHeading">编辑资料</h3>
+          <form id="meEditProfileForm" class="form-col">
+            <label id="meEditNameLabel">昵称
+              <input type="text" id="meEditName" maxlength="30" autocomplete="off">
+            </label>
+            <label id="meEditCityLabel">城市
+              <input type="text" id="meEditCity" maxlength="50" autocomplete="off">
+            </label>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <button type="submit" class="cx-btn cx-btn-primary" id="meEditProfileSave">保存</button>
+              <button type="button" class="cx-btn" id="meEditProfileCancel">取消</button>
+            </div>
+          </form>
         </article>
         <div class="split-grid">
           <article class="card">
