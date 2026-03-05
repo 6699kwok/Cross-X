@@ -150,8 +150,8 @@ function createOrLoginUser(phone, displayName = "") {
   const db = _db();
   const existing = db.getUserAuth(userId);
   if (existing) {
-    db.upsertUserAuth({ userId, phoneHash, displayName: existing.displayName, lastLogin: now });
-    return { userId, displayName: existing.displayName, isNew: false };
+    db.upsertUserAuth({ userId, phoneHash, displayName: existing.display_name, lastLogin: now });
+    return { userId, displayName: existing.display_name, isNew: false };
   }
 
   const name = displayName.trim().slice(0, 30) || `旅行者${phoneHash.slice(0, 4)}`;

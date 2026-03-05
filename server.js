@@ -7744,7 +7744,12 @@ const server = http.createServer(async (req, res) => {
       const _wxState  = _wxParams.get("state") || "";
 
       // Validate CSRF state (ts.sig, allow 10-min window)
-      const [_wxTs, _wxSigIn] = _wxState.split(".");
+      const _wxStateParts = _wxState.split(".");
+      if (_wxStateParts.length !== 2) {
+        res.writeHead(302, { Location: `${_wxBase}/?auth_error=invalid_state` });
+        return res.end();
+      }
+      const [_wxTs, _wxSigIn] = _wxStateParts;
       const _wxTsNum = parseInt(_wxTs, 10);
       const _wxSigExpected = require("crypto").createHmac("sha256", _tokenSecret())
         .update(`wechat_state:${_wxTs}`).digest("hex").slice(0, 16);
@@ -8316,10 +8321,11 @@ const server = http.createServer(async (req, res) => {
       try {
         const { loadProfile } = require("./src/session/profile");
         const { generateProactiveSuggestions } = require("./src/ai/proactive");
+        const { getRecentTrips } = require("./src/services/db");
         let profile = null;
         try { profile = loadProfile(did); } catch {}
         profile = profile && typeof profile.then === "function" ? await profile.catch(() => null) : profile;
-        const recentTrips = [];
+        const recentTrips = getRecentTrips ? getRecentTrips(did, 3) : [];
         if (!profile || (profile.tripCount || 0) < 1) {
           return writeJson(res, 200, { ok: true, suggestions: [], reason: "insufficient_history" });
         }
@@ -9795,22 +9801,24 @@ const server = http.createServer(async (req, res) => {
       if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
       const _authzActor = _whoFromReq(req);
-      const user = db.users[_authzActor] || db.users.demo;
-      user.authDomain = {
+      // Use getUser() directly — db.users proxy only resolves "demo", never real userId
+      const _authzUserId = (_authzActor !== "anon") ? _authzActor : "demo";
+      const _authzUser = getUser(_authzUserId) || getUser("demo");
+      const newAuthDomain = {
         noPinEnabled: body.noPinEnabled !== false,
-        dailyLimit: Number(body.dailyLimit || user.authDomain.dailyLimit),
-        singleLimit: Number(body.singleLimit || user.authDomain.singleLimit),
+        dailyLimit:   Number(body.dailyLimit  ?? _authzUser.authDomain?.dailyLimit  ?? 200000),
+        singleLimit:  Number(body.singleLimit ?? _authzUser.authDomain?.singleLimit ?? 50000),
       };
+      updateUser(_authzUserId, { authDomain: newAuthDomain });
       audit.append({
         kind: "payment",
         who: _whoFromReq(req),
         what: "payments.authorize.updated",
         taskId: null,
         toolInput: body,
-        toolOutput: user.authDomain,
+        toolOutput: newAuthDomain,
       });
-      saveDb();
-      return writeJson(res, 200, { ok: true, authDomain: user.authDomain });
+      return writeJson(res, 200, { ok: true, authDomain: newAuthDomain });
     }
 
     if (req.method === "GET" && pathname === "/api/payments/compliance") {
@@ -9893,8 +9901,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const _railWho = _whoFromReq(req);
-      const _railUser = (_railWho !== "anon" ? db.users[_railWho] : null) || db.users.demo;
-      _railUser.paymentRail = { selected: railId };
+      const _railUserId = (_railWho !== "anon" && _railWho !== "dev") ? _railWho : "demo";
+      updateUser(_railUserId, { paymentRail: { selected: railId } });
       audit.append({
         kind: "payment",
         who: _railWho,
@@ -9903,7 +9911,6 @@ const server = http.createServer(async (req, res) => {
         toolInput: body,
         toolOutput: { selected: railId },
       });
-      saveDb();
       return writeJson(res, 200, { ok: true, ...buildPaymentRailsStatus(_whoFromReq(req)) });
     }
 
@@ -11229,23 +11236,6 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         });
       } catch (err) {
         return writeJson(res, 500, sanitizeError(err));
-      }
-    }
-
-    // ── GET /api/proactive — Proactive suggestions for returning users ─────────
-    if (req.method === "GET" && pathname === "/api/proactive") {
-      const { searchParams } = new URL(req.url, "http://localhost");
-      const deviceId = searchParams.get("deviceId") || "demo";
-      try {
-        const { loadProfile } = require("./src/session/profile");
-        const { generateProactiveSuggestions } = require("./src/ai/proactive");
-        const { getRecentTrips } = require("./src/services/db");
-        const profile   = loadProfile(deviceId);
-        const recentTrips = getRecentTrips(deviceId, 3);
-        const suggestions = await generateProactiveSuggestions(profile, recentTrips, deviceId);
-        return writeJson(res, 200, { ok: true, suggestions });
-      } catch (err) {
-        return writeJson(res, 200, { ok: true, suggestions: [] }); // non-critical — fail silently
       }
     }
 
