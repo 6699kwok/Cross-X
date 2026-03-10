@@ -1,5 +1,22 @@
 const ASSET_VERSION = "20260228-010";
 
+// P1-A: Global error boundary — catches unhandled promise rejections and JS errors
+// Prevents app from silently entering broken state when API calls fail
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  const msg = reason instanceof Error ? reason.message : String(reason || "Unknown error");
+  console.error("[CrossX] Unhandled rejection:", msg, reason);
+  // Show toast for user-visible failures (network errors, API failures)
+  if (msg && (msg.includes("fetch") || msg.includes("API") || msg.includes("network") || msg.includes("Failed"))) {
+    if (typeof toast !== "undefined" && toast && typeof pickText === "function") {
+      try { toast.show({ message: pickText("网络请求失败，请稍后重试", "Network request failed, please retry", "ネットワークエラー、再試行してください", "네트워크 요청 실패, 다시 시도하세요"), type: "error", duration: 4000 }); } catch {}
+    }
+  }
+});
+window.addEventListener("error", (event) => {
+  console.error("[CrossX] Global error:", event.message, event.filename, event.lineno);
+});
+
 const i18n = window.CrossXI18n || {
   t: (_lang, key) => key,
   term: (_lang, key) => key,
@@ -40,7 +57,36 @@ const state = {
   auditLogs: [],
   supportTickets: [],
   replanTaskId: null,
-  uiLanguage: "ZH",
+  currency: (() => {
+    const saved = localStorage.getItem("cx_currency");
+    if (saved) return saved;
+    const nav = (navigator.language || "").toLowerCase();
+    if (nav.startsWith("zh")) return "CNY";
+    if (nav.startsWith("ja")) return "JPY";
+    if (nav.startsWith("ko")) return "KRW";
+    if (nav.startsWith("id")) return "IDR";
+    if (nav.startsWith("ar")) return "SAR";
+    if (nav.startsWith("ru")) return "RUB";
+    if (nav.startsWith("de") || nav.startsWith("fr") || nav.startsWith("es") || nav.startsWith("it") || nav.startsWith("nl") || nav.startsWith("pt-pt")) return "EUR";
+    if (nav.startsWith("gb") || nav === "en-gb") return "GBP";
+    return "USD";
+  })(),
+  uiLanguage: (() => {
+    const saved = localStorage.getItem("cx_ui_lang");
+    if (saved && ["ZH","EN","JA","KO","ID","AR","ZH-TW"].includes(saved)) return saved;
+    const nav = (navigator.language || navigator.userLanguage || "en").toLowerCase();
+    if (nav.startsWith("zh-tw") || nav.startsWith("zh-hk") || nav.startsWith("zh-mo")) return "ZH-TW";
+    if (nav.startsWith("zh")) return "ZH";
+    if (nav.startsWith("ja")) return "JA";
+    if (nav.startsWith("ko")) return "KO";
+    if (nav.startsWith("id")) return "ID";
+    if (nav.startsWith("ar")) return "AR";
+    // Track whether we fell back so we can show a one-time notice
+    if (!nav.startsWith("en")) {
+      try { sessionStorage.setItem("cx_lang_fallback", nav.slice(0, 5)); } catch { /* ignore */ }
+    }
+    return "EN";
+  })(),
   viewMode: "user",
   nearItems: [],
   selectedNearItemId: null,
@@ -127,8 +173,15 @@ const state = {
 };
 
 // ── Conversation Persistence (localStorage) ──────────────────────────────
-const CONV_STORAGE_KEY = "crossx_conv_v2";
-const CONV_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
+// Tab-isolated conversation key (CX-P2-04) — each tab gets its own storage slot
+const _TAB_ID = (() => {
+  let id = sessionStorage.getItem("cx_tab_id");
+  if (!id) { id = `t${Date.now().toString(36)}`; try { sessionStorage.setItem("cx_tab_id", id); } catch { /* ignore */ } }
+  return id;
+})();
+const CONV_STORAGE_KEY = `crossx_conv_v2_${_TAB_ID}`;
+const CONV_STORAGE_KEY_SHARED = "crossx_conv_v2"; // legacy / cross-tab shared (read-only for restore)
+const CONV_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 function saveConversationState() {
   try {
@@ -143,7 +196,8 @@ function saveConversationState() {
 
 function restoreConversationState() {
   try {
-    const raw = localStorage.getItem(CONV_STORAGE_KEY);
+    // Try tab-specific key first, fall back to shared legacy key
+    const raw = localStorage.getItem(CONV_STORAGE_KEY) || localStorage.getItem(CONV_STORAGE_KEY_SHARED);
     if (!raw) return;
     const saved = JSON.parse(raw);
     if (!saved || !saved.savedAt) return;
@@ -218,6 +272,10 @@ const el = {
   inputAssistHint: document.getElementById("inputAssistHint"),
   voiceInputBtn: document.getElementById("voiceInputBtn"),
   translateBtn: document.getElementById("translateBtn"),
+  exportChatBtn: document.getElementById("exportChatBtn"),
+  chatImageInput: document.getElementById("chatImageInput"),
+  cxOfflineBanner: document.getElementById("cxOfflineBanner"),
+  cxOfflineBannerText: document.getElementById("cxOfflineBannerText"),
   paymentModal: document.getElementById("paymentModal"),
   payModalClose: document.getElementById("payModalClose"),
   payModalTitle: document.getElementById("payModalTitle"),
@@ -228,6 +286,7 @@ const el = {
   payTotal: document.getElementById("payTotal"),
   payWechat: document.getElementById("payWechat"),
   payAlipay: document.getElementById("payAlipay"),
+  payCard: document.getElementById("payCard"),
   payQrSection: document.getElementById("payQrSection"),
   payQrLabel: document.getElementById("payQrLabel"),
   payQrImg: document.getElementById("payQrImg"),
@@ -363,6 +422,13 @@ const el = {
   languageTag: document.getElementById("languageTag"),
   langPillLabel: document.getElementById("langPillLabel"),
   langSwitch: document.getElementById("langSwitch"),
+  currencySwitch: document.getElementById("currencySwitch"),
+  currencyPillLabel: document.getElementById("currencyPillLabel"),
+  shareItinBtn: document.getElementById("shareItinBtn"),
+  shareItinBtnLabel: document.getElementById("shareItinBtnLabel"),
+  fsDecBtn: document.getElementById("fsDecBtn"),
+  fsIncBtn: document.getElementById("fsIncBtn"),
+  fsResetBtn: document.getElementById("fsResetBtn"),
   locateBtn: document.getElementById("locateBtn"),
   locationTag: document.getElementById("locationTag"),
   viewModeTag: document.getElementById("viewModeTag"),
@@ -493,11 +559,12 @@ function tUi(key, vars) {
   return i18n.t(state.uiLanguage, `ui.${key}`, vars);
 }
 
-function pickText(zh, en, ja, ko, id) {
-  if (state.uiLanguage === "ZH") return zh;
+function pickText(zh, en, ja, ko, id, ar) {
+  if (state.uiLanguage === "ZH" || state.uiLanguage === "ZH-TW") return zh;
   if (state.uiLanguage === "JA") return ja || en;
   if (state.uiLanguage === "KO") return ko || en;
   if (state.uiLanguage === "ID") return id || en;
+  if (state.uiLanguage === "AR") return ar || en;
   return en;
 }
 
@@ -585,6 +652,62 @@ let thinkingActivatedAt = 0;
 let thinkingHideTimer = null;
 // P2: abort controller for in-flight plan stream (one active stream at a time)
 let _currentPlanAbortController = null;
+// FS-B-02: Abort controller for in-flight /api/chat/reply calls — prevents duplicate submissions
+let _activeChatReplyCtrl = null;
+
+// ── Smart auto-scroll ────────────────────────────────────────────────────────
+// Pause when user manually scrolls up; resume when back near bottom.
+let _chatScrollPaused = false;
+let _chatScrollListenerBound = false;
+function _smartScrollToBottom(feed) {
+  if (!feed) return;
+  if (!_chatScrollListenerBound) {
+    _chatScrollListenerBound = true;
+    feed.addEventListener("scroll", () => {
+      const dist = feed.scrollHeight - feed.scrollTop - feed.clientHeight;
+      _chatScrollPaused = dist > 80;
+    }, { passive: true });
+  }
+  if (!_chatScrollPaused) feed.scrollTop = feed.scrollHeight;
+}
+
+// ── Tool-call context skeleton ───────────────────────────────────────────────
+let _toolSkeletonEl = null;
+const _TOOL_SKEL_META = {
+  search_hotels:       { icon: "🏨", label: (d) => pickText(`搜索${d}酒店中...`, `Finding ${d} hotels...`, `${d}のホテルを検索中...`, `${d} 호텔 검색 중...`) },
+  search_restaurants:  { icon: "🍜", label: (d) => pickText(`搜索${d}餐厅中...`, `Finding ${d} restaurants...`, `${d}のレストランを検索中...`, `${d} 식당 검색 중...`) },
+  get_attractions:     { icon: "🗺️", label: (d) => pickText(`搜索${d}景点中...`, `Finding ${d} attractions...`, `${d}の観光地を検索中...`, `${d} 명소 검색 중...`) },
+  get_route_options:   { icon: "🚄", label: ()  => pickText("计算路线中...",    "Calculating routes...",     "ルート計算中...",           "경로 계산 중...") },
+  get_city_enrichment: { icon: "✨", label: (d) => pickText(`丰富${d}数据中...`, `Enriching ${d} data...`,    `${d}のデータを充実化中...`, `${d} 데이터 보강 중...`) },
+};
+function _showToolSkeleton(toolName, dest) {
+  if (_toolSkeletonEl) return; // only one at a time
+  const feed = document.getElementById("chatFeed");
+  if (!feed) return;
+  const meta = _TOOL_SKEL_META[toolName] || { icon: "⚙️", label: () => pickText("AI 搜索中...", "AI searching...", "AI 検索中...", "AI 검색 중...") };
+  const label = meta.label(dest || "");
+  const row = document.createElement("div");
+  row.className = "msg agent";
+  row.innerHTML = `<span class="bubble cx-tool-skel-bubble">` +
+    `<span class="cx-tool-skel-icon">${meta.icon}</span>` +
+    `<span class="cx-tool-skel-lines">` +
+    `<span class="cx-tool-skel-line"></span>` +
+    `<span class="cx-tool-skel-line"></span>` +
+    `<span class="cx-tool-skel-line"></span>` +
+    `<span class="cx-tool-skel-label">${label}</span>` +
+    `</span></span>`;
+  feed.appendChild(row);
+  motion.enter(row, { duration: 160, fromY: 6 });
+  _smartScrollToBottom(feed);
+  _toolSkeletonEl = row;
+}
+function _removeToolSkeleton() {
+  if (!_toolSkeletonEl) return;
+  const row = _toolSkeletonEl;
+  _toolSkeletonEl = null;
+  row.classList.add("cx-fadeout");
+  setTimeout(() => { if (row.parentElement) row.remove(); }, 250);
+}
 
 /**
  * isAiBusy() — true whenever ANY async AI operation is in flight.
@@ -608,10 +731,11 @@ function applyThinkingIndicatorState(active, text = "") {
     el.thinkingIndicator.textContent =
       text
       || pickText(
-        "核心资源精算中...",
-        "Calculating resources...",
-        "リソースを精算中...",
-        "리소스 정산 중...",
+        "正在为你规划...",
+        "Planning your trip...",
+        "プランを作成中...",
+        "여행 계획 중...",
+        "Merencanakan perjalanan...",
       );
     if (el.conversationAura) {
       el.conversationAura.dataset.mode = "planning";
@@ -649,6 +773,12 @@ function setThinkingIndicator(active, text = "") {
 function renderHumanAssistDock() {
   if (!el.humanAssistSummary || !el.humanAssistMode) return;
   const task = state.currentTask || null;
+  // Only show the Human Assist card when there's an active task or open tickets
+  if (el.humanAssistCard) {
+    const tickets = Array.isArray(state.supportTickets) ? state.supportTickets : [];
+    const hasOpenTicket = tickets.some((t) => ["open","in_progress"].includes(String(t.status||"").toLowerCase()));
+    el.humanAssistCard.style.display = (task || hasOpenTicket) ? "" : "none";
+  }
   const tickets = Array.isArray(state.supportTickets) ? state.supportTickets : [];
   const openTickets = tickets.filter((t) => ["open", "in_progress"].includes(String(t.status || "").toLowerCase()));
   const currentTicketId = task && task.handoff ? String(task.handoff.ticketId || "") : "";
@@ -769,6 +899,11 @@ function applySingleDialogMode() {
     state.singleDialogMode = true;
   }
   document.body.classList.toggle("single-dialog-mode", state.singleDialogMode === true);
+  // Show/hide admin-only workspace panels (Context, FlowRail, AgentBrain)
+  const _isWorkspace = state.viewMode === "admin" && !state.singleDialogMode;
+  document.querySelectorAll(".admin-workspace-only").forEach((el) => {
+    el.style.display = _isWorkspace ? "" : "none";
+  });
   if (state.singleDialogMode) {
     switchTab("chat", { force: true });
   }
@@ -889,10 +1024,19 @@ function renderAgentBrain(task = null) {
 }
 
 function speechLocaleForLang(lang) {
-  if (lang === "ZH") return "zh-CN";
-  if (lang === "JA") return "ja-JP";
-  if (lang === "KO") return "ko-KR";
-  return "en-US";
+  const map = {
+    ZH: "zh-CN",
+    JA: "ja-JP",
+    KO: "ko-KR",
+    ID: "id-ID",
+    ES: "es-ES",
+    FR: "fr-FR",
+    DE: "de-DE",
+    AR: "ar-SA",
+    HI: "hi-IN",
+    VI: "vi-VN",
+  };
+  return map[lang] || "en-US";
 }
 
 function isSpeechSynthesisSupported() {
@@ -1436,11 +1580,15 @@ function initVoiceAssistant() {
   recognition.onresult = async (event) => {
     let finalTranscript = "";
     let interimTranscript = "";
+    let finalConfidence = 1;
     for (let i = event.resultIndex; i < event.results.length; i += 1) {
       const result = event.results[i];
       const piece = String((result && result[0] && result[0].transcript) || "");
       if (result.isFinal) {
         finalTranscript += `${piece} `;
+        if (result[0] && typeof result[0].confidence === "number") {
+          finalConfidence = result[0].confidence;
+        }
       } else {
         interimTranscript += `${piece} `;
       }
@@ -1453,6 +1601,20 @@ function initVoiceAssistant() {
     const text = finalTranscript.trim();
     if (!text || state.voice.processing) return;
     clearVoiceListenTimer();
+    // Low confidence warning: show a hint to confirm before submitting
+    if (finalConfidence < 0.7 && el.chatInput) {
+      el.chatInput.value = text;
+      autoResizeChatInput();
+      updateChatSendState();
+      const _hint = pickText(
+        `语音识别可信度较低 (${Math.round(finalConfidence * 100)}%)，请核对后发送。`,
+        `Low voice confidence (${Math.round(finalConfidence * 100)}%) — please check before sending.`,
+        `音声認識の精度が低いです (${Math.round(finalConfidence * 100)}%) — 送信前に確認してください。`,
+        `음성 인식 신뢰도가 낮습니다 (${Math.round(finalConfidence * 100)}%) — 전송 전 확인하세요.`,
+      );
+      notify(_hint, "warning", 4000);
+      return; // Don't auto-submit on low confidence — let user review
+    }
     await handleVoiceTranscript(text);
   };
   state.voice.recognition = recognition;
@@ -1835,7 +1997,7 @@ function buildWelcomeIntro(locationLabel) {
 
   if (state.uiLanguage === "ZH") {
     const locPart = loc ? `\u6B22\u8FCE\u6765\u5230${loc}\uFF01` : `${greetZh}\uFF01`;
-    return `${locPart}\u6211\u662F Cross X\uFF0C\u4F60\u7684 AI \u51FA\u884C\u7BA1\u5BB6\u3002\u544A\u8BC9\u6211\u4E00\u53E5\u8BDD\u76EE\u6807\uFF0C\u6211\u4F1A\u4E3A\u4F60\u5B9A\u5236\u65B9\u6848\u5E76\u63A8\u8FDB\u6267\u884C\u3002`;
+    return `${locPart}\u6211\u662F Cross X\uFF0C\u4F60\u7684 AI \u51FA\u884C\u7BA1\u5BB6\u3002\u544A\u8BC9\u6211\u4E00\u53E5\u8BDD\u76EE\u6807\uFF0C\u6211\u4F1A\u4E3A\u4F60\u5B9A\u5236\u65B9\u6848\u5E76\u63A8\u8FDB\u6267\u884C\u3002\n\n\u8BD5\u8BD5\uFF1A\u201C\u627E\u9644\u8FD1\u5C0F\u9F99\u8679\u201D\u00B7\u201C\u9884\u8BA2\u4E0A\u6D77\u4EBA\u6C11\u5E7F\u573A\u9644\u8FD1\u4F4F\u5BBF\u201D\u00B7\u201C\u53EB\u6ED1\u5934\u53BB\u673A\u573A\u201D`;
   }
   if (state.uiLanguage === "JA") {
     return loc
@@ -1847,11 +2009,12 @@ function buildWelcomeIntro(locationLabel) {
       ? `${loc}\uC5D0 \uC624\uC2E0 \uAC83\uC744 \uD658\uC601\uD569\uB2C8\uB2E4! Cross X\uC785\uB2C8\uB2E4. \uD55C \uBB38\uC7A5\uC73C\uB85C \uBAA9\uD45C\uB97C \uB9D0\uD558\uBA74 \uB9DE\uCDA4 \uC635\uC158\uC744 \uB9CC\uB4E4\uACE0 \uC2E4\uD589\uAE4C\uC9C0 \uC9C4\uD589\uD569\uB2C8\uB2E4.`
       : `${greetKo}! Cross X\uC785\uB2C8\uB2E4. \uD55C \uBB38\uC7A5\uC73C\uB85C \uBAA9\uD45C\uB97C \uB9D0\uD558\uBA74 \uB9DE\uCDA4 \uC635\uC158\uC744 \uB9CC\uB4E4\uACE0 \uC2E4\uD589\uAE4C\uC9C0 \uC9C4\uD589\uD569\uB2C8\uB2E4.`;
   }
-  // Default EN
-  const locEn = state._locationLabelEn || loc;
+  // Default EN — only use locEn if it's already English (not Chinese chars)
+  const locEn = state._locationLabelEn || (/[\u4e00-\u9fff]/.test(loc) ? "" : loc);
+  const enExamples = `\n\nTry: \u201cFind me a halal restaurant nearby\u201d · \u201cBook a hotel in Shanghai under ¥500\u201d · \u201cGet me a taxi to the airport\u201d`;
   return locEn
-    ? `${greetEn}! Welcome to ${locEn}. I\u2019m Cross X, your AI travel concierge. Tell me your goal and I\u2019ll build a tailored plan.`
-    : `${greetEn}! I\u2019m Cross X. Tell me your goal and I\u2019ll generate tailored options and move execution forward.`;
+    ? `${greetEn}! Welcome to ${locEn}. I\u2019m Cross X \u2014 your AI bridge into China. Tell me your goal and I\u2019ll build a plan with real booking links.${enExamples}`
+    : `${greetEn}! I\u2019m Cross X \u2014 your AI guide for navigating China. Tell me where you want to go or what you need.${enExamples}`;
 }
 
 function getSystemMessageByKey(key) {
@@ -1901,10 +2064,23 @@ async function silentAutoDetectLocation() {
       if (el.locationTag) el.locationTag.textContent = `${data.cityZh || data.city} · GPS`;
       state.selectedConstraints.city = data.city;
       state.selectedConstraints.origin = "current_location";
+      // Store raw coords so buildNearbyPath() can send them to the server
+      state._gpsLat = Number(coords.latitude);
+      state._gpsLng = Number(coords.longitude);
       syncChipSelectionFromConstraints();
       updateContextSummary();
       renderQuickGoals();
       updateWelcomeBubbleWithLocation(data);
+      // Update input placeholder to hint city-aware examples
+      if (el.chatInput) {
+        const _cityHint = data.city || "Shanghai";
+        el.chatInput.placeholder = pickText(
+          `试试："推荐${_cityHint}附近的餐厅"`,
+          `Try: "Find a restaurant near ${_cityHint}"`,
+          `例: "${_cityHint}のレストランを探して"`,
+          `예: "${_cityHint} 근처 음식점 찾아줘"`,
+        );
+      }
     }
   } catch {
     // Silent failure — location permission denied or unavailable, keep default welcome
@@ -2253,6 +2429,16 @@ function buildNearbyPath() {
   const params = new URLSearchParams();
   params.set("language", state.uiLanguage || "EN");
   params.set("city", getCurrentCity());
+  // Send GPS coordinates if available so server computes real distances
+  if (Number.isFinite(state._gpsLat) && Number.isFinite(state._gpsLng)) {
+    params.set("lat", String(state._gpsLat));
+    params.set("lng", String(state._gpsLng));
+  }
+  // Send active dietary filter so server can apply halal/vegan category queries
+  if (el.nearFilterForm) {
+    const dietary = el.nearFilterForm.elements.dietary && el.nearFilterForm.elements.dietary.value;
+    if (dietary && dietary !== "none") params.set("dietary", dietary);
+  }
   return `/api/nearby/suggestions?${params.toString()}`;
 }
 
@@ -3372,7 +3558,7 @@ function routeMock(slots, candidate, seedKey) {
     tool: "route_mock",
     eta,
     traffic,
-    costRange: `${Math.max(8, cost - 6)}-${cost + 10} CNY`,
+    costRange: `${formatCNY(Math.max(8, cost - 6))}-${formatCNY(cost + 10)}`,
     reason: pickText(
       `当前路况中等，预计 ${eta} 分钟可达。`,
       `Traffic is moderate. ETA is about ${eta} minutes.`,
@@ -3401,10 +3587,10 @@ function proofGenerateMock(slots, option, runId, routeInfo) {
       type: "summary",
       title: pickText("执行摘要", "Execution summary", "実行サマリー", "실행 요약"),
       content: pickText(
-        `已锁定 ${place}，预计 ${eta} 分钟可达，预计花费 ${amount} CNY。`,
-        `${place} is locked. ETA ${eta} minutes, estimated spend ${amount} CNY.`,
-        `${place} を確保しました。ETA ${eta} 分、想定費用 ${amount} CNY。`,
-        `${place} 예약 잠금 완료. ETA ${eta}분, 예상 비용 ${amount} CNY.`,
+        `已锁定 ${place}，预计 ${eta} 分钟可达，预计花费 ${formatCNY(amount)}。`,
+        `${place} is locked. ETA ${eta} minutes, estimated spend ${formatCNY(amount)}.`,
+        `${place} を確保しました。ETA ${eta} 分、想定費用 ${formatCNY(amount)}。`,
+        `${place} 예약 잠금 완료. ETA ${eta}분, 예상 비용 ${formatCNY(amount)}.`,
       ),
       generatedAt: new Date().toISOString(),
     },
@@ -3470,7 +3656,7 @@ function candidateToPlanOption(candidate, key, intent, slots, checkResult) {
     recommendationLevel: key === "main" ? pickText("推荐", "Recommended", "推奨", "추천") : pickText("备选", "Backup", "代替", "대안"),
     grade: key === "main" ? "A" : "B",
     placeDisplay: candidate.place,
-    costRange: `${Math.max(28, Math.round(candidate.amount * 0.9))}-${Math.round(candidate.amount * 1.08)} CNY`,
+    costRange: `${formatCNY(Math.max(28, Math.round(candidate.amount * 0.9)))}-${formatCNY(Math.round(candidate.amount * 1.08))}`,
     etaWindow: `${Math.max(8, candidate.eta - 6)}-${candidate.eta + 10} min`,
     openHours: pickText("营业中（模拟）", "Open now (mock)", "営業中 (mock)", "영업중 (mock)"),
     paymentFriendly: "Alipay / WeChat / Card",
@@ -3858,12 +4044,12 @@ function _updateCePreview() {
     <div class="cx-ce-preview-opt">
       <span class="cx-ce-pv-tag">${pickText("主", "A", "主", "주")}</span>
       <span class="cx-ce-pv-place">${escapeHtml(main.place || "-")}</span>
-      <span class="cx-ce-pv-meta">${Number(main.amount || 0)} CNY · ${Number(main.eta || 0)} min</span>
+      <span class="cx-ce-pv-meta">${formatCNY(Number(main.amount || 0))} · ${Number(main.eta || 0)} min</span>
     </div>
     ${backup ? `<div class="cx-ce-preview-opt cx-ce-pv-b">
       <span class="cx-ce-pv-tag">${pickText("备", "B", "備", "대")}</span>
       <span class="cx-ce-pv-place">${escapeHtml(backup.place || "-")}</span>
-      <span class="cx-ce-pv-meta">${Number(backup.amount || 0)} CNY · ${Number(backup.eta || 0)} min</span>
+      <span class="cx-ce-pv-meta">${formatCNY(Number(backup.amount || 0))} · ${Number(backup.eta || 0)} min</span>
     </div>` : ""}`;
 }
 
@@ -4089,12 +4275,17 @@ async function refineAgentPlanWithSmartReply(inputText = "", options = {}) {
   if (["planning", "confirming"].includes(state.agentConversation.mode)) {
     rerenderAgentFlowCards();
   }
+  // FS-B-02: Cancel any in-flight chat reply before starting a new one
+  if (_activeChatReplyCtrl) { _activeChatReplyCtrl.abort(); }
+  _activeChatReplyCtrl = new AbortController();
   try {
     const smart = await api("/api/chat/reply", {
       method: "POST",
+      signal: _activeChatReplyCtrl.signal,
       body: JSON.stringify({
         message,
         language: state.uiLanguage,
+        currency: state.currency || "USD",
         city: slots.city || getCurrentCity(),
         constraints,
       }),
@@ -4245,14 +4436,14 @@ function renderAgentPlanningCard(plan) {
     }
     <div class="agent-plan-grid">
       <article class="inline-block agent-option-card agent-option-primary">
-        <img class="agent-option-image media-photo" src="${escapeHtml(assetUrl((main && main.imagePath) || "/assets/solution-flow.svg"))}" alt="${escapeHtml((main && main.title) || "main option")}" />
+        <img class="agent-option-image media-photo" src="${escapeHtml(_getCityHeroUrl((main && main.place) || state.selectedConstraints.city || ""))}" alt="${escapeHtml((main && main.title) || "main option")}" loading="lazy" onerror="this.src='/assets/solution-flow.svg'" />
         <h3>${escapeHtml((main && main.title) || "-")}</h3>
         <div class="status">${pickText("地点/路线", "Place/Route", "場所/ルート", "장소/경로")}: ${escapeHtml((main && main.place) || "-")}</div>
         <div class="status">ETA ${Number((main && main.eta) || 0)} min · ${pickText("预估金额", "Estimated amount", "見積金額", "예상 금액")} ${Number((main && main.amount) || 0)} CNY</div>
         <div class="actions"><button data-action="agent-request-execute" data-option="main">${pickText("执行主方案", "Execute primary", "主案を実行", "주안 실행")}</button></div>
       </article>
       <article class="inline-block agent-option-card">
-        <img class="agent-option-image media-photo" src="${escapeHtml(assetUrl(((backup || main) && (backup || main).imagePath) || "/assets/solution-flow.svg"))}" alt="${escapeHtml(((backup || main) && (backup || main).title) || "backup option")}" />
+        <img class="agent-option-image media-photo" src="${escapeHtml(_getCityHeroUrl(((backup || main) && (backup || main).place) || state.selectedConstraints.city || ""))}" alt="${escapeHtml(((backup || main) && (backup || main).title) || "backup option")}" loading="lazy" onerror="this.src='/assets/solution-flow.svg'" />
         <h3>${escapeHtml(((backup || main) && (backup || main).title) || "-")}</h3>
         <div class="status">${pickText("地点/路线", "Place/Route", "場所/ルート", "장소/경로")}: ${escapeHtml(((backup || main) && (backup || main).place) || "-")}</div>
         <div class="status">ETA ${Number((((backup || main) && (backup || main).eta) || 0))} min · ${pickText("预估金额", "Estimated amount", "見積金額", "예상 금액")} ${Number((((backup || main) && (backup || main).amount) || 0))} CNY</div>
@@ -4492,7 +4683,7 @@ function renderAgentDeliverableCard(result) {
           <div class="cx-dlv-place">${escapeHtml(place)}</div>
           ${locationLine ? `<div class="cx-dlv-location">${escapeHtml(locationLine)}</div>` : ""}
           <div class="cx-dlv-chips">
-            <span class="cx-dlv-chip">\uD83D\uDCB0 ${amount} CNY</span>
+            <span class="cx-dlv-chip">\uD83D\uDCB0 ${formatCNY(amount)}</span>
             ${eta ? `<span class="cx-dlv-chip">\u23F1 ${eta} min</span>` : ""}
           </div>
           <div class="cx-dlv-order">\uD83D\uDCCB ${escapeHtml(orderId)}</div>
@@ -5104,7 +5295,7 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
   run.status = "completed";
   setAgentMode("completed", { runId: run.id, option: option.key || optionKey });
   const result = {
-    orderId: reservationId || `MOCK-${Date.now().toString().slice(-6)}`,
+    orderId: reservationId || `CX-${Date.now().toString().slice(-8)}`,
     place: option.place,
     amount: (activeCandidate && activeCandidate.amount) || option.amount,
     eta: routeInfo && Number(routeInfo.eta || 0) ? Number(routeInfo.eta) : Number(option.eta || 0),
@@ -5114,10 +5305,10 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
   rerenderAgentFlowCards();
   addMessage(
     pickText(
-      `已完成：${option.place}，金额 ${option.amount} CNY。可继续导航或改为备选方案。`,
-      `Done: ${option.place}, amount ${option.amount} CNY. You can navigate now or switch to backup.`,
-      `完了: ${option.place}、金額 ${option.amount} CNY。ナビ開始または代替案へ変更できます。`,
-      `완료: ${option.place}, 금액 ${option.amount} CNY. 지금 이동하거나 대안으로 변경할 수 있습니다.`,
+      `已完成：${option.place}，金额 ${formatCNY(option.amount)}。可继续导航或改为备选方案。`,
+      `Done: ${option.place}, amount ${formatCNY(option.amount)}. You can navigate now or switch to backup.`,
+      `完了: ${option.place}、金額 ${formatCNY(option.amount)}。ナビ開始または代替案へ変更できます。`,
+      `완료: ${option.place}, 금액 ${formatCNY(option.amount)}. 지금 이동하거나 대안으로 변경할 수 있습니다.`,
     ),
     "agent",
   );
@@ -5650,12 +5841,17 @@ async function runOpenAISolutionTurn(input) {
   syncChipSelectionFromConstraints();
   updateContextSummary();
   setThinkingIndicator(true);
+  // FS-B-02: Cancel any in-flight chat reply before starting a new one
+  if (_activeChatReplyCtrl) { _activeChatReplyCtrl.abort(); }
+  _activeChatReplyCtrl = new AbortController();
   try {
     const smart = await api("/api/chat/reply", {
       method: "POST",
+      signal: _activeChatReplyCtrl.signal,
       body: JSON.stringify({
         message: input,
         language: state.uiLanguage,
+        currency: state.currency || "USD",
         city: getCurrentCity(),
         constraints: mergedConstraints,
       }),
@@ -5764,7 +5960,38 @@ function applyLanguagePack() {
   if (el.chatForm && el.chatForm.querySelector("button[type='submit']")) {
     el.chatForm.querySelector("button[type='submit']").textContent = i18n.t(lang, "ui.send");
   }
-  if (el.emergencyBtn) el.emergencyBtn.textContent = i18n.t(lang, "ui.emergency");
+  if (el.emergencyBtn) {
+    el.emergencyBtn.textContent = pickText("?", "?", "?", "?");
+    el.emergencyBtn.title = pickText("紧急联系 & 帮助", "Emergency contacts & help", "緊急連絡先・ヘルプ", "긴급 연락처 & 도움말");
+    el.emergencyBtn.setAttribute("aria-label", pickText("紧急帮助", "Emergency help", "緊急ヘルプ", "긴급 도움말"));
+  }
+  // Update aria-labels and sr-only text for a11y
+  const _translateSrOnly = document.getElementById("translateBtnLabel");
+  if (_translateSrOnly) _translateSrOnly.textContent = pickText("翻译", "Translate", "翻訳", "번역");
+  if (el.translateBtn) {
+    el.translateBtn.title = pickText("翻译输入内容", "Translate input", "入力を翻訳", "입력 번역");
+    el.translateBtn.setAttribute("aria-label", pickText("翻译", "Translate", "翻訳", "번역"));
+  }
+  const _voiceSrOnly = document.getElementById("voiceInputBtnLabel");
+  if (_voiceSrOnly) _voiceSrOnly.textContent = pickText("语音输入", "Voice input", "音声入力", "음성 입력");
+  if (el.payModalClose) el.payModalClose.setAttribute("aria-label", pickText("关闭", "Close payment modal", "閉じる", "닫기"));
+  // Payment modal static labels
+  const _payTotalLbl = document.getElementById("payTotalLabel");
+  if (_payTotalLbl) _payTotalLbl.textContent = pickText("合计", "Total", "合計", "합계");
+  if (el.payDoneBtn) el.payDoneBtn.textContent = pickText("我已完成支付", "I have paid", "支払い完了", "결제 완료");
+  if (el.payQrLabel) el.payQrLabel.textContent = pickText("扫码支付", "Scan to Pay", "スキャンして支払う", "스캔하여 결제");
+  if (el.payQrHint) el.payQrHint.textContent = pickText("请使用对应App扫码", "Open the app and scan this QR code", "対応アプリを開いてスキャン", "해당 앱을 열어 스캔하세요");
+  // Profile edit form labels (i18n)
+  const _meEditNameLbl = document.getElementById("meEditNameLabel");
+  if (_meEditNameLbl) { const _t = _meEditNameLbl.firstChild; if (_t && _t.nodeType === 3) _t.textContent = pickText("昵称", "Nickname", "ニックネーム", "닉네임") + "\n              "; }
+  const _meEditCityLbl = document.getElementById("meEditCityLabel");
+  if (_meEditCityLbl) { const _t = _meEditCityLbl.firstChild; if (_t && _t.nodeType === 3) _t.textContent = pickText("城市", "City", "都市", "도시") + "\n              "; }
+  const _meEditSave = document.getElementById("meEditProfileSave");
+  if (_meEditSave) _meEditSave.textContent = pickText("保存", "Save", "保存", "저장");
+  const _meEditCancel = document.getElementById("meEditProfileCancel");
+  if (_meEditCancel) _meEditCancel.textContent = pickText("取消", "Cancel", "キャンセル", "취소");
+  const _meEditHeading = document.getElementById("meEditProfileHeading");
+  if (_meEditHeading) _meEditHeading.textContent = pickText("编辑资料", "Edit Profile", "プロフィール編集", "프로필 편집");
   const tag = document.querySelector(".brand p");
   if (tag) tag.textContent = i18n.t(lang, "ui.one_sentence");
   if (el.languageTag) el.languageTag.textContent = i18n.languageName(lang);
@@ -5773,7 +6000,28 @@ function applyLanguagePack() {
     el.myOrdersBtn.textContent = pickText("我的订单", "My Orders","マイ注文", "내 주문");
   }
   if (el.langPillLabel) {
-    el.langPillLabel.textContent = lang === "ZH" ? "语言" : lang === "ID" ? "Bahasa" : lang === "JA" ? "言語" : lang === "KO" ? "언어" : "Lang";
+    el.langPillLabel.textContent = lang === "ZH" ? "语言" : lang === "ID" ? "Bahasa" : lang === "JA" ? "言語" : lang === "KO" ? "언어" : lang === "AR" ? "اللغة" : "Lang";
+  }
+  // RTL support for Arabic
+  const isRTL = lang === "AR";
+  document.documentElement.setAttribute("dir", isRTL ? "rtl" : "ltr");
+  document.documentElement.setAttribute("lang", lang === "ZH" ? "zh" : lang === "JA" ? "ja" : lang === "KO" ? "ko" : lang === "ID" ? "id" : lang === "AR" ? "ar" : "en");
+  // Update export button label
+  const _exportLbl = document.getElementById("exportChatBtnLabel");
+  if (_exportLbl) _exportLbl.textContent = pickText("导出", "Export", "エクスポート", "내보내기", "Ekspor", "تصدير");
+  // Update share button label
+  if (el.shareItinBtnLabel) el.shareItinBtnLabel.textContent = pickText("分享", "Share", "共有", "공유", "Bagikan", "مشاركة");
+  // Update AI disclosure text to match current language
+  const _discEl = document.getElementById("cxAiDisclosure");
+  if (_discEl) {
+    const _privacyLabel = pickText("隐私政策", "Privacy", "プライバシー", "개인정보", "Privasi", "الخصوصية");
+    _discEl.innerHTML = pickText(
+      `对话内容由 OpenAI 处理生成。<a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
+      `AI responses are generated via OpenAI. <a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
+      `AI応答はOpenAIにより生成されます。<a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
+      `AI 응답은 OpenAI를 통해 생성됩니다. <a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
+      `Respons AI dihasilkan melalui OpenAI. <a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
+    );
   }
   if (el.locateBtn) {
     el.locateBtn.textContent = pickText("定位", "Use Location","現在地", "현재 위치");
@@ -5899,6 +6147,14 @@ function applyLanguagePack() {
   if (el.createTripBtn) {
     el.createTripBtn.textContent = pickText("创建行程", "Create Trip Plan","旅程を作成", "트립 생성");
   }
+  const _mrNote = document.getElementById("merchantRecordNote");
+  if (_mrNote) _mrNote.textContent = pickText(
+    "Cross X 代收代付，具体以确认页说明为准。",
+    "Cross X collects payment on behalf of the merchant. See order confirmation for details.",
+    "Cross X が加盟店に代わって決済を代行します。詳細は確認ページをご覧ください。",
+    "Cross X는 가맹점을 대신하여 결제를 대행합니다. 자세한 내용은 확인 페이지를 참조하세요.",
+    "Cross X mengumpulkan pembayaran atas nama merchant. Lihat konfirmasi pesanan untuk detailnya.",
+  );
   refreshI18nMessagesInChat();
   renderQuickGoals();
   renderVoiceControls();
@@ -5964,17 +6220,84 @@ function addMessage(text, who = "agent", options = null) {
   const opts = options || {};
   const row = document.createElement("div");
   row.className = `msg ${who}`;
+  row.setAttribute("role", "article");
+  if (who === "agent") row.setAttribute("aria-label", pickText("AI回复", "AI reply", "AI返信", "AI 답변", "Balasan AI", "رد الذكاء الاصطناعي"));
   if (opts.i18nKey) row.dataset.i18nKey = String(opts.i18nKey);
   const bubble = document.createElement("span");
   bubble.className = "bubble";
   // AI-native: typewriter effect for agent chat messages (skip for very long text)
-  const doTypewriter = opts.typewriter && who === "agent" && text.length <= 180;
+  const doTypewriter = opts.typewriter && who === "agent" && text.length <= 400;
   bubble.textContent = doTypewriter ? "" : text;
   if (!doTypewriter) bubble.innerHTML = escapeHtml(text);
   row.appendChild(bubble);
+
+  // Copy button for agent messages (P0-2: export/copy)
+  if (who === "agent" && navigator.clipboard) {
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "cx-msg-copy-btn";
+    copyBtn.title = pickText("复制", "Copy", "コピー", "복사", "Salin", "نسخ");
+    copyBtn.setAttribute("aria-label", pickText("复制消息", "Copy message", "メッセージをコピー", "메시지 복사", "Salin pesan", "نسخ الرسالة"));
+    copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+    copyBtn.onclick = () => {
+      navigator.clipboard.writeText(text).then(() => {
+        copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+        setTimeout(() => {
+          copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+        }, 2000);
+      }).catch(() => {});
+    };
+    row.appendChild(copyBtn);
+
+    // Share button (native share or fallback copy URL)
+    if (navigator.share || navigator.clipboard) {
+      const shareBtn = document.createElement("button");
+      shareBtn.className = "cx-msg-copy-btn";
+      shareBtn.title = pickText("分享", "Share", "シェア", "공유", "Bagikan", "مشاركة");
+      shareBtn.setAttribute("aria-label", pickText("分享消息", "Share message", "メッセージを共有", "메시지 공유", "Bagikan pesan", "مشاركة الرسالة"));
+      shareBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>';
+      shareBtn.onclick = async () => {
+        if (navigator.share) {
+          try { await navigator.share({ text: text, url: location.href }); return; } catch { /* cancelled */ }
+        }
+        navigator.clipboard.writeText(location.href + "\n\n" + text).then(() => {
+          shareBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+          setTimeout(() => {
+            shareBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>';
+          }, 2000);
+        }).catch(() => {});
+      };
+      row.appendChild(shareBtn);
+    }
+  }
+
+  // TTS (read aloud) button for agent messages (v8.0 P1)
+  if (who === "agent" && window.speechSynthesis) {
+    const _ttsIconIdle = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>';
+    const _ttsIconStop = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><line x1="23" y1="9" x2="23" y2="15"/><line x1="19" y1="7" x2="19" y2="17"/></svg>';
+    const ttsBtn = document.createElement("button");
+    ttsBtn.className = "cx-msg-tts-btn";
+    ttsBtn.title = pickText("朗读", "Read aloud", "読み上げ", "\uc77d\uae30", "Baca", "قراءة بصوت عالٍ");
+    ttsBtn.setAttribute("aria-label", pickText("朗读消息", "Read message aloud", "\u30e1\u30c3\u30bb\u30fc\u30b8\u3092\u8aad\u307f\u4e0a\u3052\u308b", "\uba54\uc2dc\uc9c0 \uc77d\uae30", "Baca pesan", "قراءة الرسالة بصوت عالٍ"));
+    ttsBtn.innerHTML = _ttsIconIdle;
+    ttsBtn.onclick = () => {
+      if (window.speechSynthesis.speaking) {
+        window.speechSynthesis.cancel();
+        ttsBtn.innerHTML = _ttsIconIdle;
+        return;
+      }
+      const utt = new SpeechSynthesisUtterance(text);
+      utt.lang = speechLocaleForLang(state.uiLanguage);
+      utt.onstart = () => { ttsBtn.innerHTML = _ttsIconStop; };
+      utt.onend = () => { ttsBtn.innerHTML = _ttsIconIdle; };
+      utt.onerror = () => { ttsBtn.innerHTML = _ttsIconIdle; };
+      window.speechSynthesis.speak(utt);
+    };
+    row.appendChild(ttsBtn);
+  }
+
   el.chatFeed.appendChild(row);
   motion.enter(row, { duration: 160, fromY: 8 });
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  _smartScrollToBottom(el.chatFeed);
   pulseConversationAura();
   if (doTypewriter) {
     // Speed: ~12ms/char for short messages, 8ms for longer ones
@@ -6033,9 +6356,9 @@ function addCard(html) {
   wrap.innerHTML = html;
   const card = wrap.firstElementChild;
   el.chatFeed.appendChild(card);
-  motion.enter(card, { duration: 180, fromY: 10 });
+  motion.popIn(card, { duration: 220 });
   motion.bindPressables(card);
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  _smartScrollToBottom(el.chatFeed);
   pulseConversationAura();
 }
 
@@ -6611,8 +6934,12 @@ async function api(path, options = {}) {
       signal: ctrl.signal,
       ...fetchOptions,
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || "API error");
+    // P2-D: Guard against 204 No Content or non-JSON responses (avoids SyntaxError crash)
+    const ct = res.headers.get("content-type") || "";
+    const data = (res.status !== 204 && ct.includes("json"))
+      ? await res.json().catch(() => ({}))
+      : {};
+    if (!res.ok) throw new Error(data.error || `API error ${res.status}`);
     return data;
   } catch (err) {
     if (err.name === "AbortError") throw new Error("Request timed out");
@@ -6787,8 +7114,37 @@ function renderPlanCard(task) {
   `);
 }
 
+function _showExecPermissionTip() {
+  if (localStorage.getItem("cx_exec_tip_shown")) return;
+  try { localStorage.setItem("cx_exec_tip_shown", "1"); } catch { /* quota */ }
+  trackEvent("exec_tip_shown", { lang: state.uiLanguage || "EN" }).catch(() => {});
+  const overlay = document.createElement("div");
+  overlay.className = "cx-onboarding-overlay";
+  overlay.style.cssText = "display:flex;z-index:9999;";
+  overlay.setAttribute("role", "dialog");
+  overlay.setAttribute("aria-modal", "true");
+  overlay.innerHTML = `
+    <div class="cx-onboarding-card" style="max-width:380px">
+      <div style="font-size:2rem;text-align:center;margin-bottom:12px">🤖</div>
+      <h2 style="margin:0 0 10px;font-size:1.1rem">${pickText("AI 会代你执行吗？", "Will AI book for you?", "AIが代わりに予約しますか？", "AI가 대신 예약하나요?", "Apakah AI akan memesan untuk Anda?", "هل سيحجز الذكاء الاصطناعي بدلاً منك؟")}</h2>
+      <p style="color:#555;font-size:0.9rem;line-height:1.5">${pickText(
+        "AI 会先展示方案，你确认后才会执行预订。费用由你授权，AI 不会在未经确认的情况下支付。",
+        "AI shows you a plan first. It will only execute the booking after you confirm. Payment requires your explicit approval — AI never pays without your go-ahead.",
+        "AIはまずプランを表示します。確認後のみ予約を実行します。支払いはお客様の明示的な承認が必要です。",
+        "AI가 먼저 계획을 보여줍니다. 확인 후에만 예약을 실행합니다. 결제는 귀하의 명시적 승인이 필요합니다.",
+        "AI menampilkan rencana terlebih dahulu. Pemesanan hanya dilakukan setelah Anda konfirmasi. Pembayaran memerlukan persetujuan eksplisit Anda.",
+        "يعرض الذكاء الاصطناعي الخطة أولاً. لا يتم تنفيذ الحجز إلا بعد موافقتك. الدفع يتطلب موافقتك الصريحة."
+      )}</p>
+      <div class="cx-onboarding-actions" style="margin-top:16px">
+        <button class="cx-onboarding-next" onclick="trackEvent('exec_tip_dismissed',{lang:state.uiLanguage||'EN'}).catch(()={}); this.closest('.cx-onboarding-overlay').remove()">${pickText("明白了", "Got it", "わかりました", "알겠습니다", "Mengerti", "فهمت")}</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+}
+
 function renderConfirmCard(task) {
   if (!shouldRenderExecutionCards()) return;
+  _showExecPermissionTip();
   const c = task.plan.confirm;
   const flags = c.riskFlags.map((f) => `<li>${escapeHtml(f)}</li>`).join("");
   const pricing = c.pricing || {};
@@ -6879,85 +7235,81 @@ function renderTimeline(timeline) {
 }
 
 function renderDeliverable(order) {
-  const qrId       = `qr-canvas-${escapeHtml(order.id || Date.now().toString(36))}`;
-  const statusId   = `pay-status-${escapeHtml(order.id)}`;
-  const qrText     = order.proof.qrText || order.proof.orderNo || order.id;
-  const isSandbox  = Boolean(order.proof && order.proof.qrSandbox);
-  const isCard     = order.proof.railId === "card_delegate";
-  const fx         = order.proof.fx || null;
+  const proof      = order.proof || {};
+  const isSandbox  = Boolean(proof.qrSandbox);
+  const isCard     = proof.railId === "card_delegate";
+  const fx         = proof.fx || null;
   const netPrice   = order.pricing ? Number(order.pricing.netPrice || 0) : null;
   const markup     = order.pricing ? Number(order.pricing.markup || 0) : null;
   const markupRate = order.pricing && order.pricing.markupRate ? `(${(Number(order.pricing.markupRate) * 100).toFixed(1)}%)` : "";
 
-  const rightPanel = isCard ? `
+  // Platform action grid — primary CTA buttons linking to real platforms
+  const platformLinks = [
+    proof.navLink         && { href: proof.navLink,         label: pickText("高德导航", "Amap Navigation", "Amapナビ", "Amap 내비"),         sub: pickText("", "China's top map app", "中国地図アプリ", "중국 지도 앱"),        emoji: "📍" },
+    proof.meituanLink     && { href: proof.meituanLink,     label: pickText("美团预订", "Meituan", "美団",      "메이퇀"),                    sub: pickText("", "Table booking & food", "テーブル予約・グルメ", "테이블 예약·음식"),  emoji: "🍽️" },
+    proof.dianpingLink    && { href: proof.dianpingLink,    label: pickText("大众点评", "Dianping",  "大衆点評",  "다이안핑"),                  sub: pickText("", "Reviews & ratings", "口コミ・評価", "리뷰·평점"),               emoji: "⭐" },
+    proof.didiLink        && { href: proof.didiLink,        label: pickText("滴滴出行", "Didi",       "DiDi",     "디디"),                      sub: pickText("", "Ride hailing", "配車サービス", "차량 호출"),                      emoji: "🚗" },
+    proof.ctripLink       && { href: proof.ctripLink,       label: pickText("携程预订", "Ctrip",      "Ctrip",    "씨트립"),                    sub: pickText("", "Hotels & flights (EN)", "ホテル・航空券（英語対応）", "호텔·항공권（영어）"), emoji: "✈️" },
+    proof.bookingComLink  && { href: proof.bookingComLink,  label: "Booking.com",                                                               sub: pickText("", "International credit cards OK", "国際カード対応", "국제 카드 결제 가능"), emoji: "🏨" },
+    proof.agodaLink       && { href: proof.agodaLink,       label: "Agoda",                                                                     sub: pickText("", "Asia hotel deals", "アジアのホテル割引", "아시아 호텔 할인"),      emoji: "🌏" },
+    proof.xiaohongshuLink && { href: proof.xiaohongshuLink, label: pickText("小红书", "Xiaohongshu",  "小紅書",   "샤오홍수"),                  sub: pickText("", "Local tips & photos", "ローカル情報・写真", "현지 팁·사진"),       emoji: "📖" },
+  ].filter(Boolean);
+
+  const platformGrid = platformLinks.length
+    ? `<div class="cx-platform-grid">${platformLinks.map((p) => `<a class="cx-platform-btn" href="${escapeHtml(p.href)}" target="_blank" rel="noopener"><span class="cx-pb-emoji">${p.emoji}</span><span class="cx-pb-text"><span class="cx-pb-label">${p.label}</span>${p.sub ? `<span class="cx-pb-sub">${escapeHtml(p.sub)}</span>` : ""}</span></a>`).join("")}</div>`
+    : "";
+
+  // "Show to local" card — Chinese text foreigners can show to taxi/restaurant staff
+  const showToLocalCard = proof.bilingualAddress && state.uiLanguage !== "ZH"
+    ? `<details open style="margin-top:10px"><summary style="cursor:pointer;font-size:13px;color:var(--color-primary,#1a56db)">${pickText("", "Show this to local staff / driver", "スタッフ・ドライバーに見せる", "직원·기사에게 보여주기")}</summary><div style="margin-top:8px;padding:12px;background:#f0f9ff;border-radius:8px;font-size:15px;line-height:1.7;border:1px solid #bae6fd"><strong>请带我去：</strong><br>${escapeHtml(proof.bilingualAddress.replace(/^CN:\s*/, "").split(" / EN:")[0] || proof.bilingualAddress)}<br>${proof.itinerary && proof.itinerary.includes("CN:") ? `<br>${escapeHtml(proof.itinerary.split(" / EN:")[0].replace("CN: ", ""))}` : ""}</div></details>`
+    : "";
+
+  // Real payment panel (non-sandbox card charge or real QR)
+  const hasRealPayment = isCard || (!isSandbox && proof.qrText);
+  const qrId = `qr-canvas-${escapeHtml(order.id || Date.now().toString(36))}`;
+  const payPanel = hasRealPayment ? (isCard ? `
     <div class="deliverable-card-charge">
       <div class="cdc-icon">&#x1F4B3;</div>
       <div class="cdc-rail">${pickText("外卡代扣", "Card Charge", "\u30ab\u30fc\u30c9\u6c7a\u6e08", "\uce74\ub4dc \ub300\ub9ac \uacb0\uc81c")}</div>
-      <div class="cdc-cny">&yen;${Number(order.price || 0).toFixed(2)} CNY</div>
+      <div class="cdc-cny">${formatCNY(Number(order.price || 0))}</div>
       ${fx ? `<div class="cdc-usd">&asymp; $${Number(fx.settledAmount || 0).toFixed(2)} USD <span class="cdc-rate">&times; ${fx.rate}</span></div>` : ""}
-      <div class="cdc-eta">&#x23F1; ${pickText("\u7ed3\u7b97\u52304215\u5206\u949f", "Settlement ~15 min", "\u6c7a\u6e08\u7d04 15\u5206", "\uacb0\uc81c \uc57d 15\ubd84")}</div>
-      ${order.proof.cardChargeId ? `<div class="cdc-ref">${escapeHtml(order.proof.cardChargeId)}</div>` : ""}
+      ${proof.cardChargeId ? `<div class="cdc-ref">${escapeHtml(proof.cardChargeId)}</div>` : ""}
     </div>` : `
     <div class="deliverable-qr" style="text-align:center;flex-shrink:0;">
-      <canvas id="${qrId}" width="160" height="160" style="border-radius:8px;display:block;"></canvas>
+      <canvas id="${qrId}" width="140" height="140" style="border-radius:8px;display:block;"></canvas>
       <div class="status" style="font-size:10px;margin-top:4px;">${pickText("\u626b\u7801\u652f\u4ed8", "Scan to pay", "\u30b9\u30ad\u30e3\u30f3\u3057\u3066\u652f\u6255\u3044", "\uc2a4\uce94\ud558\uc5ec \uacb0\uc81c")}</div>
-    </div>`;
-
-  const simLabel = isCard
-    ? pickText("\u6a21\u62df\u6263\u6b3e\u6210\u529f", "Simulate card charge", "\u30ab\u30fc\u30c9\u6c7a\u6e08\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uce74\ub4dc \uacb0\uc81c \uc2dc\uBBAC\ub808\uc774\uc158")
-    : pickText("\u6a21\u62df\u652f\u4ed8\u6210\u529f", "Simulate payment", "\u652f\u6255\u3044\u3092\u30b7\u30df\u30e5\u30ec\u30fc\u30c8", "\uacb0\uc81c \uc2dc\uBBAC\ub808\uc774\uc158");
+    </div>`) : "";
 
   addCard(`
     <article class="card deliverable-card" data-order-id="${escapeHtml(order.id)}">
-      <h3>${escapeHtml(tTerm("proof"))} Card</h3>
-      <div id="${statusId}" class="pay-status-badge pay-status--pending">${pickText("\u5f85\u652f\u4ed8", "Awaiting payment", "\u652f\u6255\u3044\u5f85\u3061", "\uacb0\uC81C \uB300\uAE30")}</div>
-      <div class="deliverable-row">
-        <div class="deliverable-info">
-          <div>${pickText("\u8ba2\u5355\u53f7", "Order", "\u6ce8\u6587\u756a\u53f7", "\uc8fc\ubb38 \ubc88\ud638")}: <span class="code">${escapeHtml(order.proof.orderNo)}</span></div>
-          <div>${pickText("\u91d1\u989d", "Amount", "\u91d1\u984d", "\uae08\uc561")}: <strong>${Number(order.price || 0)} ${escapeHtml(order.currency || "CNY")}</strong>${netPrice !== null ? ` <span class="status">\u51c0\u4ef7 ${netPrice} + \u670d\u52a1\u8d39 ${markup} ${markupRate}</span>` : ""}</div>
-          <div>${pickText("\u4ea4\u6613\u4e3b\u4f53", "Merchant of Record", "\u53d6\u5f15\u4e3b\u4f53", "\uac70\ub798 \uc8fc\uccb4")}: ${escapeHtml((order.merchantOfRecord) || "Cross X\u4ee3\u6536\u4ee3\u4ed8")}</div>
-          <div>${pickText("\u5730\u5740", "Address", "\u4f4f\u6240", "\uc8fc\uc18c")}: ${escapeHtml(order.proof.bilingualAddress)}</div>
-          <div>${pickText("\u884c\u7a0b\u5907\u6ce8", "Trip note", "\u65c5\u7a0b\u30e1\u30e2", "\uc5ec\ud589 \uba54\ubaa8")}: ${escapeHtml(order.proof.itinerary || "")}</div>
-        </div>
-        ${rightPanel}
-      </div>
-      <div class="actions">
+      <h3>${pickText("AI 已为您准备好以下入口", "Your China action card is ready", "中国プラットフォームリンクが揃いました", "중국 플랫폼 링크가 준비되었습니다")}</h3>
+      <div class="status">${escapeHtml(proof.bilingualAddress || "")}</div>
+      <div class="status" style="margin-bottom:8px">${escapeHtml(proof.itinerary || "")}</div>
+      ${platformGrid}
+      ${showToLocalCard}
+      ${payPanel ? `<div class="deliverable-row" style="margin-top:12px"><div class="deliverable-info">
+        <div>${pickText("\u8ba2\u5355\u53f7", "Order", "\u6ce8\u6587\u756a\u53f7", "\uc8fc\ubb38 \ubc88\ud638")}: <span class="code">${escapeHtml(proof.orderNo || order.id)}</span></div>
+        <div>${pickText("\u91d1\u989d", "Amount", "\u91d1\u984d", "\uae08\uc561")}: <strong>${Number(order.price || 0)} ${escapeHtml(order.currency || "CNY")}</strong></div>
+      </div>${payPanel}</div>` : ""}
+      <div class="actions" style="margin-top:8px">
         <button class="secondary" data-action="open-order-detail" data-order="${order.id}">${pickText("\u8ba2\u5355\u8be6\u60c5", "Order detail", "\u6ce8\u6587\u8a73\u7d30", "\uc8fc\ubb38 \uc0c1\uc138")}</button>
-        <button class="secondary" data-action="open-proof" data-order="${order.id}">${pickText("\u6253\u5f00\u51ed\u8bc1", "Open proof", "\u8a3c\u6190\u3092\u958b\u304f", "\uc99d\ube59 \uc5f4\uae30")}</button>
-        <button class="secondary" data-action="open-task" data-task="${order.taskId}">${pickText("\u4efb\u52a1\u8be6\u60c5", "Task detail", "\u30bf\u30b9\u30af\u8a73\u7d30", "\uc791\uc5c5 \uc0c1\uc138")}</button>
+        <button class="secondary" data-action="open-proof" data-order="${order.id}">${pickText("\u51ed\u8bc1\u5305", "Proof bundle", "\u8a3c\u6190\u30d1\u30c3\u30af", "\uc99d\ube59 \ubc88\ub4e4")}</button>
         <button class="secondary" data-action="share-order" data-order="${order.id}">${pickText("\u5206\u4eab", "Share", "\u5171\u6709", "\uacf5\uc720")}</button>
-        ${isSandbox ? `<button class="secondary" data-action="simulate-pay" data-order="${escapeHtml(order.id)}" data-rail="${escapeHtml(order.proof.railId || "alipay_cn")}">${simLabel}</button>` : ""}
       </div>
     </article>
   `);
-  // Render QR only for non-card rails
-  if (!isCard) {
+
+  // Render real QR only for non-sandbox rails
+  if (hasRealPayment && !isCard) {
     setTimeout(() => {
       const canvas = document.getElementById(qrId);
-      if (!canvas) return;
+      if (!canvas || !proof.qrText) return;
       if (window.QRCode) {
-        window.QRCode.toCanvas(canvas, qrText, {
-          width: 160, margin: 2,
-          color: { dark: "#1a1a2e", light: "#f8f9ff" },
-        }, (err) => {
-          if (err) {
-            const ctx = canvas.getContext("2d");
-            if (ctx) { ctx.fillStyle = "#f0f0f0"; ctx.fillRect(0, 0, 160, 160); ctx.fillStyle = "#333"; ctx.font = "11px monospace"; ctx.fillText(qrText.slice(0, 20), 8, 80); }
-          }
-        });
-      } else {
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.fillStyle = "#f8f9ff"; ctx.fillRect(0, 0, 160, 160);
-          ctx.strokeStyle = "#ddd"; ctx.lineWidth = 1; ctx.strokeRect(2, 2, 156, 156);
-          ctx.fillStyle = "#1a1a2e"; ctx.font = "bold 12px monospace";
-          ctx.textAlign = "center"; ctx.fillText(qrText.slice(0, 18), 80, 75);
-          ctx.font = "10px sans-serif"; ctx.fillStyle = "#888"; ctx.fillText("QR \u00b7 scan to pay", 80, 95);
-        }
+        window.QRCode.toCanvas(canvas, proof.qrText, { width: 140, margin: 2, color: { dark: "#1a1a2e", light: "#f8f9ff" } }, () => {});
       }
     }, 80);
   }
-  _startPaymentPoll(order.id);
+  if (hasRealPayment) _startPaymentPoll(order.id);
 }
 
 // ── Payment status polling ─────────────────────────────────────────────────
@@ -6976,7 +7328,15 @@ function _startPaymentPoll(orderId) {
         return;
       }
     } catch { /* network hiccup — keep polling */ }
-    if (attempts >= 60) _stopPaymentPoll(orderId); // stop after 3 min
+    if (attempts >= 60) {
+      _stopPaymentPoll(orderId);
+      addMessage(pickText(
+        "支付验证超时（3分钟）。请检查支付宝/微信支付是否已完成，或联系客服。",
+        "Payment verification timed out (3 min). Please check if Alipay/WeChat Pay completed, or contact support.",
+        "支払い確認がタイムアウトしました（3分）。Alipay/WeChatの支払いを確認するか、サポートに連絡してください。",
+        "결제 확인 시간 초과（3분）. Alipay/WeChat Pay 완료 여부를 확인하거나 고객 지원에 문의하세요.",
+      ), "agent");
+    }
   }, 3000);
   _activePayPolls.set(orderId, tid);
 }
@@ -7006,6 +7366,58 @@ function _onPaymentConfirmed(orderId) {
     <div class="cx-td-header">${pickText("\u2713 \u652f\u4ed8\u6210\u529f", "\u2713 Payment confirmed", "\u2713 \u652f\u6255\u5b8c\u4e86", "\u2713 \uACB0\uC81C \uC644\uB8CC")}</div>
     <div class="cx-td-row">${pickText("\u8ba2\u5355\u5df2\u5b8c\u6210\uff0c\u611f\u8c22\u4f7f\u7528 Cross X", "Order complete. Thank you for using Cross X.", "\u3054\u5229\u7528\u3042\u308a\u304c\u3068\u3046\u3054\u3056\u3044\u307e\u3059\u3002", "Cross X\ub97c \uc774\uc6a9\ud574 \uc8fc\uc154\uc11c \uac10\uc0ac\ud569\ub2c8\ub2e4.")}</div>
   </article>`);
+}
+
+/**
+ * Lightweight input modal — replaces window.prompt() with a branded overlay.
+ * Returns Promise<string|null>  (null = user cancelled)
+ * @param {string} title
+ * @param {string} [placeholder]
+ * @param {{ multiline?: boolean, options?: string[] }} [opts]
+ */
+function _showInputModal(title, placeholder, opts = {}) {
+  return new Promise(resolve => {
+    const overlay = document.createElement("div");
+    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:9999;padding:16px";
+    const body = opts.options && opts.options.length
+      ? `<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
+          ${opts.options.map((o, i) => `
+            <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px">
+              <input type="radio" name="cx-modal-opt" value="${i}" style="accent-color:#1a1a1a"> ${escapeHtml(o)}
+            </label>`).join("")}
+         </div>`
+      : opts.multiline
+        ? `<textarea id="cx-modal-inp" rows="3" placeholder="${escapeHtml(placeholder || "")}" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;resize:vertical;margin-bottom:16px"></textarea>`
+        : `<input id="cx-modal-inp" type="text" placeholder="${escapeHtml(placeholder || "")}" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;margin-bottom:16px">`;
+    overlay.innerHTML = `
+      <div style="background:#fff;border-radius:16px;padding:24px;width:100%;max-width:360px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
+        <div style="font-weight:600;font-size:15px;margin-bottom:14px">${escapeHtml(title)}</div>
+        ${body}
+        <div style="display:flex;gap:8px">
+          <button id="cx-modal-cancel" style="flex:1;padding:10px;border:1px solid #ddd;border-radius:8px;background:#f8fafc;cursor:pointer;font-size:14px">${pickText("取消","Cancel","キャンセル","취소","Batal","إلغاء")}</button>
+          <button id="cx-modal-ok" style="flex:1;padding:10px;background:#1a1a1a;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px">${pickText("确认","OK","確認","확인","OK","موافق")}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const inp = overlay.querySelector("#cx-modal-inp");
+    overlay.querySelector("#cx-modal-cancel").onclick = () => { overlay.remove(); resolve(null); };
+    overlay.querySelector("#cx-modal-ok").onclick = () => {
+      if (opts.options) {
+        const checked = overlay.querySelector("input[name=cx-modal-opt]:checked");
+        overlay.remove();
+        resolve(checked ? checked.value : null);
+      } else {
+        const v = inp ? inp.value.trim() : "";
+        overlay.remove();
+        resolve(v || null);
+      }
+    };
+    if (inp) {
+      inp.addEventListener("keydown", e => { if (e.key === "Enter" && !opts.multiline) overlay.querySelector("#cx-modal-ok").click(); });
+      setTimeout(() => inp.focus(), 50);
+    }
+    overlay.addEventListener("click", e => { if (e.target === overlay) { overlay.remove(); resolve(null); } });
+  });
 }
 
 function notify(message, type = "info", actionLabel = "", onAction = null) {
@@ -7091,6 +7503,20 @@ function _travelCacheGet(key) { return _travelPlanCache[key] || {}; }
 
 function _travelShouldFail(plan, cardData) {
   return plan.id === "budget" && /\u6df1\u5733/.test(cardData.destination || "");
+}
+
+function _toggleOtherPlans(cardId) {
+  const othersEl = document.getElementById(`${cardId}-others`);
+  const btnEl    = document.getElementById(`${cardId}-expand-btn`);
+  if (!othersEl) return;
+  const isOpen = othersEl.style.display !== "none";
+  othersEl.style.display = isOpen ? "none" : "block";
+  if (btnEl) {
+    btnEl.classList.toggle("cx-plan-expand-btn--open", !isOpen);
+    btnEl.textContent = isOpen
+      ? pickText("查看其他方案 ↓","See Other Plans ↓","他のプランを見る ↓","다른 플랜 보기 ↓")
+      : pickText("收起其他方案 ↑","Hide Other Plans ↑","他のプランを閉じる ↑","다른 플랜 닫기 ↑");
+  }
 }
 
 function _planOptionSelect(cardId, idx) {
@@ -7311,7 +7737,7 @@ function renderTravelFailCard(failedStep, plan, cardData) {
       <div class="cx-tf-reason">${reason}</div>
       <div class="cx-tf-actions">
         ${backupKey ? `<button class="cx-tf-btn" onclick="_startTravelExecution('${backupKey}', null)">\u5207\u6362\u5907\u9009\u65b9\u6848 \u2192</button>` : ""}
-        <button class="cx-tf-btn cx-tf-btn--sec" onclick="createTaskFromText('\u91cd\u65b0\u89c4\u5212${destText}')">\u91cd\u65b0\u89c4\u5212</button>
+        <button class="cx-tf-btn cx-tf-btn--sec" onclick="createTaskFromText(${JSON.stringify(`\u91cd\u65b0\u89c4\u5212${destText}`)})">\u91cd\u65b0\u89c4\u5212</button>
       </div>
     </article>
   `);
@@ -7587,11 +8013,12 @@ function renderSmartReplyCard(smart) {
         ].filter(Boolean);
         return `
           <article class="smart-option-card smart-option-card-user">
-            <img class="smart-option-image media-photo" src="${escapeHtml(assetUrl(item.imagePath || "/assets/solution-flow.svg"))}" alt="${escapeHtml(item.title || "option image")}" />
+            <img class="smart-option-image media-photo cx-lazy-img" data-cx-search="${escapeHtml(item.placeDisplay || item.placeName || item.hotelDisplay || item.hotelName || item.title || "")}" data-cx-cat="${escapeHtml(item.hotelName || item.hotelDisplay ? 'hotel' : 'food')}" src="${escapeHtml(assetUrl(_localPlaceholder(item)))}" alt="${escapeHtml(item.title || "option image")}" loading="lazy" onerror="this.src='/assets/solution-flow.svg'" />
             <div class="smart-option-body">
               <div class="smart-option-title">
                 <strong>${idx + 1}. ${escapeHtml(item.title || "-")}</strong>
                 <span class="status-badge lane-grade">${escapeHtml(item.grade || "B")}</span>
+                ${item.accepts_foreign_guests === true ? `<span class="status-badge" style="background:#2563eb;color:#fff;margin-left:4px">${pickText("外籍可入住 ✓", "Foreign guests OK ✓", "外国人OK ✓", "외국인 가능 ✓")}</span>` : item.accepts_foreign_guests === false ? `<span class="status-badge" style="background:#ef4444;color:#fff;margin-left:4px">${pickText("不接受外籍", "No foreign guests", "外国人不可", "외국인 불가")}</span>` : ""}
               </div>
               <div class="smart-meta-row">
                 ${userMetaBits.map((bit) => `<span class="smart-meta-chip">${bit}</span>`).join("")}
@@ -7603,7 +8030,7 @@ function renderSmartReplyCard(smart) {
               <div class="actions">
                 <button data-action="run-smart-option" data-intent="${escapeHtml(item.prompt || item.title || "")}" data-option="${escapeHtml(item.id || "")}"
                   data-cost="${escapeHtml(item.costRange || item.cost || "")}" data-title="${escapeHtml(item.title || "")}"
-                  onclick="window.crossxShowPayment && window.crossxShowPayment({title:'${escapeHtml(item.title || "")}',costRange:'${escapeHtml(item.costRange || "")}',price:'${escapeHtml(item.costRange || "")}'}); return false;">
+                  onclick="window.crossxShowPayment && window.crossxShowPayment({title:${JSON.stringify(item.title||'')},costRange:${JSON.stringify(item.costRange||'')},price:${JSON.stringify(item.costRange||'')}}); return false;">
                   ${pickText("立即预订", "Book Now","今すぐ予約", "지금 예약")}
                 </button>
                 ${actionRows}
@@ -7614,11 +8041,12 @@ function renderSmartReplyCard(smart) {
       }
       return `
         <article class="smart-option-card">
-          <img class="smart-option-image media-photo" src="${escapeHtml(assetUrl(item.imagePath || "/assets/solution-flow.svg"))}" alt="${escapeHtml(item.title || "option image")}" />
+          <img class="smart-option-image media-photo cx-lazy-img" data-cx-search="${escapeHtml(item.placeDisplay || item.placeName || item.hotelDisplay || item.hotelName || item.title || "")}" data-cx-cat="${escapeHtml(item.hotelName || item.hotelDisplay ? 'hotel' : 'food')}" src="${escapeHtml(assetUrl(_localPlaceholder(item)))}" alt="${escapeHtml(item.title || "option image")}" loading="lazy" onerror="this.src='/assets/solution-flow.svg'" />
           <div class="smart-option-body">
             <div class="smart-option-title">
               <strong>${idx + 1}. ${escapeHtml(item.title || "-")}</strong>
               <span class="status-badge lane-grade">${escapeHtml(item.grade || "B")}</span>
+              ${item.accepts_foreign_guests === true ? `<span class="status-badge" style="background:#2563eb;color:#fff;margin-left:4px">${pickText("外籍可入住 ✓", "Foreign guests OK ✓", "外国人OK ✓", "외국인 가능 ✓")}</span>` : item.accepts_foreign_guests === false ? `<span class="status-badge" style="background:#ef4444;color:#fff;margin-left:4px">${pickText("不接受外籍", "No foreign guests", "外国人不可", "외국인 불가")}</span>` : ""}
             </div>
             <div class="status">${escapeHtml(item.recommendationLevel || "-")}</div>
             ${commentRows}
@@ -7662,11 +8090,67 @@ function renderSmartReplyCard(smart) {
       ${
         optionCards
           ? `<div class="status">${pickText(`可选方案（${options.length}选）`, `Options (${options.length})`, `選択可能な提案（${options.length}）`, `선택 가능한 옵션 (${options.length})`)}${userMode && allOptions.length > options.length ? ` · ${escapeHtml(pickText("其余方案可通过\u201c换一批\u201c继续获取。", "Use refresh to load more options.","他の案は「再提案」で取得できます。", "다른 옵션은 새로고침으로 확인하세요."))}` : ""}</div><div class="smart-options-grid">${optionCards}</div>`
-          : ""
+          : (allOptions.length === 0
+              ? `<div class="status empty-state" style="padding:12px 0;color:var(--text-secondary)">
+                  ${pickText(
+                    "暂无符合条件的结果。可以尝试：换一个城市、调整日期或预算，或直接告诉我你的具体需求。",
+                    "No results found. Try a different city, adjust your dates or budget, or describe what you\u2019re looking for.",
+                    "条件に合う結果が見つかりませんでした。都市・日程・予算を変えてみるか、ご希望を詳しくお知らせください。",
+                    "결과를 찾지 못했습니다. 다른 도시, 날짜 또는 예산을 조정하거나 원하는 내용을 구체적으로 알려주세요."
+                  )}
+                  <div class="actions" style="margin-top:8px">
+                    <button data-action="send-message" data-message="${escapeHtml(pickText("请帮我重新搜索，条件可以放宽一些", "Please search again with broader criteria", "条件を広げて再検索してください", "조건을 넓혀 다시 검색해 주세요"))}">${pickText("重新搜索", "Search again", "再検索", "다시 검색")}</button>
+                  </div>
+                </div>`
+              : "")
       }
     </article>
   `);
   speakAssistantMessage(thinkingText || smart.reply);
+  // Async: replace placeholder images with Wikipedia photos
+  setTimeout(() => _lazyLoadOptionImages(), 100);
+}
+
+// ── Local placeholder URL helper ────────────────────────────────────────────
+function _localPlaceholder(item) {
+  if (item.hotelName || item.hotelDisplay) return "/api/placeholder?cat=hotel";
+  if (item.transportMode) return "/api/placeholder?cat=taxi";
+  return "/api/placeholder?cat=food";
+}
+
+// ── Lazy load Wikipedia images for option cards ─────────────────────────────
+async function _lazyLoadOptionImages() {
+  const imgs = document.querySelectorAll(".cx-lazy-img[data-cx-search]");
+  if (!imgs.length) return;
+  const city = state.selectedConstraints && state.selectedConstraints.city || "";
+  const queries = [];
+  imgs.forEach((img, idx) => {
+    // Use place name; for hotels with fake names, strip English alias and fallback to city
+    let q = img.dataset.cxSearch || "";
+    // Strip English alias in parens like "上海优享商务酒店 (Value Business Stay)"
+    const cleaned = q.replace(/\s*\(.*?\)\s*/g, "").trim();
+    // If looks like a fake/generic name (contains "酒店" but no famous place) use city instead
+    const isFakeName = /酒店|Hotel|hotel/.test(cleaned) && !/万豪|希尔顿|喜来登|洲际|君悦|四季|文华|半岛/.test(cleaned);
+    const searchQ = isFakeName ? city : (cleaned || city);
+    if (searchQ) queries.push({ id: String(idx), q: searchQ, city, cat: img.dataset.cxCat || "default" });
+  });
+  if (!queries.length) return;
+  try {
+    const res = await fetch("/api/rag/images", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ queries }),
+    });
+    if (!res.ok) return;
+    const { results } = await res.json();
+    imgs.forEach((img, idx) => {
+      const url = results[String(idx)];
+      if (url && img.isConnected) {
+        img.src = url;
+        img.classList.remove("cx-lazy-img");
+      }
+    });
+  } catch {}
 }
 
 /**
@@ -7674,13 +8158,72 @@ function renderSmartReplyCard(smart) {
  * Equivalent to the React <ItineraryCards> component — three gradient cards
  * with hotel/transport/dining/features and a "Book Now" CTA.
  */
+// ── Affiliate booking button ───────────────────────────────────────────────
+// Routing strategy:
+//   ZH users  → Level 1: Amap app deep-link → Level 2: Ctrip H5 (Chinese)
+//   Non-ZH    → Booking.com EN (no Chinese app assumption)
+function _handleBooking(name, externalId) {
+  const safeName = name || "";
+  const isZH = (state.uiLanguage || "ZH") === "ZH";
+  const hasAmapId = externalId && !externalId.startsWith("synthetic_");
+  trackEvent("book_click", { item: safeName.slice(0, 60), has_amap: hasAmapId ? "1" : "0", lang: state.uiLanguage || "ZH" }).catch(() => {});
+
+  if (!isZH) {
+    // Non-ZH users: Booking.com English interface for hotels
+    window.open(`https://www.booking.com/search.html?ss=${encodeURIComponent(safeName)}&lang=en-us`, "_blank");
+    return;
+  }
+
+  // ZH users: Level 1 — Amap app deep-link (600ms fallback to Ctrip H5)
+  if (hasAmapId) {
+    const amapUrl = `amapuri://poi?id=${encodeURIComponent(externalId)}&name=${encodeURIComponent(safeName)}`;
+    const fallback = setTimeout(() => {
+      window.open(`https://m.ctrip.com/webapp/hotel/hotels/list?keyword=${encodeURIComponent(safeName)}&sourcesite=crossx`, "_blank");
+    }, 600);
+    window.location.href = amapUrl;
+    window.addEventListener("blur", () => clearTimeout(fallback), { once: true });
+    return;
+  }
+  // ZH Level 2 fallback: Ctrip H5 hotel search
+  window.open(`https://m.ctrip.com/webapp/hotel/hotels/list?keyword=${encodeURIComponent(safeName)}&sourcesite=crossx`, "_blank");
+}
+function _buildBookBtnHtml(name, externalId) {
+  if (!name) return "";
+  const safeId   = escapeHtml(externalId || "");
+  const safeName = escapeHtml(name);
+  const isZH     = (state.uiLanguage || "EN") === "ZH";
+
+  if (isZH) {
+    const label = "前往预订";
+    return `<div class="cx-book-btn-wrap">` +
+      `<button class="cx-book-btn" onclick="_handleBooking(${JSON.stringify(name)},${JSON.stringify(externalId || '')})">` +
+      `✈️ ${label}</button></div>`;
+  }
+  // International users: show Booking.com + Agoda + Klook choices
+  const bookingUrl = escapeHtml(PLATFORM_DEEPLINKS.booking.url(name));
+  const agodaUrl   = escapeHtml(PLATFORM_DEEPLINKS.agoda.url(name));
+  const klookUrl   = escapeHtml(PLATFORM_DEEPLINKS.klook.url(name));
+  return `<div class="cx-book-btn-wrap cx-book-multi">` +
+    `<a class="cx-book-btn cx-book-booking" href="${bookingUrl}" target="_blank" rel="noopener">🏨 Booking.com</a>` +
+    `<a class="cx-book-btn cx-book-agoda"   href="${agodaUrl}"   target="_blank" rel="noopener">🏩 Agoda</a>` +
+    `<a class="cx-book-btn cx-book-klook"   href="${klookUrl}"   target="_blank" rel="noopener">🎫 Klook</a>` +
+    `</div>`;
+}
+
 // ── Platform deeplink helpers ──────────────────────────────────────────────
 const PLATFORM_DEEPLINKS = {
-  ctrip:   { name:"携程",   color: "#00A0E9", icon: "✈️", url: (kw) => `https://m.ctrip.com/webapp/hotel/list/?hotelname=${encodeURIComponent(kw)}` },
-  meituan: { name:"美团",   color: "#F5A623", icon: "🍜", url: (kw) => `https://i.meituan.com/s/search.html?q=${encodeURIComponent(kw)}` },
-  didi:    { name:"滴滴",   color: "#FF6600", icon: "🚕", url: ()   => "https://www.didiglobal.com/" },
-  taobao:  { name:"淘宝",   color: "#FF4400", icon: "🛒", url: (kw) => `https://s.taobao.com/search?q=${encodeURIComponent(kw)}` },
-  default: { name:"查看",   color: "#6B7280", icon: "🔗", url: (kw) => `https://www.baidu.com/s?wd=${encodeURIComponent(kw)}` },
+  ctrip:    { name:"携程",       color: "#00A0E9", icon: "✈️", url: (kw) => `https://m.ctrip.com/webapp/hotel/list/?hotelname=${encodeURIComponent(kw)}` },
+  meituan:  { name:"美团",       color: "#F5A623", icon: "🍜", url: (kw) => `https://i.meituan.com/s/search.html?q=${encodeURIComponent(kw)}` },
+  didi:     { name:"滴滴",       color: "#FF6600", icon: "🚕", url: ()   => "https://www.didiglobal.com/" },
+  taobao:   { name:"淘宝",       color: "#FF4400", icon: "🛒", url: (kw) => `https://s.taobao.com/search?q=${encodeURIComponent(kw)}` },
+  booking:  { name:"Booking",   color: "#003580", icon: "🏨", url: (kw) => {
+    const langMap = { ZH: "zh-cn", "ZH-TW": "zh-tw", JA: "ja", KO: "ko", AR: "ar", ID: "id" };
+    const lang = langMap[state.uiLanguage] || "en-us";
+    return `https://www.booking.com/search.html?ss=${encodeURIComponent(kw)}&lang=${lang}`;
+  }},
+  agoda:    { name:"Agoda",     color: "#5B2D8E", icon: "🏩", url: (kw) => `https://www.agoda.com/search?city=${encodeURIComponent(kw)}&checkIn=&checkOut=&rooms=1&adults=2&children=0` },
+  klook:    { name:"Klook",     color: "#FF6B35", icon: "🎫", url: (kw) => `https://www.klook.com/search/?query=${encodeURIComponent(kw)}` },
+  default:  { name:"Search",    color: "#6B7280", icon: "🔗", url: (kw) => `https://www.google.com/search?q=${encodeURIComponent(kw + " China hotel")}` },
 };
 
 function renderPaymentPanel(opt) {
@@ -7708,10 +8251,10 @@ function renderPaymentPanel(opt) {
 
   return `
     <div class="payment-panel">
-      <div class="payment-panel-title">预订明细</div>
+      <div class="payment-panel-title">${pickText("预订明细", "Booking Details", "予約内訳", "예약 내역")}</div>
       <div class="payment-items-list">${itemRows}</div>
       <div class="payment-total-row">
-        <span>总预算</span>
+        <span>${pickText("总预算", "Total", "合計", "합계")}</span>
         <span class="payment-grand-total">¥${escapeHtml(total)}</span>
       </div>
       <button class="payment-confirm-btn"
@@ -7732,17 +8275,68 @@ function renderMealPlanSection(opt) {
   const preview = days.slice(0, 2).map((d) => `
     <div class="meal-day-row">
       <span class="meal-day-label">Day ${d.day}</span>
-      <span class="meal-slot"><span class="meal-type">早</span>${escapeHtml(d.breakfast || "-")}</span>
-      <span class="meal-slot"><span class="meal-type">中</span>${escapeHtml(d.lunch || "-")}</span>
-      <span class="meal-slot"><span class="meal-type">晚</span>${escapeHtml(d.dinner || "-")}</span>
+      <span class="meal-slot"><span class="meal-type">${pickText("早","B","朝","조")}</span>${escapeHtml(d.breakfast || "-")}</span>
+      <span class="meal-slot"><span class="meal-type">${pickText("中","L","昼","점")}</span>${escapeHtml(d.lunch || "-")}</span>
+      <span class="meal-slot"><span class="meal-type">${pickText("晚","D","夜","저")}</span>${escapeHtml(d.dinner || "-")}</span>
     </div>`).join("");
 
-  const remaining = days.length > 2 ? `<div class="meal-more-days">+ ${days.length - 2} 天餐饮规划（已自动安排）</div>` : "";
+  const remaining = days.length > 2 ? `<div class="meal-more-days">${pickText(`+ ${days.length - 2} 天餐饮规划（已自动安排）`, `+ ${days.length - 2} more days planned`, `+ ${days.length - 2} 日分の食事プラン`, `+ ${days.length - 2}일 식사 계획`)}</div>` : "";
   return `
     <div class="meal-plan-section">
-      <div class="meal-plan-header">🍽️ 每日餐饮规划</div>
+      <div class="meal-plan-header">🍽️ ${pickText("每日餐饮规划", "Daily Meal Plan", "毎日の食事プラン", "매일 식사 계획")}</div>
       ${preview}${remaining}
     </div>`;
+}
+
+// ── Unsplash CDN fallback images by activity type (accessible in China) ───
+const _UNSPLASH_FALLBACK = {
+  food:       "/api/placeholder?cat=default",
+  hotel:      "/api/placeholder?cat=default",
+  transport:  "/api/placeholder?cat=travel",
+  attraction: "/api/placeholder?cat=default",
+};
+function _actFallbackImg(act) {
+  const t = String(act.type || "").toLowerCase();
+  if (/餐|食|meal|food|breakfast|lunch|dinner/.test(t)) return _UNSPLASH_FALLBACK.food;
+  if (/酒店|住宿|hotel|checkin|checkout/.test(t))       return _UNSPLASH_FALLBACK.hotel;
+  if (/交通|transport|train|flight|bus/.test(t))        return _UNSPLASH_FALLBACK.transport;
+  return _UNSPLASH_FALLBACK.attraction;
+}
+
+// ── Platform deep-link buttons renderer ──────────────────────────────────
+// Renders a compact row of platform buttons from a platform_links object.
+// actType guides which platforms are most relevant (hotels vs restaurants vs sightseeing).
+function _renderPlatformLinks(links, actType) {
+  if (!links) return "";
+  const t = String(actType || "").toLowerCase();
+  const isHotel     = /hotel|checkin|checkout|酒店|住宿|入住/.test(t);
+  const isFood      = /meal|food|breakfast|lunch|dinner|meals|餐|饮|饭|菜|小吃|早餐|午餐|晚餐/.test(t);
+  const isTransport = /transport|city_change|交通|火车|飞机|高铁|地铁|出行/.test(t);
+
+  let btns = [];
+  if (isHotel) {
+    if (links.ctrip)   btns.push({ href: links.ctrip,   label: "携程订酒店", emoji: "🏨" });
+    if (links.booking) btns.push({ href: links.booking,  label: "Booking",  emoji: "🌐" });
+    if (links.agoda)   btns.push({ href: links.agoda,    label: "Agoda",    emoji: "🌐" });
+  } else if (isFood) {
+    if (links.meituan)  btns.push({ href: links.meituan,  label: "美团",    emoji: "🍽️" });
+    if (links.dianping) btns.push({ href: links.dianping, label: "大众点评", emoji: "⭐" });
+    if (links.amap)     btns.push({ href: links.amap,     label: "高德地图", emoji: "📍" });
+  } else if (isTransport) {
+    if (links.ctrip_flight) btns.push({ href: links.ctrip_flight, label: "携程机票", emoji: "✈️" });
+    if (links.train_12306)  btns.push({ href: links.train_12306,  label: "12306火车", emoji: "🚄" });
+    if (links.didi)         btns.push({ href: links.didi,         label: "滴滴出行", emoji: "🚗" });
+  } else {
+    // Sightseeing / attraction
+    if (links.amap)         btns.push({ href: links.amap,         label: "高德导航", emoji: "📍" });
+    if (links.ctrip)        btns.push({ href: links.ctrip,        label: "携程景点", emoji: "🎯" });
+    if (links.xiaohongshu)  btns.push({ href: links.xiaohongshu,  label: "小红书",   emoji: "📖" });
+  }
+  if (!btns.length) return "";
+  const btnHtml = btns.map(b =>
+    `<a class="cx-pl-btn" href="${escapeHtml(b.href)}" target="_blank" rel="noopener noreferrer">${b.emoji} ${b.label}</a>`
+  ).join("");
+  return `<div class="cx-platform-links">${btnHtml}</div>`;
 }
 
 // ── Type icons & booking platforms for card_data items ───────────────────
@@ -8044,7 +8638,7 @@ function _buildRatingBar(cardId, cd) {
   const dur  = cd.duration_days || 0;
   const stars = [1,2,3,4,5].map(i =>
     `<button class="cx-star" data-star="${i}" aria-label="${i} star"
-       onclick="submitPlanRating('${cardId}',${i},'${dest}',${dur},this)">★</button>`
+       onclick="submitPlanRating(${JSON.stringify(cardId)},${i},${JSON.stringify(cd.destination||'')},${dur},this)">★</button>`
   ).join("");
   return `<div class="cx-rating-bar" id="rbar-${cardId}">
     <span class="cx-rating-label">${pickText("方案满意吗？","Rate this plan","評価する","평가하기")}</span>
@@ -8088,30 +8682,30 @@ const _LIST_CARD_TAG_STYLES = {
 // Fixed Unsplash photo IDs for each major Chinese city landmark.
 // Falls back to a scenic travel photo if city not in map.
 const GLOBAL_CITY_HERO_MAP = {
-  "北京":   "https://images.unsplash.com/photo-1547981609-4b6bfe67ca0b?w=800&q=80", // Great Wall
-  "上海":   "https://images.unsplash.com/photo-1538428494232-9c0d8a3ab403?w=800&q=80", // The Bund
-  "深圳":   "https://images.unsplash.com/photo-1596464716127-f2a82984de30?w=800&q=80", // Talent Park 人才公园
-  "广州":   "https://images.unsplash.com/photo-1598887141926-d0a1fc2bb862?w=800&q=80", // Canton Tower
-  "成都":   "https://images.unsplash.com/photo-1548393594-d73d12babb3e?w=800&q=80", // Chengdu
-  "重庆":   "https://images.unsplash.com/photo-1518060350020-07882a01fca6?w=800&q=80", // Night view
-  "杭州":   "https://images.unsplash.com/photo-1541250848046-a1e7ea06bd81?w=800&q=80", // West Lake
-  "苏州":   "https://images.unsplash.com/photo-1587082870498-2e8ace6c3bd6?w=800&q=80", // Garden
-  "西安":   "https://images.unsplash.com/photo-1548080819-6f8d2843e08b?w=800&q=80", // City Wall
-  "南京":   "https://images.unsplash.com/photo-1587595431973-160d0d94add1?w=800&q=80", // Nanjing
-  "三亚":   "https://images.unsplash.com/photo-1562183241-840b8af0721e?w=800&q=80", // Beach
-  "丽江":   "https://images.unsplash.com/photo-1598208040073-c8fd7ef6283a?w=800&q=80", // Ancient town
-  "大理":   "https://images.unsplash.com/photo-1589519673049-72edf5e30ae5?w=800&q=80", // Erhai Lake
-  "桂林":   "https://images.unsplash.com/photo-1537531069765-d34bf5c4a944?w=800&q=80", // Karst peaks
-  "张家界": "https://images.unsplash.com/photo-1578662996442-48f60103fc96?w=800&q=80", // Pillars
-  "黄山":   "https://images.unsplash.com/photo-1519451241324-20b4ea2c4220?w=800&q=80", // Misty peaks
-  "青岛":   "https://images.unsplash.com/photo-1585830438540-3e5edde62c8f?w=800&q=80", // Coastal
-  "厦门":   "https://images.unsplash.com/photo-1559847844-5315695dadae?w=800&q=80", // Gulangyu
-  "拉萨":   "https://images.unsplash.com/photo-1571406252241-db0280bd36cd?w=800&q=80", // Potala Palace
-  "哈尔滨": "https://images.unsplash.com/photo-1548438294-1ad5d5f4f063?w=800&q=80", // Ice festival
-  "新疆":   "https://images.unsplash.com/photo-1508739773434-c26b3d09e071?w=800&q=80", // Prairie
-  "乌鲁木齐": "https://images.unsplash.com/photo-1508739773434-c26b3d09e071?w=800&q=80",
+  "北京":   "/api/placeholder?cat=travel&label=Beijing",
+  "上海":   "/api/placeholder?cat=travel&label=Shanghai",
+  "深圳":   "/api/placeholder?cat=travel&label=Shenzhen",
+  "广州":   "/api/placeholder?cat=travel&label=Guangzhou",
+  "成都":   "/api/placeholder?cat=travel&label=Chengdu",
+  "重庆":   "/api/placeholder?cat=travel&label=Chongqing",
+  "杭州":   "/api/placeholder?cat=travel&label=Hangzhou",
+  "苏州":   "/api/placeholder?cat=travel&label=Suzhou",
+  "西安":   "/api/placeholder?cat=travel&label=Xi'an",
+  "南京":   "/api/placeholder?cat=travel&label=Nanjing",
+  "三亚":   "/api/placeholder?cat=travel&label=Sanya",
+  "丽江":   "/api/placeholder?cat=travel&label=Lijiang",
+  "大理":   "/api/placeholder?cat=travel&label=Dali",
+  "桂林":   "/api/placeholder?cat=travel&label=Guilin",
+  "张家界": "/api/placeholder?cat=travel&label=Zhangjiajie",
+  "黄山":   "/api/placeholder?cat=travel&label=Huangshan",
+  "青岛":   "/api/placeholder?cat=travel&label=Qingdao",
+  "厦门":   "/api/placeholder?cat=travel&label=Xiamen",
+  "拉萨":   "/api/placeholder?cat=travel&label=Lhasa",
+  "哈尔滨": "/api/placeholder?cat=travel&label=Harbin",
+  "新疆":   "/api/placeholder?cat=travel&label=Xinjiang",
+  "乌鲁木齐": "/api/placeholder?cat=travel&label=Urumqi",
 };
-const _CITY_HERO_FALLBACK = "https://images.unsplash.com/photo-1476514525535-07fb3b4ae5f1?w=800&q=80"; // scenic travel
+const _CITY_HERO_FALLBACK = "/api/placeholder?cat=travel&label=China";
 
 function _getCityHeroUrl(dest) {
   // Coze hero_image takes top priority (live data from real Coze workflow)
@@ -8169,7 +8763,7 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
   // Image: food_only → real dish photo (real_photo_url / food_image) → curated food fallback
   //        others  → hotel hero → city Unsplash photo → styled cover
   // "深圳酒店大图" can NEVER leak into a food card because heroUrl skips hotel fields.
-  const FOOD_FALLBACK_URL = "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?w=800&q=80"; // street food
+  const FOOD_FALLBACK_URL = "/api/placeholder?cat=travel"; // street food
   const heroUrl = isFoodCard
     ? (p.real_photo_url || p.food_image || p.item_image || "")   // real Coze photo first
     : (p.hotel?.hero_image || "");                                 // hotel image only for non-food
@@ -8181,7 +8775,7 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
      </div>`;
   const imgHtml = heroUrl
     ? `<img class="cx-lc-img" src="${heroUrl}" alt="${coverLabel}" loading="lazy"
-         onerror="this.src='${fallbackUrl}';this.onerror=function(){this.style.display='none';this.nextElementSibling.style.display='flex'}">`
+         onerror="if(this.src!=='${fallbackUrl}'){this.src='${fallbackUrl}';}else{this.style.display='none';this.nextElementSibling.style.display='flex';}">`
        + `<div class="cx-lc-img-cover" style="display:none">${coverHtml}</div>`
     : `<img class="cx-lc-img" src="${fallbackUrl}" alt="${coverLabel}" loading="lazy"
          onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
@@ -8297,26 +8891,57 @@ function renderCardData(cd, spokenText) {
     const dur = cd.duration_days || 3;
     const pax = cd.pax || 1;
 
-    // Build plan option cards using shared builder
-    const planCards = cd.plans.map((p, idx) => _buildListCard(p, idx, cardId, dur, pax, cd.destination || "")).join("");
+    // 找推荐方案（is_recommended=true 优先，否则取 balanced / 第二个）
+    const _recIdx = (() => {
+      const ri = cd.plans.findIndex(p => p.is_recommended);
+      if (ri >= 0) return ri;
+      const bi = cd.plans.findIndex(p => p.id === "balanced");
+      return bi >= 0 ? bi : Math.min(1, cd.plans.length - 1);
+    })();
 
-    // P0②: Data quality banner — warn when agent used synthetic/mock data
-    const qualityBanner = (cd._dataQuality === "synthetic" || cd._dataQuality === "mock")
-      ? `<div class="cx-quality-banner"><span class="cx-quality-banner-icon">⚠️</span>${pickText(
-          "当前数据来自模拟资源库，真实价格及可用性请出行前确认",
-          "Data from simulation — verify pricing and availability before travel",
-          "シミュレーションデータ — 出発前に実際の情報をご確認ください",
-          "시뮬레이션 데이터 — 출발 전 실제 정보를 확인하세요"
+    // 默认只渲染推荐方案；其余折叠，需点击展开
+    const recCard   = _buildListCard(cd.plans[_recIdx], _recIdx, cardId, dur, pax, cd.destination || "");
+    const otherCards = cd.plans
+      .filter((_, i) => i !== _recIdx)
+      .map((p, i) => {
+        const origIdx = cd.plans.indexOf(p);
+        return _buildListCard(p, origIdx, cardId, dur, pax, cd.destination || "");
+      }).join("");
+    const planCards = recCard +
+      (otherCards ? `
+        <div class="cx-plan-others" id="${cardId}-others" style="display:none">${otherCards}</div>
+        <button class="cx-plan-expand-btn" id="${cardId}-expand-btn"
+          onclick="_toggleOtherPlans('${cardId}')">
+          ${pickText("查看其他方案 ↓","See Other Plans ↓","他のプランを見る ↓","다른 플랜 보기 ↓")}
+        </button>` : "");
+
+    // AP-04: Data quality banner — warn for synthetic/mock; confirm for live Amap data
+    const qualityBanner = cd._dataQuality === "live"
+      ? `<div class="cx-quality-banner cx-quality-banner--live"><span class="cx-quality-banner-icon">✅</span>${pickText(
+          "实时数据（高德地图）· 价格与可用性均来自实时接口",
+          "Live data (Amap) · Prices and availability from real-time APIs",
+          "リアルタイムデータ（高徳地図）· 実際の情報",
+          "실시간 데이터 (Amap) · 실시간 API 기반"
         )}</div>`
-      : "";
+      : (cd._dataQuality === "synthetic" || cd._dataQuality === "mock")
+        ? `<div class="cx-quality-banner"><span class="cx-quality-banner-icon">⚠️</span>${pickText(
+            "当前数据来自模拟资源库，真实价格及可用性请出行前确认",
+            "Data from simulation — verify pricing and availability before travel",
+            "シミュレーションデータ — 出発前に実際の情報をご確認ください",
+            "시뮬레이션 데이터 — 출발 전 실제 정보를 확인하세요"
+          )}</div>`
+        : "";
 
     // Day-by-day itinerary section (shared, shown after plan selection or always for balanced)
     let dayItineraryHtml = "";
     if (hasDays) {
+      // P2: detect multi-city plan (any day has a different city from destination)
+      const _isMultiCity = (cd.days || []).some(d => d.city && d.city !== cd.destination);
       const dayTabsHtml = `<div class="plan-day-tabs" id="${cardId}-tabs">` +
-        cd.days.map((d, i) =>
-          `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})">Day ${d.day}</button>`
-        ).join("") +
+        cd.days.map((d, i) => {
+          const cityBadge = _isMultiCity && d.city ? `<span class="day-tab-city">${escapeHtml(d.city)}</span>` : "";
+          return `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})">Day ${d.day}${cityBadge}</button>`;
+        }).join("") +
         `<button class="day-tab" data-day="map" onclick="switchPlanDay('${cardId}','map')">🗺 地图</button>` +
         "</div>";
 
@@ -8328,11 +8953,9 @@ function renderCardData(cd, spokenText) {
         const _dayHotel = d.hotel?.name || "";
         const activities = (d.activities || []).map((act) => {
           const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
-          const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
-          // P8.9: real_photo_url (from Coze via Rule 15) takes priority; picsum as last resort
-          const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
+          const actImgSrc = act.image_url || act.real_photo_url || _actFallbackImg(act);
           const costRaw = act.cost_cny || act.cost || 0;
-          const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` :"免费";
+          const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` : pickText("免费","Free","無料","무료");
           const costCls  = costRaw === 0 ? " act-cost--free" : "";
           const mins = act.duration_min || 0;
           const durFmt = mins > 0 ? (mins >= 60 ? `${Math.floor(mins/60)}h${mins%60?""+mins%60+"m":""}` : `${mins}m`) : "";
@@ -8344,28 +8967,29 @@ function renderCardData(cd, spokenText) {
           const isFood = /food|restaurant|eat|meal|lunch|dinner|breakfast/i.test(act.type||"") || act.type === "food";
           const isSight = /sight|attraction|museum|temple|park|activity/i.test(act.type||"") || act.type === "sightseeing";
           const cozeQueue = isFood && state.cozeData?.restaurant_queue > 0
-            ? `<span class="act-coze-queue">⏳ 排队约${state.cozeData.restaurant_queue}分钟</span>` : "";
+            ? `<span class="act-coze-queue">⏳ ${pickText("排队约","~","約","대기")}${state.cozeData.restaurant_queue}${pickText("分钟","min","分","분")}</span>` : "";
           const cozeTicket = isSight && state.cozeData?.ticket_availability
-            ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
+            ? `<span class="act-coze-ticket">🟢 ${pickText("有票·可代订","Tickets available","チケットあり","티켓 가능")}</span>` : "";
           // Local nav strip (skip transport/city_change rows)
           const isTransportRow = /^(transport|city_change)$/i.test(act.type || "");
           const localNavHtml = (!isTransportRow && _dayCity && act.name)
             ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
                 data-city="${escapeHtml(_dayCity)}" data-hotel="${escapeHtml(_dayHotel)}" data-place="${escapeHtml(act.name)}">
-                <span class="act-local-nav-label">📍 导航</span>
-                <span class="act-local-nav-modes">点击查看</span>
+                <span class="act-local-nav-label">📍 ${pickText("导航","Navigate","ナビ","내비")}</span>
+                <span class="act-local-nav-modes">${pickText("点击查看","Tap to view","タップして確認","탭하여 확인")}</span>
               </div>` : "";
           return `${transitHtml}
             <div class="act-row">
               <div class="act-drag-handle">\u22EE</div>
-              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
+              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.src='${isFood?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}'">
               <div class="act-body">
-                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue}${cozeTicket}</div>
+                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._verified ? '<span class="cx-verified-badge" title="已通过数据源验证">✓</span>' : ''}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue}${cozeTicket}</div>
                 ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
                 ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
                 ${(act.insider_tip||act.insider_tips) ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip||act.insider_tips)}</div>` : ""}
                 ${localNavHtml}
+                ${act.platform_links ? _renderPlatformLinks(act.platform_links, act.type) : ""}
               </div>
               <span class="act-cost${costCls}">${costFmt}</span>
               <button class="act-delete-btn" onclick="deleteActivity(this)" title="删除">✕</button>
@@ -8373,16 +8997,18 @@ function renderCardData(cd, spokenText) {
         }).join("");
         const hotelHtml = d.hotel ? (() => {
           const h = d.hotel;
-          const hc = h.cost_cny > 0 ? `<span class="act-hotel-cost">¥${Number(h.cost_cny).toLocaleString()}/晚</span>` : "";
-          return `<div class="act-hotel-card"><div class="act-hotel-header"><span>🏨</span><span class="act-hotel-name">${escapeHtml(h.name||"")}</span>${h.type?`<span class="act-hotel-type">${escapeHtml(h.type)}</span>`:""} ${hc}</div>${h.area?`<div class="act-hotel-area">📍 ${escapeHtml(h.area)}</div>`:""}${h.tip?`<div class="act-hotel-tip">💡 ${escapeHtml(h.tip)}</div>`:""}</div>`;
+          const hc = h.cost_cny > 0 ? `<span class="act-hotel-cost">¥${Number(h.cost_cny).toLocaleString()}${pickText("/晚","/night","/泊","/박")}</span>` : "";
+          const bookBtn = h.name ? `<button class="cx-hotel-book-btn" onclick="_handleBooking(${JSON.stringify(h.name||'')},${JSON.stringify(h.external_id||'')})">🏨 ${pickText("立即预订","Book Now","今すぐ予約","지금 예약")}</button>` : "";
+          const hotelPlatformLinks = h.platform_links ? _renderPlatformLinks(h.platform_links, "hotel") : "";
+          return `<div class="act-hotel-card"><div class="act-hotel-header"><span>🏨</span><span class="act-hotel-name">${escapeHtml(h.name||"")}</span>${h.type?`<span class="act-hotel-type">${escapeHtml(h.type)}</span>`:""} ${hc}</div>${h.area?`<div class="act-hotel-area">📍 ${escapeHtml(h.area)}</div>`:""}${h.tip?`<div class="act-hotel-tip">💡 ${escapeHtml(h.tip)}</div>`:""}${bookBtn}${hotelPlatformLinks}</div>`;
         })() : "";
         const budgetHtml = d.day_budget ? (() => {
           const b = d.day_budget;
-          const parts = [b.transport>0?`🚇 交通¥${b.transport}`:null,b.meals>0?`🍽 餐饮¥${b.meals}`:null,b.activities>0?`🎯 游览¥${b.activities}`:null,b.hotel>0?`🏨 住宿¥${b.hotel}`:null].filter(Boolean).join(" · ");
-          return `<div class="act-day-budget"><div class="act-day-budget-items">${parts}</div>${b.total>0?`<div class="act-day-budget-total">合计 ¥${b.total}</div>`:""}</div>`;
+          const parts = [b.transport>0?`🚇 ${pickText("交通","Transport","交通","교통")}¥${b.transport}`:null,b.meals>0?`🍽 ${pickText("餐饮","Food","食事","식사")}¥${b.meals}`:null,b.activities>0?`🎯 ${pickText("游览","Activities","観光","관광")}¥${b.activities}`:null,b.hotel>0?`🏨 ${pickText("住宿","Hotel","宿泊","숙소")}¥${b.hotel}`:null].filter(Boolean).join(" · ");
+          return `<div class="act-day-budget"><div class="act-day-budget-items">${parts}</div>${b.total>0?`<div class="act-day-budget-total">${pickText("合计","Total","合計","합계")} ¥${b.total}</div>`:""}</div>`;
         })() : "";
         return `<div class="plan-day-panel${di === 0 ? " active" : ""}" data-panel="${di}" id="${cardId}-panel-${di}">
-          <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="编辑行程">✏️</button></div>
+          <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
           ${icHtml}<div class="day-activities">${activities}</div>${hotelHtml}${budgetHtml}
         </div>`;
       }).join("");
@@ -8434,22 +9060,22 @@ function renderCardData(cd, spokenText) {
           </div>
         </div>
         <div id="${cardId}-weather" class="cx-weather-strip cx-weather-strip--loading">⏳ 正在获取天气预报...</div>
-        ${spokenText ? `
-        <div class="plan-analysis-block">
-          <div class="plan-analysis-label">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 110 20A10 10 0 0112 2zm0 5a1 1 0 00-1 1v5l3.5 2a1 1 0 001-1.73L13 12.27V8a1 1 0 00-1-1z"/></svg>
-            ${pickText("AI 方案解读","AI Insights","AI の解説","AI 인사이트")}
-          </div>
-          <div class="plan-analysis-text">${escapeHtml(spokenText)}</div>
-        </div>` : ""}
+        ${spokenText ? `<div class="cx-spoken-hero" id="${cardId}-spoken">${escapeHtml(spokenText)}</div>` : ""}
         ${qualityBanner}
-        <div class="plan-section-header">${pickText("选择你的方案","Choose Your Plan","プランを選ぶ","플랜 선택")}</div>
+        <div class="plan-section-header cx-section-header--recommend">
+          ${pickText("为你推荐","Recommended for You","あなたへのおすすめ","추천 플랜")}
+        </div>
         <div class="cx-plan-list">${planCards}</div>
         ${dayItineraryHtml}
         ${_buildRefineBar(cd)}
         ${_buildRatingBar(cardId, cd)}
         <div class="cx-sbar-mount" id="cx-sbar-mount-${cardId}"></div>
-        <div style="text-align:center;margin:6px 0 2px"><button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 \u5206\u4eab\u884c\u7a0b</button></div>
+        <div class="cx-plan-action-bar">
+          <button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 ${pickText("分享行程", "Share","共有", "공유", "Bagikan")}</button>
+          <button class="cx-hist-btn" onclick="openPlanHistory('${cardId}')">📋 ${pickText("改稿历史", "History","改稿履歴", "수정 이력")}</button>
+          <button class="cx-invite-btn" onclick="sharePlanInvite('${cardId}')">👥 ${pickText("邀请同行", "Invite","同行者を招待", "동행자 초대")}</button>
+          <button class="cx-save-trip-btn" onclick="_saveItineraryToTrips('${cardId}')">💾 ${pickText("保存到行程", "Save to Trips","旅程に保存", "트립에 저장", "Simpan ke Trips", "حفظ في الرحلات")}</button>
+        </div>
         <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "\u78ba\u8a8d\u3059\u308b\u3068 Cross X \u304c\u5168\u4e88\u7d04\u3092\u30ed\u30c3\u30af\u3057\u307e\u3059 \u00b7 \u624b\u6570\u6599\u306a\u3057", "\ud655\uc778\ud558\uba74 Cross X\uac00 \ubaa8\ub4e0 \uc608\uc57d\uc744 \uc78a\uae08\uc778\uc2b5\ub2c8\ub2e4 \u00b7 \uc218\uc218\ub8cc \uc5c6\uc74c")}</p>
       </article>
     `);
@@ -8476,12 +9102,23 @@ function renderCardData(cd, spokenText) {
         });
         // Fetch weather forecast for destination
         fetchWeatherStrip(cardId, dest).catch(() => {});
+        // Check holiday overlap
+        _injectHolidayBanner(articleEl, cd);
       }
     }, 150);
     if (spokenText) speakAssistantMessage(spokenText);
     // Save plan for spotlight panel + per-card share registry
     state.lastAiPlan = { cd, spokenText };
     _planCardData.set(cardId, cd);
+
+    // Implement LRU cache: keep only last 10 plans to prevent memory leak
+    if (_planCardData.size > 10) {
+      const firstKey = _planCardData.keys().next().value;
+      _planCardData.delete(firstKey);
+    }
+
+    _recordPlanVersion(cardId, cd, spokenText);
+    _maybeShowShareCelebration(cardId, cd);
     updateSpotlightWithAiPlan(cd, spokenText);
     return true;
   }
@@ -8503,15 +9140,17 @@ function renderCardData(cd, spokenText) {
   if ((state._layoutType || "travel_full") !== "food_only" && cd.hotel && cd.hotel.name) {
     const h = cd.hotel;
     const hotelTotalFmt = Number(h.total || 0).toLocaleString();
+    const _hBookHtml = _buildBookBtnHtml(h.name, h.external_id);
     hotelHtml = `
       <div class="plan-hotel-strip">
-        <img class="plan-hotel-img" src="${_getCityHeroUrl(cd.destination || h.name || "")}" alt="${escapeHtml(h.name)}" loading="lazy" onerror="this.style.display='none'">
+        <img class="plan-hotel-img" src="${_getCityHeroUrl(cd.destination || h.name || "")}" alt="${escapeHtml(h.name)}" loading="lazy" onerror="this.src='/assets/solution-travel.svg'">
         <div class="plan-hotel-info">
           <div class="plan-hotel-name">${escapeHtml(h.name)}</div>
-          <div class="plan-hotel-meta">${escapeHtml(h.type || "")}${h.price_per_night ? ` · ¥${h.price_per_night}/晚` : ""}${cd.duration_days ? ` · ${cd.duration_days}晚` : ""}</div>
+          <div class="plan-hotel-meta">${escapeHtml(h.type || "")}${h.price_per_night ? ` · ${formatCNY(h.price_per_night)}/${pickText("晚","night","泊","박")}` : ""}${cd.duration_days ? ` · ${cd.duration_days}${pickText("晚","nights","泊","박")}` : ""}</div>
         </div>
         <span class="plan-hotel-price">¥${hotelTotalFmt}</span>
-      </div>`;
+      </div>
+      ${_hBookHtml}`;
   }
 
   // ── Day tabs + panels ─────────────────────────────────────────────────
@@ -8521,10 +9160,12 @@ function renderCardData(cd, spokenText) {
 
   if (hasDays) {
     const cardId = "plan-" + Math.random().toString(36).slice(2, 8);
+    const _isMultiCity2 = cd.days.some(d => d.city && d.city !== cd.destination);
     dayTabsHtml = `<div class="plan-day-tabs" id="${cardId}-tabs">` +
-      cd.days.map((d, i) =>
-        `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})" data-day="${i}">Day ${d.day}</button>`
-      ).join("") +
+      cd.days.map((d, i) => {
+        const cityBadge2 = _isMultiCity2 && d.city ? `<span class="day-tab-city">${escapeHtml(d.city)}</span>` : "";
+        return `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})" data-day="${i}">Day ${d.day}${cityBadge2}</button>`;
+      }).join("") +
       `<button class="day-tab" data-day="map" onclick="switchPlanDay('${cardId}','map')">🗺 地图</button>` +
       `</div>`;
 
@@ -8536,11 +9177,9 @@ function renderCardData(cd, spokenText) {
       const _dayHotel2 = d.hotel?.name || "";
       const activities = (d.activities || []).map((act) => {
         const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
-        const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
-        // P8.9: real photo first; picsum as last resort
-        const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
+        const actImgSrc = act.image_url || act.real_photo_url || _actFallbackImg(act);
         const costRaw = act.cost_cny || act.cost || 0;
-        const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` : "免费";
+        const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` : pickText("免费","Free","無料","무료");
         const costCls  = costRaw === 0 ? " act-cost--free" : "";
         const mins = act.duration_min || 0;
         const durFmt = mins > 0 ? (mins >= 60 ? `${Math.floor(mins/60)}h${mins%60?""+mins%60+"m":""}` : `${mins}m`) : "";
@@ -8550,22 +9189,22 @@ function renderCardData(cd, spokenText) {
         const isFood2 = /food|restaurant|eat|meal|lunch|dinner|breakfast/i.test(act.type||"") || act.type === "food";
         const isSight2 = /sight|attraction|museum|temple|park|activity/i.test(act.type||"") || act.type === "sightseeing";
         const cozeQueue2 = isFood2 && state.cozeData?.restaurant_queue > 0
-          ? `<span class="act-coze-queue">⏳ 排队约${state.cozeData.restaurant_queue}分钟</span>` : "";
+          ? `<span class="act-coze-queue">⏳ ${pickText("排队约","~","約","대기")}${state.cozeData.restaurant_queue}${pickText("分钟","min","分","분")}</span>` : "";
         const cozeTicket2 = isSight2 && state.cozeData?.ticket_availability
-          ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
+          ? `<span class="act-coze-ticket">🟢 ${pickText("有票·可代订","Tickets available","チケットあり","티켓 가능")}</span>` : "";
         const isTransportRow2 = /^(transport|city_change)$/i.test(act.type || "");
         const localNavHtml2 = (!isTransportRow2 && _dayCity2 && act.name)
           ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
               data-city="${escapeHtml(_dayCity2)}" data-hotel="${escapeHtml(_dayHotel2)}" data-place="${escapeHtml(act.name)}">
-              <span class="act-local-nav-label">📍 导航</span>
-              <span class="act-local-nav-modes">点击查看</span>
+              <span class="act-local-nav-label">📍 ${pickText("导航","Navigate","ナビ","내비")}</span>
+              <span class="act-local-nav-modes">${pickText("点击查看","Tap to view","タップして確認","탭하여 확인")}</span>
             </div>` : "";
         return `${transitHtml}
           <div class="act-row">
             <div class="act-drag-handle">\u22EE</div>
-            <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
+            <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.src='${isFood2?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}'">
             <div class="act-body">
-              <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue2}${cozeTicket2}</div>
+              <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._verified ? '<span class="cx-verified-badge" title="已通过数据源验证">✓</span>' : ''}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue2}${cozeTicket2}</div>
               ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
               ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
               ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
@@ -8578,16 +9217,19 @@ function renderCardData(cd, spokenText) {
       }).join("");
       const _hotelHtml2 = d.hotel ? (() => {
         const h = d.hotel;
-        const hc = h.cost_cny > 0 ? `<span class="act-hotel-cost">¥${Number(h.cost_cny).toLocaleString()}/晚</span>` : "";
-        return `<div class="act-hotel-card"><div class="act-hotel-header"><span>🏨</span><span class="act-hotel-name">${escapeHtml(h.name||"")}</span>${h.type?`<span class="act-hotel-type">${escapeHtml(h.type)}</span>`:""} ${hc}</div>${h.area?`<div class="act-hotel-area">📍 ${escapeHtml(h.area)}</div>`:""}${h.tip?`<div class="act-hotel-tip">💡 ${escapeHtml(h.tip)}</div>`:""}</div>`;
+        const hc = h.cost_cny > 0 ? `<span class="act-hotel-cost">¥${Number(h.cost_cny).toLocaleString()}${pickText("/晚","/night","/泊","/박")}</span>` : "";
+        const _hbn2 = escapeHtml(h.name||"").replace(/'/g,"\\'");
+        const _hbi2 = escapeHtml(h.external_id||"").replace(/'/g,"\\'");
+        const bookBtn2 = h.name ? `<button class="cx-hotel-book-btn" onclick="_handleBooking('${_hbn2}','${_hbi2}')">🏨 ${pickText("立即预订","Book Now","今すぐ予約","지금 예약")}</button>` : "";
+        return `<div class="act-hotel-card"><div class="act-hotel-header"><span>🏨</span><span class="act-hotel-name">${escapeHtml(h.name||"")}</span>${h.type?`<span class="act-hotel-type">${escapeHtml(h.type)}</span>`:""} ${hc}</div>${h.area?`<div class="act-hotel-area">📍 ${escapeHtml(h.area)}</div>`:""}${h.tip?`<div class="act-hotel-tip">💡 ${escapeHtml(h.tip)}</div>`:""}${bookBtn2}</div>`;
       })() : "";
       const _budgetHtml2 = d.day_budget ? (() => {
         const b = d.day_budget;
-        const parts = [b.transport>0?`🚇 交通¥${b.transport}`:null,b.meals>0?`🍽 餐饮¥${b.meals}`:null,b.activities>0?`🎯 游览¥${b.activities}`:null,b.hotel>0?`🏨 住宿¥${b.hotel}`:null].filter(Boolean).join(" · ");
-        return `<div class="act-day-budget"><div class="act-day-budget-items">${parts}</div>${b.total>0?`<div class="act-day-budget-total">合计 ¥${b.total}</div>`:""}</div>`;
+        const parts = [b.transport>0?`🚇 ${pickText("交通","Transport","交通","교통")}¥${b.transport}`:null,b.meals>0?`🍽 ${pickText("餐饮","Food","食事","식사")}¥${b.meals}`:null,b.activities>0?`🎯 ${pickText("游览","Activities","観光","관광")}¥${b.activities}`:null,b.hotel>0?`🏨 ${pickText("住宿","Hotel","宿泊","숙소")}¥${b.hotel}`:null].filter(Boolean).join(" · ");
+        return `<div class="act-day-budget"><div class="act-day-budget-items">${parts}</div>${b.total>0?`<div class="act-day-budget-total">${pickText("合计","Total","合計","합계")} ¥${b.total}</div>`:""}</div>`;
       })() : "";
       return `<div class="plan-day-panel${di === 0 ? " active" : ""}" data-panel="${di}" id="${cardId}-panel-${di}">
-        <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="编辑行程">✏️</button></div>
+        <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
         ${_icHtml2}<div class="day-activities">${activities}</div>${_hotelHtml2}${_budgetHtml2}
       </div>`;
     }).join("");
@@ -8597,12 +9239,10 @@ function renderCardData(cd, spokenText) {
   } else {
     // Legacy items[] fallback
     dayPanelsHtml = `<div class="plan-items">` + cd.items.map((item) => {
-      const imgKw = encodeURIComponent(item.image_keyword || item.name || "");
-      // P8.9: real photo first; picsum as last resort
-      const itemImgSrc = item.image_url || item.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
+      const itemImgSrc = item.image_url || item.real_photo_url || _actFallbackImg(item);
       const priceFmt = Number(item.price || 0).toLocaleString();
       return `<div class="cd-item-row">
-        <img class="cd-item-img" src="${itemImgSrc}" alt="${escapeHtml(item.name || "")}" loading="lazy" onerror="this.style.display='none'">
+        <img class="cd-item-img" src="${itemImgSrc}" alt="${escapeHtml(item.name || "")}" loading="lazy" onerror="this.src='/assets/solution-eat.svg'">
         <div class="cd-item-body">
           <div class="cd-item-name">${escapeHtml(item.name || "")}</div>
           <div class="cd-item-desc">${escapeHtml(item.description || "")}</div>
@@ -8631,33 +9271,40 @@ function renderCardData(cd, spokenText) {
   ).join("");
 
   const btn = cd.action_button || {};
-  const btnText = btn.text || `确认方案 · 开始预订 ¥${totalFmt}`;
+  const btnText = btn.text || `${pickText("确认方案 · 开始预订","Confirm & Book","プランを確認・予約","플랜 확인 · 예약")} ¥${totalFmt}`;
   const btnPayload = JSON.stringify(btn.payload || {});
 
   const arrivalNote = cd.arrival_note
     ? `<div class="arrival-banner">✈️ ${escapeHtml(cd.arrival_note)}</div>`
     : "";
 
-  // P0②: quality banner for legacy single-plan card
-  const legacyQualityBanner = (cd._dataQuality === "synthetic" || cd._dataQuality === "mock")
-    ? `<div class="cx-quality-banner"><span class="cx-quality-banner-icon">⚠️</span>${pickText(
-        "当前数据来自模拟资源库，真实价格及可用性请出行前确认",
-        "Data from simulation — verify pricing and availability before travel",
-        "シミュレーションデータ — 出発前に実際の情報をご確認ください",
-        "시뮬레이션 데이터 — 출발 전 실제 정보를 확인하세요"
+  // AP-04: quality banner for legacy single-plan card
+  const legacyQualityBanner = cd._dataQuality === "live"
+    ? `<div class="cx-quality-banner cx-quality-banner--live"><span class="cx-quality-banner-icon">✅</span>${pickText(
+        "实时数据（高德地图）· 价格与可用性均来自实时接口",
+        "Live data (Amap) · Prices and availability from real-time APIs",
+        "リアルタイムデータ（高徳地図）· 実際の情報",
+        "실시간 데이터 (Amap) · 실시간 API 기반"
       )}</div>`
-    : "";
+    : (cd._dataQuality === "synthetic" || cd._dataQuality === "mock")
+      ? `<div class="cx-quality-banner"><span class="cx-quality-banner-icon">⚠️</span>${pickText(
+          "当前数据来自模拟资源库，真实价格及可用性请出行前确认",
+          "Data from simulation — verify pricing and availability before travel",
+          "シミュレーションデータ — 出発前に実際の情報をご確認ください",
+          "시뮬레이션 데이터 — 출발 전 실제 정보를 확인하세요"
+        )}</div>`
+      : "";
 
   clearChatCards({ keepDeliverable: true, keepSmartReply: false });
   addCard(`
     <article class="card smart-reply-card plan-card">
       <div class="plan-card-header">
         <div class="plan-card-header-left">
-          <h3 class="plan-card-title">${escapeHtml(cd.title || "定制行程方案")}</h3>
+          <h3 class="plan-card-title">${escapeHtml(cd.title || pickText("定制行程方案","Custom Itinerary","カスタム旅程","맞춤 일정"))}</h3>
           ${tripMeta ? `<div class="plan-card-meta">${tripMeta}</div>` : ""}
         </div>
         <div class="plan-total-price">
-          <span class="price-label">总计</span>
+          <span class="price-label">${pickText("总计","Total","合計","합계")}</span>
           <span class="price-amount">¥${escapeHtml(totalFmt)}</span>
         </div>
       </div>
@@ -8666,7 +9313,7 @@ function renderCardData(cd, spokenText) {
       <div class="plan-analysis-block">
         <div class="plan-analysis-label">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 110 20A10 10 0 0112 2zm0 5a1 1 0 00-1 1v5l3.5 2a1 1 0 001-1.73L13 12.27V8a1 1 0 00-1-1z"/></svg>
-          AI 方案解读
+          ${pickText("AI 方案解读","AI Analysis","AI 分析","AI 분석")}
         </div>
         <div class="plan-analysis-text">${escapeHtml(spokenText)}</div>
       </div>` : ""}
@@ -8681,7 +9328,7 @@ function renderCardData(cd, spokenText) {
       <button class="payment-confirm-btn"
         data-payload="${escapeHtml(btnPayload)}"
         onclick="handleCardPaymentConfirm(this)">
-        确认行程 · 开始预订 ¥${escapeHtml(totalFmt)}
+        ${pickText("确认行程 · 开始预订","Confirm & Book","行程を確認・予約","여정 확인 · 예약")} ¥${escapeHtml(totalFmt)}
       </button>
       <div style="text-align:center;margin:8px 0 2px"><button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 \u5206\u4eab\u884c\u7a0b</button></div>
       <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "\u78ba\u8a8d\u3059\u308b\u3068 Cross X \u304c\u5168\u4e88\u7d04\u3092\u30ed\u30c3\u30af\u3057\u307e\u3059 \u00b7 \u624b\u6570\u6599\u306a\u3057", "\ud655\uc778\ud558\uba74 Cross X\uac00 \ubaa8\ub4e0 \uc608\uc57d\uc744 \uc78a\uae08\uc778\uc2b5\ub2c8\ub2e4 \u00b7 \uc218\uc218\ub8cc \uc5c6\uc74c")}</p>
@@ -8695,6 +9342,299 @@ function renderCardData(cd, spokenText) {
 // ── Per-card plan data registry (cardId → cd) ─────────────────────────────
 // Allows openShareCard to share the correct card's data when multiple cards exist
 const _planCardData = new Map();
+
+// ── Plan version history registry (cardId → [{cd, spokenText, ts}]) ────────
+const _planVersionHistory = new Map();
+const _MAX_PLAN_VERSIONS = 5;
+
+function _recordPlanVersion(cardId, cd, spokenText) {
+  if (!cardId || !cd) return;
+  const existing = _planVersionHistory.get(cardId) || [];
+  existing.push({ cd: JSON.parse(JSON.stringify(cd)), spokenText, ts: Date.now() });
+  if (existing.length > _MAX_PLAN_VERSIONS) existing.shift();
+  _planVersionHistory.set(cardId, existing);
+}
+
+function openPlanHistory(cardId) {
+  const versions = _planVersionHistory.get(cardId) || [];
+  if (versions.length < 2) { showToast("暂无历史版本"); return; }
+
+  document.getElementById("cx-plan-hist-modal")?.remove();
+  const modal = document.createElement("div");
+  modal.id = "cx-plan-hist-modal";
+  modal.className = "cx-share-modal"; // reuse backdrop style
+  const items = versions.slice().reverse().map((v, i) => {
+    const dt = new Date(v.ts);
+    const label = `${dt.getHours()}:${String(dt.getMinutes()).padStart(2,"0")} · ${escapeHtml(v.cd.destination || "方案")} ${v.cd.duration_days || ""}天`;
+    const isCurrent = i === 0;
+    return `<div class="cx-hist-item${isCurrent ? " cx-hist-item--current" : ""}">
+      <div class="cx-hist-label">${isCurrent ? "✦ 当前版本" : `版本 ${versions.length - i}`}　${label}</div>
+      ${!isCurrent ? `<button class="cx-hist-restore" onclick="restorePlanVersion('${cardId}',${versions.length - 1 - i})">还原</button>` : ""}
+    </div>`;
+  }).join("");
+
+  modal.innerHTML = `<div class="cx-sm-box"><div class="cx-sm-header"><span>📋 改稿历史</span><button class="cx-sm-close">✕</button></div><div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px">${items}</div></div>`;
+  modal.querySelector(".cx-sm-close").addEventListener("click", () => modal.remove());
+  modal.addEventListener("click", e => { if (e.target === modal) modal.remove(); });
+  document.body.appendChild(modal);
+}
+
+function restorePlanVersion(cardId, versionIdx) {
+  const versions = _planVersionHistory.get(cardId);
+  if (!versions || !versions[versionIdx]) return;
+  const { cd, spokenText } = versions[versionIdx];
+  document.getElementById("cx-plan-hist-modal")?.remove();
+  showToast("已还原历史版本");
+  renderCardData(cd, spokenText);
+}
+
+// ── Multi-person invite: encode plan as URL param ─────────────────────────
+function sharePlanInvite(cardId) {
+  const cd = _planCardData.get(cardId) || state.lastAiPlan?.cd;
+  if (!cd) { showToast("\u6682\u65e0\u65b9\u6848\u6570\u636e"); return; }
+  try {
+    // Generate a short token for social feedback tracking
+    const _rb = new Uint8Array(6); crypto.getRandomValues(_rb);
+    const token = Date.now().toString(36) + Array.from(_rb, b => b.toString(36)).join("").slice(0, 6);
+    const payload = {
+      dest:  cd.destination || "",
+      days:  cd.duration_days || 3,
+      pax:   cd.pax || 1,
+      title: cd.title || "",
+      token,
+      plans: (cd.plans || []).map(p => ({
+        tag: p.tag, hotel: p.hotel?.name, price: p.total_price, id: p.id
+      })),
+    };
+    // Record this token as "mine" so we can detect when others view it
+    try {
+      const myTokens = JSON.parse(localStorage.getItem("crossx_my_shared_tokens_v1") || "[]");
+      myTokens.unshift({ token, dest: payload.dest, at: Date.now() });
+      localStorage.setItem("crossx_my_shared_tokens_v1", JSON.stringify(myTokens.slice(0, 20)));
+    } catch { /* ignore */ }
+
+    const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+    const inviteUrl = `${location.origin}${location.pathname}?cx_invite=${encoded}`;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(inviteUrl).then(() => {
+        showToast("\u9080\u8bf7\u94fe\u63a5\u5df2\u590d\u5236\uff0c\u53d1\u7ed9\u540c\u884c\u4eba\u5373\u53ef \ud83d\udc65");
+      }).catch(() => _showInviteModal(inviteUrl));
+    } else {
+      _showInviteModal(inviteUrl);
+    }
+  } catch (e) {
+    showToast("\u751f\u6210\u9080\u8bf7\u94fe\u63a5\u5931\u8d25");
+  }
+}
+
+function _showInviteModal(url) {
+  document.getElementById("cx-invite-modal")?.remove();
+  const modal = document.createElement("div");
+  modal.id = "cx-invite-modal";
+  modal.className = "cx-share-modal";
+  modal.innerHTML = `<div class="cx-sm-box"><div class="cx-sm-header"><span>👥 邀请同行人</span><button class="cx-sm-close">✕</button></div><div style="padding:16px"><p style="font-size:13px;color:#6b7280;margin:0 0 10px">将以下链接发给同行人，他们可以查看并基于此方案继续规划：</p><textarea readonly style="width:100%;height:80px;font-size:12px;border:1px solid #e5e7eb;border-radius:8px;padding:8px;resize:none;color:#374151">${escapeHtml(url)}</textarea></div><div class="cx-sm-actions"><button class="cx-sm-dl-btn" id="cxInviteCopyBtn">📋 复制链接</button></div></div>`;
+  modal.querySelector(".cx-sm-close").addEventListener("click", () => modal.remove());
+  modal.addEventListener("click", e => { if (e.target === modal) modal.remove(); });
+  modal.querySelector("#cxInviteCopyBtn").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(url).catch(() => {});
+    showToast("已复制！");
+    modal.remove();
+  });
+  document.body.appendChild(modal);
+}
+
+// ── Flywheel: Planned destination history ─────────────────────────────────
+const _RECENT_DESTS_KEY = "crossx_recent_dests_v1";
+const _MAX_RECENT_DESTS = 6;
+
+function _recordPlannedDest(dest, days) {
+  if (!dest) return;
+  try {
+    const existing = JSON.parse(localStorage.getItem(_RECENT_DESTS_KEY) || "[]");
+    const filtered = existing.filter(d => d.dest !== dest);
+    filtered.unshift({ dest, days: days || 3, at: Date.now() });
+    localStorage.setItem(_RECENT_DESTS_KEY, JSON.stringify(filtered.slice(0, _MAX_RECENT_DESTS)));
+  } catch { /* ignore */ }
+}
+
+function _getRecentDests() {
+  try { return JSON.parse(localStorage.getItem(_RECENT_DESTS_KEY) || "[]"); }
+  catch { return []; }
+}
+
+// ── Flywheel: Share celebration moment ────────────────────────────────────
+const _celebratedCards = new Set();
+
+function _maybeShowShareCelebration(cardId, cd) {
+  if (_celebratedCards.has(cardId)) return;
+  _celebratedCards.add(cardId);
+  _recordPlannedDest(cd.destination, cd.duration_days);
+  // Delay so the plan card fully renders before overlay appears
+  setTimeout(() => _showShareCelebration(cd), 1800);
+}
+
+function _showShareCelebration(cd) {
+  document.getElementById("cx-celebrate-overlay")?.remove();
+  const dest = cd.destination || pickText("\u65c5\u884c", "Trip", "\u65c5\u884c", "\uc5ec\ud589");
+  const days = cd.duration_days ? ` \u00b7 ${cd.duration_days}${pickText("\u5929", " days", "\u65e5\u9593", "\uc77c")}` : "";
+  const overlay = document.createElement("div");
+  overlay.id = "cx-celebrate-overlay";
+  overlay.className = "cx-celebrate-overlay";
+  overlay.innerHTML = `
+    <div class="cx-celebrate-box">
+      <div class="cx-celebrate-sparkle">\u2728</div>
+      <div class="cx-celebrate-title">${pickText("\u884c\u7a0b\u89c4\u5212\u5b8c\u6210", "Itinerary Ready", "\u65c5\u7a0b\u304c\u5b8c\u6210\u3057\u307e\u3057\u305f", "\uc77c\uc815 \uc644\uc131")}</div>
+      <div class="cx-celebrate-dest">${escapeHtml(dest)}${days}</div>
+      <div class="cx-celebrate-hint">${pickText("\u53d1\u7ed9\u540c\u884c\u4eba\uff0c\u4e00\u8d77\u671f\u5f85\u8fd9\u6b21\u65c5\u884c", "Share with your travel companions", "\u4e00\u7dd2\u306b\u65c5\u884c\u3059\u308b\u4eba\u306b\u30b7\u30a7\u30a2\u3057\u307e\u3057\u3087\u3046", "\uc5ec\ud589 \ub3d9\ubc18\uc5d0\uac8c \uacf5\uc720\ud558\uc138\uc694")}</div>
+      <div class="cx-celebrate-actions">
+        <button class="cx-celebrate-share-btn" id="cxCelebShare">\ud83d\udce4 ${pickText("\u5206\u4eab\u6d77\u62a5", "Share Poster", "\u30dd\u30b9\u30bf\u30fc\u3092\u30b7\u30a7\u30a2", "\ud3ec\uc2a4\ud130 \uacf5\uc720")}</button>
+        <button class="cx-celebrate-invite-btn" id="cxCelebInvite">\ud83d\udc65 ${pickText("\u9080\u8bf7\u540c\u884c", "Invite", "\u62db\u5f85", "\uc2ec\ucd08")}</button>
+        <button class="cx-celebrate-dismiss" id="cxCelebDismiss">${pickText("\u7a0d\u540e", "Later", "\u3042\u3068\u3067", "\ub098\uc911\uc5d0")}</button>
+      </div>
+    </div>
+  `;
+  const lastCardId = [..._planCardData.keys()].at(-1);
+  const dismiss = () => overlay.remove();
+  const timer = setTimeout(dismiss, 9000);
+  overlay.querySelector("#cxCelebShare").addEventListener("click", () => {
+    clearTimeout(timer); dismiss();
+    if (lastCardId) openShareCard(lastCardId);
+  });
+  overlay.querySelector("#cxCelebInvite").addEventListener("click", () => {
+    clearTimeout(timer); dismiss();
+    if (lastCardId) sharePlanInvite(lastCardId);
+  });
+  overlay.querySelector("#cxCelebDismiss").addEventListener("click", () => { clearTimeout(timer); dismiss(); });
+  overlay.addEventListener("click", e => { if (e.target === overlay) { clearTimeout(timer); dismiss(); } });
+  document.body.appendChild(overlay);
+}
+
+// ── Flywheel: Social feedback — invite view tracking ──────────────────────
+const _INVITE_VIEWS_KEY = "crossx_invite_views_v1";
+
+function _recordInviteView(token) {
+  if (!token) return;
+  try {
+    const store = JSON.parse(localStorage.getItem(_INVITE_VIEWS_KEY) || "{}");
+    store[token] = (store[token] || 0) + 1;
+    localStorage.setItem(_INVITE_VIEWS_KEY, JSON.stringify(store));
+  } catch { /* ignore */ }
+}
+
+function _getInviteViewCount(token) {
+  if (!token) return 0;
+  try {
+    const store = JSON.parse(localStorage.getItem(_INVITE_VIEWS_KEY) || "{}");
+    return store[token] || 0;
+  } catch { return 0; }
+}
+
+function _checkInviteViewNotification() {
+  // Check if any of our shared tokens have been viewed (same device only in v1)
+  // In production this would be server-side push
+  try {
+    const shared = JSON.parse(localStorage.getItem("crossx_my_shared_tokens_v1") || "[]");
+    if (!shared.length) return;
+    const views = JSON.parse(localStorage.getItem(_INVITE_VIEWS_KEY) || "{}");
+    const notified = JSON.parse(localStorage.getItem("crossx_view_notified_v1") || "{}");
+    for (const { token, dest } of shared) {
+      const total = views[token] || 0;
+      const lastNotified = notified[token] || 0;
+      if (total > lastNotified) {
+        const newViews = total - lastNotified;
+        notified[token] = total;
+        localStorage.setItem("crossx_view_notified_v1", JSON.stringify(notified));
+        setTimeout(() => showToast(`\u2728 \u4f60\u7684${escapeHtml(dest)}\u884c\u7a0b\u88ab ${newViews} \u4eba\u67e5\u770b\u4e86`), 500);
+        break; // show one at a time
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+// ── Flywheel: Invite CTA handlers (called from landing card onclick) ───────
+function _inviteActBasedOn() {
+  const payload = window._lastInvitePayload;
+  if (!payload) return;
+  const pax = payload.pax > 1 ? ` ${payload.pax}\u4eba` : "";
+  if (el.chatInput) {
+    el.chatInput.value = `\u5e2e\u6211\u89c4\u5212${escapeHtml(payload.dest)} ${payload.days}\u5929${pax}\uff0c\u671f\u671b\u4e0e\u670b\u53cb\u5206\u4eab\u7684\u65b9\u6848\u7c7b\u4f3c\uff0c\u4f46\u6309\u6211\u7684\u504f\u597d\u91cd\u65b0\u5b9a\u5236`;
+    autoResizeChatInput?.();
+    updateChatSendState?.();
+    el.chatInput.focus();
+    document.getElementById("cx-invite-landing")?.remove();
+    if (typeof el.chatForm.requestSubmit === "function") el.chatForm.requestSubmit();
+    else el.chatForm.dispatchEvent(new Event("submit", { bubbles: true }));
+  }
+}
+
+function _inviteActFresh() {
+  const payload = window._lastInvitePayload;
+  if (!payload) return;
+  if (el.chatInput) {
+    el.chatInput.value = `\u5e2e\u6211\u89c4\u5212${escapeHtml(payload.dest)}\u7684\u884c\u7a0b`;
+    autoResizeChatInput?.();
+    updateChatSendState?.();
+    el.chatInput.focus();
+    document.getElementById("cx-invite-landing")?.remove();
+  }
+}
+
+// ── Invite param detection on page load ──────────────────────────────────
+function _checkInviteParam() {
+  try {
+    const params = new URLSearchParams(location.search);
+    const encoded = params.get("cx_invite");
+    if (!encoded) return;
+    const cleanUrl = location.pathname + (location.hash || "");
+    history.replaceState(null, "", cleanUrl);
+    const payload = JSON.parse(decodeURIComponent(escape(atob(encoded))));
+    if (!payload.dest) return;
+    window._lastInvitePayload = payload;
+    // Track view for social feedback
+    if (payload.token) _recordInviteView(payload.token);
+    _showInviteLandingBanner(payload);
+  } catch { /* ignore bad param */ }
+}
+
+function _showInviteLandingBanner(payload) {
+  document.getElementById("cx-invite-landing")?.remove();
+  const dest    = escapeHtml(payload.dest || "");
+  const days    = payload.days || 3;
+  const pax     = payload.pax || 1;
+  const plans   = payload.plans || [];
+
+  const plansHtml = plans.map(p => `
+    <div class="cx-ilb-plan-row">
+      <span class="cx-ilb-plan-tag">${escapeHtml(p.tag || "")}</span>
+      <span class="cx-ilb-plan-hotel">${escapeHtml(p.hotel || "")}</span>
+      <span class="cx-ilb-plan-price">${p.price ? "\u00a5" + Number(p.price).toLocaleString() : ""}</span>
+    </div>`).join("");
+
+  const card = document.createElement("article");
+  card.id = "cx-invite-landing";
+  card.className = "card cx-invite-landing-card";
+  card.innerHTML = `
+    <div class="cx-ilb-header">
+      <span class="cx-ilb-avatar">\ud83d\udc65</span>
+      <div class="cx-ilb-info">
+        <div class="cx-ilb-title">\u670b\u53cb\u4e3a\u4f60\u5206\u4eab\u4e86\u4e00\u4efd\u884c\u7a0b</div>
+        <div class="cx-ilb-meta">${dest} \u00b7 ${days}\u5929${pax > 1 ? " \u00b7 " + pax + "\u4eba" : ""}</div>
+      </div>
+    </div>
+    ${plansHtml ? `<div class="cx-ilb-plans">${plansHtml}</div>` : ""}
+    <div class="cx-ilb-divider"></div>
+    <div class="cx-ilb-cta-label">\u4f60\u60f3\u600e\u4e48\u505a\uff1f</div>
+    <div class="cx-ilb-actions">
+      <button class="cx-ilb-btn cx-ilb-btn--primary" onclick="_inviteActBasedOn()">\u57fa\u4e8e\u6b64\u65b9\u6848\u91cd\u65b0\u5b9a\u5236</button>
+      <button class="cx-ilb-btn cx-ilb-btn--secondary" onclick="_inviteActFresh()">\u91cd\u65b0\u89c4\u5212 ${dest}</button>
+    </div>
+    <button class="cx-ilb-dismiss" onclick="document.getElementById('cx-invite-landing')?.remove()">\u2715</button>
+  `;
+  // Insert at top of chat messages
+  const feed = document.getElementById("chatMessages") || document.getElementById("chat-messages");
+  if (feed) feed.prepend(card);
+  else addCard(card.outerHTML);
+}
 
 // ── Cached Amap web key (fetched once, reused across all map tabs) ─────────
 let _amapWebKey = null;
@@ -8802,6 +9742,30 @@ function deleteActivity(btn) {
   setTimeout(() => {
     if (prev?.classList.contains("act-transit")) prev.remove();
     row.remove();
+
+    // Check if day panel is now empty after deletion
+    const dayPanel = row.closest(".day-panel");
+    if (dayPanel) {
+      const remainingActivities = dayPanel.querySelectorAll(".act-row");
+      if (remainingActivities.length === 0) {
+        const emptyMsg = document.createElement("div");
+        emptyMsg.className = "status";
+        emptyMsg.style.padding = "16px";
+        emptyMsg.style.textAlign = "center";
+        emptyMsg.style.color = "var(--color-text-secondary, #888)";
+        emptyMsg.textContent = pickText("该天暂无活动。点击「编辑」添加新活动。", "No activities for this day. Click 'Edit' to add.", "この日のアクティビティはありません。「編集」をクリックして追加してください。", "이 날 활동이 없습니다. '편집'을 클릭하여 추가하세요.");
+        dayPanel.querySelector(".day-activities")?.appendChild(emptyMsg);
+      }
+    }
+
+    // Update state.lastAiPlan to reflect deletion (prevents state loss on tab switch)
+    const cardId = row.closest(".card")?.id;
+    if (cardId && _planCardData.has(cardId)) {
+      const cd = _planCardData.get(cardId);
+      // Mark as modified so re-renders use current DOM state
+      cd._userModified = true;
+      state.lastAiPlan = { cd, spokenText: state.lastAiPlan?.spokenText };
+    }
   }, 270);
 }
 
@@ -8828,31 +9792,52 @@ function _buildShareCardHtml(cd) {
   const grad = _cityGradient(cd.destination || "");
   const total = Number(cd.total_price || 0);
   const totalFmt = total ? `¥${total.toLocaleString()}` : "";
-  const perDay = (total && daysN) ? ` · ¥${Math.round(total / Number(daysN)).toLocaleString()}/天` : "";
+  const perDay = (total && daysN) ? `¥${Math.round(total / Number(daysN)).toLocaleString()}/天` : "";
 
-  const dayItems = (cd.days || []).slice(0, 5).map((d, i) => {
+  // Build day highlights — up to 4 days, 2 activities each
+  const dayItems = (cd.days || []).slice(0, 4).map((d, i) => {
     const acts = (d.activities || []).slice(0, 2).map(a =>
       `<div class="cx-sc-act">\u2022 ${escapeHtml(a.name || "")}</div>`
     ).join("");
+    const cityLabel = d.city && d.city !== (cd.destination || "") ? ` · ${escapeHtml(d.city)}` : "";
     return `<div class="cx-sc-day">
-      <div class="cx-sc-day-label">Day ${d.day || i + 1} · ${escapeHtml(d.label || "")}</div>
+      <div class="cx-sc-day-label">Day ${d.day || i + 1}${cityLabel} · ${escapeHtml(d.label || "")}</div>
       ${acts || ""}
     </div>`;
   }).join("");
 
+  // Tags from plan highlights or destination
+  const tagSrc = (cd.plans || []).find(p => p.is_recommended)?.highlights || [];
+  const tagsHtml = tagSrc.slice(0, 3).map(h => `<span class="cx-sc-tag">#${escapeHtml(h.split("·")[0].trim().slice(0, 10))}</span>`).join("");
+
+  // Meta chips row
+  const chips = [
+    daysN ? `${daysN}天` : "",
+    pax > 1 ? `${pax}人` : "",
+    perDay ? perDay : (totalFmt || ""),
+  ].filter(Boolean).map(c => `<span class="cx-sc-chip">${escapeHtml(c)}</span>`).join("");
+
   return `<div class="cx-sc-root" style="background:${grad}">
-    ${heroUrl ? `<img class="cx-sc-hero-img" src="${heroUrl}" crossorigin="anonymous" onerror="this.style.display='none'">` : ""}
+    ${heroUrl ? `<img class="cx-sc-hero-img" src="${heroUrl}" crossorigin="anonymous" onerror="this.src='/assets/solution-flow.svg'">` : ""}
     <div class="cx-sc-overlay">
-      <div class="cx-sc-brand">\u2708 Cross X</div>
+      <div class="cx-sc-brand-row">
+        <span class="cx-sc-brand-icon">\u2708\ufe0f</span>
+        <span class="cx-sc-brand-name">Cross X</span>
+        <span class="cx-sc-brand-tag">AI \u65c5\u884c\u89c4\u5212</span>
+      </div>
       <div class="cx-sc-dest">${dest}</div>
-      <div class="cx-sc-meta">${daysN ? `${daysN}\u5929` : ""}${pax > 1 ? ` \u00b7 ${pax}\u4eba` : ""}${totalFmt ? ` \u00b7 ${totalFmt}` : ""}${perDay}</div>
+      <div class="cx-sc-chips">${chips}</div>
     </div>
     <div class="cx-sc-body">
       ${dayItems || '<div class="cx-sc-empty">\u7cbe\u5f69\u65c5\u7a0b\u5373\u5c06\u5f00\u59cb</div>'}
     </div>
+    ${tagsHtml ? `<div class="cx-sc-tags">${tagsHtml}</div>` : ""}
     <div class="cx-sc-footer">
-      <span class="cx-sc-footer-logo">Cross X · AI \u65c5\u884c\u89c4\u5212</span>
-      <span class="cx-sc-footer-tip">\u626b\u7801\u83b7\u53d6\u5b8c\u6574\u884c\u7a0b</span>
+      <div class="cx-sc-footer-left">
+        <div class="cx-sc-footer-logo">Cross X</div>
+        <div class="cx-sc-footer-sub">AI \u65c5\u884c\u89c4\u5212\u5f15\u64ce</div>
+      </div>
+      <div class="cx-sc-footer-cta">\u626b\u7801\u514d\u8d39\u89c4\u5212 \u2192</div>
     </div>
   </div>`;
 }
@@ -8866,28 +9851,63 @@ function _showShareModal(blob, fileName) {
   modal.innerHTML = `
     <div class="cx-sm-box">
       <div class="cx-sm-header">
-        <span>\u884c\u7a0b\u5206\u4eab\u56fe</span>
+        <span>\u5206\u4eab\u65c5\u884c\u6d77\u62a5</span>
         <button class="cx-sm-close">\u2715</button>
       </div>
       <div class="cx-sm-preview">
-        <img src="${url}" style="max-width:100%;border-radius:12px;" alt="\u5206\u4eab\u56fe">
+        <img src="${url}" style="max-width:100%;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);" alt="\u5206\u4eab\u56fe">
+      </div>
+      <div class="cx-sm-social-hint">
+        <span class="cx-sm-hint-icon">\ud83d\udcf1</span>
+        <span>\u957f\u6309\u56fe\u7247\u4fdd\u5b58\uff0c\u53d1\u5c0f\u7ea2\u4e66 / \u670b\u53cb\u5708\u5206\u4eab\u65c5\u884c\u8ba1\u5212</span>
       </div>
       <div class="cx-sm-actions">
-        <a class="cx-sm-dl-btn" href="${url}" download="${escapeHtml(fileName)}">\u2b07 \u4e0b\u8f7d\u56fe\u7247</a>
-        <button class="cx-sm-copy-btn">\u590d\u5236\u56fe\u7247</button>
+        <a class="cx-sm-dl-btn" href="${url}" download="${escapeHtml(fileName)}">\u2b07 \u4fdd\u5b58\u56fe\u7247</a>
+        <button class="cx-sm-copy-btn">\ud83d\udcf8 \u590d\u5236</button>
+      </div>
+      <div class="cx-sm-share-tips">
+        <div class="cx-sm-tip-item">\ud83d\udcd5 \u5c0f\u7ea2\u4e66\uff1a\u4e0a\u4f20\u56fe\u7247\uff0c\u52a0 #\u65c5\u884c\u8ba1\u5212 #CrossX</div>
+        <div class="cx-sm-tip-item">\ud83d\udcf2 \u5fae\u4fe1\uff1a\u53d1\u5230\u540c\u884c\u7fa4\u6216\u670b\u53cb\u5708</div>
+      </div>
+      <div class="cx-sm-invite-section">
+        <div class="cx-sm-invite-label">\ud83d\udc65 \u8ba9\u540c\u884c\u4e00\u8d77\u770b\u8fd9\u4efd\u884c\u7a0b</div>
+        <div class="cx-sm-invite-hint">\u53d1\u9080\u8bf7\u94fe\u63a5\uff0c\u5bf9\u65b9\u53ef\u76f4\u63a5\u67e5\u770b\u5e76\u57fa\u4e8e\u6b64\u65b9\u6848\u91cd\u65b0\u89c4\u5212</div>
+        <button class="cx-sm-invite-btn" id="cx-sm-invite-copy">\ud83d\udd17 \u590d\u5236\u9080\u8bf7\u94fe\u63a5</button>
       </div>
     </div>
   `;
-  const cleanup = () => URL.revokeObjectURL(url);
-  modal.querySelector(".cx-sm-close").addEventListener("click", () => { modal.remove(); cleanup(); });
+  // P1-B: Auto-revoke blob URL after 5 minutes as safety net (covers all dismiss paths)
+  const _blobGcTimer = setTimeout(() => URL.revokeObjectURL(url), 5 * 60 * 1000);
+  const cleanup = () => { clearTimeout(_blobGcTimer); URL.revokeObjectURL(url); };
+  // Revoke after download link is clicked (delay to allow browser to initiate download)
+  modal.querySelector(".cx-sm-dl-btn").addEventListener("click", () => setTimeout(cleanup, 2000), { once: true });
+  modal.querySelector(".cx-sm-close").addEventListener("click", () => { modal.remove(); cleanup(); }, { once: true });
   modal.querySelector(".cx-sm-copy-btn").addEventListener("click", async () => {
     try {
       await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
       showToast("\u56fe\u7247\u5df2\u590d\u5236\u5230\u526a\u8d34\u677f");
     } catch { showToast("\u8bf7\u957f\u6309\u56fe\u7247\u4fdd\u5b58"); }
   });
+  // Invite link copy — use the last generated plan's invite URL if available
+  const inviteBtn = modal.querySelector("#cx-sm-invite-copy");
+  if (inviteBtn) {
+    inviteBtn.addEventListener("click", async () => {
+      // Find a card id from the current plan to build invite URL
+      const cardId = _planCardData.size > 0 ? [..._planCardData.keys()].at(-1) : null;
+      if (cardId) {
+        sharePlanInvite(cardId);
+        modal.remove(); cleanup();
+      } else {
+        const inviteUrl = location.href.split("?")[0];
+        try { await navigator.clipboard.writeText(inviteUrl); } catch { /* ignore */ }
+        showToast("\u94fe\u63a5\u5df2\u590d\u5236");
+      }
+    });
+  }
   modal.addEventListener("click", (e) => { if (e.target === modal) { modal.remove(); cleanup(); } });
   document.body.appendChild(modal);
+  // Track share event for growth flywheel analytics
+  trackEvent("poster_share_opened").catch(() => {});
 }
 
 async function openShareCard(cardId) {
@@ -9013,6 +10033,53 @@ function _renderWeatherStrip(el, data, city) {
     </div>
     <div class="cx-ws-days">${dayPills}</div>
     ${data.tip ? `<div class="cx-ws-tip">${data.tip}</div>` : ""}`;
+}
+
+// ── Holiday awareness ─────────────────────────────────────────────────────
+// Key Chinese national holidays 2025-2026 (YYYY-MM-DD start, days)
+const _CN_HOLIDAYS = [
+  { name: "春节黄金周", start: "2025-01-28", days: 7, warn: "酒店价格涨幅 50-100%，提前锁定" },
+  { name: "清明节小长假", start: "2025-04-04", days: 3, warn: "热门景区人流密集" },
+  { name: "劳动节假期", start: "2025-05-01", days: 5, warn: "酒店&门票提前 2 周售罄" },
+  { name: "端午节小长假", start: "2025-05-31", days: 3, warn: "跨城交通需提前抢票" },
+  { name: "国庆黄金周", start: "2025-10-01", days: 8, warn: "酒店价格涨幅 30-80%，建议提前 1 个月预订" },
+  { name: "春节黄金周", start: "2026-02-17", days: 7, warn: "酒店价格涨幅 50-100%，提前锁定" },
+  { name: "劳动节假期", start: "2026-05-01", days: 5, warn: "酒店&门票提前 2 周售罄" },
+  { name: "国庆黄金周", start: "2026-10-01", days: 7, warn: "酒店价格涨幅 30-80%，建议提前 1 个月预订" },
+];
+
+function _injectHolidayBanner(articleEl, cd) {
+  if (!articleEl) return;
+  // Try to get start date from arrival_date or first day
+  const rawDate = cd.arrival_date || (cd.days && cd.days[0]?.date) || "";
+  if (!rawDate) return;
+  const tripStart = new Date(rawDate);
+  if (isNaN(tripStart.getTime())) return;
+  const tripEnd = new Date(tripStart);
+  tripEnd.setDate(tripEnd.getDate() + Math.max(1, Number(cd.duration_days || 1)));
+
+  const hit = _CN_HOLIDAYS.find(h => {
+    const hStart = new Date(h.start);
+    const hEnd = new Date(h.start);
+    hEnd.setDate(hEnd.getDate() + h.days);
+    // Overlap: trip start < holiday end AND trip end > holiday start
+    return tripStart < hEnd && tripEnd > hStart;
+  });
+  if (!hit) return;
+
+  const existing = articleEl.querySelector(".cx-holiday-banner");
+  if (existing) return;
+
+  const banner = document.createElement("div");
+  banner.className = "cx-holiday-banner";
+  banner.innerHTML = `<span class="cx-hb-icon">🎉</span><div class="cx-hb-text"><strong>${escapeHtml(hit.name)}</strong>：${escapeHtml(hit.warn)}</div><button class="cx-hb-close" onclick="this.parentNode.remove()">✕</button>`;
+  // Insert after quality banner or at top of card body
+  const qualityBanner = articleEl.querySelector(".cx-quality-banner");
+  if (qualityBanner) qualityBanner.after(banner);
+  else {
+    const planList = articleEl.querySelector(".cx-plan-list");
+    if (planList) planList.before(banner);
+  }
 }
 
 // ── Map panel helpers ─────────────────────────────────────────────────────
@@ -9233,11 +10300,9 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         // ── Activity rows ────────────────────────────────────────────────────
         const activities = (d.activities || []).map((act) => {
           const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
-          const imgKw = encodeURIComponent(act.image_keyword || act.name || "");
-          // P8.9: real photo first; picsum as last resort
-          const actImgSrc = act.image_url || act.real_photo_url || `https://picsum.photos/seed/${imgKw}/120/80`;
+          const actImgSrc = act.image_url || act.real_photo_url || _actFallbackImg(act);
           const costRaw = act.cost_cny || act.cost || 0;
-          const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` :"免费";
+          const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` : pickText("免费","Free","無料","무료");
           const costCls  = costRaw === 0 ? " act-cost--free" : "";
           const mins = act.duration_min || 0;
           const durFmt = mins > 0
@@ -9254,22 +10319,22 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
           const isFood3 = /food|restaurant|eat|meal|lunch|dinner|breakfast/i.test(act.type||"") || act.type === "food";
           const isSight3 = /sight|attraction|museum|temple|park|activity/i.test(act.type||"") || act.type === "sightseeing";
           const cozeQueue3 = isFood3 && state.cozeData?.restaurant_queue > 0
-            ? `<span class="act-coze-queue">⏳ 排队约${state.cozeData.restaurant_queue}分钟</span>` : "";
+            ? `<span class="act-coze-queue">⏳ ${pickText("排队约","~","約","대기")}${state.cozeData.restaurant_queue}${pickText("分钟","min","分","분")}</span>` : "";
           const cozeTicket3 = isSight3 && state.cozeData?.ticket_availability
-            ? `<span class="act-coze-ticket">🟢 有票·可代订</span>` : "";
+            ? `<span class="act-coze-ticket">🟢 ${pickText("有票·可代订","Tickets available","チケットあり","티켓 가능")}</span>` : "";
           const isTransportRow3 = /^(transport|city_change)$/i.test(act.type || "");
           const localNavHtml3 = (!isTransportRow3 && _dayCity3 && act.name)
             ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
                 data-city="${escapeHtml(_dayCity3)}" data-hotel="${escapeHtml(_dayHotel3)}" data-place="${escapeHtml(act.name)}">
-                <span class="act-local-nav-label">📍 导航</span>
-                <span class="act-local-nav-modes">点击查看</span>
+                <span class="act-local-nav-label">📍 ${pickText("导航","Navigate","ナビ","내비")}</span>
+                <span class="act-local-nav-modes">${pickText("点击查看","Tap to view","タップして確認","탭하여 확인")}</span>
               </div>` : "";
           return `${transitHtml}
             <div class="act-row">
               <div class="act-drag-handle">\u22EE</div>
-              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.style.display='none'">
+              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.src='${isFood3?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}'">
               <div class="act-body">
-                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue3}${cozeTicket3}</div>
+                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._verified ? '<span class="cx-verified-badge" title="已通过数据源验证">✓</span>' : ''}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue3}${cozeTicket3}</div>
                 ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
                 ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
@@ -9284,7 +10349,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         // ── Hotel card ───────────────────────────────────────────────────────
         const hotelHtml = d.hotel ? (() => {
           const h = d.hotel;
-          const cost = h.cost_cny > 0 ? `<span class="act-hotel-cost">¥${Number(h.cost_cny).toLocaleString()}/晚</span>` : "";
+          const cost = h.cost_cny > 0 ? `<span class="act-hotel-cost">¥${Number(h.cost_cny).toLocaleString()}${pickText("/晚","/night","/泊","/박")}</span>` : "";
           return `<div class="act-hotel-card">
             <div class="act-hotel-header">
               <span>🏨</span>
@@ -9301,19 +10366,19 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         const budgetHtml = d.day_budget ? (() => {
           const b = d.day_budget;
           const parts = [
-            b.transport  > 0 ? `🚇 交通¥${b.transport}`  : null,
-            b.meals      > 0 ? `🍽 餐饮¥${b.meals}`      : null,
-            b.activities > 0 ? `🎯 游览¥${b.activities}` : null,
-            b.hotel      > 0 ? `🏨 住宿¥${b.hotel}`      : null,
+            b.transport  > 0 ? `🚇 ${pickText("交通","Transport","交通","교통")}¥${b.transport}`  : null,
+            b.meals      > 0 ? `🍽 ${pickText("餐饮","Food","食事","식사")}¥${b.meals}`      : null,
+            b.activities > 0 ? `🎯 ${pickText("游览","Activities","観光","관광")}¥${b.activities}` : null,
+            b.hotel      > 0 ? `🏨 ${pickText("住宿","Hotel","宿泊","숙소")}¥${b.hotel}`      : null,
           ].filter(Boolean).join(" · ");
           return `<div class="act-day-budget">
             <div class="act-day-budget-items">${parts}</div>
-            ${b.total > 0 ? `<div class="act-day-budget-total">合计 ¥${b.total}</div>` : ""}
+            ${b.total > 0 ? `<div class="act-day-budget-total">${pickText("合计","Total","合計","합계")} ¥${b.total}</div>` : ""}
           </div>`;
         })() : "";
 
         return `<div class="plan-day-panel${globalIdx === 0 ? " active" : ""}" data-panel="${globalIdx}" id="${cardId}-panel-${globalIdx}">
-          <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="编辑行程">✏️</button></div>
+          <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
           ${intercityHtml}
           <div class="day-activities">${activities}</div>
           ${hotelHtml}
@@ -9532,11 +10597,11 @@ function buildBookingGuideHTML(plan, destination) {
       <strong class="cx-checkout-total">¥${totalPrice.toLocaleString()}</strong>
     </div>
     <div class="cx-checkout-note">
-      ${pickText("💡 价格基于实时数据估算，CrossX 将在确认后锁定最优报价", "💡 Prices are estimated. CrossX will lock the best rate upon confirmation.", "💡 価格は見積もりです。確認後に最適料金を確定します。", "💡 가격은 견적입니다. 확인 후 최적 금액을 확정합니다.")}
+      ${pickText("💡 价格基于实时数据估算，请在平台完成最终预订并获取官方确认。", "💡 Prices are estimated. Complete your booking on the platform to get an official confirmation.", "💡 価格は見積もりです。プラットフォームで予約を完了し、公式確認書を取得してください。", "💡 가격은 견적입니다. 플랫폼에서 예약을 완료하고 공식 확인서를 받으세요.")}
     </div>
-    <button class="cx-checkout-cta" onclick="crossXConfirmBooking(this, '${escapeHtml(hotelName)}', '${destination}', ${totalPrice})">
+    <button class="cx-checkout-cta" onclick="crossXConfirmBooking(this, '${escapeHtml(hotelName)}', '${escapeHtml(destination)}', ${totalPrice})">
       <span class="cx-checkout-cta-icon">✦</span>
-      ${pickText("CrossX 一键搞定全部预订", "CrossX: Book Everything Now", "CrossX が全て手配します", "CrossX 전체 예약 실행")}
+      ${hotelName ? pickText(`预订「${hotelName}」`, `Book "${hotelName}"`, `「${hotelName}」を予約`, `"${hotelName}" 예약`) : pickText("查看预订平台", "View Booking Options", "予約プラットフォームを選択", "예약 플랫폼 보기")}
     </button>
     <div class="cx-checkout-assist">
       <button class="cx-checkout-text-btn" onclick="addMessage(${JSON.stringify(pickText("我想修改方案", "I want to modify the plan","プランを変更したい", "플랜을 수정하고 싶어요"))}, 'user'); createTaskFromText(${JSON.stringify(pickText("我想修改方案", "modify plan","プランを変更したい", "플랜 수정"))})">
@@ -9546,47 +10611,603 @@ function buildBookingGuideHTML(plan, destination) {
       <button class="cx-checkout-text-btn" onclick="addMessage(${JSON.stringify(pickText("我需要礼宾顾问协助", "I need concierge help","コンシェルジュの助けが必要", "컨시어지 도움이 필요합니다"))}, 'user'); createTaskFromText(${JSON.stringify(pickText("需要礼宾顾问协助", "concierge help","コンシェルジュ支援", "컨시어지 지원"))})">
         ${pickText("礼宾顾问", "Concierge","コンシェルジュ", "컨시어지")}
       </button>
+      <span class="cx-checkout-dot">·</span>
+      <button class="cx-checkout-text-btn cx-feedback-btn" onclick="_reportRecommendation(this)">
+        ${pickText("反馈问题", "Report Issue","問題を報告", "문제 신고", "Laporkan Masalah", "الإبلاغ عن مشكلة")}
+      </button>
     </div>
   </div>`;
 }
 
-// ── CrossX in-app booking confirmation flow ───────────────────────────────────
-function crossXConfirmBooking(btn, hotelName, destination, totalPrice) {
-  btn.disabled = true;
-  const sheet = btn.closest(".cx-checkout-sheet");
-  const phases = pickText(
-    ["正在核查库存...", "锁定最优价格...", "生成预订凭证...", "✓ 预订成功！"],
-    ["Checking availability...", "Locking best rate...", "Generating confirmation...", "✓ Booked!"],
-    ["在庫確認中...", "最適料金確定中...", "予約確定書生成中...", "✓ 予約完了！"],
-    ["재고 확인 중...", "최적 요금 확정 중...", "예약 확인서 생성 중...", "✓ 예약 완료!"],
-  );
-  let step = 0;
-  btn.textContent = phases[step];
-  const interval = setInterval(() => {
-    step++;
-    if (step < phases.length - 1) {
-      btn.textContent = phases[step];
-    } else {
-      clearInterval(interval);
-      btn.textContent = phases[phases.length - 1];
-      btn.classList.add("cx-checkout-cta--success");
-      // Show confirmation panel
-      const confId = "CXB" + Math.random().toString(36).slice(2,8).toUpperCase();
-      const confHtml = `
-        <div class="cx-confirm-panel">
-          <div class="cx-confirm-icon">🎉</div>
-          <div class="cx-confirm-title">${pickText("预订已提交", "Booking Submitted","予約提出済み", "예약 제출됨")}</div>
-          <div class="cx-confirm-ref">${pickText("确认编号", "Ref.","確認番号", "참조 번호")}: ${confId}</div>
-          <div class="cx-confirm-hotel">${escapeHtml(hotelName || destination)}</div>
-          <div class="cx-confirm-total">¥${Number(totalPrice).toLocaleString()}</div>
-          <div class="cx-confirm-note">${pickText("CrossX 礼宾团队将在1小时内联系您确认细节", "CrossX concierge will contact you within 1 hour to confirm details.", "CrossX コンシェルジュが1時間以内にご連絡します。", "CrossX 컨시어지가 1시간 이내에 연락드립니다.")}</div>
-          <button class="cx-confirm-chat" onclick="addMessage(${JSON.stringify(pickText(`预订编号 ${confId} 已提交，CrossX 礼宾顾问什么时候联系我？`, `Booking ref ${confId} submitted. When will CrossX contact me?`, `予約番号 ${confId} を提出しました。CrossX はいつ連絡しますか？`, `예약 번호 ${confId} 제출됨. CrossX가 언제 연락하나요?`))}, 'user')">
-            ${pickText("查看预订状态", "Check Booking Status","予約状況を確認", "예약 상태 확인")}
-          </button>
-        </div>`;
-      if (sheet) sheet.insertAdjacentHTML("beforeend", confHtml);
+// ── Chat → Trips save (CX-P1-06) ──────────────────────────────────────────────
+async function _saveItineraryToTrips(cardId) {
+  const cd = _planCardData && _planCardData.get(cardId);
+  const dest = cd ? (cd.destination || cd.city || "") : "";
+  const days = cd ? (cd.duration_days || (cd.days || []).length || 0) : 0;
+  const title = dest ? pickText(`${dest} ${days}天行程`, `${dest} ${days}-day trip`, `${dest} ${days}日旅程`, `${dest} ${days}일 여행`) : pickText("AI生成行程", "AI Itinerary", "AI旅程", "AI 여행");
+  if (!state.currentUserId || state.currentUserId === "anon") {
+    notify(pickText("请先登录以保存行程", "Please sign in to save trips", "旅程を保存するにはログインしてください", "여행을 저장하려면 로그인하세요"), "info");
+    return;
+  }
+  try {
+    const resp = await api("/api/trips", {
+      method: "POST",
+      body: JSON.stringify({ title, city: dest, note: pickText("由 AI Chat 生成", "Generated from AI Chat", "AIチャットで生成", "AI 채팅에서 생성"), durationDays: days }),
+    });
+    if (resp && resp.trip) {
+      notify(pickText("行程已保存到「行程计划」✓", "Saved to Trips ✓", "旅程プランに保存しました ✓", "트립에 저장했습니다 ✓"), "success");
+      await loadTrips();
     }
-  }, 900);
+  } catch (err) {
+    notify(pickText(`保存失败：${err.message}`, `Save failed: ${err.message}`, `保存失敗: ${err.message}`, `저장 실패: ${err.message}`), "error");
+  }
+}
+
+// ── Recommendation feedback (CX-P1-12) ────────────────────────────────────────
+async function _reportRecommendation(btn) {
+  const sheet = btn.closest(".cx-checkout-sheet");
+  const title = sheet ? (sheet.querySelector(".cx-checkout-title")?.textContent || "") : "";
+  const reasons = [
+    pickText("已关门/已停业", "Permanently closed", "閉店した", "폐업함", "Sudah tutup", "أغلق نهائياً"),
+    pickText("信息有误", "Wrong information", "情報が間違っている", "잘못된 정보", "Informasi salah", "معلومات خاطئة"),
+    pickText("价格不准确", "Incorrect price", "価格が不正確", "가격 부정확", "Harga tidak akurat", "سعر غير دقيق"),
+    pickText("其他问题", "Other issue", "その他の問題", "기타 문제", "Masalah lain", "مشكلة أخرى"),
+  ];
+  const pick = await _showInputModal(
+    pickText("请选择反馈原因", "Select feedback reason", "フィードバック理由を選択", "피드백 이유 선택", "Pilih alasan", "اختر السبب"),
+    "",
+    { options: reasons }
+  );
+  if (pick === null) return;
+  const idx = parseInt(pick, 10);
+  if (isNaN(idx) || idx < 0 || idx >= reasons.length) return;
+  fetch("/api/feedback", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type: "recommendation", reason: reasons[idx], item: title, lang: state.uiLanguage }),
+  }).catch(() => {});
+  notify(pickText("感谢反馈，我们会及时修正数据。", "Thanks for your feedback — we'll fix it soon.", "フィードバックをありがとうございます。", "피드백 감사합니다."), "success");
+  if (btn) { btn.textContent = pickText("已反馈 ✓", "Reported ✓", "報告済み ✓", "신고됨 ✓"); btn.disabled = true; }
+}
+
+async function _applyInvoice(evt, orderId) {
+  const form = evt.target;
+  const email = form.email.value.trim();
+  const title = form.title ? form.title.value.trim() : "";
+  const taxId = form.taxId ? form.taxId.value.trim() : "";
+  const resultEl = document.getElementById(`invoiceResult_${orderId}`);
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!email || !emailRegex.test(email)) {
+    if (resultEl) resultEl.textContent = pickText("请输入有效邮箱地址。", "Please enter a valid email address.", "有効なメールアドレスを入力してください。", "유효한 이메일 주소를 입력하세요.");
+    return;
+  }
+  if (resultEl) resultEl.textContent = pickText("提交中…", "Submitting…", "送信中…", "제출 중…");
+  try {
+    await api(`/api/orders/${orderId}/invoice`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ..._authHeaders() },
+      body: JSON.stringify({ email, title, taxId }),
+    });
+    if (resultEl) resultEl.textContent = pickText("发票申请已提交，请查收邮件。", "Invoice request submitted — check your email.", "請求書を申請しました。メールをご確認ください。", "영수증 신청이 완료되었습니다. 이메일을 확인하세요.");
+    notify(pickText("发票申请已提交", "Invoice request submitted", "請求書を申請しました", "영수증 신청 완료"), "success");
+    form.reset();
+  } catch (err) {
+    if (resultEl) resultEl.textContent = pickText("提交失败，请重试。", "Submission failed — please retry.", "送信に失敗しました。再試行してください。", "제출 실패 — 다시 시도하세요.");
+  }
+}
+
+// ── Export / share conversation (P0) ──────────────────────────────────────────
+function exportChat() {
+  const msgs = state.agentConversation && Array.isArray(state.agentConversation.messages) ? state.agentConversation.messages : [];
+  if (!msgs.length) {
+    notify(pickText("暂无对话内容可导出。", "No conversation to export yet.", "エクスポートする会話がありません。", "내보낼 대화가 없습니다."), "info");
+    return;
+  }
+  const date = new Date().toISOString().slice(0, 10);
+  const city = String(state.currentCity || state.city || "China").split("·")[0].trim();
+  const langLabel = { ZH: "中文", EN: "English", JA: "日本語", KO: "한국어", ID: "Bahasa", AR: "العربية" }[state.uiLanguage] || "English";
+  const header = [
+    "Cross X — AI Travel Planner",
+    `Exported: ${date}  |  City: ${city}  |  Language: ${langLabel}`,
+    "=".repeat(60),
+    "",
+  ].join("\n");
+  const body = msgs.map((m) => {
+    const who = m.role === "assistant" ? "CrossX" : m.role === "system" ? "System" : "You";
+    const bar  = m.role === "assistant" ? "────────────────────" : "    ";
+    return `[${who}]\n${String(m.content || "")}\n${bar}`;
+  }).join("\n\n");
+  const footer = "\n\n" + "=".repeat(60) + "\ncrossX.ai — The only travel platform that starts with who you are.";
+  const blob = new Blob([header + body + footer], { type: "text/plain;charset=utf-8" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = `CrossX-chat-${city}-${date}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+  notify(pickText("对话已导出为 .txt 文件。", "Conversation exported as .txt file.", "会話を .txt ファイルとしてエクスポートしました。", "대화를 .txt 파일로 내보냈습니다."), "success");
+}
+
+// ── Offline detection & banner (P1) ───────────────────────────────────────────
+function _initOfflineDetection() {
+  const banner = el.cxOfflineBanner;
+  if (!banner) return;
+  const _update = () => {
+    const offline = !navigator.onLine;
+    banner.classList.toggle("hidden", !offline);
+    if (offline) {
+      const msg = pickText(
+        "当前离线 — 显示缓存对话",
+        "Offline — showing cached conversation",
+        "オフライン — キャッシュした会話を表示中",
+        "오프라인 — 캐시된 대화 표시 중",
+      );
+      if (el.cxOfflineBannerText) el.cxOfflineBannerText.textContent = msg;
+    }
+  };
+  window.addEventListener("online",  _update);
+  window.addEventListener("offline", _update);
+  _update();
+}
+
+// ── Currency preference selector (v8.0 P0) ───────────────────────────────────
+const _CURRENCY_SYMBOL_MAP = {
+  USD: "$", EUR: "\u20ac", GBP: "\u00a3", JPY: "\u00a5", CNY: "\u00a5",
+  KRW: "\u20a9", SAR: "\ufdfc", INR: "\u20b9", IDR: "Rp", MXN: "$",
+  ARS: "$", BRL: "R$", RUB: "\u20bd", AED: "\u062f.\u0625",
+};
+
+function _initCurrencySelector() {
+  if (!el.currencySwitch) return;
+  el.currencySwitch.value = state.currency;
+  if (el.currencyPillLabel) el.currencyPillLabel.textContent = _CURRENCY_SYMBOL_MAP[state.currency] || state.currency;
+  el.currencySwitch.addEventListener("change", () => {
+    const c = el.currencySwitch.value || "USD";
+    state.currency = c;
+    try { localStorage.setItem("cx_currency", c); } catch { /* quota */ }
+    if (el.currencyPillLabel) el.currencyPillLabel.textContent = _CURRENCY_SYMBOL_MAP[c] || c;
+    notify(pickText(`货币偏好已设为 ${c}`, `Currency set to ${c}`, `通貨を ${c} に設定しました`, `통화가 ${c}로 설정되었습니다`), "success");
+  });
+}
+
+// ── Font size toggle A-/A+ (v8.0 P1) ─────────────────────────────────────────
+const _FS_STEPS = [85, 92, 100, 110, 120, 132];
+const _FS_DEFAULT_IDX = 2; // 100%
+
+function _initFontSize() {
+  if (!el.fsDecBtn || !el.fsIncBtn || !el.fsResetBtn) return;
+  let idx = _FS_DEFAULT_IDX;
+  try {
+    const saved = parseInt(localStorage.getItem("cx_fs_idx"), 10);
+    if (!isNaN(saved) && saved >= 0 && saved < _FS_STEPS.length) idx = saved;
+  } catch { /* ignore */ }
+  const apply = () => {
+    document.documentElement.style.fontSize = `${_FS_STEPS[idx]}%`;
+    el.fsDecBtn.disabled = idx <= 0;
+    el.fsIncBtn.disabled = idx >= _FS_STEPS.length - 1;
+    el.fsDecBtn.classList.toggle("cx-fs-btn--active", idx < _FS_DEFAULT_IDX);
+    el.fsResetBtn.classList.toggle("cx-fs-btn--active", idx === _FS_DEFAULT_IDX);
+    el.fsIncBtn.classList.toggle("cx-fs-btn--active", idx > _FS_DEFAULT_IDX);
+    try { localStorage.setItem("cx_fs_idx", String(idx)); } catch { /* quota */ }
+  };
+  apply();
+  el.fsDecBtn.addEventListener("click", () => { if (idx > 0) { idx--; apply(); } });
+  el.fsResetBtn.addEventListener("click", () => { idx = _FS_DEFAULT_IDX; apply(); });
+  el.fsIncBtn.addEventListener("click", () => { if (idx < _FS_STEPS.length - 1) { idx++; apply(); } });
+}
+
+// ── Share read-only itinerary link (v8.0 P1) ──────────────────────────────────
+function _updateShareItinBtnVisibility() {
+  if (!el.shareItinBtn) return;
+  const hasMessages = state.agentConversation.messages && state.agentConversation.messages.length > 1;
+  el.shareItinBtn.style.display = hasMessages ? "" : "none";
+}
+
+async function generateShareLink(btn) {
+  const msgs = state.agentConversation && Array.isArray(state.agentConversation.messages) ? state.agentConversation.messages : [];
+  if (!msgs.length) {
+    notify(pickText("暂无对话内容可分享。", "No conversation to share yet.", "共有できる会話がありません。", "공유할 대화가 없습니다."), "info");
+    return;
+  }
+  try {
+    if (btn) btn.disabled = true;
+    const resp = await api("/api/share", {
+      method: "POST",
+      body: JSON.stringify({
+        messages: msgs.slice(-20),
+        city: state.currentCity || state.city || "",
+        language: state.uiLanguage,
+      }),
+    });
+    const shareId = resp && resp.shareId;
+    if (!shareId) throw new Error("No share ID returned");
+    const url = `${window.location.origin}/?share=${encodeURIComponent(shareId)}`;
+    if (navigator.share) {
+      await navigator.share({ title: "Cross X Itinerary", url });
+    } else if (navigator.clipboard) {
+      await navigator.clipboard.writeText(url);
+      notify(pickText("分享链接已复制！", "Share link copied!", "共有リンクをコピーしました！", "공유 링크가 복사되었습니다!"), "success");
+    } else {
+      prompt(pickText("复制此链接：", "Copy this link:", "このリンクをコピー:", "이 링크를 복사하세요:"), url);
+    }
+  } catch (err) {
+    notify(pickText(`分享失败：${err.message}`, `Share failed: ${err.message}`, `共有失敗: ${err.message}`, `공유 실패: ${err.message}`), "error");
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function _loadSharedConversation(shareId) {
+  try {
+    const data = await api(`/api/share/${encodeURIComponent(shareId)}`);
+    if (!data || !Array.isArray(data.messages)) return;
+    // Render in read-only mode
+    data.messages.forEach((m) => {
+      if (m.role === "user" || m.role === "assistant") {
+        addMessage(String(m.content || ""), m.role === "assistant" ? "agent" : "user");
+      }
+    });
+    notify(pickText("已加载共享行程（只读）", "Shared itinerary loaded (read-only)", "共有の旅程を読み込みました（読み取り専用）", "공유 일정을 불러왔습니다 (읽기 전용)"), "info", 5000);
+  } catch {
+    notify(pickText("加载共享行程失败。", "Could not load shared itinerary.", "共有の旅程を読み込めませんでした。", "공유 일정을 불러오지 못했습니다."), "error");
+  }
+}
+
+// ── Destination emergency contact numbers (v8.0 P1) ──────────────────────────
+const _EMERGENCY_NUMBERS = {
+  ZA: { name: "South Africa", police: "10111", ambulance: "10177", fire: "10111" },
+  JP: { name: "Japan",        police: "110",   ambulance: "119",   fire: "119"   },
+  CN: { name: "China",        police: "110",   ambulance: "120",   fire: "119"   },
+  SG: { name: "Singapore",    police: "999",   ambulance: "995",   fire: "995"   },
+  MY: { name: "Malaysia",     police: "999",   ambulance: "999",   fire: "994"   },
+  TH: { name: "Thailand",     police: "191",   ambulance: "1669",  fire: "199"   },
+  ID: { name: "Indonesia",    police: "110",   ambulance: "118",   fire: "113"   },
+  IN: { name: "India",        police: "100",   ambulance: "108",   fire: "101"   },
+  AE: { name: "UAE",          police: "999",   ambulance: "998",   fire: "997"   },
+  SA: { name: "Saudi Arabia", police: "999",   ambulance: "911",   fire: "998"   },
+  TR: { name: "Turkey",       police: "155",   ambulance: "112",   fire: "110"   },
+  DE: { name: "Germany",      police: "110",   ambulance: "112",   fire: "112"   },
+  FR: { name: "France",       police: "17",    ambulance: "15",    fire: "18"    },
+  GB: { name: "UK",           police: "999",   ambulance: "999",   fire: "999"   },
+  US: { name: "USA",          police: "911",   ambulance: "911",   fire: "911"   },
+  NZ: { name: "New Zealand",  police: "111",   ambulance: "111",   fire: "111"   },
+  AU: { name: "Australia",    police: "000",   ambulance: "000",   fire: "000"   },
+  MV: { name: "Maldives",     police: "119",   ambulance: "102",   fire: "118"   },
+  KR: { name: "South Korea",  police: "112",   ambulance: "119",   fire: "119"   },
+  PH: { name: "Philippines",  police: "117",   ambulance: "161",   fire: "160"   },
+  VN: { name: "Vietnam",      police: "113",   ambulance: "115",   fire: "114"   },
+  PT: { name: "Portugal",     police: "112",   ambulance: "112",   fire: "112"   },
+  ES: { name: "Spain",        police: "112",   ambulance: "112",   fire: "112"   },
+  HI: { name: "Hawaii",       police: "911",   ambulance: "911",   fire: "911"   },
+};
+
+const _CITY_TO_COUNTRY = {
+  tokyo: "JP", osaka: "JP", kyoto: "JP",
+  beijing: "CN", shanghai: "CN", shenzhen: "CN", guangzhou: "CN", chengdu: "CN", chongqing: "CN",
+  "cape town": "ZA", johannesburg: "ZA", durban: "ZA",
+  singapore: "SG", kuala: "MY", "kuala lumpur": "MY",
+  bangkok: "TH", "chiang mai": "TH", phuket: "TH",
+  bali: "ID", jakarta: "ID",
+  dubai: "AE", "abu dhabi": "AE",
+  riyadh: "SA", jeddah: "SA",
+  istanbul: "TR",
+  berlin: "DE", munich: "DE", frankfurt: "DE",
+  paris: "FR", lyon: "FR",
+  london: "GB", manchester: "GB",
+  "new york": "US", "san francisco": "US", "las vegas": "US", chicago: "US",
+  sydney: "AU", melbourne: "AU",
+  auckland: "NZ", queenstown: "NZ",
+  amsterdam: "NL",
+  "ho chi minh": "VN", hanoi: "VN",
+  lisbon: "PT",
+  barcelona: "ES", madrid: "ES",
+  seoul: "KR", busan: "KR",
+  manila: "PH",
+  "male": "MV",
+  mumbai: "IN", delhi: "IN", bangalore: "IN",
+  hawaii: "HI",
+};
+
+function _getEmergencyBlockHtml(destination) {
+  if (!destination) return "";
+  const key = String(destination).toLowerCase();
+  let countryCode = null;
+  for (const [city, cc] of Object.entries(_CITY_TO_COUNTRY)) {
+    if (key.includes(city)) { countryCode = cc; break; }
+  }
+  if (!countryCode) return "";
+  const em = _EMERGENCY_NUMBERS[countryCode];
+  if (!em) return "";
+  const label = pickText("紧急联系号码", "Emergency Numbers", "緊急連絡先", "긴급 연락처");
+  return `<div class="cx-emergency-block">
+    <strong>🆘 ${escapeHtml(label)} · ${escapeHtml(em.name)}</strong>
+    <span>Police: ${escapeHtml(em.police)} &nbsp;|&nbsp; Ambulance: ${escapeHtml(em.ambulance)} &nbsp;|&nbsp; Fire: ${escapeHtml(em.fire)}</span>
+  </div>`;
+}
+
+// ── Arrival orientation mode (v8.0 P1) ───────────────────────────────────────
+const _ARRIVAL_REGEX = /\b(just arrived|just landed|arriving|i(?:'ve| have) landed|from (?:the )?airport|airport exit|terminal|baggage claim|customs|ground transportation|how (?:do i )?get (?:from|to) (?:the )?airport)\b/i;
+
+const _AIRPORT_GUIDES = {
+  shanghai: { airport: "Pudong Airport (PVG) / Hongqiao (SHA)", guide: [
+    "Exit arrivals hall → follow signs to Maglev (PVG) or Metro Line 2 (both airports)",
+    "Maglev to Longyang Rd: 8 min, \u00a550 CNY — then Metro to city center",
+    "Metro Line 2 direct: 45-60 min, \u00a57-8 CNY",
+    "Taxi rank: outside arrivals, metered, \u00a5150-200 CNY to city center",
+    "Didi app: scan QR at taxi desk or use Didi app — typically cheaper",
+  ]},
+  beijing: { airport: "Capital Airport (PEK) / Daxing (PKX)", guide: [
+    "PEK: Airport Express train to Dongzhimen: 16-28 min, \u00a525 CNY",
+    "PKX: Daxing Line Metro to city: ~35 min, \u00a530 CNY",
+    "Taxi rank: outside arrivals Level 1 — metered, \u00a5100-150 CNY to center",
+    "Didi: available at both airports — book from app",
+  ]},
+  tokyo: { airport: "Narita (NRT) / Haneda (HND)", guide: [
+    "Narita: Narita Express (N'EX) to Shinjuku 90 min, \u00a53,070 — buy IC card at airport",
+    "Haneda: Keikyu Line to Shinagawa 13 min, \u00a5300 — or monorail to Hamamatsucho",
+    "IC Card (Suica/Pasmo): buy at machine in arrivals, use for all trains/buses/shops",
+    "Taxi: expensive — Narita to central Tokyo \u00a520,000+",
+  ]},
+  singapore: { airport: "Changi Airport", guide: [
+    "MRT Changi Airport station: follow green signs, \u00a52.50-3.50 SGD to city",
+    "Taxi rank: level 1 arrivals — metered, ~SGD 20-35 to city",
+    "Grab app: available at Changi — book from app",
+    "Bus 36 to Orchard/City Hall: \u00a22.50 SGD (need EZ-Link card)",
+  ]},
+  dubai: { airport: "Dubai International (DXB)", guide: [
+    "Metro Red Line from Terminal 1/3: runs 5:50am-midnight, AED 3-8",
+    "Terminal 2: no Metro — take bus or taxi",
+    "Taxi: AED 25-60 to most city areas, airport surcharge applies",
+    "Uber/Careem: available — book from app in arrivals",
+  ]},
+  amsterdam: { airport: "Schiphol Airport", guide: [
+    "Follow signs to 'Trains' — platforms below Arrivals Hall",
+    "Train to Amsterdam Centraal: 15-20 min, \u20ac5-6 — buy OV-chipkaart (reusable)",
+    "Buy ticket at yellow NS machines — Intercity Direct is fastest",
+    "Taxi: ~\u20ac45-55 to city center, official Schiphol taxis only (blue/white)",
+  ]},
+};
+
+function _getArrivalGuideHtml(destination) {
+  if (!destination) return null;
+  const key = String(destination).toLowerCase();
+  for (const [city, info] of Object.entries(_AIRPORT_GUIDES)) {
+    if (key.includes(city)) {
+      const steps = info.guide.map((s, i) => `<li>${escapeHtml(s)}</li>`).join("");
+      return `<div class="cx-arrival-guide">
+        <strong>✈️ ${escapeHtml(info.airport)} — ${pickText("到达指南", "Arrival Guide", "到着ガイド", "도착 가이드")}</strong>
+        <ol>${steps}</ol>
+      </div>`;
+    }
+  }
+  return null;
+}
+
+function _checkArrivalIntent(text) {
+  if (!_ARRIVAL_REGEX.test(text)) return false;
+  const city = (state.currentCity || state.city || state.agentConversation.slots.city || "").toLowerCase();
+  const guide = _getArrivalGuideHtml(city || text);
+  if (guide) {
+    setTimeout(() => addMessage(guide, "agent", { speak: false }), 300);
+    return true;
+  }
+  return false;
+}
+
+// ── PDF / print export (v8.0 P0) ─────────────────────────────────────────────
+function printItinerary() {
+  const msgs = state.agentConversation && Array.isArray(state.agentConversation.messages) ? state.agentConversation.messages : [];
+  if (!msgs.length) {
+    notify(pickText("暂无对话内容可打印。", "No conversation to print yet.", "印刷できる会話がありません。", "인쇄할 대화가 없습니다."), "info");
+    return;
+  }
+  const date = new Date().toISOString().slice(0, 10);
+  const city = String(state.currentCity || state.city || "").split("·")[0].trim() || "CrossX";
+  const currency = state.currency || "USD";
+  const rows = msgs
+    .filter((m) => m.role === "user" || m.role === "assistant")
+    .map((m) => {
+      const who = m.role === "assistant" ? "CrossX" : pickText("您", "You", "あなた", "나");
+      const content = escapeHtml(String(m.content || "")).replace(/\n/g, "<br>");
+      return `<tr><td class="cx-print-who">${escapeHtml(who)}</td><td class="cx-print-msg">${content}</td></tr>`;
+    })
+    .join("");
+  const html = `<!doctype html><html><head><meta charset="UTF-8">
+<title>CrossX — ${escapeHtml(city)} — ${date}</title>
+<style>
+body{font-family:system-ui,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;color:#111}
+h1{font-size:20px;color:#1a56db;margin-bottom:4px}
+.cx-print-meta{font-size:12px;color:#6b7280;margin-bottom:20px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#f3f4f6;text-align:left;padding:8px 10px;border:1px solid #e5e7eb;font-size:12px}
+td{padding:8px 10px;border:1px solid #e5e7eb;vertical-align:top}
+.cx-print-who{width:80px;font-weight:600;color:#374151;white-space:nowrap}
+.cx-print-msg{color:#111}
+footer{margin-top:30px;font-size:11px;color:#9ca3af;border-top:1px solid #e5e7eb;padding-top:12px}
+@media print{footer{position:fixed;bottom:0;width:100%}}
+</style></head><body>
+<h1>Cross X \u2014 ${escapeHtml(city)}</h1>
+<div class="cx-print-meta">Exported: ${date} &nbsp;|&nbsp; Currency: ${escapeHtml(currency)} &nbsp;|&nbsp; crossx.ai</div>
+<table><thead><tr><th>From</th><th>Message</th></tr></thead><tbody>${rows}</tbody></table>
+<footer>Generated by Cross X &mdash; AI Travel Planner for China &amp; Asia</footer>
+</body></html>`;
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  const url  = URL.createObjectURL(blob);
+  const win  = window.open(url, "_blank");
+  if (win) {
+    win.addEventListener("load", () => {
+      setTimeout(() => { win.print(); URL.revokeObjectURL(url); }, 400);
+    });
+  } else {
+    // Fallback: download as HTML
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `CrossX-itinerary-${city}-${date}.html`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+    notify(pickText("已下载 HTML 行程文件。", "Itinerary downloaded as HTML.", "旅程をHTMLとしてダウンロードしました。", "여정을 HTML로 다운로드했습니다."), "success");
+  }
+}
+
+// ── Image OCR/translation via OpenAI Vision (P2) ──────────────────────────────
+function _initImageUpload() {
+  if (!el.chatImageInput) return;
+  el.chatImageInput.setAttribute("multiple", "");
+  el.chatImageInput.addEventListener("change", async () => {
+    const files = el.chatImageInput.files ? [...el.chatImageInput.files] : [];
+    el.chatImageInput.value = "";
+    if (!files.length) return;
+    const MAX_SIZE = 4 * 1024 * 1024;
+    const tooBig = files.filter((f) => f.size > MAX_SIZE);
+    if (tooBig.length) {
+      notify(pickText("每张图片不能超过 4MB。", "Each image must be under 4MB.", "各画像は4MB以下にしてください。", "각 이미지는 4MB 이하여야 합니다."), "warning");
+      return;
+    }
+    addMessage(
+      files.length > 1
+        ? pickText(`正在识别 ${files.length} 张图片…`, `Reading ${files.length} images…`, `${files.length} 枚の画像を読み取り中…`, `${files.length}개 이미지 분석 중…`)
+        : pickText("正在识别图片内容…", "Reading image…", "画像を読み取り中…", "이미지 분석 중…"),
+      "system",
+    );
+    // Read all files as base64, then send in batch
+    const toBase64 = (f) => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (ev) => resolve({ imageBase64: ev.target.result.split(",")[1], mimeType: f.type || "image/jpeg" });
+      reader.onerror = reject;
+      reader.readAsDataURL(f);
+    });
+    try {
+      const images = await Promise.all(files.map(toBase64));
+      const resp = await api("/api/chat/ocr", {
+        method: "POST",
+        body: JSON.stringify({ images, language: state.uiLanguage }),
+      });
+      const text = resp && resp.text ? String(resp.text).trim() : "";
+      if (!text) {
+        notify(pickText("无法识别图片内容。", "Could not read image.", "画像を認識できませんでした。", "이미지를 인식하지 못했습니다."), "warning");
+        return;
+      }
+      if (el.chatInput) {
+        el.chatInput.value = text;
+        autoResizeChatInput();
+        updateChatSendState();
+      }
+      notify(pickText("图片已识别，请确认内容后发送。", "Image read — please confirm and send.", "画像を認識しました。内容を確認して送信してください。", "이미지를 인식했습니다. 확인 후 전송하세요."), "success", 5000);
+    } catch {
+      notify(pickText("图片识别失败，请重试。", "Image read failed — try again.", "画像認識に失敗しました。再試行してください。", "이미지 인식 실패 — 다시 시도하세요."), "error");
+    }
+  });
+}
+
+// ── CrossX booking platform selector — replaced fake confirmation ─────────────
+function crossXConfirmBooking(btn, hotelName, destination, totalPrice) {
+  const sheet = btn.closest(".cx-checkout-sheet");
+  const searchTerm = hotelName || destination || "";
+  const isZH = state.uiLanguage === "ZH";
+
+  // Extract dates from session constraints for pre-filled booking URLs
+  const _sc       = state.selectedConstraints || {};
+  const _checkIn  = _sc.check_in  || _sc.checkIn  || _sc.checkin  || "";
+  const _checkOut = _sc.check_out || _sc.checkOut || _sc.checkout || "";
+  const _navLc = (navigator.language || "").toLowerCase();
+  const _bookingLang = state.uiLanguage === "JA" ? "ja" : state.uiLanguage === "KO" ? "ko" : state.uiLanguage === "ZH" ? "zh-cn" : state.uiLanguage === "ID" ? "id" : state.uiLanguage === "AR" ? "ar" : _navLc.startsWith("es") ? "es" : _navLc.startsWith("fr") ? "fr" : _navLc.startsWith("de") ? "de" : _navLc.startsWith("pt") ? "pt-br" : "en-us";
+  const _agodaLang   = state.uiLanguage === "JA" ? "ja-jp" : state.uiLanguage === "KO" ? "ko-kr" : state.uiLanguage === "ID" ? "id-id" : state.uiLanguage === "AR" ? "ar-ae" : _navLc.startsWith("es") ? "es-es" : _navLc.startsWith("fr") ? "fr-fr" : _navLc.startsWith("de") ? "de-de" : "en-us";
+  function _bookingUrl(base, kw) {
+    let url = base + `?ss=${encodeURIComponent(kw)}&lang=${_bookingLang}&group_adults=2`;
+    if (_checkIn)  url += `&checkin=${encodeURIComponent(_checkIn)}`;
+    if (_checkOut) url += `&checkout=${encodeURIComponent(_checkOut)}`;
+    return url;
+  }
+  function _agodaUrl(kw) {
+    let url = `https://www.agoda.com/search?city=${encodeURIComponent(kw)}&rooms=1&adults=2&children=0&locale=${_agodaLang}`;
+    if (_checkIn)  url += `&checkIn=${encodeURIComponent(_checkIn)}`;
+    if (_checkOut) url += `&checkOut=${encodeURIComponent(_checkOut)}`;
+    return url;
+  }
+  function _ctripUrl(kw) {
+    let url = `https://m.ctrip.com/webapp/hotel/list/?hotelname=${encodeURIComponent(kw)}`;
+    if (_checkIn)  url += `&checkindate=${encodeURIComponent(_checkIn)}`;
+    if (_checkOut) url += `&checkoutdate=${encodeURIComponent(_checkOut)}`;
+    return url;
+  }
+
+  const _titleLabel = searchTerm
+    ? pickText(`预订 ${searchTerm}`, `Book ${searchTerm}`, `${searchTerm} を予約`, `${searchTerm} 예약`)
+    : pickText("选择预订平台完成预订", "Choose a booking platform", "予約プラットフォームを選択", "예약 플랫폼을 선택하세요");
+  const _mapsQuery = encodeURIComponent(`${searchTerm} ${destination || ""}`.trim());
+  const _mapsUrl   = isZH
+    ? `https://uri.amap.com/search?keyword=${encodeURIComponent(searchTerm)}&city=${encodeURIComponent(destination || "")}`
+    : `https://www.google.com/maps/search/?api=1&query=${_mapsQuery}`;
+  const _mapsLabel = pickText("查看地图", "View on Map", "地図で見る", "지도에서 보기", "Lihat di Peta", "عرض على الخريطة");
+  const _mapsLinkHtml = searchTerm ? `<a class="cx-book-btn cx-book-maps" href="${escapeHtml(_mapsUrl)}" target="_blank" rel="noopener">🗺 ${escapeHtml(_mapsLabel)}</a>` : "";
+
+  let linksHtml;
+  if (isZH) {
+    const ctripUrl   = escapeHtml(_ctripUrl(searchTerm));
+    const meituanUrl = escapeHtml(PLATFORM_DEEPLINKS.meituan.url(searchTerm));
+    linksHtml = `
+      <div class="cx-confirm-panel" id="cx-confirm-panel-current">
+        <img class="cx-confirm-img hidden" id="cx-confirm-img-current" src="" alt="" />
+        <div class="cx-confirm-title">${escapeHtml(_titleLabel)}</div>
+        <div class="cx-book-btn-wrap cx-book-multi" style="margin-top:12px">
+          <a class="cx-book-btn cx-book-ctrip"   href="${ctripUrl}"   target="_blank" rel="noopener">🏨 携程 Ctrip</a>
+          <a class="cx-book-btn cx-book-meituan"  href="${meituanUrl}" target="_blank" rel="noopener">🛎️ 美团 Meituan</a>
+          ${_mapsLinkHtml}
+        </div>
+        <div class="cx-confirm-note">${pickText("点击后将在平台完成预订，官方确认由平台直接发送到您的账号。", "", "", "")}</div>
+      </div>`;
+  } else {
+    const bookingUrl = escapeHtml(_bookingUrl("https://www.booking.com/search.html", searchTerm));
+    const agodaUrl   = escapeHtml(_agodaUrl(searchTerm));
+    const klookUrl   = escapeHtml(PLATFORM_DEEPLINKS.klook.url(searchTerm));
+    linksHtml = `
+      <div class="cx-confirm-panel" id="cx-confirm-panel-current">
+        <img class="cx-confirm-img hidden" id="cx-confirm-img-current" src="" alt="" />
+        <div class="cx-confirm-title">${escapeHtml(_titleLabel)}</div>
+        <div class="cx-book-btn-wrap cx-book-multi" style="margin-top:12px">
+          <a class="cx-book-btn cx-book-booking" href="${bookingUrl}" target="_blank" rel="noopener">🏨 Booking.com</a>
+          <a class="cx-book-btn cx-book-agoda"   href="${agodaUrl}"   target="_blank" rel="noopener">🏩 Agoda</a>
+          <a class="cx-book-btn cx-book-klook"   href="${klookUrl}"   target="_blank" rel="noopener">🎫 Klook</a>
+          ${_mapsLinkHtml}
+        </div>
+        <div class="cx-confirm-note">${pickText("", "Tap a platform to complete your real booking. Your confirmation will be sent directly by the platform.", "上記をタップしてプラットフォームで予約を完了してください。確認書はプラットフォームから直接送信されます。", "위 플랫폼을 탭하여 예약을 완료하세요. 확인서는 플랫폼에서 직접 발송됩니다.", "Ketuk platform di atas untuk menyelesaikan pemesanan. Konfirmasi akan dikirim langsung oleh platform.", "انقر على منصة لإتمام حجزك الحقيقي. سيتم إرسال التأكيد مباشرة من المنصة.")}</div>
+      </div>`;
+  }
+
+  btn.style.display = "none";
+  // Inject emergency numbers block for the destination (v8.0 P1)
+  const _emHtml = _getEmergencyBlockHtml(destination || searchTerm);
+  if (_emHtml && sheet) sheet.insertAdjacentHTML("beforeend", _emHtml);
+  if (sheet) sheet.insertAdjacentHTML("beforeend", linksHtml);
+
+  // P0-1: Fetch place photo from Wikipedia and inject if found
+  if (searchTerm) {
+    const uniqueId = `cx-img-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const imgEl = document.getElementById("cx-confirm-img-current");
+    if (imgEl) {
+      imgEl.id = uniqueId; // Replace with unique ID to avoid race conditions
+    }
+
+    fetch(`/api/rag/image?q=${encodeURIComponent(searchTerm)}`)
+      .then((r) => { if (!r.ok) throw new Error("photo not found"); return r.json(); })
+      .then(({ imageUrl }) => {
+        if (!imageUrl) return;
+        const targetImg = document.getElementById(uniqueId);
+        if (!targetImg) return;
+        targetImg.src = imageUrl;
+        targetImg.alt = searchTerm;
+        targetImg.classList.remove("hidden");
+      })
+      .catch(() => {});
+  }
+
+  // Clear the panel ID so future panels can use it
+  setTimeout(() => {
+    const panel = document.getElementById("cx-confirm-panel-current");
+    if (panel) panel.removeAttribute("id");
+  }, 100);
 }
 
 // ── Typewriter animation for analysis text ───────────────────────────────
@@ -9640,7 +11261,7 @@ function renderItineraryOptionsCard(structured) {
 
   // Arrival transport banner
   const arrivalBanner = structured.arrival_transport
-    ? `<div class="arrival-banner"><span class="arrival-icon">✈️→🏨</span> <strong>机场到酒店：</strong>${escapeHtml(structured.arrival_transport)}</div>`
+    ? `<div class="arrival-banner"><span class="arrival-icon">✈️→🏨</span> <strong>${pickText("机场到酒店：", "Airport → Hotel: ", "空港→ホテル：", "공항→호텔：")}</strong>${escapeHtml(structured.arrival_transport)}</div>`
     : "";
 
   const optCards = opts.map((opt, i) => {
@@ -9656,16 +11277,16 @@ function renderItineraryOptionsCard(structured) {
     const total = opt.total_cost || 1;
     const breakdownBar = (bd.hotel || bd.transport || bd.meals)
       ? `<div class="budget-breakdown-bar">
-          ${bd.hotel   ? `<div class="bb-seg bb-hotel"   style="width:${Math.round(bd.hotel/total*100)}%"   title="酒店 ¥${bd.hotel.toLocaleString()}">🏨</div>` : ""}
-          ${bd.meals   ? `<div class="bb-seg bb-meals"   style="width:${Math.round(bd.meals/total*100)}%"   title="餐饮 ¥${bd.meals.toLocaleString()}">🍜</div>` : ""}
-          ${bd.transport? `<div class="bb-seg bb-transport" style="width:${Math.round(bd.transport/total*100)}%" title="交通 ¥${bd.transport.toLocaleString()}">🚇</div>` : ""}
-          ${bd.misc    ? `<div class="bb-seg bb-misc"    style="width:${Math.round(bd.misc/total*100)}%"    title="其他 ¥${bd.misc.toLocaleString()}">📦</div>` : ""}
+          ${bd.hotel   ? `<div class="bb-seg bb-hotel"   style="width:${Math.round(bd.hotel/total*100)}%"   title="${pickText("酒店","Hotel","ホテル","호텔")} ¥${bd.hotel.toLocaleString()}">🏨</div>` : ""}
+          ${bd.meals   ? `<div class="bb-seg bb-meals"   style="width:${Math.round(bd.meals/total*100)}%"   title="${pickText("餐饮","Food","食事","식사")} ¥${bd.meals.toLocaleString()}">🍜</div>` : ""}
+          ${bd.transport? `<div class="bb-seg bb-transport" style="width:${Math.round(bd.transport/total*100)}%" title="${pickText("交通","Transport","交通","교통")} ¥${bd.transport.toLocaleString()}">🚇</div>` : ""}
+          ${bd.misc    ? `<div class="bb-seg bb-misc"    style="width:${Math.round(bd.misc/total*100)}%"    title="${pickText("其他","Other","その他","기타")} ¥${bd.misc.toLocaleString()}">📦</div>` : ""}
         </div>
         <div class="bb-legend">
-          ${bd.hotel    ? `<span>🏨 酒店 ¥${Number(bd.hotel).toLocaleString()}</span>` : ""}
-          ${bd.meals    ? `<span>🍜 餐饮 ¥${Number(bd.meals).toLocaleString()}</span>` : ""}
-          ${bd.transport? `<span>🚇 交通 ¥${Number(bd.transport).toLocaleString()}</span>` : ""}
-          ${bd.misc     ? `<span>📦 其他 ¥${Number(bd.misc).toLocaleString()}</span>` : ""}
+          ${bd.hotel    ? `<span>🏨 ${pickText("酒店","Hotel","ホテル","호텔")} ¥${Number(bd.hotel).toLocaleString()}</span>` : ""}
+          ${bd.meals    ? `<span>🍜 ${pickText("餐饮","Food","食事","식사")} ¥${Number(bd.meals).toLocaleString()}</span>` : ""}
+          ${bd.transport? `<span>🚇 ${pickText("交通","Transport","交通","교통")} ¥${Number(bd.transport).toLocaleString()}</span>` : ""}
+          ${bd.misc     ? `<span>📦 ${pickText("其他","Other","その他","기타")} ¥${Number(bd.misc).toLocaleString()}</span>` : ""}
         </div>`
       : "";
 
@@ -9673,7 +11294,7 @@ function renderItineraryOptionsCard(structured) {
       <article class="itinerary-option-card ${tierClass}">
         ${isRecommended ? `<div class="recommended-badge">${pickText("✦ 推荐 · 最佳性价比", "✦ Best Value","おすすめ", "추천")}</div>` : ""}
         <div class="option-header">
-          <span class="option-tag">${escapeHtml(opt.tag || `方案 ${i + 1}`)}</span>
+          <span class="option-tag">${escapeHtml(opt.tag || pickText(`方案 ${i + 1}`, `Plan ${i + 1}`, `プラン ${i + 1}`, `플랜 ${i + 1}`))}</span>
           <div class="option-price">
             <span class="price-currency">¥</span>
             <span class="price-amount">${escapeHtml(totalFmt)}</span>
@@ -9682,7 +11303,7 @@ function renderItineraryOptionsCard(structured) {
         <div class="option-details">
           <div class="option-detail-row">
             <span class="detail-label">🏨</span>
-            <span><strong>${escapeHtml(opt.hotel_name || "-")}</strong>${opt.hotel_area ? ` · ${escapeHtml(opt.hotel_area)}` : ""}${opt.hotel_includes_breakfast ? " <em>(含早)</em>" : ""} <span class="price-per-night">¥${Number(opt.hotel_price_per_night || 0).toLocaleString()}/晚</span></span>
+            <span><strong>${escapeHtml(opt.hotel_name || "-")}</strong>${opt.hotel_area ? ` · ${escapeHtml(opt.hotel_area)}` : ""}${opt.hotel_includes_breakfast ? ` <em>(${pickText("含早","Incl. breakfast","朝食付き","조식포함")})</em>` : ""} <span class="price-per-night">¥${Number(opt.hotel_price_per_night || 0).toLocaleString()}/${pickText("晚","night","泊","박")}</span></span>
           </div>
           <div class="option-detail-row">
             <span class="detail-label">🚇</span>
@@ -9732,7 +11353,7 @@ function handleCardPaymentConfirm(btn) {
   }
   addMessage(
     pickText(
-      "方案已确认！请依次点击每项右侧的平台按钮完成预订 —— 🏨 携程预订酒店，🍜 美团找餐厅，🚇 滴滴叫车。",
+      pickText("方案已确认！请依次点击每项右侧的平台按钮完成预订 —— 🏨 携程预订酒店，🍜 美团找餐厅，🚇 滴滴叫车。", "Plan confirmed! Click each item's booking button to complete — 🏨 Booking.com for hotel, 🎫 Klook for activities, 🚕 DiDi/Grab for transport.", "プランが確定しました！各項目の予約ボタンをクリックしてください — 🏨 ホテルはBooking.com、🎫 アクティビティはKlook、🚕 交通はDiDi。", "계획 확정! 각 항목의 예약 버튼을 클릭하세요 — 🏨 Booking.com으로 호텔, 🎫 Klook으로 액티비티, 🚕 DiDi로 교통."),
       "Plan confirmed! Tap each platform button to complete bookings — Ctrip for hotel, Meituan for food, Didi for rides.",
       "プランが確定しました。各プラットフォームのボタンをタップして予約を完了させてください。",
       "플랜 확정! 각 플랫폼 버튼을 눌러 예약을 완료하세요."
@@ -9880,12 +11501,38 @@ async function captureLocationFromBrowser(triggerBtn = null) {
         );
         await Promise.all([loadNearSuggestions(), loadAuditLogs()]);
       } catch (err) {
+        // Fallback: try IP-based location
+        try {
+          const ipData = await api("/api/user/location", {
+            method: "POST",
+            body: JSON.stringify({ lat: null, lng: null, source: "ip_fallback" }),
+          });
+          if (ipData && ipData.city) {
+            if (el.locationTag) el.locationTag.textContent = `${ipData.city} · IP`;
+            state.selectedConstraints.city = ipData.city;
+            state.selectedConstraints.origin = "ip_fallback";
+            syncChipSelectionFromConstraints();
+            updateContextSummary();
+            renderQuickGoals();
+            notify(
+              pickText(
+                `已通过网络IP估算位置：${ipData.city}（如不准确请手动选择城市）`,
+                `Location estimated via IP: ${ipData.city}. Tap a city chip to override.`,
+                `IPから位置を推定しました: ${ipData.city}（正確でない場合は都市を選択してください）`,
+                `IP로 위치 추정: ${ipData.city}. 도시 칩을 눌러 변경하세요.`,
+              ),
+              "warning",
+            );
+            await Promise.all([loadNearSuggestions(), loadAuditLogs()]);
+            return;
+          }
+        } catch { /* IP fallback also failed, show manual prompt below */ }
         notify(
           pickText(
-            "定位失败，请检查浏览器定位权限。",
-            "Location failed. Please check browser permission.",
-            "位置情報の取得に失敗しました。ブラウザ権限を確認してください。",
-            "위치 확인에 실패했습니다. 브라우저 권한을 확인하세요.",
+            "定位失败，请检查浏览器定位权限，或在上方点击城市手动选择。",
+            "Location failed. Check browser permissions or tap a city chip above to set manually.",
+            "位置情報の取得に失敗しました。ブラウザ権限を確認するか、都市を手動で選択してください。",
+            "위치 확인 실패. 브라우저 권한을 확인하거나 도시 칩을 눌러 수동으로 선택하세요.",
           ),
           "error",
         );
@@ -9900,22 +11547,69 @@ async function createTaskFromText(text) {
     _currentPlanAbortController.abort();
     _currentPlanAbortController = null;
   }
+  if (window._planStreamGuardTimer) {
+    clearTimeout(window._planStreamGuardTimer); // Clear previous timer to prevent race condition
+    window._planStreamGuardTimer = null;
+  }
   _currentPlanAbortController = new AbortController();
   const _planStreamSignal = _currentPlanAbortController.signal;
   // U2: Safety guard — auto-abort if stream takes >180s (prevents infinite spinner)
-  const _planStreamGuardTimer = setTimeout(() => {
+  window._planStreamGuardTimer = setTimeout(() => {
     if (_currentPlanAbortController && _currentPlanAbortController.signal === _planStreamSignal) {
       console.warn("[plan] 180s guard triggered — aborting hung stream");
       _currentPlanAbortController.abort();
     }
   }, 180000);
   setLoopProgress("intent");
+
+  // Halal / dietary / accessibility disclaimer — shown once per session when relevant
+  const _textLower = String(text || "").toLowerCase();
+  const _disclaimerKey = "cx_disclaimer_shown";
+  const _needsDisclaimer = /halal|清真|vegan|纯素|vegetarian|素食|wheelchair|accessible|无障碍/.test(_textLower);
+  if (_needsDisclaimer) {
+    try {
+      if (!sessionStorage.getItem(_disclaimerKey)) {
+        sessionStorage.setItem(_disclaimerKey, "1");
+        const _isA11y = /wheelchair|accessible|无障碍/.test(_textLower);
+        const _msg = _isA11y
+          ? pickText(
+              "♿ 提示：无障碍设施信息来自第三方数据，未经独立核实。出行前请直接联系商家确认轮椅通道、电梯等设施。",
+              "♿ Note: Accessibility info is sourced from third-party data and has not been independently verified. Please confirm wheelchair access, elevators, and facilities directly with the venue before booking.",
+              "♿ 注意：バリアフリー情報はサードパーティのデータに基づいており、独立した検証はされていません。予約前に施設に直接ご確認ください。",
+              "♿ 참고: 접근성 정보는 제3자 데이터를 기반으로 하며 독립적으로 검증되지 않았습니다. 예약 전 시설에 직접 확인하세요.",
+            )
+          : pickText(
+              "🍽️ 提示：清真/素食认证信息来自第三方数据，未经独立核实。请在就餐前直接向餐厅确认认证情况。",
+              "🍽️ Note: Halal/vegan status is based on third-party data and has not been independently verified. Please confirm dietary compliance directly with the restaurant before ordering.",
+              "🍽️ 注意：ハラール・ビーガン情報はサードパーティのデータに基づいており、独立した検証はされていません。注文前に直接レストランにご確認ください。",
+              "🍽️ 참고: 할랄/비건 정보는 제3자 데이터를 기반으로 하며 독립적으로 검증되지 않았습니다. 주문 전 식당에 직접 확인하세요.",
+            );
+        setTimeout(() => addMessage(_msg, "system"), 400);
+      }
+    } catch { /* ignore */ }
+  }
+
   if (!Array.isArray(state.agentConversation.messages)) state.agentConversation.messages = [];
   // Build history from PREVIOUS turns only, BEFORE pushing current user message
   const conversationHistory = state.agentConversation.messages.slice(-6).map((m) => ({
     role: m.role,
     content: m.content,
   }));
+  // Persist dietary/religious constraints as a pinned system reminder on every request.
+  // This ensures halal/vegetarian/vegan requirements survive long conversations where the
+  // original constraint message has scrolled out of the 6-turn history window.
+  const _activeDiet = state.selectedConstraints && state.selectedConstraints.dietary;
+  if (_activeDiet) {
+    const _dietLabel =
+      _activeDiet === "halal"       ? pickText("清真（无猪肉/酒精，仅清真认证食品）", "Halal (no pork/alcohol, certified halal only)", "ハラール（豚肉・アルコール不可、認証済みのみ）", "할랄 (돼지고기/알코올 불가, 인증 할랄만)", "Halal (tanpa babi/alkohol, hanya halal bersertifikat)", "حلال (بدون لحم خنزير/كحول، معتمد حلال فقط)")
+      : _activeDiet === "vegetarian" ? pickText("素食（无肉蛋鱼）", "Vegetarian (no meat, fish, or eggs)", "ベジタリアン（肉・魚・卵不可）", "채식 (고기, 생선, 계란 불가)", "Vegetarian (tanpa daging, ikan, atau telur)", "نباتي (بدون لحم أو سمك أو بيض)")
+      : _activeDiet === "vegan"      ? pickText("纯素（无任何动物制品）", "Vegan (no animal products)", "完全菜食主義（動物性食品全般不可）", "비건 (모든 동물성 식품 불가)", "Vegan (tanpa produk hewani)", "نباتي صارم (بدون منتجات حيوانية)")
+      : _activeDiet;
+    conversationHistory.unshift({
+      role: "system",
+      content: `[Dietary requirement — apply to ALL food and restaurant suggestions throughout this conversation]: ${_dietLabel}`,
+    });
+  }
   // Store for on-demand detail fetch (revealPlanItinerary uses this)
   state.lastPlanMessage = text;
   // Now store current user message and persist
@@ -9964,6 +11658,11 @@ async function createTaskFromText(text) {
           const _dest   = _extractDestFromText(text);
           const _foodKw = _extractFoodKw(text);
           const _toolName = code.startsWith("TOOL:") ? code.slice(5) : code;
+          // First tool call: swap typing bubble for context-aware skeleton
+          if (code.startsWith("TOOL:") && !_toolSkeletonEl) {
+            _removeTypingBubble(_typingBubble);
+            _showToolSkeleton(_toolName, _extractDestFromText(text));
+          }
           const stepCode  = TOOL_STEP_MAP[_toolName] || code;  // map agent tool → step id
           appendThinkingStep(_thinkingStream, stepCode, label);
           const fn = REALTIME_THINKING_MAP[_toolName];
@@ -9985,7 +11684,32 @@ async function createTaskFromText(text) {
         teardownThinkingUI(_thinkingStream, _planSkeleton); // clean up immediately on abort
         return null;
       }
-      return { type: "error", msg: null }; // let existing error handler render the card
+      // Map specific HTTP error codes to actionable user messages
+      let _specificMsg = null;
+      const _eMsg = (e && e.message) || "";
+      if (_eMsg.includes("429")) {
+        _specificMsg = pickText(
+          "请求太频繁，请稍候片刻再试。",
+          "Too many requests. Please wait a moment and try again.",
+          "リクエストが多すぎます。しばらくしてから再試行してください。",
+          "요청이 너무 많습니다. 잠시 후 다시 시도하세요.",
+        );
+      } else if (_eMsg.includes("503") || _eMsg.includes("502")) {
+        _specificMsg = pickText(
+          "服务器暂时繁忙，请稍后再试。",
+          "Server is busy right now. Please try again in a moment.",
+          "サーバーが混み合っています。しばらくしてから再試行してください。",
+          "서버가 일시적으로 바쁩니다. 잠시 후 다시 시도하세요.",
+        );
+      } else if (_eMsg.includes("408") || _eMsg.includes("timeout") || _eMsg.includes("Timeout")) {
+        _specificMsg = pickText(
+          "请求超时，请检查网络连接后重试。",
+          "Request timed out. Check your connection and try again.",
+          "リクエストがタイムアウトしました。接続を確認して再試行してください。",
+          "요청 시간이 초과되었습니다. 연결을 확인하고 다시 시도하세요.",
+        );
+      }
+      return { type: "error", msg: _specificMsg }; // let existing error handler render the card
     }
   })();
   syncChipSelectionFromConstraints();
@@ -10038,7 +11762,7 @@ async function createTaskFromText(text) {
     const data = await api("/api/tasks", {
       method: "POST",
       body: JSON.stringify({
-        userId: "demo",
+        userId: (_getAuthUserId && _getAuthUserId()) || "demo",
         intent: text,
         constraints: mergedConstraints,
         tripId: state.activeTripId || undefined,
@@ -10061,11 +11785,13 @@ async function createTaskFromText(text) {
     renderAgentBrain(state.currentTask);
     setLoopProgress("plan");
     if (store) store.dispatch({ type: "SET_TASK", task: data.task });
-    await trackEvent("intent_submitted", { textLen: text.length, constraints: mergedConstraints, inferred }, data.task.id);
+    const _intentAxis = _iFood ? "food" : _iStay ? "hotel" : _iSight ? "activity" : "travel";
+    await trackEvent("intent_submitted", { textLen: String(text.length), intent: _intentAxis, lang: state.uiLanguage || "EN" }, data.task.id);
     const smart = await smartReplyPromise;
     clearInterval(thinkingRotateTimer);
     setThinkingIndicator(false);
     _removeTypingBubble(_typingBubble);
+    _removeToolSkeleton();
     // P2: fade out thinking stream + skeleton; collapse reasoning panel
     teardownThinkingUI(_thinkingStream, _planSkeleton);
     collapseThinkingPanel(_thinkingPanel);
@@ -10123,6 +11849,15 @@ async function createTaskFromText(text) {
           "플랜 생성에 문제가 발생했습니다. 잠시 후 다시 시도하거나 요청을 바꿔 보세요.",
         );
         addMessage(errMsg, "agent");
+        // Inline retry chip — re-fires the exact same user input, zero re-typing
+        if (text) {
+          setTimeout(() => {
+            const _retryChip = document.createElement("div");
+            _retryChip.style.cssText = "display:flex;gap:8px;padding:0 16px 12px;flex-wrap:wrap";
+            _retryChip.innerHTML = `<button class="cx-followup-chip" onclick="createTaskFromText(${JSON.stringify(text)})">${pickText("🔄 重试刚才的请求", "🔄 Retry my request", "🔄 同じリクエストを再試行", "🔄 다시 시도")}</button>`;
+            if (el.chatFeed) el.chatFeed.appendChild(_retryChip);
+          }, 100);
+        }
         replyContent = errMsg;
         // No automatic handoff — let the user decide to retry
       } else if (smart.reply) {
@@ -10138,6 +11873,14 @@ async function createTaskFromText(text) {
           "플랜 생성 중 문제가 발생했습니다. 나중에 다시 시도해 주세요.",
         );
         addMessage(_unhandledMsg, "agent");
+        if (text) {
+          setTimeout(() => {
+            const _retryChip2 = document.createElement("div");
+            _retryChip2.style.cssText = "display:flex;gap:8px;padding:0 16px 12px;flex-wrap:wrap";
+            _retryChip2.innerHTML = `<button class="cx-followup-chip" onclick="createTaskFromText(${JSON.stringify(text)})">${pickText("🔄 重试刚才的请求", "🔄 Retry my request", "🔄 同じリクエストを再試行", "🔄 다시 시도")}</button>`;
+            if (el.chatFeed) el.chatFeed.appendChild(_retryChip2);
+          }, 100);
+        }
         replyContent = _unhandledMsg;
       }
       if (replyContent) {
@@ -10150,6 +11893,35 @@ async function createTaskFromText(text) {
         if (state.agentConversation.messages.length > 20)
           state.agentConversation.messages = state.agentConversation.messages.slice(-20);
         saveConversationState();
+
+        // Time-sensitive disclaimer: regulations, visa, VPN, payment apps change frequently.
+        // Append a system note when the response touches these topics.
+        const _timeSensitiveRe = /visa|permit|regulation|policy|vpn|wechat\s*pay|alipay|restriction|xinjiang|drone|certificate|insurance|border|entry\s*ban|travel\s*ban|签证|政策|法规|许可证|无人机|限制|边境|保险/i;
+        const _supplierFreshnessRe = /supplier|vendor|wholesale|market stall|booth|factory floor|component|stock|inventory|price per|per unit|MOQ|sourcing|trading company|freight|forwarder|供应商|市场摊位|出厂价|批发|库存|零部件|采购|价格/i;
+        if (!replyContent.startsWith("{") && _supplierFreshnessRe.test(replyContent)) {
+          setTimeout(() => addMessage(
+            pickText(
+              "🏪 提示：供应商位置、市场摊位和价格信息可能已发生变化，建议到场后当面确认。",
+              "🏪 Market note: Supplier locations, stall numbers, and prices may have changed since this information was compiled. Verify on-site or with contacts before committing.",
+              "🏪 市場情報注意：サプライヤーの場所、ブース番号、価格は変更されている可能性があります。現地または連絡先で確認してください。",
+              "🏪 시장 정보: 공급업체 위치, 부스 번호, 가격은 변경되었을 수 있습니다. 현장에서 직접 확인하세요.",
+              "🏪 Info pasar: Lokasi pemasok, nomor stan, dan harga mungkin telah berubah. Verifikasi langsung di lokasi.",
+            ),
+            "system",
+          ), 400);
+        }
+        if (!replyContent.startsWith("{") && _timeSensitiveRe.test(replyContent)) {
+          setTimeout(() => addMessage(
+            pickText(
+              "⏱️ 提示：签证、政策、支付、VPN 等信息变化较快，建议出发前通过中国驻外大使馆或官方渠道核实最新要求。",
+              "⏱️ Note: Visa rules, regulations, payment systems, and policies in China change frequently. Verify time-sensitive details through official sources (embassy or government websites) before travel.",
+              "⏱️ 注意：ビザ規則、規制、決済システム、政策は頻繁に変更されます。渡航前に大使館または公式サイトで最新情報をご確認ください。",
+              "⏱️ 참고: 비자 규정, 규정, 결제 시스템 및 정책은 자주 변경됩니다. 여행 전 대사관 또는 공식 출처를 통해 시간에 민감한 정보를 확인하세요.",
+              "⏱️ Catatan: Aturan visa, peraturan, sistem pembayaran, dan kebijakan di China sering berubah. Verifikasi informasi terkini melalui sumber resmi (kedutaan atau situs pemerintah) sebelum bepergian.",
+            ),
+            "system",
+          ), 300);
+        }
       }
     }
     setLoopProgress("confirm");
@@ -10159,10 +11931,11 @@ async function createTaskFromText(text) {
     await Promise.all([loadChatSolutionStrip(data.task.id), loadSolutionBoard(data.task.id)]);
     return data.task;
   } finally {
-    clearTimeout(_planStreamGuardTimer);  // U2: clear the 180s safety guard
+    clearTimeout(window._planStreamGuardTimer);  // U2: clear the 180s safety guard
     clearInterval(thinkingRotateTimer);
     setThinkingIndicator(false);
     _removeTypingBubble(_typingBubble);  // ensure cleanup on abort/error
+    _removeToolSkeleton();
     teardownThinkingUI(_thinkingStream, _planSkeleton); // safe no-op if already cleaned up at line 9883
     collapseThinkingPanel(_thinkingPanel);
     // P2: release abort controller when stream finishes (normally or by abort)
@@ -10198,7 +11971,7 @@ async function runPromptWithExecution(prompt, meta = {}) {
   const data = await api("/api/tasks", {
     method: "POST",
     body: JSON.stringify({
-      userId: "demo",
+      userId: (_getAuthUserId && _getAuthUserId()) || "demo",
       intent: text,
       constraints: mergedConstraints,
       tripId: state.activeTripId || undefined,
@@ -10228,6 +12001,10 @@ async function confirmAndExecute(taskId, options = {}) {
   const opts = options || {};
   const taskData = await api(`/api/tasks/${taskId}`);
   const task = taskData.task;
+  if (!task || !task.plan || !task.plan.confirm) {
+    notify(pickText("任务数据不完整，无法执行。", "Task data incomplete, cannot execute.", "タスクデータが不完全です。", "작업 데이터가 불완전합니다."), "error");
+    return { ok: false, reason: "incomplete_task" };
+  }
   const amount = task.plan.confirm.amount;
 
   const confirmedByModal = opts.skipModal
@@ -10267,7 +12044,7 @@ async function confirmAndExecute(taskId, options = {}) {
                 <div style="font-size:32px;margin-bottom:8px;">🔐</div>
                 <div style="font-weight:600;margin-bottom:4px">${pickText("高额二次验证", "High-Amount Verification", "高額認証", "고액 인증")}</div>
                 <div style="font-size:13px;color:#64748b;margin-bottom:12px">${pickText("支付金额", "Amount", "支払金額", "금액")}: <strong>${amount} CNY</strong></div>
-                <input id="cx-totp-input" type="tel" inputmode="numeric" maxlength="6" placeholder="6位验证码"
+                <input id="cx-totp-input" type="tel" inputmode="numeric" maxlength="6" placeholder="${pickText('6位验证码', '6-digit code', '6桁コード', '6자리 코드')}"
                   style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:22px;text-align:center;letter-spacing:6px;margin-bottom:8px"/>
                 <div id="cx-totp-err" style="color:#ef4444;font-size:12px;min-height:16px;margin-bottom:8px"></div>
                 <div style="display:flex;gap:8px">
@@ -10333,6 +12110,7 @@ async function confirmAndExecute(taskId, options = {}) {
   } catch (err) {
     if (state.executionMockTimer) clearTimeout(state.executionMockTimer);
     setLoopProgress("support");
+    trackEvent("task_execution_failed", { reason: (err.message || "unknown").slice(0, 120) }, taskId).catch(() => {});
     notify(pickText("执行失败，已提供兜底方案。", "Execution failed. Fallback ready.","実行失敗。フォールバックを提示しました。", "실행 실패. 대체 경로를 준비했습니다."), "error");
     renderFallbackCard(taskId, err.message);
     await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
@@ -10485,7 +12263,7 @@ function renderDrawerTab() {
       .join("");
     const p = detail.progress || {};
     const taskTypeLabel = (() => {
-      const v = String(detail.overview.type || "").toLowerCase();
+      const v = String((detail.overview && detail.overview.type) || "").toLowerCase();
       if (v === "eat") return pickText("餐饮", "Eat","飲食", "식사");
       if (v === "travel") return pickText("出行", "Travel","移動", "이동");
       if (v === "support") return pickText("售后", "Support","サポート", "지원");
@@ -10522,24 +12300,24 @@ function renderDrawerTab() {
         : "";
     el.drawerBody.innerHTML = `
       <article class="card">
-        <h3>${escapeHtml(detail.overview.intent)}</h3>
-        <div>${pickText("状态", "Status","状態", "상태")}: ${escapeHtml(localizeStatus(detail.overview.status || "-"))}</div>
+        <h3>${escapeHtml((detail.overview && detail.overview.intent) || "-")}</h3>
+        <div>${pickText("状态", "Status","状態", "상태")}: ${escapeHtml(localizeStatus((detail.overview && detail.overview.status) || "-"))}</div>
         <div>${pickText("类型", "Type","タイプ", "유형")}: ${escapeHtml(taskTypeLabel)}</div>
         <div class="status">${pickText("进度", "Progress","進捗", "진행률")}: ${pickText("成功", "Success","成功", "성공")} ${Number(p.success || 0)} / ${Number(p.total || 0)} · ${pickText("执行中", "Running","実行中", "실행중")} ${Number(p.running || 0)} · ${pickText("兜底", "Fallback","フォールバック", "대체")} ${Number(p.fallback || 0)} · ${pickText("失败", "Failed","失敗", "실패")} ${Number(p.failed || 0)}</div>
-        <div>${pickText("原因说明", "Reasoning","理由", "근거")}: ${escapeHtml(detail.overview.reasoning)}</div>
-        <div>${pickText("支付通道", "Payment rail","決済レール", "결제 레일")}: ${escapeHtml(detail.overview.paymentRail || "alipay_cn")}</div>
+        <div>${pickText("原因说明", "Reasoning","理由", "근거")}: ${escapeHtml((detail.overview && detail.overview.reasoning) || "-")}</div>
+        <div>${pickText("支付通道", "Payment rail","決済レール", "결제 레일")}: ${escapeHtml((detail.overview && detail.overview.paymentRail) || "alipay_cn")}</div>
         ${
-          detail.overview.pricing
-            ? `<div>${pickText("费用", "Pricing","価格", "가격")}: ${pickText("净价", "Net","ネット", "순액")} ${Number(detail.overview.pricing.netPrice || 0)} + ${pickText("服务费", "Markup","マークアップ", "마크업")} ${Number(detail.overview.pricing.markup || 0)} (${(Number(detail.overview.pricing.markupRate || 0) * 100).toFixed(1)}%)</div>`
+          detail.overview && detail.overview.pricing
+            ? `<div>${pickText("费用", "Amount","金額", "금액")}: <strong>${Number(detail.overview.pricing.finalPrice || detail.overview.pricing.netPrice || 0)} ${escapeHtml(detail.overview.currency || "CNY")}</strong></div>`
             : ""
         }
-        <div>${pickText("创建时间", "Created","作成日時", "생성 시각")}: ${new Date(detail.overview.createdAt).toLocaleString()}</div>
+        <div>${pickText("创建时间", "Created","作成日時", "생성 시각")}: ${detail.overview && detail.overview.createdAt ? new Date(detail.overview.createdAt).toLocaleString() : "-"}</div>
         <div>${pickText("人工接管", "Handoff","有人対応", "사람 상담")}: ${detail.handoff ? `<span class="code">${escapeHtml(detail.handoff.ticketId)}</span> (${escapeHtml(detail.handoff.status)})` : pickText("未请求", "Not requested","未リクエスト", "요청되지 않음")}</div>
         <div class="status">${detail.handoff ? `${pickText("请求时间", "Requested","依頼時刻", "요청 시각")}: ${new Date(detail.handoff.requestedAt).toLocaleString()}` : ""}</div>
         <div class="status">${detail.handoff && detail.handoff.updatedAt ? `${pickText("更新时间", "Updated","更新時刻", "업데이트 시각")}: ${new Date(detail.handoff.updatedAt).toLocaleString()}` : ""}</div>
         <div class="actions">
-          <button class="secondary" data-action="request-handoff" data-task="${escapeHtml(detail.overview.taskId)}">${pickText("请求人工接管", "Request Human Handoff","有人対応を依頼", "사람 상담 요청")}</button>
-          <button class="secondary" data-action="show-refund-policy" data-task="${escapeHtml(detail.overview.taskId)}">${pickText("退款规则", "Refund Policy","返金ポリシー", "환불 정책")}</button>
+          <button class="secondary" data-action="request-handoff" data-task="${escapeHtml((detail.overview && detail.overview.taskId) || "")}">${pickText("请求人工接管", "Request Human Handoff","有人対応を依頼", "사람 상담 요청")}</button>
+          <button class="secondary" data-action="show-refund-policy" data-task="${escapeHtml((detail.overview && detail.overview.taskId) || "")}">${pickText("退款规则", "Refund Policy","返金ポリシー", "환불 정책")}</button>
         </div>
       </article>
       <article class="card">
@@ -10561,7 +12339,7 @@ function renderDrawerTab() {
   }
 
   if (state.currentSubtab === "steps") {
-    const steps = detail.steps
+    const steps = (detail.steps || [])
       .map(
         (s) => `
       <li class="step-line status-${escapeHtml(s.status)} ${s.status === "running" ? "is-current" : ""}">
@@ -10588,10 +12366,10 @@ function renderDrawerTab() {
       </article>
       <article class="card">
         <h3>MCP ${pickText("摘要", "Summary","サマリー", "요약")}</h3>
-        <div>${pickText("查询", "Query","照会", "조회")}: <span class="code">${escapeHtml(detail.mcpSummary.query)}</span></div>
-        <div>${pickText("预订", "Book","予約", "예약")}: <span class="code">${escapeHtml(detail.mcpSummary.book)}</span></div>
-        <div>${pickText("支付", "Pay","支払い", "결제")}: <span class="code">${escapeHtml(detail.mcpSummary.pay)}</span></div>
-        <div>${pickText("状态", "Status","状態", "상태")}: <span class="code">${escapeHtml(detail.mcpSummary.status)}</span></div>
+        <div>${pickText("查询", "Query","照会", "조회")}: <span class="code">${escapeHtml((detail.mcpSummary && detail.mcpSummary.query) || "-")}</span></div>
+        <div>${pickText("预订", "Book","予約", "예약")}: <span class="code">${escapeHtml((detail.mcpSummary && detail.mcpSummary.book) || "-")}</span></div>
+        <div>${pickText("支付", "Pay","支払い", "결제")}: <span class="code">${escapeHtml((detail.mcpSummary && detail.mcpSummary.pay) || "-")}</span></div>
+        <div>${pickText("状态", "Status","状態", "상태")}: <span class="code">${escapeHtml((detail.mcpSummary && detail.mcpSummary.status) || "-")}</span></div>
       </article>
     `;
     motion.bindPressables(el.drawerBody);
@@ -10648,6 +12426,11 @@ function renderDrawerTab() {
         <div>QR: <span class="code">${escapeHtml(proof.qrText)}</span></div>
         <div>${pickText("地址", "Address","住所", "주소")}: ${escapeHtml(proof.bilingualAddress)}</div>
         <div>${pickText("行程", "Itinerary","行程", "일정")}: ${escapeHtml(proof.itinerary || "")}</div>
+        ${proof.navLink || proof.meituanLink || proof.didiLink ? `<div class="actions" style="flex-wrap:wrap;gap:6px;margin:8px 0">
+          ${proof.navLink ? `<a class="secondary" href="${escapeHtml(proof.navLink)}" target="_blank" rel="noopener">${pickText("高德导航", "Amap Nav", "Amapナビ", "Amap 내비")}</a>` : ""}
+          ${proof.meituanLink ? `<a class="secondary" href="${escapeHtml(proof.meituanLink)}" target="_blank" rel="noopener">${pickText("美团预订", "Meituan Book", "美団予約", "메이퇀 예약")}</a>` : ""}
+          ${proof.didiLink ? `<a class="secondary" href="${escapeHtml(proof.didiLink)}" target="_blank" rel="noopener">${pickText("滴滴出行", "Didi Ride", "DiDi乗車", "디디 탑승")}</a>` : ""}
+        </div>` : ""}
       </article>
       <article class="card">
         <h3>${pickText("证据抽屉", "Evidence Drawer","証跡ドロワー", "증거 서랍")}</h3>
@@ -10700,7 +12483,7 @@ function fitNearFilters(item, filters) {
   }
   if (filters.budget && filters.budget !== "any") {
     const mid = readCostMid(item.costRange);
-    if (filters.budget === "low" && mid > 90) return false;
+    if (filters.budget === "low" && mid >= 85) return false; // Adjusted threshold with buffer
     if (filters.budget === "mid" && (mid < 60 || mid > 160)) return false;
     if (filters.budget === "high" && mid < 140) return false;
   }
@@ -10710,11 +12493,20 @@ function fitNearFilters(item, filters) {
     if (riskCode.includes("queue") || riskText.includes("queue") || riskText.includes("排队")) return false;
   }
   if (filters.dietary && filters.dietary !== "none") {
-    const text = `${item.title || ""} ${item.why || ""}`.toLowerCase();
-    if (!text.includes(String(filters.dietary).toLowerCase())) return false;
+    const d = String(filters.dietary).toLowerCase();
+    // First check structured fields, then fall back to text search
+    const itemDietary = String(item.dietary || "").toLowerCase();
+    const isHalal = d === "halal" && (item.halal_certified || itemDietary.includes("halal"));
+    const isVegan = d === "vegan" && itemDietary.includes("vegan");
+    const isVeg   = d === "vegetarian" && (itemDietary.includes("vegetarian") || itemDietary.includes("vegan"));
+    const textMatch = `${item.title || ""} ${item.why || ""} ${item.executeWill || ""}`.toLowerCase().includes(d);
+    if (!isHalal && !isVegan && !isVeg && !textMatch) return false;
   }
-  if (filters.foreignCard === "supported_only" && item.type === "travel" && item.id === "n4") return false;
-  if (filters.booking === "bookable_only" && item.type === "eat" && item.id === "n2") return false;
+  if (filters.foreignCard === "supported_only" && item.accepts_foreign_guests === false) return false;
+  if (filters.booking === "bookable_only") {
+    const hasBooking = !!(item.bookingUrl || item.meituanLink || item.bookingComLink || item.ctripLink || item.agodaLink);
+    if (!hasBooking) return false;
+  }
   return true;
 }
 
@@ -10726,7 +12518,7 @@ function renderNearMap(item, mapPreview) {
   }
   const map = item.map || {};
   el.nearMapPreview.innerHTML = `
-    <img class="near-map-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || (mapPreview && mapPreview.imagePath) || "/assets/solution-flow.svg"))}" alt="near map preview" />
+    <img class="near-map-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || (mapPreview && mapPreview.imagePath) || "/assets/solution-flow.svg"))}" alt="near map preview" loading="lazy" onerror="this.src='${item.type==="eat"?"/assets/solution-eat.svg":item.type==="stay"?"/assets/solution-travel.svg":"/assets/solution-flow.svg"}'" />
     <div><strong>${escapeHtml(item.title)}</strong></div>
     <div class="status">${escapeHtml(item.placeName || "-")} · <span class="status-badge lane-grade">${escapeHtml(item.recommendationGrade || "-")}</span> ${escapeHtml(item.recommendationLevel || "-")}</div>
     <div class="status">${pickText("路线", "Route","ルート", "경로")}: ${escapeHtml(map.route || "-")} · ${pickText("距离", "Distance","距離", "거리")}: ${Number(map.distanceKm || 0)} km</div>
@@ -10767,18 +12559,39 @@ function _clearNearFilters() {
   loadNearSuggestions();
 }
 
+let _nearSuggestionsAbort = null;
+
 async function loadNearSuggestions() {
+  // Cancel any in-flight request from a previous tab visit
+  if (_nearSuggestionsAbort) { _nearSuggestionsAbort.abort(); }
+  _nearSuggestionsAbort = new AbortController();
+  const _nearSignal = _nearSuggestionsAbort.signal;
+
   _restoreNearFilter();
   if (skeleton && el.nearList) {
     el.nearList.innerHTML = "";
     skeleton.render(el.nearList, { count: 2, lines: 4 });
   }
-  const data = await api(buildNearbyPath());
+  let data;
+  try {
+    data = await api(buildNearbyPath(), { signal: _nearSignal });
+  } catch (err) {
+    if (skeleton && el.nearList) skeleton.clear(el.nearList); // Clear skeleton for all errors including abort
+    if (err && err.name === "AbortError") return; // intentional cancel — no error shown
+    if (el.nearList) el.nearList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载附近信息失败，请稍后重试。", "Failed to load nearby suggestions.", "近くの情報の読み込みに失敗しました。", "근처 정보 불러오기 실패.")}</p><div class="actions"><button onclick="loadNearSuggestions()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    return;
+  }
+  if (_nearSignal.aborted) return; // tab switched while request was in flight
   if (skeleton && el.nearList) skeleton.clear(el.nearList);
   state.nearItems = Array.isArray(data.items) ? data.items : [];
   if (store) store.dispatch({ type: "SET_NEARBY", items: state.nearItems });
-  if (el.nearFilterForm && data.filters && data.filters.defaultBudget && el.nearFilterForm.budget.value === "any") {
-    el.nearFilterForm.budget.value = data.filters.defaultBudget;
+  if (el.nearFilterForm && data.filters && data.filters.defaultBudget) {
+    // Only set default budget if user hasn't manually changed it (check if it's still "any")
+    const currentBudget = el.nearFilterForm.budget.value;
+    const hasUserFilter = currentBudget !== "any";
+    if (!hasUserFilter) {
+      el.nearFilterForm.budget.value = data.filters.defaultBudget;
+    }
   }
   const form = el.nearFilterForm ? new FormData(el.nearFilterForm) : new FormData();
   const activeFilter = {
@@ -10791,33 +12604,64 @@ async function loadNearSuggestions() {
   };
   const visible = state.nearItems.filter((item) => fitNearFilters(item, activeFilter));
   if (!visible.length) {
-    el.nearList.innerHTML = `<article class="card"><p>${pickText("当前筛选下没有结果。", "No nearby result under current filters.","現在のフィルターに一致する結果はありません。", "현재 필터 조건에 맞는 결과가 없습니다.")}</p><div class="actions"><button onclick="_clearNearFilters()">${pickText("清除筛选", "Clear Filters", "フィルターをリセット", "필터 초기화")}</button></div></article>`;
+    const _noItemsAtAll = state.nearItems.length === 0;
+    const _city = state.selectedConstraints.city || getCurrentCity() || "Shanghai";
+    el.nearList.innerHTML = _noItemsAtAll
+      ? `<article class="card" style="text-align:center;padding:24px 16px">
+          <p style="font-size:32px;margin:0 0 8px">📍</p>
+          <p style="font-weight:600">${pickText(`${_city}暂无附近数据`, `No nearby data for ${_city}`, `${_city}周辺のデータがありません`, `${_city} 근처 데이터 없음`)}</p>
+          <p style="font-size:13px;color:var(--color-text-secondary,#888)">${pickText("可尝试切换城市或直接在对话中描述你的需求。", "Try switching to a different city, or just describe your need in chat.", "別の都市に切り替えるか、チャットで直接ご要望をお伝えください。", "다른 도시로 전환하거나 채팅에서 직접 필요 사항을 설명하세요.")}</p>
+          <div class="actions" style="justify-content:center;margin-top:12px">
+            <button data-action="send-message" data-message="${escapeHtml(pickText(`推荐${_city}附近餐厅`, `Recommend restaurants near ${_city}`, `${_city}近くのレストランを推薦して`, `${_city} 근처 레스토랑 추천`))}">${pickText("在对话中寻找", "Ask in Chat", "チャットで探す", "채팅에서 찾기")}</button>
+          </div>
+        </article>`
+      : `<article class="card"><p>${pickText("当前筛选下没有结果。", "No results match your filters.", "現在のフィルターに一致する結果はありません。", "현재 필터 조건에 맞는 결과가 없습니다.")}</p><div class="actions"><button onclick="_clearNearFilters()">${pickText("清除筛选", "Clear Filters", "フィルターをリセット", "필터 초기화")}</button></div></article>`;
     renderNearMap(null, data.mapPreview || null);
     return;
   }
   if (!state.selectedNearItemId || !visible.some((item) => item.id === state.selectedNearItemId)) {
     state.selectedNearItemId = visible[0].id;
   }
-  el.nearList.innerHTML = visible
+  const _nearPageSize = 3;
+  state._nearPage = state._nearPage || 1;
+  const _renderNearItems = (items, showAll) => items
     .map(
       (item) => `
       <article class="card ${item.id === state.selectedNearItemId ? "lane-recommended" : ""}">
         <h3>${escapeHtml(item.title)}</h3>
-        <img class="near-card-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || "/assets/solution-flow.svg"))}" alt="${escapeHtml(item.placeName || item.title)}" />
-        <div class="status">${escapeHtml(item.placeName || "-")} · <span class="status-badge lane-grade">${escapeHtml(item.recommendationGrade || "-")}</span> ${escapeHtml(item.recommendationLevel || "-")}</div>
+        <img class="near-card-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || "/assets/solution-flow.svg"))}" alt="${escapeHtml(item.placeName || item.title)}" loading="lazy" onerror="this.src='${item.type==="eat"?"/assets/solution-eat.svg":item.type==="stay"?"/assets/solution-travel.svg":"/assets/solution-flow.svg"}'" />
+        <div class="status">${escapeHtml(item.placeName || "-")} · <span class="status-badge lane-grade">${escapeHtml(item.recommendationGrade || "-")}</span> ${escapeHtml(item.recommendationLevel || "-")}${item.dietary === "halal" ? ` · <span class="status-badge" style="background:#16a34a;color:#fff">${item.halal_certified ? pickText("官方清真认证 ✓", "Halal Certified ✓","ハラール認証 ✓", "할랄 인증 ✓") : pickText("清真标注", "Halal (self-labeled)","ハラール（自称）", "할랄 (자칭)")}</span>` : ""}${item.accepts_foreign_guests === false ? ` · <span class="status-badge" style="background:#ef4444;color:#fff">${pickText("不接受外籍旅客", "No foreign guests","外国人不可", "외국인 불가")}</span>` : item.accepts_foreign_guests === true ? ` · <span class="status-badge" style="background:#2563eb;color:#fff">${pickText("外籍旅客可入住 ✓", "Foreign guests OK ✓","外国人OK ✓", "외국인 가능 ✓")}</span>` : ""}</div>
         <div class="status">ETA ${escapeHtml(item.eta)} · ${pickText("成功率", "Success","成功率", "성공률")} ${(Number(item.successRate7d || 0) * 100).toFixed(0)}% · ${pickText("风险", "Risk","リスク", "리스크")} ${escapeHtml(localizeRiskValue(item.risk, item.riskCode))}</div>
-        <div class="status">${pickText("费用", "Cost","費用", "비용")} ${escapeHtml(item.costRange || "-")}</div>
+        <div class="status">${pickText("费用", "Cost","費用", "비용")} ${escapeHtml(item.costRange || "-")}${item.rating ? ` · ${Number(item.rating).toFixed(1)} ★` : ""}</div>
+        ${item.address ? `<div class="status" style="font-size:12px;color:var(--color-text-secondary,#888)">${escapeHtml(item.address)}</div>` : ""}
+        ${item.accepts_foreign_guests && state.uiLanguage !== "ZH" ? `<div style="margin:4px 0"><span class="status-badge" style="background:#dcfce7;color:#166534;font-size:11px">${pickText("", "Foreign-friendly ✓", "外国人OK ✓", "외국인 환영 ✓", "", "ترحيب بالأجانب ✓")}</span>${item.foreignCardNote ? ` <span class="status" style="font-size:11px">${escapeHtml(item.foreignCardNote)}</span>` : ""}</div>` : ""}
         <div class="status">${pickText("推荐理由", "Why recommended","推奨理由", "추천 이유")}: ${escapeHtml(item.why || "-")}</div>
         <div class="status">${pickText("一键后执行", "After one click","ワンクリック後の処理", "원클릭 후 실행")}: ${escapeHtml(item.executeWill || "-")}</div>
         <div class="actions">
           <button class="secondary" data-action="select-near-item" data-item="${escapeHtml(item.id)}">${pickText("地图预览", "Preview on map","地図で確認", "지도에서 보기")}</button>
           <button data-action="run-intent" data-intent="${escapeHtml(item.title)}">${pickText("在聊天中执行", "Run in Chat","チャットで実行", "채팅에서 실행")}</button>
+          ${item.navLink ? `<a class="secondary" href="${escapeHtml(item.navLink)}" target="_blank" rel="noopener">${state.uiLanguage === "ZH" ? "高德导航" : state.uiLanguage === "JA" ? "Amapナビ" : state.uiLanguage === "KO" ? "Amap 내비" : "Amap Nav"}</a>` : state.uiLanguage !== "ZH" ? `<a class="secondary" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent((item.placeName || item.title) + ' ' + (item.address || ''))}" target="_blank" rel="noopener">${pickText("Google地图", "Google Maps", "Googleマップ", "구글 지도")}</a>` : ""}
+          ${item.meituanLink ? `<a class="secondary" href="${escapeHtml(item.meituanLink)}" target="_blank" rel="noopener">${state.uiLanguage === "ZH" ? "美团" : "Meituan"}</a>` : ""}
+          ${item.dianpingLink ? `<a class="secondary" href="${escapeHtml(item.dianpingLink)}" target="_blank" rel="noopener">${state.uiLanguage === "ZH" ? "大众点评" : "Dianping"}</a>` : ""}
+          ${item.bookingComLink ? `<a class="secondary" href="${escapeHtml(item.bookingComLink)}" target="_blank" rel="noopener">Booking.com</a>` : item.bookingUrl ? `<a class="secondary" href="${escapeHtml(item.bookingUrl)}" target="_blank" rel="noopener">${pickText("立即预订", "Book Now","今すぐ予約", "지금 예약")}</a>` : ""}
+          ${item.agodaLink ? `<a class="secondary" href="${escapeHtml(item.agodaLink)}" target="_blank" rel="noopener">Agoda</a>` : ""}
+          ${item.didiLink ? `<a class="secondary" href="${escapeHtml(item.didiLink)}" target="_blank" rel="noopener">${state.uiLanguage === "ZH" ? "滴滴" : "Didi"}</a>` : ""}
         </div>
       </article>
     `,
     )
     .join("");
-  motion.bindPressables(el.nearList);
+  const _renderNearList = () => {
+    const shown = visible.slice(0, state._nearPage * _nearPageSize);
+    const hasMore = visible.length > shown.length;
+    el.nearList.innerHTML = _renderNearItems(shown) +
+      (hasMore ? `<div class="actions" style="margin:8px 0"><button id="nearLoadMoreBtn" class="secondary">${pickText(`加载更多（还有${visible.length - shown.length}条）`, `Load more (${visible.length - shown.length} more)`, `さらに表示（残り${visible.length - shown.length}件）`, `더 보기（${visible.length - shown.length}개 남음）`)}</button></div>` : "");
+    motion.bindPressables(el.nearList);
+    const moreBtn = document.getElementById("nearLoadMoreBtn");
+    if (moreBtn) moreBtn.addEventListener("click", () => { state._nearPage += 1; _renderNearList(); });
+  };
+  state._nearPage = 1;
+  _renderNearList();
   const selected = visible.find((item) => item.id === state.selectedNearItemId) || visible[0];
   renderNearMap(selected, data.mapPreview || null);
 }
@@ -10847,10 +12691,18 @@ async function loadTrips() {
     data = await api("/api/trips?limit=50&offset=0");
   } catch (err) {
     if (skeleton) skeleton.clear(el.tripList);
+    if (String(err.message || "").includes("401") || String(err.message || "").includes("unauthorized")) {
+      el.tripList.innerHTML = `<article class="card" style="text-align:center;padding:24px 16px"><p>${pickText("请登录后查看行程。", "Sign in to view your trips.", "旅程を確認するにはサインインしてください。", "트립을 보려면 로그인하세요.")}</p><div class="actions" style="justify-content:center"><button onclick="_showLoginModal()">${pickText("登录", "Sign in", "サインイン", "로그인")}</button></div></article>`;
+      return;
+    }
     el.tripList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载行程失败，请稍后重试。", "Failed to load trips. Please try again.", "旅程の読み込みに失敗しました。", "트립을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadTrips()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
     return;
   }
   if (skeleton) skeleton.clear(el.tripList);
+  if (!data || !data.trips) {
+    el.tripList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载行程失败，请稍后重试。", "Failed to load trips. Please try again.", "旅程の読み込みに失敗しました。", "트립을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadTrips()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    return;
+  }
   state.tripPlans = Array.isArray(data.trips) ? data.trips : [];
   if (store) store.dispatch({ type: "SET_ERROR", error: null });
   if (!state.activeTripId || !state.tripPlans.some((trip) => trip.id === state.activeTripId)) {
@@ -10983,12 +12835,16 @@ async function loadOrders() {
     data = await api("/api/orders?limit=50&offset=0");
   } catch (err) {
     if (skeleton && el.ordersList) skeleton.clear(el.ordersList);
+    if (String(err.message || "").includes("401") || String(err.message || "").includes("unauthorized")) {
+      if (el.ordersList) el.ordersList.innerHTML = `<article class="card" style="text-align:center;padding:24px 16px"><p>${pickText("请登录后查看订单。", "Sign in to view your orders.", "注文を確認するにはサインインしてください。", "주문을 보려면 로그인하세요.")}</p><div class="actions" style="justify-content:center"><button onclick="_showLoginModal()">${pickText("登录", "Sign in", "サインイン", "로그인")}</button></div></article>`;
+      return;
+    }
     if (el.ordersList) el.ordersList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载订单失败，请稍后重试。", "Failed to load orders. Please try again.", "注文の読み込みに失敗しました。", "주문을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadOrders()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
     return;
   }
   if (skeleton && el.ordersList) skeleton.clear(el.ordersList);
   if (store) store.dispatch({ type: "SET_ORDERS", orders: data.orders || [] });
-  if (!data.orders.length) {
+  if (!data.orders || !Array.isArray(data.orders) || !data.orders.length) {
     el.ordersList.innerHTML = `<article class="card"><p>${pickText("暂无订单。", "No orders yet.", "注文はまだありません。", "주문이 아직 없습니다.")}</p><p class="status">${pickText("完成一次行程规划并确认预订后，订单将出现在这里。", "Complete a trip plan and confirm booking to see orders.", "旅程プランを完成させ予約を確定すると、ここに注文が表示されます。", "여행 계획 완료 후 예약을 확인하면 주문이 여기에 표시됩니다.")}</p><div class="actions"><button onclick="switchTab('chat')">${pickText("去规划行程 →", "Plan a trip →", "旅程を計画 →", "여행 계획하기 →")}</button></div></article>`;
     return;
   }
@@ -11001,8 +12857,8 @@ async function loadOrders() {
         <div>${pickText("城市", "City","都市", "도시")}: ${escapeHtml(o.city || "Shanghai")}</div>
         <div>${pickText("状态", "Status","状態", "상태")}: <span class="status-badge ${escapeHtml(o.status)}">${escapeHtml(localizeStatus(o.status))}</span></div>
         <div>${pickText("类型", "Type","タイプ", "유형")}: ${escapeHtml(o.type)}</div>
-        <div>${pickText("金额", "Amount","金額", "금액")}: ${o.price} ${escapeHtml(o.currency)} ${o.pricing ? `(Net ${o.pricing.netPrice} + Markup ${o.pricing.markup})` : ""}</div>
-        <div>${pickText("订单号", "Order","注文番号", "주문번호")}: <span class="code">${escapeHtml(o.proof.orderNo)}</span></div>
+        <div>${pickText("金额", "Amount","金額", "금액")}: ${escapeHtml(String(o.price || ""))} ${escapeHtml(o.currency || "")}</div>
+        <div>${pickText("订单号", "Order","注文番号", "주문번호")}: <span class="code">${escapeHtml((o.proof && o.proof.orderNo) || o.outOrderNo || o.id)}</span></div>
         <div class="status">${pickText("凭证数量", "Proof count","証憑数", "증빙 수")}: ${Array.isArray(o.proofItems) ? o.proofItems.length : 0} · ${pickText("售后", "After-sales","アフターサポート", "사후지원")}: ${o.refund ? escapeHtml(localizeStatus(o.refund.status || "processing")) : pickText("可用", "available","利用可", "사용 가능")}</div>
         <div class="status">${pickText("生命周期", "Lifecycle","ライフサイクル", "라이프사이클")}: ${(o.lifecycle || []).map((x) => escapeHtml(localizeStatus(x.state))).join(" -> ")}</div>
         <div class="actions">
@@ -11063,7 +12919,14 @@ function _loadFavorites() {
 }
 
 function _saveFavorites() {
-  try { localStorage.setItem(_FAV_KEY, JSON.stringify(state.favorites)); } catch {}
+  try {
+    localStorage.setItem(_FAV_KEY, JSON.stringify(state.favorites));
+  } catch (err) {
+    if (err.name === "QuotaExceededError" && !window._storageQuotaWarned) {
+      window._storageQuotaWarned = true;
+      notify(pickText("存储空间已满，部分偏好设置可能无法保存。请清理浏览器数据。", "Storage full. Some preferences may not be saved. Clear browser data to fix.", "ストレージが満杯です。一部の設定が保存されない可能性があります。", "저장 공간이 가득 찼습니다. 일부 설정이 저장되지 않을 수 있습니다."), "warning");
+    }
+  }
 }
 
 function _toggleFavorite(cardId, destination, title, dur, pax) {
@@ -11198,6 +13061,24 @@ async function loadOrderDetail(orderId, trigger = null) {
       <h3>${pickText("售后支持", "Support","サポート", "지원")}</h3>
       ${support}
     </article>
+    <article class="card" id="invoiceCard_${escapeHtml(orderId)}">
+      <h3>${pickText("申请电子发票", "Apply for E-Invoice", "電子インボイス申請", "전자 영수증 신청")}</h3>
+      <form class="form-col" onsubmit="event.preventDefault();_applyInvoice(event,'${escapeHtml(orderId)}')">
+        <label>${pickText("邮箱", "Email", "メール", "이메일")}
+          <input type="email" name="email" required placeholder="email@example.com" />
+        </label>
+        <label>${pickText("抬头（个人 / 公司名称）", "Invoice title (personal / company)", "宛名（個人 / 会社名）", "발행 대상（개인 / 회사명）")}
+          <input type="text" name="title" placeholder="${pickText("个人 / 公司名称", "Personal / Company name", "個人 / 会社名", "개인 / 회사명")}" />
+        </label>
+        <label>${pickText("纳税人识别号（企业填写）", "Tax ID (companies only)", "法人番号（法人のみ）", "사업자번호（법인만）")}
+          <input type="text" name="taxId" placeholder="${pickText("纳税人识别号", "Tax ID", "法人番号", "사업자번호")}" />
+        </label>
+        <div class="actions">
+          <button type="submit">${pickText("提交发票申请", "Submit Invoice Request", "請求書を申請", "영수증 신청")}</button>
+        </div>
+      </form>
+      <div id="invoiceResult_${escapeHtml(orderId)}" class="status-text"></div>
+    </article>
   `;
   motion.bindPressables(el.orderDrawerBody);
   updateSupportEtaCountdown();
@@ -11230,8 +13111,17 @@ async function loadAuditLogs() {
     if (el.supportList) skeleton.clear(el.supportList);
   }
 
-  el.languageTag.textContent = userData.user.language;
-  state.uiLanguage = userData.user.language || "EN";
+  const _serverLang = userData?.user?.language;
+  const _localLang = (() => { try { return localStorage.getItem("cx_ui_lang"); } catch { return null; } })();
+  // Priority: localStorage (user preference) > server language > default EN
+  if (_localLang) {
+    state.uiLanguage = _localLang;
+  } else if (_serverLang) {
+    state.uiLanguage = _serverLang;
+  } else {
+    state.uiLanguage = "EN";
+  }
+  el.languageTag.textContent = state.uiLanguage;
   applyLanguagePack();
   const hasGps = userData.user && userData.user.location && Number.isFinite(Number(userData.user.location.lat)) && Number.isFinite(Number(userData.user.location.lng));
   el.locationTag.textContent = hasGps ? `${userData.user.city || "Shanghai"} · GPS` : userData.user.city || "Shanghai";
@@ -12877,6 +14767,19 @@ function bindActions() {
       return;
     }
 
+    if (action === "send-message") {
+      const msg = String(target.dataset.message || "").trim();
+      if (!msg) return;
+      switchTab("chat");
+      el.chatInput && (el.chatInput.value = msg);
+      try {
+        await handleAgentConversationInput(msg);
+      } catch (err) {
+        addMessage(pickText(`发送失败：${err.message}`, `Send failed: ${err.message}`, `送信失敗: ${err.message}`, `전송 실패: ${err.message}`));
+      }
+      return;
+    }
+
     if (action === "select-near-item") {
       state.selectedNearItemId = target.dataset.item || null;
       try {
@@ -13066,7 +14969,11 @@ function bindActions() {
     if (action === "ticket-evidence") {
       const ticketId = target.dataset.ticket;
       if (!ticketId) return;
-      const note = window.prompt("Add evidence note for this ticket:");
+      const note = await _showInputModal(
+        pickText("添加证据备注", "Add evidence note", "証拠メモを追加", "증빙 메모 추가", "Tambah catatan bukti", "إضافة ملاحظة دليل"),
+        pickText("描述证据内容", "Describe the evidence", "証拠の内容を説明", "증빙 내용 설명", "Deskripsi bukti", "وصف الدليل"),
+        { multiline: true }
+      );
       if (!note) return;
       try {
         await api(`/api/support/tickets/${ticketId}/evidence`, {
@@ -13178,6 +15085,7 @@ function bindActions() {
       try {
         const proofPath = `/api/orders/${target.dataset.order}/proof?language=${encodeURIComponent(state.uiLanguage || "EN")}`;
         const data = await api(proofPath);
+        const proof = data.proof || null;
         const insights = data.insights || {};
         const proofItems = (data.proofItems || [])
           .map(
@@ -13194,9 +15102,14 @@ function bindActions() {
           el.proofDrawerBody.innerHTML = `
             <article class="card">
               <h3>${pickText("凭证快照", "Proof Snapshot","証憑スナップショット", "증빙 스냅샷")}</h3>
-              <div>${pickText("订单号", "Order","注文番号", "주문 번호")}: <span class="code">${escapeHtml(data.proof.orderNo)}</span></div>
-              <div>${pickText("地址", "Address","住所", "주소")}: ${escapeHtml(data.proof.bilingualAddress)}</div>
-              <div class="status">QR: ${escapeHtml(data.proof.qrText)}</div>
+              <div>${pickText("订单号", "Order","注文番号", "주문 번호")}: <span class="code">${escapeHtml((proof && proof.orderNo) || "-")}</span></div>
+              <div>${pickText("地址", "Address","住所", "주소")}: ${escapeHtml((proof && proof.bilingualAddress) || "")}</div>
+              <div class="status">QR: ${escapeHtml((proof && proof.qrText) || "")}</div>
+              ${proof && (proof.navLink || proof.meituanLink || proof.didiLink) ? `<div class="actions" style="flex-wrap:wrap;gap:6px;margin:8px 0">
+                ${proof && proof.navLink ? `<a class="secondary" href="${escapeHtml(proof.navLink)}" target="_blank" rel="noopener">${pickText("高德导航", "Amap Nav", "Amapナビ", "Amap 내비")}</a>` : ""}
+                ${proof && proof.meituanLink ? `<a class="secondary" href="${escapeHtml(proof.meituanLink)}" target="_blank" rel="noopener">${pickText("美团预订", "Meituan Book", "美団予約", "메이퇀 예약")}</a>` : ""}
+                ${proof && proof.didiLink ? `<a class="secondary" href="${escapeHtml(proof.didiLink)}" target="_blank" rel="noopener">${pickText("滴滴出行", "Didi Ride", "DiDi乗車", "디디 탑승")}</a>` : ""}
+              </div>` : ""}
               ${insights.imagePath ? `<img class="media-photo" src="${escapeHtml(assetUrl(insights.imagePath))}" alt="proof insight" />` : ""}
               <h3>${pickText("证据抽屉", "Evidence Drawer","証跡ドロワー", "증거 서랍")}</h3>
               <ul class="steps">${proofItems || `<li>${pickText("暂无证据。", "No evidence items.","証跡はありません。", "증거가 없습니다.")}</li>`}</ul>
@@ -13211,13 +15124,13 @@ function bindActions() {
         }
         if (el.proofDrawerTitle) {
           el.proofDrawerTitle.dataset.lockedTitle = "true";
-          el.proofDrawerTitle.textContent = `${tTerm("proof")} · ${data.proof.orderNo}`;
+          el.proofDrawerTitle.textContent = proof ? `${tTerm("proof")} · ${proof.orderNo || "-"}` : tTerm("proof");
         }
         if (el.proofDrawer) {
           delete el.proofDrawer.dataset.ticketId;
         }
         if (drawerController) drawerController.open(el.proofDrawer, { trigger: target });
-        notify(`${tUi("proof_ready")}: ${data.proof.orderNo}`, "success");
+        if (proof) notify(`${tUi("proof_ready")}: ${proof.orderNo || ""}`, "success");
       } catch (err) {
         notify(pickText(`凭证加载失败：${err.message}`, `Failed to load proof: ${err.message}`, `証憑の読み込み失敗: ${err.message}`, `증빙 로드 실패: ${err.message}`), "error");
       }
@@ -13300,17 +15213,18 @@ function bindActions() {
       try {
         const data = await api(`/api/orders/${target.dataset.order}/share-card`);
         await trackEvent("order_share_clicked", { orderId: target.dataset.order });
-        addMessage(
-          pickText(
-            `分享卡已生成：${data.shareCard.title} | 支付宝路径：${data.shareCard.miniProgram.alipayPath}`,
-            `Share card ready: ${data.shareCard.title} | Alipay path: ${data.shareCard.miniProgram.alipayPath}`,
-            `共有カード生成済み: ${data.shareCard.title} | Alipay パス: ${data.shareCard.miniProgram.alipayPath}`,
-            `공유 카드 생성 완료: ${data.shareCard.title} | Alipay 경로: ${data.shareCard.miniProgram.alipayPath}`,
-          ),
-          "agent",
-        );
+        const shareUrl = `${location.origin}/?share=${target.dataset.order}`;
+        const shareTitle = data.shareCard?.title || "CrossX Order";
+        if (navigator.share) {
+          await navigator.share({ title: shareTitle, url: shareUrl });
+        } else {
+          await navigator.clipboard.writeText(shareUrl);
+          showToast(pickText("链接已复制", "Link copied", "リンクをコピーしました", "링크 복사됨"));
+        }
       } catch (err) {
-        addMessage(pickText(`分享卡生成失败：${err.message}`, `Share card failed: ${err.message}`, `共有カード生成失敗: ${err.message}`, `공유 카드 생성 실패: ${err.message}`));
+        if (err.name !== "AbortError") {
+          showToast(pickText(`分享失败`, `Share failed`, `共有失敗`, `공유 실패`), "error");
+        }
       }
       return;
     }
@@ -13381,14 +15295,17 @@ function bindActions() {
 
     if (action === "cancel-order") {
       try {
-        const reason = window.prompt(
+        const reason = await _showInputModal(
+          pickText("退款原因", "Refund reason", "返金理由", "환불 사유", "Alasan pengembalian", "سبب الاسترداد"),
           pickText(
-            "请输入退款原因（如：行程变更/下错单/重复支付）",
-            "Please enter refund reason (e.g. schedule change / wrong order / duplicate payment)",
-            "返金理由を入力してください（例：予定変更 / 誤注文 / 重複支払い）",
-            "환불 사유를 입력하세요 (예: 일정 변경 / 오주문 / 중복 결제)",
+            "行程变更 / 下错单 / 重复支付",
+            "Schedule change / Wrong order / Duplicate payment",
+            "予定変更 / 誤注文 / 重複支払い",
+            "일정 변경 / 오주문 / 중복 결제",
+            "Perubahan jadwal / Salah pesan / Pembayaran ganda",
+            "تغيير الجدول / طلب خاطئ / دفع مكرر",
           ),
-          "schedule_change",
+          { multiline: false }
         );
         if (reason === null) return;
         await withButtonLoading(
@@ -13404,13 +15321,16 @@ function bindActions() {
             if (data.refund && data.refund.gatewayWarning) {
               notify(pickText("退款已记录，但真实退款通道出错，请联系客服确认到账。", "Refund recorded but real gateway failed — contact support to confirm.", "返金を記録しましたが、ゲートウェイエラーが発生しました。サポートにご連絡ください。", "환불이 기록되었지만 실제 결제 게이트웨이 오류가 발생했습니다. 고객 서비스에 문의하세요."), "warning");
             }
+            const _refundInfo = data.order && data.order.refund;
             addMessage(
-              pickText(
-                `订单已取消，退款：${data.order.refund.amount} ${data.order.refund.currency}`,
-                `Order canceled. Refund: ${data.order.refund.amount} ${data.order.refund.currency}`,
-                `注文をキャンセルしました。返金: ${data.order.refund.amount} ${data.order.refund.currency}`,
-                `주문이 취소되었습니다. 환불: ${data.order.refund.amount} ${data.order.refund.currency}`,
-              ),
+              _refundInfo
+                ? pickText(
+                    `订单已取消，退款：${_refundInfo.amount} ${_refundInfo.currency}`,
+                    `Order canceled. Refund: ${_refundInfo.amount} ${_refundInfo.currency}`,
+                    `注文をキャンセルしました。返金: ${_refundInfo.amount} ${_refundInfo.currency}`,
+                    `주문이 취소되었습니다. 환불: ${_refundInfo.amount} ${_refundInfo.currency}`,
+                  )
+                : pickText("订单已取消。", "Order canceled.", "注文をキャンセルしました。", "주문이 취소되었습니다."),
             );
             await Promise.all([loadTrips(), loadOrders(), loadAuditLogs(), loadDashboard()]);
           },
@@ -13486,6 +15406,26 @@ function bindActions() {
       return;
     }
 
+    if (action === "buy-once") {
+      try {
+        await api("/api/subscription/plus", {
+          method: "POST",
+          body: JSON.stringify({ active: false, plan: "buy_once", credits: 5 }),
+        });
+        await trackEvent("buy_once_purchased");
+        notify(pickText("已购买 5 次额度 ✓", "5 credits purchased ✓", "5回分のクレジットを購入しました ✓", "5 크레딧 구매 완료 ✓"), "success");
+        addMessage(pickText(
+          "已为您充值 5 次规划额度（¥9.9），用完可随时再购买或升级 Plus。",
+          "5 planning credits added (¥9.9). Buy more or upgrade to Plus anytime.",
+          "5回分の計画クレジット（¥9.9）を追加しました。いつでも追加購入またはPlussへのアップグレードができます。",
+          "5회 계획 크레딧 추가 완료(¥9.9). 언제든지 더 구매하거나 Plus로 업그레이드할 수 있습니다.",
+        ));
+      } catch (err) {
+        notify(pickText(`购买失败：${err.message}`, `Purchase failed: ${err.message}`, `購入失敗: ${err.message}`, `구매 실패: ${err.message}`), "error");
+      }
+      return;
+    }
+
     if (action === "plus-subscribe") {
       try {
         await api("/api/subscription/plus", {
@@ -13546,6 +15486,11 @@ function bindActions() {
       try {
         await api("/api/user/delete-data", { method: "POST", body: JSON.stringify({ reason: "user_request" }) });
         await trackEvent("data_deleted");
+        // Clear all user data from localStorage (preserve auth token, device ID, GDPR consent)
+        [CONV_STORAGE_KEY, _NEAR_FILTER_KEY, _FAV_KEY, CX_PLAN_SESSION_KEY, "cx_onboarded"].forEach(k => {
+          try { localStorage.removeItem(k); } catch {}
+        });
+        state.favorites = [];
         el.privacyResult.textContent = pickText("本地数据已删除。", "Local data deleted.","ローカルデータを削除しました。", "로컬 데이터를 삭제했습니다.");
         addMessage(pickText("你的本地数据已删除。", "Your local data has been deleted.","ローカルデータを削除しました。", "로컬 데이터가 삭제되었습니다."));
         await Promise.all([loadTrips(), loadOrders(), loadAuditLogs(), loadDashboard()]);
@@ -13556,22 +15501,172 @@ function bindActions() {
   });
 }
 
+// ── Cold-start starter prompts ─────────────────────────────────────────────
+function _initStarterPrompts() {
+  const container = document.getElementById("cxStarterPrompts");
+  const chipsEl   = document.getElementById("cxStarterChips");
+  const labelEl   = document.getElementById("cxStarterLabel");
+  if (!container || !chipsEl) return;
+
+  // Hide if conversation already exists
+  if ((state.agentConversation?.messages || []).length > 0) {
+    container.style.display = "none";
+    return;
+  }
+
+  const STARTERS = {
+    ZH: [
+      "帮我规划成都5天4夜，2人，预算5000元",
+      "上海明晚住一晚，预算500元以内",
+      "三亚亲子游4天，带两个小孩",
+      "云南大理+丽江7天深度游，不喜欢跟团",
+    ],
+    "ZH-TW": [
+      "幫我規劃成都5天4夜，2人，預算5000元",
+      "上海明晚住一晚，預算500元以內",
+      "三亞親子遊4天，帶兩個小孩",
+      "雲南大理+麗江7天深度遊，不喜歡跟團",
+    ],
+    EN: [
+      "Plan a 5-day trip to Kyoto for 2, budget $1500",
+      "Hotel in Tokyo for tomorrow night, under $150",
+      "3-day family trip to Bali with kids",
+      "Backpacker route: Bangkok → Chiang Mai 7 days",
+    ],
+    JA: [
+      "2人で京都・奈良5日間旅行を計画して",
+      "明日のホテルを東京で予算15000円以内で",
+      "子連れ家族旅行 沖縄3泊4日",
+    ],
+    KO: [
+      "2인 도쿄 5박6일 여행 계획해줘, 예산 200만원",
+      "내일 서울 호텔 예약, 15만원 이하",
+      "가족여행 제주도 3박4일 아이 2명",
+    ],
+    ID: [
+      "Rencanakan perjalanan 5 hari ke Shanghai untuk 2 orang, budget Rp8 juta",
+      "Hotel di Beijing besok malam, di bawah Rp1 juta",
+      "Wisata keluarga 4 hari ke Chengdu dengan 2 anak",
+      "Rute backpacker: Shanghai → Hangzhou 3 hari",
+    ],
+    AR: [
+      "خطط لرحلة 5 أيام إلى شنغهاي لشخصين، ميزانية 2000 دولار",
+      "فندق في بكين غداً، أقل من 150 دولار",
+      "رحلة عائلية 4 أيام إلى تشنغدو مع طعام حلال",
+      "مطاعم حلال قريبة في شنغهاي",
+    ],
+  };
+
+  const lang = state.uiLanguage || "ZH";
+  const prompts = STARTERS[lang] || STARTERS.EN;
+  if (labelEl) labelEl.textContent = pickText("✦ 试试这些", "✦ Try these", "✦ 試してみて", "✦ 이런 건 어떠세요", "✦ Coba ini", "✦ جرب هذه");
+
+  // Prepend recent destinations as "继续上次" chips
+  const recentDests = _getRecentDests ? _getRecentDests() : [];
+  const recentChips = recentDests.slice(0, 2).map(d => {
+    const label = pickText(
+      `\u7ee7\u7eed\u89c4\u5212 ${d.dest}`,
+      `Continue: ${d.dest}`,
+      `${d.dest}\u306e\u65c5\u884c\u3092\u7d9a\u3051\u308b`,
+      `${d.dest} \uc5ec\ud589 \uacc4\uc18d`
+    );
+    const query = pickText(
+      `\u5e2e\u6211\u91cd\u65b0\u89c4\u5212 ${d.dest} ${d.days}\u5929\u7684\u884c\u7a0b`,
+      `Re-plan my ${d.days}-day trip to ${d.dest}`,
+      `${d.dest}\u306e${d.days}\u65e5\u9593\u65c5\u884c\u3092\u518d\u8a08\u753b\u3057\u3066`,
+      `${d.dest} ${d.days}\uc77c \uc5ec\ud589 \uc7ac\uacc4\ud68d`
+    );
+    return `<button class="cx-starter-chip cx-starter-chip--recent" type="button" data-query="${escapeHtml(query)}">\ud83d\udd01 ${escapeHtml(label)}</button>`;
+  }).join("");
+
+  chipsEl.innerHTML = recentChips + prompts.map(p =>
+    `<button class="cx-starter-chip" type="button">${escapeHtml(p)}</button>`
+  ).join("");
+
+  chipsEl.querySelectorAll(".cx-starter-chip").forEach(btn => {
+    btn.addEventListener("click", () => {
+      if (el.chatInput) {
+        el.chatInput.value = btn.dataset.query || btn.textContent;
+        autoResizeChatInput();
+        updateChatSendState();
+        el.chatInput.focus();
+        if (typeof el.chatForm.requestSubmit === "function") el.chatForm.requestSubmit();
+        else el.chatForm.dispatchEvent(new Event("submit", { bubbles: true }));
+      }
+    });
+  });
+}
+
+function _hideStarterPrompts() {
+  const el2 = document.getElementById("cxStarterPrompts");
+  if (el2 && el2.style.display !== "none") {
+    el2.style.opacity = "0";
+    el2.style.transform = "translateY(-6px)";
+    setTimeout(() => { el2.style.display = "none"; }, 250);
+  }
+}
+
+// ── P1: Modal overflow management — prevents scroll conflicts when multiple modals open ──
+let _modalCount = 0;
+function _incrementModalCount() {
+  _modalCount++;
+  if (_modalCount === 1) document.body.style.overflow = "hidden";
+}
+function _decrementModalCount() {
+  _modalCount = Math.max(0, _modalCount - 1);
+  if (_modalCount === 0) document.body.style.overflow = "";
+}
+
 function bindInput() {
   el.chatForm.addEventListener("submit", async (event) => {
     event.preventDefault();
     if (state._planStreamActive) return;
     const text = el.chatInput.value.trim();
     if (!text) return;
+    if (text.length > 10000) {
+      notify(pickText("消息过长（最多 10,000 字符）", "Message too long (max 10,000 characters)", "メッセージが長すぎます（最大10,000文字）", "메시지가 너무 깁니다（최대 10,000자）"), "error");
+      return;
+    }
+    state._planStreamActive = true; // Set immediately to prevent double-submit
+    _hideStarterPrompts();
     el.chatInput.value = "";
     autoResizeChatInput();
-    state._planStreamActive = true;
     updateChatSendState();
     _hideTypingHint();
+    // Check for arrival/airport orientation intent before AI call
+    _checkArrivalIntent(text);
+    // Update share button visibility
+    _updateShareItinBtnVisibility();
+    state._lastChatInput = text;
+    // CX-P2-19: severe allergy disclaimer
+    if (/严重过敏|anaphylax|severe.*allerg|allerg.*severe|坚果过敏|花生过敏|nuts?.*(allerg|intoleranc)|peanut.*(allerg|intoleranc)/i.test(text)) {
+      addMessage(pickText(
+        "⚠️ 安全提示：AI 无法保证过敏原信息的准确性。如您有严重过敏史，请在就餐前直接致电餐厅确认食材，不要完全依赖 AI 推荐。",
+        "⚠️ Safety notice: AI cannot guarantee allergy information accuracy. If you have a severe allergy, please call the restaurant directly before dining — do not rely solely on AI recommendations.",
+        "⚠️ 安全のご注意：AIはアレルギー情報の正確性を保証できません。重篤なアレルギーをお持ちの方は、ご来店前に直接レストランへご確認ください。",
+        "⚠️ 안전 알림: AI는 알레르기 정보의 정확성을 보장할 수 없습니다. 심각한 알레르기가 있으시면 방문 전 식당에 직접 확인하세요.",
+      ), "agent", { i18nKey: "allergy_disclaimer" });
+    }
     try {
       // AI-native flow: always use plan stream (createTaskFromText)
       await createTaskFromText(text);
     } catch (err) {
-      addMessage(pickText(`创建任务失败：${err.message}`, `Failed to create task: ${err.message}`, `タスク作成失敗: ${err.message}`, `작업 생성 실패: ${err.message}`));
+      const _retryId = `retry_${Date.now()}`;
+      const _retryLabel = pickText("重试", "Retry", "再試行", "재시도", "Coba Lagi", "إعادة المحاولة");
+      const _errRow = addMessage(pickText(`创建任务失败：${err.message}`, `Failed to create task: ${err.message}`, `タスク作成失敗: ${err.message}`, `작업 생성 실패: ${err.message}`));
+      if (_errRow) {
+        const _retryBtn = document.createElement("button");
+        _retryBtn.className = "secondary";
+        _retryBtn.id = _retryId;
+        _retryBtn.style.cssText = "margin-top:8px;font-size:0.8rem";
+        _retryBtn.textContent = _retryLabel;
+        _retryBtn.addEventListener("click", () => {
+          if (el.chatInput) el.chatInput.value = state._lastChatInput || "";
+          if (typeof el.chatForm.requestSubmit === "function") el.chatForm.requestSubmit();
+          else el.chatForm.dispatchEvent(new Event("submit", { bubbles: true }));
+        });
+        _errRow.querySelector(".bubble")?.appendChild(_retryBtn);
+      }
     } finally {
       state._planStreamActive = false;
       updateChatSendState();
@@ -13583,6 +15678,7 @@ function bindInput() {
       autoResizeChatInput();
       updateChatSendState();
       _updateTypingHint(el.chatInput.value);
+      _updateCharCounter();
     });
     el.chatInput.addEventListener("blur", () => _hideTypingHint());
     if (el.chatInput instanceof HTMLTextAreaElement) {
@@ -13650,21 +15746,30 @@ function bindInput() {
     if (!el.paymentModal) return;
     const title = (option && option.title) || (option && option.name) || "服务方案";
     const priceRaw = (option && (option.costRange || option.price || option.cost || option.estimatedCost)) || "";
-    const priceLabel = priceRaw ? String(priceRaw) :"价格面议";
+    const numericPrice = priceRaw ? Number(String(priceRaw).replace(/[^\d.]/g, "")) : 0;
+    const priceLabel = numericPrice > 0 ? formatCNY(numericPrice) : (priceRaw ? String(priceRaw) : pickText("价格面议", "Price TBD", "価格要相談", "가격 협의", "Harga TBD", "السعر غير محدد"));
     if (el.payItemName) el.payItemName.textContent = title;
     if (el.payItemPrice) el.payItemPrice.textContent = priceLabel;
     if (el.payTotal) el.payTotal.textContent = priceLabel;
-    if (el.payModalTitle) el.payModalTitle.textContent = pickText("确认订单", "Confirm Order","注文を確認", "주문 확인");
-    if (el.payModalSubtitle) el.payModalSubtitle.textContent = pickText("请选择支付方式完成预订", "Choose payment to complete booking","お支払い方法を選択してください", "결제 방법을 선택하세요");
+    if (el.payModalTitle) el.payModalTitle.textContent = pickText("确认订单", "Confirm Order","注文を確認", "주문 확인", "Konfirmasi Pesanan");
+    if (el.payModalSubtitle) el.payModalSubtitle.textContent = pickText("请选择支付方式完成预订", "Choose payment to complete booking","お支払い方法を選択してください", "결제 방법을 선택하세요", "Pilih metode pembayaran");
     if (el.payQrSection) el.payQrSection.classList.add("hidden");
+    // Store orderId for Stripe checkout linking
+    el.paymentModal.dataset.orderId = (option && option.orderId) || "";
     el.paymentModal.classList.remove("hidden");
-    document.body.style.overflow = "hidden";
+    _incrementModalCount();
+    // For international users: put Credit/Debit Card first in the method list (only once)
+    const _methods = el.paymentModal.querySelector(".payment-methods");
+    if (_methods && el.payCard && state.uiLanguage !== "ZH" && !el.payCard.dataset.reordered) {
+      _methods.prepend(el.payCard);
+      el.payCard.dataset.reordered = "1";
+    }
   }
 
   function hidePaymentModal() {
     if (!el.paymentModal) return;
     el.paymentModal.classList.add("hidden");
-    document.body.style.overflow = "";
+    _decrementModalCount();
     if (el.payQrSection) el.payQrSection.classList.add("hidden");
     if (el.paymentModal) el.paymentModal.dataset.provider = "";
   }
@@ -13672,22 +15777,47 @@ function bindInput() {
   function showPaymentQR(provider) {
     if (!el.payQrSection) return;
     const priceText = (el.payQrAmount && el.payTotal && el.payTotal.textContent) ? el.payTotal.textContent : "";
+
+    // International card (Stripe checkout) — redirect to hosted checkout
+    if (provider === "card") {
+      // Prevent double-click: disable all payment buttons
+      if (window._paymentRedirecting) return;
+      window._paymentRedirecting = true;
+      const _allPayBtns = el.paymentModal?.querySelectorAll("button[id^='pay']");
+      if (_allPayBtns) _allPayBtns.forEach(btn => { btn.disabled = true; });
+
+      hidePaymentModal();
+      const _ordId   = el.paymentModal?.dataset?.orderId || "";
+      const _locale  = { EN: "en", JA: "ja", KO: "ko", ID: "en" }[state.uiLanguage] || "auto";
+      const _amt     = encodeURIComponent(el.payTotal?.textContent || "");
+      const checkoutUrl = `/api/payment/checkout?ref=${Date.now()}&amount=${_amt}`
+        + (_ordId  ? `&orderId=${encodeURIComponent(_ordId)}` : "")
+        + `&locale=${_locale}`;
+      notify(
+        pickText("正在跳转到安全支付页...", "Redirecting to secure card payment...", "安全なカード決済ページへ移動中...", "안전한 카드 결제 페이지로 이동 중...", "Mengarahkan ke halaman pembayaran kartu...", "جارٍ التحويل إلى صفحة الدفع الآمنة..."),
+        "info",
+      );
+      setTimeout(() => { window.location.href = checkoutUrl; }, 600);
+      return;
+    }
+
     const isWeChat  = provider === "wechat";
     const deeplink  = isWeChat
       ? `weixin://wxpay/bizpayurl?pr=CROSSX_${Date.now()}`
       : `alipays://platformapi/startapp?appId=20000067&url=${encodeURIComponent("https://crossx.ai/pay?ref=" + Date.now())}`;
     if (el.payQrImg) {
       el.payQrImg.alt = isWeChat ? "WeChat Pay QR" : "Alipay QR";
+      el.payQrImg.style.display = "";
+      // Clear any existing fallback error message before attempting new QR generation
+      const existingErr = el.payQrSection.querySelector(".cx-qr-fallback");
+      if (existingErr) existingErr.remove();
+
       el.payQrImg.onerror = () => {
-        // QR generation failed — show text fallback
         el.payQrImg.style.display = "none";
-        const errDiv = el.payQrSection.querySelector(".cx-qr-fallback") || (() => {
-          const d = document.createElement("div");
-          d.className = "cx-qr-fallback";
-          d.style.cssText = "padding:16px;text-align:center;color:var(--color-error,#e53935);font-size:13px;";
-          el.payQrSection.insertBefore(d, el.payQrImg.nextSibling);
-          return d;
-        })();
+        const errDiv = document.createElement("div");
+        errDiv.className = "cx-qr-fallback";
+        errDiv.style.cssText = "padding:16px;text-align:center;color:var(--color-error,#e53935);font-size:13px;";
+        el.payQrSection.insertBefore(errDiv, el.payQrImg.nextSibling);
         errDiv.textContent = pickText("二维码生成失败，请刷新重试", "QR code generation failed, please refresh", "QRコードの生成に失敗しました", "QR 코드 생성 실패, 새로고침 해주세요");
       };
       if (window.QRCode) {
@@ -13699,8 +15829,12 @@ function bindInput() {
         el.payQrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&color=000000&bgcolor=ffffff&data=${encodeURIComponent(deeplink)}&format=svg`;
       }
     }
-    if (el.payQrLabel) el.payQrLabel.textContent = isWeChat ? "微信扫码支付" : "支付宝扫码支付";
-    if (el.payQrHint) el.payQrHint.textContent = isWeChat ? "请打开微信 → 扫一扫" : "请打开支付宝 → 扫一扫";
+    if (el.payQrLabel) el.payQrLabel.textContent = isWeChat
+      ? pickText("微信扫码支付", "WeChat Pay — Scan QR", "WeChat Pay — QRスキャン", "WeChat Pay — QR 스캔")
+      : pickText("支付宝扫码支付", "Alipay — Scan QR", "Alipay — QRスキャン", "Alipay — QR 스캔");
+    if (el.payQrHint) el.payQrHint.textContent = isWeChat
+      ? pickText("请打开微信 → 扫一扫", "Open WeChat → Scan", "WeChatを開く → スキャン", "WeChat 열기 → 스캔")
+      : pickText("请打开支付宝 → 扫一扫", "Open Alipay → Scan", "Alipayを開く → スキャン", "Alipay 열기 → 스캔");
     if (el.payQrAmount) el.payQrAmount.textContent = priceText || el.payTotal?.textContent || "";
     el.payQrSection.classList.remove("hidden");
   }
@@ -13709,6 +15843,8 @@ function bindInput() {
   if (el.paymentModal) el.paymentModal.addEventListener("click", (e) => { if (e.target === el.paymentModal) hidePaymentModal(); });
   if (el.payWechat) el.payWechat.addEventListener("click", () => showPaymentQR("wechat"));
   if (el.payAlipay) el.payAlipay.addEventListener("click", () => showPaymentQR("alipay"));
+  const _payCardBtn = document.getElementById("payCard");
+  if (_payCardBtn) _payCardBtn.addEventListener("click", () => showPaymentQR("card"));
   if (el.payDoneBtn) {
     el.payDoneBtn.addEventListener("click", () => {
       hidePaymentModal();
@@ -13878,6 +16014,13 @@ function bindInput() {
   if (el.nearFilterForm) {
     el.nearFilterForm.addEventListener("change", async () => {
       _saveNearFilter();
+      // Show brief "Filtering..." banner so user knows action is processing
+      if (el.nearList) {
+        const _filterBanner = document.createElement("div");
+        _filterBanner.style.cssText = "text-align:center;padding:8px;font-size:13px;color:var(--color-primary,#1a56db);opacity:0.8";
+        _filterBanner.textContent = pickText("筛选中...", "Filtering...", "フィルタリング中...", "필터링 중...");
+        el.nearList.prepend(_filterBanner);
+      }
       try {
         await loadNearSuggestions();
       } catch {
@@ -13888,11 +16031,12 @@ function bindInput() {
 
   if (el.langSwitch) {
     el.langSwitch.addEventListener("change", () => {
-      const next = i18n.normalizeLanguage(el.langSwitch.value || "ZH");
+      const next = i18n.normalizeLanguage(el.langSwitch.value || "EN");
 
       // ── Step 1: Update language state + redraw all static labels immediately.
       // This is always safe — it only touches DOM text nodes, never sends requests.
       state.uiLanguage = next;
+      try { localStorage.setItem("cx_ui_lang", next); } catch { /* quota */ }
       applyLanguagePack();
 
       // ── Step 2: Re-translate any rendered plan cards in the new language.
@@ -14245,6 +16389,19 @@ function bindForms() {
         }),
       });
       state._prefsDirty = false;
+      // Apply language change immediately — update static elements AND reload dynamic content
+      const _newLang = String(form.get("language") || "").toUpperCase();
+      if (_newLang && _newLang !== state.uiLanguage) {
+        state.uiLanguage = _newLang;
+        applyLanguagePack();
+        // Re-render each tab's content so pickText() runs with new language.
+        // Near / Trips / Trust reload on next tab visit; reload Me tab now since user is here.
+        loadUserProfile().catch(() => {});
+        // Reload Near and Trips data in background so they reflect new language when visited
+        loadNearSuggestions().catch(() => {});
+        loadTrips().catch(() => {});
+        loadOrders().catch(() => {});
+      }
       // Remove unsaved indicator
       const _prefSubmitBtn = el.prefForm.querySelector("[type=submit]");
       if (_prefSubmitBtn && _prefSubmitBtn.dataset.origText) { _prefSubmitBtn.textContent = _prefSubmitBtn.dataset.origText; delete _prefSubmitBtn.dataset.origText; }
@@ -14430,9 +16587,59 @@ function exposeAgentDebugInterface() {
   };
 }
 
+// ── PWA install prompt after 3rd visit (CX-P2-07) ──────────────────────────────
+(function _initPwaPrompt() {
+  let _deferredInstall = null;
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    _deferredInstall = e;
+    const visits = parseInt(localStorage.getItem("cx_visits") || "0", 10) + 1;
+    localStorage.setItem("cx_visits", String(visits));
+    if (visits >= 3 && !localStorage.getItem("cx_pwa_dismissed")) {
+      setTimeout(() => {
+        const banner = document.createElement("div");
+        banner.id = "cx-pwa-banner";
+        banner.style.cssText = "position:fixed;bottom:72px;left:50%;transform:translateX(-50%);background:#1a56db;color:#fff;padding:10px 16px;border-radius:12px;display:flex;align-items:center;gap:12px;z-index:8888;box-shadow:0 4px 16px rgba(0,0,0,0.2);max-width:90vw;font-size:0.85rem";
+        banner.innerHTML = `<span>${pickText("添加 Cross X 到主屏幕", "Add Cross X to Home Screen", "Cross X をホーム画面に追加", "Cross X를 홈 화면에 추가")}</span>
+          <button style="background:#fff;color:#1a56db;border:none;padding:5px 12px;border-radius:8px;cursor:pointer;font-weight:600" id="cx-pwa-install">${pickText("安装", "Install", "インストール", "설치")}</button>
+          <button style="background:transparent;color:#fff;border:none;cursor:pointer;font-size:1.1rem" id="cx-pwa-dismiss">✕</button>`;
+        document.body.appendChild(banner);
+        document.getElementById("cx-pwa-install")?.addEventListener("click", () => {
+          _deferredInstall?.prompt();
+          banner.remove();
+        });
+        document.getElementById("cx-pwa-dismiss")?.addEventListener("click", () => {
+          localStorage.setItem("cx_pwa_dismissed", "1");
+          banner.remove();
+        });
+      }, 3000);
+    }
+  });
+})();
+
+function _checkWeChatBrowser() {
+  const ua = navigator.userAgent || "";
+  if (/MicroMessenger/i.test(ua)) {
+    setTimeout(() => {
+      notify(
+        pickText(
+          "检测到微信内置浏览器：对话记录可能无法保存，建议点右上角「...」用系统浏览器打开。",
+          "WeChat browser detected: conversation may not be saved. Tap ··· → Open in Browser for best experience.",
+          "WeChat内蔵ブラウザを検出：会話が保存されない場合があります。··· → ブラウザで開く を推奨。",
+          "WeChat 브라우저 감지: 대화가 저장되지 않을 수 있습니다. ··· → 브라우저에서 열기를 권장합니다.",
+        ),
+        "info",
+        10000
+      );
+    }, 1500);
+  }
+}
+
 async function init() {
   // GDPR: show consent banner before any tracking (Art. 7)
   _checkGdprConsent();
+  // WeChat browser compatibility warning (CX-P1-14)
+  _checkWeChatBrowser();
   // Restore conversation history and slots from previous session (up to 4h)
   restoreConversationState();
   // Restore plan session ID so delta-patch and session badge work after page reload
@@ -14448,6 +16655,90 @@ async function init() {
     state.viewMode = "user";
     state.singleDialogMode = true;
   }
+
+  // Mobile keyboard: when virtual keyboard opens, scroll chatForm into view.
+  // Uses visualViewport API — covers iOS, Android, HarmonyOS, MIUI, etc.
+  if (window.visualViewport && window.innerWidth <= 768) {
+    let _lastVpHeight = window.visualViewport.height;
+    window.visualViewport.addEventListener("resize", () => {
+      const vp = window.visualViewport;
+      const keyboardOpen = vp.height < _lastVpHeight - 80;
+      _lastVpHeight = vp.height;
+      const form = document.getElementById("chatForm");
+      if (!form) return;
+      if (keyboardOpen) {
+        // Keyboard just opened — scroll chat to bottom and nudge form into view
+        setTimeout(() => {
+          form.scrollIntoView({ block: "end", behavior: "smooth" });
+          const feed = document.getElementById("chatFeed");
+          if (feed) feed.scrollTop = feed.scrollHeight;
+        }, 100);
+      }
+    });
+  }
+  // Show language fallback notice once per browser session (not per page load)
+  try {
+    const _fallbackLang = sessionStorage.getItem("cx_lang_fallback");
+    if (_fallbackLang) {
+      sessionStorage.removeItem("cx_lang_fallback");
+      const _langNames = { hi: "Hindi", vi: "Vietnamese", ar: "Arabic", es: "Spanish", fr: "French", de: "German", pt: "Portuguese", ru: "Russian", th: "Thai", tr: "Turkish", nl: "Dutch", pl: "Polish", uk: "Ukrainian", bg: "Bulgarian", ro: "Romanian", sv: "Swedish", da: "Danish", fi: "Finnish", no: "Norwegian", cs: "Czech", sk: "Slovak", hr: "Croatian", hu: "Hungarian", el: "Greek", he: "Hebrew", fa: "Persian", ur: "Urdu", bn: "Bengali", ta: "Tamil", te: "Telugu", mr: "Marathi", gu: "Gujarati", pa: "Punjabi", ms: "Malay", tl: "Filipino", sw: "Swahili", yo: "Yoruba", ha: "Hausa", ig: "Igbo", am: "Amharic", wo: "Wolof" };
+      const _langName = _langNames[_fallbackLang.slice(0, 2)] || _fallbackLang;
+      setTimeout(() => notify(
+        `${_langName} is not yet fully supported — showing English. You can switch languages from the Lang menu.`,
+        "info", 7000
+      ), 1500);
+    }
+  } catch { /* ignore */ }
+
+  // Show onboarding for first-time visitors
+  _initOnboarding();
+
+  // Cold-start example prompts (shown only when chat is empty)
+  _initStarterPrompts();
+
+  // Multi-person invite param detection
+  _checkInviteParam();
+
+  // Social feedback: notify sharer if their plan was viewed
+  setTimeout(_checkInviteViewNotification, 2000);
+
+  // Offline detection banner
+  _initOfflineDetection();
+
+  // Image upload / OCR
+  _initImageUpload();
+
+  // Currency selector
+  _initCurrencySelector();
+
+  // Font size toggle
+  _initFontSize();
+
+  // Export chat button (txt) + print itinerary (PDF)
+  if (el.exportChatBtn) {
+    el.exportChatBtn.addEventListener("click", (ev) => {
+      if (ev.shiftKey) {
+        printItinerary();
+      } else {
+        exportChat();
+      }
+    });
+  }
+
+  // Share itinerary link
+  if (el.shareItinBtn) {
+    el.shareItinBtn.addEventListener("click", () => generateShareLink(el.shareItinBtn));
+  }
+  _updateShareItinBtnVisibility();
+
+  // Check ?share= URL param to load a shared conversation
+  try {
+    const _shareId = new URLSearchParams(window.location.search).get("share");
+    if (_shareId) {
+      setTimeout(() => _loadSharedConversation(_shareId).catch(() => {}), 800);
+    }
+  } catch { /* ignore */ }
+
   addMessage(getSystemMessageByKey("welcome_intro"), "agent", { i18nKey: "welcome_intro" });
   // AI session context banner (restored sessions) or time-aware suggestions (fresh sessions)
   if (state._sessionRestored) {
@@ -14488,14 +16779,28 @@ async function init() {
     }).catch(() => {});
   }, 2000);
 
-  // Force-remove stale service workers that can pin old JS/CSS.
+  // AP-01/P2-07: Register CrossX Service Worker for offline caching.
+  // Replaces the previous "unregister all" approach — sw.js now properly
+  // handles cache versioning and cleanup of old caches in its activate handler.
   if ("serviceWorker" in navigator) {
-    try {
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
-    } catch {
-      // ignore
-    }
+    navigator.serviceWorker.register("/sw.js", { scope: "/" })
+      .then((reg) => {
+        console.log("[SW] Registered, scope:", reg.scope);
+        // Tell any waiting SW to activate immediately
+        if (reg.waiting) reg.waiting.postMessage("SKIP_WAITING");
+        reg.addEventListener("updatefound", () => {
+          const newWorker = reg.installing;
+          if (newWorker) {
+            newWorker.addEventListener("statechange", () => {
+              if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
+                // New SW installed — page reload picks up updates on next navigation
+                console.log("[SW] Update available");
+              }
+            });
+          }
+        });
+      })
+      .catch((err) => console.warn("[SW] Registration failed:", err.message));
   }
 
   bindActions();
@@ -14640,10 +16945,10 @@ async function init() {
 
 // ── P6: FX rates — live from /api/gateway/fx, static fallback ───────────────
 const FX_RATES_FALLBACK = {
-  EN: { code: "USD", symbol: "$",  rate: 0.138  },
-  JA: { code: "JPY", symbol: "¥",  rate: 20.8   },
-  KO: { code: "KRW", symbol: "₩",  rate: 186.5  },
-  MY: { code: "MYR", symbol: "RM", rate: 0.648  },
+  EN: { code: "USD", symbol: "$",   rate: 0.138  },
+  JA: { code: "JPY", symbol: "\u00a5",   rate: 20.8   },
+  KO: { code: "KRW", symbol: "\u20a9",   rate: 186.5  },
+  ID: { code: "IDR", symbol: "Rp",  rate: 2116   },
 };
 const _fxLive = { rates: null }; // populated by fetchGatewayFx()
 const _couponCache = new Map();  // destination → coupon object
@@ -14652,11 +16957,30 @@ function getActiveFx() {
   const lang = state.uiLanguage || "ZH";
   const fb   = FX_RATES_FALLBACK[lang] || null;
   if (!_fxLive.rates) return fb;
-  const codeMap = { EN: "USD", JA: "JPY", KO: "KRW", MY: "MYR" };
-  const symMap  = { USD: "$", JPY: "¥", KRW: "₩", MYR: "RM" };
+  const codeMap = { EN: "USD", JA: "JPY", KO: "KRW", ID: "IDR" };
+  const symMap  = { USD: "$", JPY: "\u00a5", KRW: "\u20a9", IDR: "Rp" };
   const code    = codeMap[lang];
   if (!code || !_fxLive.rates[code]) return fb;
   return { code, symbol: symMap[code] || code, rate: _fxLive.rates[code] };
+}
+
+/**
+ * Format a CNY amount, appending a reference conversion for non-ZH users.
+ * e.g. "¥2,800 CNY (~$386 USD)" or "¥2,800 CNY (~¥58,240 JPY)"
+ */
+function formatCNY(amountCNY, opts = {}) {
+  const n = Number(amountCNY) || 0;
+  const cnyStr = `\u00a5${n.toLocaleString()} CNY`;
+  if ((state.uiLanguage || "ZH") === "ZH") return cnyStr;
+  const fx = getActiveFx();
+  if (!fx || !fx.rate || fx.code === "CNY") return cnyStr;
+  // Special: JPY uses ¥ too — clarify both to avoid confusion
+  if (fx.code === "JPY") {
+    const jpyAmt = Math.round(n * fx.rate).toLocaleString();
+    return `${cnyStr} (~\u00a5${jpyAmt} JPY)`;
+  }
+  const converted = (n * fx.rate).toFixed(2);
+  return `${cnyStr} (~${fx.symbol}${converted} ${fx.code})`;
 }
 
 async function fetchGatewayFx() {
@@ -14845,7 +17169,7 @@ function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
     return `<div class="opt-bb-seg" style="width:${pct}%;background:${e.color}"></div>`;
   }).join("");
   const bbLegend = bbEntries.map((e) =>
-    `<span class="opt-bb-item"><span style="background:${e.color}"></span>${e.label} ¥${Number((p.budget_breakdown || {})[e.key] || 0).toLocaleString()}</span>`
+    `<span class="opt-bb-item"><span style="background:${e.color}"></span>${e.label} ¥${Number((p.budget_breakdown || {})[e.key] || 0).toLocaleString()} CNY</span>`
   ).join("");
 
   el.innerHTML = `
@@ -14878,9 +17202,12 @@ function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
           onclick="cxDetailOpenItinerary(this)">
           ${pickText("查看逐日行程 ↓","View Itinerary ↓","日程を見る ↓","일정 보기 ↓")}
         </button>
-        ${p.hotel?.name ? `<a class="cx-detail-hotel-link" href="https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(p.hotel.name)}" target="_blank" rel="noopener noreferrer">
-          🏨 ${pickText("在携程查看酒店","View on Ctrip","携程で見る","携程에서 보기")}
-        </a>` : ""}
+        ${p.hotel?.name ? (
+          (state.uiLanguage === "ZH")
+            ? `<a class="cx-detail-hotel-link" href="https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏨 携程订酒店</a>`
+            : `<a class="cx-detail-hotel-link" href="${PLATFORM_DEEPLINKS.booking.url(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏨 Book on Booking.com</a>
+               <a class="cx-detail-hotel-link" href="${PLATFORM_DEEPLINKS.agoda.url(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏩 Agoda</a>`
+        ) : ""}
         <button class="cx-detail-book-btn"
           data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
           onclick="cxGoToCheckout(this)">
@@ -15268,14 +17595,14 @@ function openModal(title, contentEl) {
     _cxModalBackdrop.classList.add("cx-modal-open");
     _cxModal.classList.add("cx-modal-open");
   });
-  document.body.style.overflow = "hidden";
+  _incrementModalCount();
 }
 
 function closeModal() {
   if (!_cxModal) return;
   _cxModalBackdrop.classList.remove("cx-modal-open");
   _cxModal.classList.remove("cx-modal-open");
-  document.body.style.overflow = "";
+  _decrementModalCount();
 }
 
 // ── P3: Bottom Sheet ──────────────────────────────────────────────────────
@@ -15321,14 +17648,14 @@ function openSheet(title, contentEl) {
     _cxSheetBackdrop.classList.add("cx-sheet-open");
     _cxBottomSheet.classList.add("cx-sheet-open");
   });
-  document.body.style.overflow = "hidden";
+  _incrementModalCount();
 }
 
 function closeSheet() {
   if (!_cxBottomSheet) return;
   _cxSheetBackdrop.classList.remove("cx-sheet-open");
   _cxBottomSheet.classList.remove("cx-sheet-open");
-  document.body.style.overflow = "";
+  _decrementModalCount();
 }
 
 // ── P2: Session Auto-Binding ──────────────────────────────────────────────
@@ -15340,10 +17667,12 @@ const CX_DEVICE_ID_KEY = "cx_device_id";
 function getDeviceId() {
   let id;
   try { id = localStorage.getItem(CX_DEVICE_ID_KEY); } catch {}
-  if (!id) {
-    id = (typeof crypto !== "undefined" && crypto.randomUUID)
-      ? crypto.randomUUID()
-      : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  // Validate existing ID matches backend format; regenerate if it's an old UUID or random format
+  if (!id || !/^cx_[a-f0-9]{32}$/.test(id)) {
+    const bytes = (typeof crypto !== "undefined" && crypto.getRandomValues)
+      ? Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2, "0")).join("")
+      : Math.random().toString(16).slice(2).padEnd(32, "0");
+    id = `cx_${bytes}`;
     try { localStorage.setItem(CX_DEVICE_ID_KEY, id); } catch {}
   }
   return id;
@@ -15496,7 +17825,7 @@ const REALTIME_THINKING_MAP = {
     : pickText("正在理解需求...",              "Analyzing request...",                      "リクエスト解析中...",             "요청 분석 중..."),
   H_SEARCH: (d, f) => f
     ? pickText(`搜寻${d}${f}`,       `Hunting ${d} ${f}`,           `${d}の${f}を探索中`,  `${d} ${f} 탐색 중`)
-    : pickText("核心资源精算中...", "Calculating resources...", "リソースを精算中...", "리소스 정산 중..."),
+    : pickText("正在搜索酒店...", "Searching for hotels...", "ホテルを検索中...", "호텔 검색 중...", "Mencari hotel...", "جارٍ البحث عن الفنادق..."),
   T_CALC:   (d, f) => f
     ? pickText(`规划${d}美食打卡路线`,         `Mapping ${d} food trail`,                   `${d}グルメルートを計画中`,        `${d} 맛집 경로 계획 중`)
     : pickText("正在核算交通费用...",          "Calculating transport...",                  "交通費を計算中...",               "교통비 계산 중..."),
@@ -15658,7 +17987,7 @@ function appendThinkingStep(stream, code, label) {
   });
 
   const feed = document.getElementById("chatFeed");
-  if (feed) feed.scrollTop = feed.scrollHeight;
+  if (feed) _smartScrollToBottom(feed);
 }
 
 /** Render 3-column shimmer skeleton below the thinking stream. Returns root el. */
@@ -15679,7 +18008,7 @@ function renderPlanSkeleton() {
     wrap.appendChild(col);
   }
   feed.appendChild(wrap);
-  feed.scrollTop = feed.scrollHeight;
+  _smartScrollToBottom(feed);
   return wrap;
 }
 
@@ -15708,7 +18037,7 @@ function createThinkingPanel() {
     </div>
     <div class="thinking-panel-body"><span class="thinking-text"></span></div>`;
   feed.appendChild(panel);
-  feed.scrollTop = feed.scrollHeight;
+  _smartScrollToBottom(feed);
   return panel;
 }
 
@@ -15798,7 +18127,15 @@ function showBookingPaymentModal(orderData) {
         modal.classList.add("hidden");
         if (result && result.status === "success") renderPaymentSuccessCard(result);
       } catch {
-        notify(pickText("确认支付失败，请重试", "Payment confirmation failed","支払い確認に失敗", "결제 확인 실패"), "error");
+        modal.classList.add("hidden");
+        const refundMsg = pickText(
+          "支付后订单处理失败。如已扣款，退款将在 1-3 个工作日内原路返回。如需帮助，请联系客服：support@crossx.ai",
+          "Payment processed but booking failed. If charged, a refund will be returned within 1–3 business days. Contact support: support@crossx.ai",
+          "支払い後の予約に失敗しました。引き落とされた場合、1〜3営業日以内に返金されます。サポート: support@crossx.ai",
+          "결제 후 예약 처리 실패. 출금된 경우 1~3 영업일 내 환불됩니다. 문의: support@crossx.ai",
+        );
+        addMessage(refundMsg, "agent");
+        notify(pickText("确认支付失败，请联系客服", "Booking failed — see chat for refund steps","支払い確認に失敗", "결제 확인 실패"), "error");
       }
     };
   }
@@ -15901,7 +18238,7 @@ function _showTypingBubble() {
   row.className = "msg agent cx-typing-bubble-row";
   row.innerHTML = `<span class="bubble cx-typing-bubble"><span></span><span></span><span></span></span>`;
   feed.appendChild(row);
-  feed.scrollTop = feed.scrollHeight;
+  _smartScrollToBottom(feed);
   return row;
 }
 function _removeTypingBubble(row) {
@@ -15956,6 +18293,24 @@ function _hideTypingHint() {
 }
 
 /**
+ * Updates character counter for chat input (P0-2.2)
+ * Shows warning at 80%, error at 95%
+ */
+function _updateCharCounter() {
+  const input = document.getElementById("chatInput");
+  const counter = document.getElementById("charCounter");
+  if (!input || !counter) return;
+
+  const current = input.value.length;
+  const max = parseInt(input.getAttribute("maxlength") || "500", 10);
+  counter.textContent = `${current}/${max}`;
+
+  counter.classList.remove("cx-char-warning", "cx-char-limit");
+  if (current >= max * 0.95) counter.classList.add("cx-char-limit");
+  else if (current >= max * 0.8) counter.classList.add("cx-char-warning");
+}
+
+/**
  * Session context banner — shown when a previous session is restored.
  * Tells the user the AI still has their context so they can continue naturally.
  */
@@ -15992,6 +18347,37 @@ function _renderSessionContextBanner() {
       <button class="cx-scb-clear" onclick="clearSession()" title="\u6E05\u9664\u8BB0\u5F55">\u00D7</button>
     </div>
   `);
+}
+
+// ── Clear session context (called from session context banner × button) ──────
+function clearSession() {
+  if (!confirm(pickText("确定清除当前会话记录？", "Clear current session?", "現在のセッションをクリアしますか？", "현재 세션을 지우시겠습니까?"))) return;
+
+  // Clear conversation state
+  state.agentConversation = { mode: "idle", slots: {}, preferences: [], messages: [] };
+  state.currentTask = null;
+  state._lastSessionId = null;
+  state._lastCardData = null;
+
+  // Clear UI
+  const chatFeed = document.getElementById("chatFeed");
+  if (chatFeed) chatFeed.innerHTML = "";
+
+  // Clear session context banner
+  const banner = document.getElementById("sessionContextBanner");
+  if (banner) banner.remove();
+
+  // Clear storage
+  try {
+    const tabId = sessionStorage.getItem("cx_tab_id") || "";
+    const key = tabId ? `cx_conv_${tabId}` : "cx_conv";
+    sessionStorage.removeItem(key);
+  } catch {}
+
+  notify(pickText("会话已清除", "Session cleared", "セッションをクリアしました", "세션이 지워졌습니다"), "success");
+
+  // Re-render time-aware suggestions
+  _renderTimeAwareSuggestions();
 }
 
 /**
@@ -16147,15 +18533,26 @@ const AUTH_TOKEN_KEY   = "cx_user_token";
 const AUTH_USERID_KEY  = "cx_user_id";
 const AUTH_NAME_KEY    = "cx_user_name";
 
-function _getAuthToken()   { try { return localStorage.getItem(AUTH_TOKEN_KEY) || null; } catch { return null; } }
+// SEC-03: Token now primarily stored in HttpOnly cookie (server sets cx_token cookie on login).
+// localStorage fallback kept for backwards compat with existing sessions and cookie-blocked envs.
+function _getAuthToken() {
+  try {
+    // If the server set a cx_token cookie we still need the value for Authorization header injection.
+    // Cookies are not readable from JS when HttpOnly, so fall back to localStorage for the header.
+    // The server will accept EITHER the cookie OR the Authorization header.
+    return localStorage.getItem(AUTH_TOKEN_KEY) || null;
+  } catch { return null; }
+}
 function _getAuthUserId()  { try { return localStorage.getItem(AUTH_USERID_KEY) || null; } catch { return null; } }
 function _getAuthName()    { try { return localStorage.getItem(AUTH_NAME_KEY) || null; } catch { return null; } }
 
 function _saveAuthState(token, userId, displayName) {
   try {
+    // Still save token in localStorage for Authorization header injection (HttpOnly cookie handles security)
     localStorage.setItem(AUTH_TOKEN_KEY,  token);
     localStorage.setItem(AUTH_USERID_KEY, userId);
     localStorage.setItem(AUTH_NAME_KEY,   displayName);
+    // Note: HttpOnly cx_token cookie is set by the server on login — no JS needed here
   } catch { /* storage disabled */ }
 }
 
@@ -16164,6 +18561,7 @@ function _clearAuthState() {
     localStorage.removeItem(AUTH_TOKEN_KEY);
     localStorage.removeItem(AUTH_USERID_KEY);
     localStorage.removeItem(AUTH_NAME_KEY);
+    // Note: HttpOnly cx_token cookie is cleared by the server on logout (Set-Cookie: Max-Age=0)
   } catch { /* storage disabled */ }
 }
 
@@ -16174,7 +18572,7 @@ function _applyAuthUi(loggedIn, displayName) {
   if (!loginBtn) return;
   if (loggedIn) {
     loginBtn.classList.add("hidden");
-    userNameTag.textContent = displayName || "旅行者";
+    userNameTag.textContent = displayName || pickText("旅行者", "Traveler", "旅人", "여행자");
     userNameTag.classList.remove("hidden");
     logoutBtn.classList.remove("hidden");
   } else {
@@ -16207,7 +18605,58 @@ async function _initAuthState() {
     return;
   }
   if (_authErr) {
-    notify(`微信登录失败：${_authErr}`, "error");
+    const _authErrMap = {
+      denied:                pickText("登录已取消。", "Sign-in was cancelled.", "サインインがキャンセルされました。", "로그인이 취소되었습니다."),
+      invalid_state:         pickText("会话已过期，请重试。", "Session expired. Please try again.", "セッションの有効期限が切れました。もう一度お試しください。", "세션이 만료되었습니다. 다시 시도하세요."),
+      google_failed:         pickText("Google 登录失败，请重试。", "Google sign-in failed. Please try again.", "Googleサインインに失敗しました。もう一度お試しください。", "Google 로그인에 실패했습니다. 다시 시도하세요."),
+      wechat_failed:         pickText("微信登录失败，请重试。", "WeChat sign-in failed. Please try again.", "WeChatサインインに失敗しました。", "WeChat 로그인에 실패했습니다."),
+      google_not_configured: pickText("暂不支持 Google 登录。", "Google sign-in is not available.", "Google サインインはご利用いただけません。", "Google 로그인을 사용할 수 없습니다."),
+      wechat_not_configured: pickText("暂不支持微信登录。", "WeChat sign-in is not available.", "WeChat サインインはご利用いただけません。", "WeChat 로그인을 사용할 수 없습니다."),
+    };
+    notify(_authErrMap[_authErr] || pickText("登录失败，请重试。", "Sign-in failed. Please try again.", "サインインに失敗しました。", "로그인에 실패했습니다."), "error");
+    history.replaceState({}, "", window.location.pathname);
+  }
+
+  // Handle Stripe Checkout return
+  const _payOk     = _urlP.get("pay_ok");
+  const _payCancel = _urlP.get("pay_cancel");
+  const _payErr    = _urlP.get("pay_error");
+  if (_payOk) {
+    notify(pickText("支付成功！正在前往订单详情…", "Payment successful! Taking you to your order…", "お支払い完了！ご注文へ移動します…", "결제 완료! 주문 페이지로 이동합니다…", "Pembayaran berhasil! Menuju ke pesanan Anda…", "تم الدفع بنجاح! جارٍ الانتقال إلى طلبك…"), "success");
+    const _payOrderId = _urlP.get("orderId") || "";
+    history.replaceState({}, "", window.location.pathname);
+    // Refresh orders immediately; then poll up to 3× for webhook to mark paid
+    setTimeout(async () => {
+      switchTab("trips");
+      await Promise.all([loadTrips(), loadOrders()]);
+      if (_payOrderId) {
+        // Poll /api/orders/:id/status to detect webhook arrival (max 3 attempts, 3s apart)
+        for (let _pi = 0; _pi < 3; _pi++) {
+          await new Promise(r => setTimeout(r, 3000));
+          try {
+            const _ps = await api(`/api/orders/${encodeURIComponent(_payOrderId)}/status`);
+            if (_ps && _ps.paymentStatus === "paid") { await loadOrders(); break; }
+          } catch { break; }
+        }
+      }
+    }, 800);
+  } else if (_payCancel) {
+    notify(pickText("支付已取消。", "Payment cancelled.", "お支払いがキャンセルされました。", "결제가 취소되었습니다.", "Pembayaran dibatalkan.", "تم إلغاء الدفع."), "info");
+    history.replaceState({}, "", window.location.pathname);
+  } else if (_payErr) {
+    const _errMsg = _payErr === "stripe_not_configured"
+      ? pickText("暂不支持国际卡支付，请使用微信或支付宝。", "International card payment is not available yet. Please use WeChat Pay or Alipay.", "現在、国際カード決済はご利用いただけません。WeChatまたはAlipayをご利用ください。", "현재 국제 카드 결제를 사용할 수 없습니다. WeChat Pay 또는 Alipay를 사용하세요.", "Pembayaran kartu internasional belum tersedia. Gunakan WeChat Pay atau Alipay.", "الدفع بالبطاقة الدولية غير متاح بعد. يرجى استخدام WeChat Pay أو Alipay.")
+      : pickText(`支付失败：${_payErr}`, `Payment failed: ${_payErr}`, `支払い失敗：${_payErr}`, `결제 실패: ${_payErr}`, `Pembayaran gagal: ${_payErr}`);
+    notify(_errMsg, "error");
+    // Show refund guidance in chat if payment was attempted
+    if (_payErr !== "cancelled" && _payErr !== "user_cancel") {
+      setTimeout(() => addMessage(pickText(
+        "如果您已被扣款，退款将在 1-3 个工作日内原路返回到您的账户。如需协助，请联系 support@crossx.ai 或点击\"需要帮助\"联系人工客服。",
+        "If you were charged, a refund will be returned to your account within 1–3 business days. For assistance, contact support@crossx.ai or click \"Need Help\" to reach a human agent.",
+        "引き落とされた場合、1〜3営業日以内にご返金します。サポート: support@crossx.ai または「ヘルプ」をクリックしてください。",
+        "출금된 경우 1~3 영업일 내 환불됩니다. 문의: support@crossx.ai 또는 '도움 필요' 버튼을 누르세요.",
+      ), "agent"), 500);
+    }
     history.replaceState({}, "", window.location.pathname);
   }
 
@@ -16227,11 +18676,97 @@ async function _initAuthState() {
   } catch { _applyAuthUi(false); }
 }
 
+// ── Onboarding (first-visit 3-step guide) ─────────────────────────────────
+function _initOnboarding() {
+  try {
+    if (localStorage.getItem("cx_onboarded")) return;
+  } catch { return; }
+  const overlay = document.getElementById("onboardingOverlay");
+  if (!overlay) return;
+  overlay.classList.remove("hidden");
+  trackEvent("onboarding_shown", { lang: state.uiLanguage || "EN" }).catch(() => {});
+  let step = 1;
+  const steps = overlay.querySelectorAll(".cx-onboarding-step");
+  const dots  = overlay.querySelectorAll(".cx-onboarding-dot");
+  const nextBtn = document.getElementById("onboardNextBtn");
+  const skipBtn = document.getElementById("onboardSkipBtn");
+
+  function _i18nOnboard() {
+    const s1t = document.getElementById("onboardStep1Title");
+    const s1b = document.getElementById("onboardStep1Body");
+    const s2t = document.getElementById("onboardStep2Title");
+    const s2b = document.getElementById("onboardStep2Body");
+    const s3t = document.getElementById("onboardStep3Title");
+    const s3b = document.getElementById("onboardStep3Body");
+    if (s1t) s1t.textContent = pickText("告诉我你的目标", "Tell me your goal", "目標を教えてください", "목표를 알려주세요", "Ceritakan tujuan Anda", "أخبرني بهدفك");
+    if (s1b) s1b.textContent = pickText(
+      "用自然语言输入，例如「上海明晚住一晚，预算100美元以内」",
+      "Type naturally — e.g. 'Good hotel in Shanghai tonight, budget $100'",
+      "例：「上海に1泊、予算100ドル」と自然語で入力",
+      "예: '오늘 밤 상하이 호텔, 예산 $100'",
+      "Ketik secara alami — mis. 'Hotel bagus di Shanghai malam ini, budget $100'",
+      "اكتب بشكل طبيعي — مثل: 'فندق جيد في شنغهاي الليلة، الميزانية 100 دولار'",
+    );
+    if (s2t) s2t.textContent = pickText("AI 生成完整方案", "AI builds your plan", "AIがプランを作成", "AI가 플랜 생성", "AI membuat rencana Anda", "الذكاء الاصطناعي يبني خطتك");
+    if (s2b) s2b.textContent = pickText(
+      "Cross X 自动生成酒店、餐厅、交通方案，含价格明细",
+      "CrossX creates a full itinerary with hotels, food, transport and pricing — in seconds.",
+      "CrossXが宿泊・食事・移動・料金を含む完全なプランを数秒で作成します。",
+      "CrossX가 호텔·음식·교통·가격을 포함한 전체 일정을 몇 초 안에 생성합니다.",
+      "CrossX membuat itinerary lengkap dengan hotel, makanan, transportasi, dan harga — dalam hitungan detik.",
+      "يُنشئ CrossX جدول رحلة كامل مع الفنادق والطعام والنقل والأسعار في ثوانٍ.",
+    );
+    if (s3t) s3t.textContent = pickText("确认执行，立刻完成", "Confirm & it's done", "確認して完了", "확인하면 완료", "Konfirmasi & selesai", "تأكيد والانتهاء");
+    if (s3b) s3b.textContent = pickText(
+      "确认方案，用信用卡或微信支付，即刻获得预订凭证",
+      "Review the plan, pay with your card or WeChat, and get a booking confirmation instantly.",
+      "プランを確認し、カードまたはWeChatで支払い、即座に予約確認書を受け取ります。",
+      "플랜을 확인하고 카드 또는 WeChat으로 결제하면 바로 예약 확인서를 받을 수 있습니다.",
+      "Tinjau rencana, bayar dengan kartu atau WeChat, dan dapatkan konfirmasi pemesanan seketika.",
+      "راجع الخطة، ادفع ببطاقتك أو WeChat، واحصل على تأكيد الحجز فوراً.",
+    );
+    if (nextBtn) nextBtn.textContent = step < 3
+      ? pickText("下一步", "Next", "次へ", "다음", "Berikutnya", "التالي")
+      : pickText("开始使用", "Get Started", "始める", "시작하기", "Mulai", "ابدأ الآن");
+    if (skipBtn) skipBtn.textContent = pickText("跳过", "Skip", "スキップ", "건너뛰기", "Lewati", "تخطي");
+  }
+
+  function _goStep(n) {
+    step = n;
+    steps.forEach((s) => s.classList.toggle("active", +s.dataset.step === step));
+    dots.forEach((d) => d.classList.toggle("active", +d.dataset.step === step));
+    if (nextBtn) nextBtn.textContent = step < 3
+      ? pickText("下一步", "Next", "次へ", "다음", "Berikutnya", "التالي")
+      : pickText("开始使用", "Get Started", "始める", "시작하기", "Mulai", "ابدأ الآن");
+  }
+
+  function _dismiss(source) {
+    overlay.classList.add("hidden");
+    try { localStorage.setItem("cx_onboarded", "1"); } catch { /* ignore */ }
+    if (source === "complete") {
+      trackEvent("onboarding_completed", { lang: state.uiLanguage || "EN" }).catch(() => {});
+    } else {
+      trackEvent("onboarding_dismissed", { step: String(step), source: source || "button", lang: state.uiLanguage || "EN" }).catch(() => {});
+    }
+  }
+
+  _i18nOnboard();
+  if (nextBtn) nextBtn.addEventListener("click", () => {
+    if (step < 3) {
+      _goStep(step + 1);
+      trackEvent("onboarding_step_advanced", { step: String(step), lang: state.uiLanguage || "EN" }).catch(() => {});
+    } else {
+      _dismiss("complete");
+    }
+  });
+  if (skipBtn) skipBtn.addEventListener("click", () => _dismiss("skip"));
+  dots.forEach((d) => d.addEventListener("click", () => _goStep(+d.dataset.step)));
+}
+
 function _onLoginSuccess(token, userId, displayName) {
   _saveAuthState(token, userId, displayName);
   _applyAuthUi(true, displayName);
-  notify(`欢迎回来，${displayName}！`, "success");
-  // Sync local favorites to server account
+  notify(pickText(`欢迎回来，${displayName}！`, `Welcome, ${displayName}!`, `ようこそ、${displayName}！`, `환영합니다, ${displayName}!`), "success");
   _syncFavoritesToAccount(token).catch(() => {});
 }
 
@@ -16279,7 +18814,7 @@ function _onLogout() {
   _clearAuthState();
   _applyAuthUi(false);
   fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
-  notify("已退出登录", "info");
+  notify(pickText("已退出登录", "Signed out successfully", "サインアウトしました", "로그아웃 완료"), "info");
 }
 
 // ── Login Modal ───────────────────────────────────────────────────────────────
@@ -16287,54 +18822,182 @@ function _showLoginModal() {
   const existing = document.getElementById("cx-login-modal");
   if (existing) existing.remove();
 
+  const t = (zh, en, ja, ko) => pickText(zh, en, ja, ko);
+
   const modal = document.createElement("div");
   modal.id = "cx-login-modal";
   modal.innerHTML = `
     <div class="cx-modal-backdrop" id="cxLoginBackdrop"></div>
-    <div class="cx-modal-panel" role="dialog" aria-modal="true" aria-label="\u767b\u5f55 CrossX">
-      <button class="cx-modal-close" id="cxLoginClose" aria-label="\u5173\u95ed">\u00d7</button>
-      <h2 class="cx-modal-title">登录 / 注册</h2>
+    <div class="cx-modal-panel" role="dialog" aria-modal="true" aria-label="Sign in to CrossX">
+      <button class="cx-modal-close" id="cxLoginClose" aria-label="Close">&times;</button>
+      <div class="cx-modal-logo-row">
+        <img src="/assets/logo-crossx.jpg" alt="CrossX" class="cx-modal-logo" onerror="this.style.display='none'" />
+        <h2 class="cx-modal-title">${t("登录 CrossX", "Sign in to CrossX", "CrossX にサインイン", "CrossX 로그인")}</h2>
+      </div>
+      <p class="cx-modal-sub">${t("AI 中国旅行助手", "Your AI travel companion for China", "AIによる中国旅行コンシェルジュ", "AI 중국 여행 어시스턴트")}</p>
+
+      <!-- Google OAuth — primary for foreign users -->
+      <button class="cx-modal-btn cx-modal-btn-google" id="cxLoginGoogle">
+        <svg width="18" height="18" viewBox="0 0 24 24" style="vertical-align:middle;margin-right:8px" aria-hidden="true">
+          <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+          <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+          <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
+          <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+        </svg>
+        ${t("使用 Google 登录", "Continue with Google", "Google でサインイン", "Google로 로그인")}
+      </button>
+
+      <!-- WeChat OAuth — conditional, shown when configured -->
+      <button class="cx-modal-btn cx-modal-btn-wechat hidden" id="cxLoginWechat">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:8px" aria-hidden="true"><path d="M8.69 11.52c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm4.62 0c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm2.71 5.13c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zm3.14 0c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zM12 2C6.48 2 2 6.04 2 11c0 2.96 1.54 5.6 3.96 7.36L5.1 21l3.06-1.53C9.34 19.81 10.64 20 12 20c5.52 0 10-4.04 10-9s-4.48-9-10-9z"/></svg>
+        ${t("微信登录", "WeChat Login", "WeChat でログイン", "WeChat 로그인")}
+      </button>
+
+      <div class="cx-modal-divider"><span>${t("或用手机/邮箱登录", "or sign in with phone / email", "電話またはメールでサインイン", "전화 또는 이메일로 로그인")}</span></div>
+
+      <!-- Method tabs: Phone | Email -->
+      <div class="cx-modal-tabs" style="display:flex;gap:0;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:12px">
+        <button class="cx-modal-tab cx-modal-tab-active" id="cxTabPhone" style="flex:1;padding:8px;background:#eff6ff;font-size:13px;border:none;cursor:pointer;font-weight:600;color:#1a56db">${t("手机号", "Phone", "電話番号", "전화번호")}</button>
+        <button class="cx-modal-tab" id="cxTabEmail" style="flex:1;padding:8px;background:#fff;font-size:13px;border:none;cursor:pointer;font-weight:500;color:#6b7280">${t("邮箱", "Email", "メール", "이메일")}</button>
+      </div>
+
+      <!-- Phone OTP — international prefix support -->
+      <div id="cxLoginPhoneSection">
       <div id="cxLoginStep1">
-        <label class="cx-modal-label">手机号</label>
-        <input class="cx-modal-input" type="tel" id="cxLoginPhone" placeholder="13800138000" maxlength="15" autocomplete="tel" />
-        <button class="cx-modal-btn" id="cxLoginSendOtp">发送验证码</button>
+        <div style="display:flex;gap:6px;align-items:center">
+          <select id="cxLoginCountry" class="cx-modal-select" style="width:90px;flex-shrink:0">
+            <option value="+1">🇺🇸 +1</option>
+            <option value="+44">🇬🇧 +44</option>
+            <option value="+61">🇦🇺 +61</option>
+            <option value="+81">🇯🇵 +81</option>
+            <option value="+82">🇰🇷 +82</option>
+            <option value="+65">🇸🇬 +65</option>
+            <option value="+60">🇲🇾 +60</option>
+            <option value="+62">🇮🇩 +62</option>
+            <option value="+66">🇹🇭 +66</option>
+            <option value="+63">🇵🇭 +63</option>
+            <option value="+91">🇮🇳 +91</option>
+            <option value="+49">🇩🇪 +49</option>
+            <option value="+33">🇫🇷 +33</option>
+            <option value="+966">🇸🇦 +966</option>
+            <option value="+971">🇦🇪 +971</option>
+            <option value="+974">🇶🇦 +974</option>
+            <option value="+965">🇰🇼 +965</option>
+            <option value="+973">🇧🇭 +973</option>
+            <option value="+968">🇴🇲 +968</option>
+            <option value="+20">🇪🇬 +20</option>
+            <option value="+962">🇯🇴 +962</option>
+            <option value="+86">🇨🇳 +86</option>
+          </select>
+          <input class="cx-modal-input" type="tel" id="cxLoginPhone" placeholder="${t("手机号", "Phone number", "電話番号", "전화번호")}" maxlength="15" autocomplete="tel" style="flex:1" />
+        </div>
+        <button class="cx-modal-btn cx-modal-btn-outline" id="cxLoginSendOtp">${t("发送验证码", "Send verification code", "認証コードを送信", "인증 코드 전송")}</button>
         <div class="cx-modal-error hidden" id="cxLoginErr1"></div>
       </div>
       <div id="cxLoginStep2" class="hidden">
-        <label class="cx-modal-label">验证码（6位）</label>
+        <label class="cx-modal-label">${t("验证码（6位）", "6-digit code", "6桁の認証コード", "6자리 코드")}</label>
         <input class="cx-modal-input cx-otp-input" type="text" id="cxLoginCode" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
-        <label class="cx-modal-label" style="margin-top:10px">昵称（可选）</label>
-        <input class="cx-modal-input" type="text" id="cxLoginName" placeholder="旅行者" maxlength="20" />
-        <button class="cx-modal-btn" id="cxLoginVerify">确认登录</button>
-        <button class="cx-modal-link" id="cxLoginResend">重新发送</button>
+        <label class="cx-modal-label" style="margin-top:10px">${t("昵称（可选）", "Name (optional)", "ニックネーム（任意）", "닉네임 (선택)")}</label>
+        <input class="cx-modal-input" type="text" id="cxLoginName" placeholder="${t("旅行者", "Traveler", "旅人", "여행자")}" maxlength="20" />
+        <button class="cx-modal-btn" id="cxLoginVerify">${t("确认登录", "Confirm", "確認", "확인")}</button>
+        <button class="cx-modal-link" id="cxLoginResend">${t("重新发送", "Resend code", "再送信", "재전송")}</button>
         <div class="cx-modal-error hidden" id="cxLoginErr2"></div>
         <div class="cx-modal-dev-hint hidden" id="cxLoginDevHint" style="font-size:11px;color:#6366f1;margin-top:6px;font-family:monospace;text-align:center;"></div>
       </div>
-      <div class="cx-modal-divider" id="cxLoginWxSection">
-        <span>或</span>
+      </div><!-- end cxLoginPhoneSection -->
+
+      <!-- Email OTP section -->
+      <div id="cxLoginEmailSection" class="hidden">
+        <div id="cxLoginEmailStep1">
+          <input class="cx-modal-input" type="email" id="cxLoginEmail" placeholder="${t("邮箱地址", "Email address", "メールアドレス", "이메일 주소")}" maxlength="254" autocomplete="email" />
+          <button class="cx-modal-btn cx-modal-btn-outline" id="cxLoginSendEmail">${t("发送验证码", "Send verification code", "認証コードを送信", "인증 코드 전송")}</button>
+          <div class="cx-modal-error hidden" id="cxLoginEmailErr1"></div>
+        </div>
+        <div id="cxLoginEmailStep2" class="hidden">
+          <label class="cx-modal-label">${t("验证码（6位）", "6-digit code", "6桁の認証コード", "6자리 코드")}</label>
+          <input class="cx-modal-input cx-otp-input" type="text" id="cxLoginEmailCode" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
+          <label class="cx-modal-label" style="margin-top:10px">${t("昵称（可选）", "Name (optional)", "ニックネーム（任意）", "닉네임 (선택)")}</label>
+          <input class="cx-modal-input" type="text" id="cxLoginEmailName" placeholder="${t("旅行者", "Traveler", "旅人", "여행자")}" maxlength="20" />
+          <button class="cx-modal-btn" id="cxLoginEmailVerify">${t("确认登录", "Confirm", "確認", "확인")}</button>
+          <button class="cx-modal-link" id="cxLoginEmailResend">${t("重新发送", "Resend code", "再送信", "재전송")}</button>
+          <div class="cx-modal-error hidden" id="cxLoginEmailErr2"></div>
+          <div class="cx-modal-dev-hint hidden" id="cxLoginEmailDevHint" style="font-size:11px;color:#6366f1;margin-top:6px;font-family:monospace;text-align:center;"></div>
+        </div>
       </div>
-      <button class="cx-modal-btn cx-modal-btn-wechat" id="cxLoginWechat">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:6px"><path d="M8.69 11.52c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm4.62 0c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm2.71 5.13c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zm3.14 0c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zM12 2C6.48 2 2 6.04 2 11c0 2.96 1.54 5.6 3.96 7.36L5.1 21l3.06-1.53C9.34 19.81 10.64 20 12 20c5.52 0 10-4.04 10-9s-4.48-9-10-9zm6.15 13.7c-.57 1.25-1.75 2.08-3.12 2.38-.32.07-.65.1-.99.1-1.39 0-2.68-.47-3.69-1.24l-2.17 1.08.53-2.02C7.27 15.03 6.5 13.08 6.5 11c0-3.87 2.91-7 6.5-7s6.5 3.13 6.5 7c0 1.7-.56 3.27-1.35 4.7z"/></svg>
-        微信登录
+
+      <!-- Guest mode — no account needed -->
+      <div class="cx-modal-divider"><span>${t("不想注册？", "No account?", "登録不要？", "계정 없이")}</span></div>
+      <button class="cx-modal-link cx-modal-guest-btn" id="cxLoginGuest">
+        ${t("以访客身份继续（功能受限）", "Continue as guest (limited features)", "ゲストとして続ける（機能制限あり）", "게스트로 계속 (기능 제한)")}
       </button>
     </div>`;
   document.body.appendChild(modal);
 
-  const close = () => modal.remove();
+  // Auto-select country code based on detected UI language / browser locale
+  const _countrySelect = document.getElementById("cxLoginCountry");
+  if (_countrySelect) {
+    const _ulang = (state.uiLanguage || "").toUpperCase();
+    const _nav   = (navigator.language || "").toLowerCase();
+    const _code  =
+      _ulang === "ZH"             ? "+86"
+      : _ulang === "JA"           ? "+81"
+      : _ulang === "KO"           ? "+82"
+      : _ulang === "ID"           ? "+62"
+      : _ulang === "AR"           ? "+966"
+      : _nav.startsWith("en-gb")  ? "+44"
+      : _nav.startsWith("en-au")  ? "+61"
+      : _nav.startsWith("en-sg")  ? "+65"
+      : _nav.startsWith("de")     ? "+49"
+      : _nav.startsWith("fr")     ? "+33"
+      : _nav.startsWith("ja")     ? "+81"
+      : _nav.startsWith("ko")     ? "+82"
+      : _nav.startsWith("id")     ? "+62"
+      : _nav.startsWith("ar")     ? "+966"
+      : "+1";
+    _countrySelect.value = _code;
+  }
+
+  const close = () => {
+    if (typeof _otpCooldownTimer !== "undefined" && _otpCooldownTimer) { clearInterval(_otpCooldownTimer); _otpCooldownTimer = null; }
+    if (typeof _emailCooldownTimer !== "undefined" && _emailCooldownTimer) { clearInterval(_emailCooldownTimer); _emailCooldownTimer = null; }
+    modal.remove();
+  };
   document.getElementById("cxLoginClose").onclick    = close;
   document.getElementById("cxLoginBackdrop").onclick = close;
 
-  // WeChat OAuth button — check if configured, then redirect
+  // Google OAuth — primary login for international users
+  const _googleBtn = document.getElementById("cxLoginGoogle");
+  if (_googleBtn) {
+    fetch("/api/system/providers").then(r => r.json()).then(d => {
+      const _googleAvail = d && d.google_oauth;
+      const _wxAvail     = d && d.wechat_oauth;
+      if (!_googleAvail) {
+        _googleBtn.classList.add("hidden");
+      }
+      const _wxBtn2 = document.getElementById("cxLoginWechat");
+      if (_wxBtn2 && _wxAvail) _wxBtn2.classList.remove("hidden");
+    }).catch(() => {
+      _googleBtn.classList.add("hidden");
+    });
+    _googleBtn.onclick = () => { window.location.href = "/api/auth/google"; };
+  }
+
+  // WeChat OAuth button
   const _wxBtn = document.getElementById("cxLoginWechat");
   if (_wxBtn) {
-    // Check if WeChat OAuth is available (server configured)
-    fetch("/api/system/providers").then(r => r.json()).then(d => {
-      const _wxAvail = d && d.wechat_oauth;
-      if (!_wxAvail) {
-        _wxBtn.parentElement.style.display = "none"; // hide divider + button
-      }
-    }).catch(() => { if (_wxBtn.parentElement) _wxBtn.parentElement.style.display = "none"; });
     _wxBtn.onclick = () => { window.location.href = "/api/auth/wechat"; };
+  }
+
+  // Guest mode — dismiss modal and continue without auth
+  const _guestBtn = document.getElementById("cxLoginGuest");
+  if (_guestBtn) {
+    _guestBtn.onclick = () => {
+      close();
+      notify(
+        pickText("以访客身份继续，部分功能需登录后使用。", "Continuing as guest. Sign in anytime for full access.", "ゲストとして続けます。全機能はサインイン後にご利用いただけます。", "게스트로 계속합니다. 전체 기능은 로그인 후 사용 가능합니다."),
+        "info",
+      );
+    };
   }
 
   const phoneInput = document.getElementById("cxLoginPhone");
@@ -16350,7 +19013,7 @@ function _showLoginModal() {
   function _startOtpCooldown(btn) {
     let secs = 60;
     btn.disabled = true;
-    btn.textContent = `重新发送 (${secs}s)`;
+    btn.textContent = pickText(`重新发送 (${secs}s)`, `Resend (${secs}s)`, `再送信 (${secs}s)`, `재전송 (${secs}s)`);
     if (_otpCooldownTimer) clearInterval(_otpCooldownTimer);
     _otpCooldownTimer = setInterval(() => {
       secs -= 1;
@@ -16358,20 +19021,22 @@ function _showLoginModal() {
         clearInterval(_otpCooldownTimer);
         _otpCooldownTimer = null;
         btn.disabled = false;
-        btn.textContent = "重新发送";
+        btn.textContent = pickText("重新发送", "Resend code", "再送信", "재전송");
       } else {
-        btn.textContent = `重新发送 (${secs}s)`;
+        btn.textContent = pickText(`重新发送 (${secs}s)`, `Resend (${secs}s)`, `再送信 (${secs}s)`, `재전송 (${secs}s)`);
       }
     }, 1000);
   }
 
   async function sendOtp() {
-    const phone = phoneInput.value.trim();
-    if (!phone) { err1.textContent = "请输入手机号"; err1.classList.remove("hidden"); return; }
+    const prefix = (document.getElementById("cxLoginCountry") || {}).value || "";
+    const raw    = phoneInput.value.trim();
+    if (!raw) { err1.textContent = pickText("请输入手机号", "Please enter your phone number", "電話番号を入力してください", "전화번호를 입력하세요"); err1.classList.remove("hidden"); return; }
+    const phone = prefix ? `${prefix}${raw.replace(/^0+/, "")}` : raw;
     err1.classList.add("hidden");
     const btn = document.getElementById("cxLoginSendOtp");
     if (btn.disabled) return;
-    btn.disabled = true; btn.textContent = "发送中…";
+    btn.disabled = true; btn.textContent = pickText("发送中…", "Sending…", "送信中…", "전송 중…");
     try {
       const r = await fetch("/api/auth/send-otp", {
         method: "POST",
@@ -16379,28 +19044,49 @@ function _showLoginModal() {
         body: JSON.stringify({ phone }),
       });
       const data = await r.json();
-      if (!data.ok) { err1.textContent = data.error || "发送失败，请稍后重试"; err1.classList.remove("hidden"); btn.disabled = false; btn.textContent = "发送验证码"; return; }
+      if (!data.ok) {
+        if (data.error === "too_soon" && data.retryAfterSec) {
+          err1.textContent = pickText(`请等待 ${data.retryAfterSec} 秒后再重发`, `Please wait ${data.retryAfterSec}s before resending`, `${data.retryAfterSec}秒後に再送してください`, `${data.retryAfterSec}초 후에 재전송하세요`);
+          err1.classList.remove("hidden"); btn.disabled = false;
+          btn.textContent = pickText("发送验证码", "Send code", "コードを送信", "코드 전송");
+        } else if (data.error === "locked") {
+          err1.textContent = pickText(`验证码已锁定，请等待 ${data.retryAfterSec || 300} 秒`, `Code locked. Wait ${data.retryAfterSec || 300}s`, `コードがロックされました。${data.retryAfterSec || 300}秒後に再試行`, `코드 잠김. ${data.retryAfterSec || 300}초 대기`);
+          err1.classList.remove("hidden"); btn.disabled = false;
+          btn.textContent = pickText("发送验证码", "Send code", "コードを送信", "코드 전송");
+        } else {
+        err1.textContent = pickText("发送失败，请稍后重试", data.error || "Failed to send. Please try again.", "送信に失敗しました。もう一度お試しください。", "전송 실패. 다시 시도하세요.");
+        err1.classList.remove("hidden"); btn.disabled = false;
+        btn.textContent = pickText("发送验证码", "Send code", "コードを送信", "코드 전송");
+        }
+        return;
+      }
       _currentPhone = phone;
       _startOtpCooldown(btn);
       step1.classList.add("hidden");
       step2.classList.remove("hidden");
-      // Dev mode: auto-fill code and show hint
       if (data.dev_code) {
         codeInput.value = data.dev_code;
         const devHint = document.getElementById("cxLoginDevHint");
-        if (devHint) { devHint.textContent = `[Dev] 验证码: ${data.dev_code}`; devHint.classList.remove("hidden"); }
+        if (devHint) { devHint.textContent = `[Dev] code: ${data.dev_code}`; devHint.classList.remove("hidden"); }
       }
       codeInput.focus();
-    } catch { err1.textContent = "网络错误，请重试"; err1.classList.remove("hidden"); btn.disabled = false; btn.textContent = "发送验证码"; }
+    } catch {
+      err1.textContent = pickText("网络错误，请重试", "Network error. Please retry.", "ネットワークエラー。再試行してください。", "네트워크 오류. 다시 시도하세요.");
+      err1.classList.remove("hidden"); btn.disabled = false;
+      btn.textContent = pickText("发送验证码", "Send code", "コードを送信", "코드 전송");
+    }
   }
 
   async function verifyOtp() {
     const code = codeInput.value.trim();
     const name = document.getElementById("cxLoginName").value.trim();
-    if (!code || code.length !== 6) { err2.textContent = "请输入6位验证码"; err2.classList.remove("hidden"); return; }
+    if (!code || !/^\d{6}$/.test(code)) {
+      err2.textContent = pickText("请输入6位数字验证码", "Enter the 6-digit code", "6桁の数字コードを入力してください", "6자리 숫자 코드를 입력하세요");
+      err2.classList.remove("hidden"); return;
+    }
     err2.classList.add("hidden");
     const btn = document.getElementById("cxLoginVerify");
-    btn.disabled = true; btn.textContent = "验证中…";
+    btn.disabled = true; btn.textContent = pickText("验证中…", "Verifying…", "確認中…", "확인 중…");
     try {
       const r = await fetch("/api/auth/verify-otp", {
         method: "POST",
@@ -16409,12 +19095,22 @@ function _showLoginModal() {
       });
       const data = await r.json();
       if (!data.ok) {
-        const msg = data.error === "wrong_code" ? `验证码错误（剩余${data.attemptsLeft || 0}次）` : (data.error === "expired" ? "验证码已过期，请重新发送" : data.error || "验证失败");
-        err2.textContent = msg; err2.classList.remove("hidden"); btn.disabled = false; btn.textContent = "确认登录"; return;
+        const msg = data.error === "wrong_code"
+          ? pickText(`验证码错误（剩余${data.attemptsLeft || 0}次）`, `Wrong code (${data.attemptsLeft || 0} attempts left)`, `コードが違います（残り${data.attemptsLeft || 0}回）`, `코드 오류 (${data.attemptsLeft || 0}회 남음)`)
+          : data.error === "expired"
+            ? pickText("验证码已过期，请重新发送", "Code expired. Please resend.", "コードが期限切れです。再送信してください。", "코드 만료. 재전송하세요.")
+            : (data.error || pickText("验证失败", "Verification failed", "認証失敗", "인증 실패"));
+        err2.textContent = msg; err2.classList.remove("hidden");
+        btn.disabled = false; btn.textContent = pickText("确认登录", "Confirm", "確認", "확인");
+        return;
       }
       modal.remove();
       _onLoginSuccess(data.token, data.userId, data.displayName);
-    } catch { err2.textContent = "网络错误，请重试"; err2.classList.remove("hidden"); btn.disabled = false; btn.textContent = "确认登录"; }
+    } catch {
+      err2.textContent = pickText("网络错误，请重试", "Network error. Please retry.", "ネットワークエラー。再試行してください。", "네트워크 오류. 다시 시도하세요.");
+      err2.classList.remove("hidden"); btn.disabled = false;
+      btn.textContent = pickText("确认登录", "Confirm", "確認", "확인");
+    }
   }
 
   document.getElementById("cxLoginSendOtp").onclick = sendOtp;
@@ -16422,6 +19118,132 @@ function _showLoginModal() {
   document.getElementById("cxLoginResend").onclick   = () => { step2.classList.add("hidden"); step1.classList.remove("hidden"); phoneInput.focus(); };
   phoneInput.onkeydown = (e) => { if (e.key === "Enter") sendOtp(); };
   codeInput.onkeydown  = (e) => { if (e.key === "Enter") verifyOtp(); };
+
+  // ── Tab switcher: Phone | Email ──────────────────────────────────────────
+  const _tabPhone   = document.getElementById("cxTabPhone");
+  const _tabEmail   = document.getElementById("cxTabEmail");
+  const _phoneSection = document.getElementById("cxLoginPhoneSection");
+  const _emailSection = document.getElementById("cxLoginEmailSection");
+  function _switchTab(tab) {
+    if (tab === "email") {
+      _tabEmail.style.background = "#eff6ff"; _tabEmail.style.color = "#1a56db"; _tabEmail.style.fontWeight = "600";
+      _tabPhone.style.background = "#fff";    _tabPhone.style.color = "#6b7280"; _tabPhone.style.fontWeight = "500";
+      _phoneSection.classList.add("hidden"); _emailSection.classList.remove("hidden");
+      const emailInput = document.getElementById("cxLoginEmail"); if (emailInput) emailInput.focus();
+    } else {
+      _tabPhone.style.background = "#eff6ff"; _tabPhone.style.color = "#1a56db"; _tabPhone.style.fontWeight = "600";
+      _tabEmail.style.background = "#fff";    _tabEmail.style.color = "#6b7280"; _tabEmail.style.fontWeight = "500";
+      _emailSection.classList.add("hidden"); _phoneSection.classList.remove("hidden");
+      phoneInput.focus();
+    }
+  }
+  if (_tabPhone) _tabPhone.onclick = () => _switchTab("phone");
+  if (_tabEmail) _tabEmail.onclick = () => _switchTab("email");
+
+  // ── Email OTP logic ──────────────────────────────────────────────────────
+  let _currentEmail = "";
+  let _emailCooldownTimer = null;
+
+  function _startEmailCooldown(btn) {
+    let secs = 60;
+    btn.disabled = true;
+    btn.textContent = pickText(`重新发送 (${secs}s)`, `Resend (${secs}s)`, `再送信 (${secs}s)`, `재전송 (${secs}s)`);
+    if (_emailCooldownTimer) clearInterval(_emailCooldownTimer);
+    _emailCooldownTimer = setInterval(() => {
+      secs -= 1;
+      if (secs <= 0) {
+        clearInterval(_emailCooldownTimer); _emailCooldownTimer = null;
+        btn.disabled = false; btn.textContent = pickText("重新发送", "Resend code", "再送信", "재전송");
+      } else {
+        btn.textContent = pickText(`重新发送 (${secs}s)`, `Resend (${secs}s)`, `再送信 (${secs}s)`, `재전송 (${secs}s)`);
+      }
+    }, 1000);
+  }
+
+  const emailInput  = document.getElementById("cxLoginEmail");
+  const emailCode   = document.getElementById("cxLoginEmailCode");
+  const emailStep1  = document.getElementById("cxLoginEmailStep1");
+  const emailStep2  = document.getElementById("cxLoginEmailStep2");
+  const emailErr1   = document.getElementById("cxLoginEmailErr1");
+  const emailErr2   = document.getElementById("cxLoginEmailErr2");
+
+  async function sendEmailCode() {
+    const email = (emailInput || {}).value.trim();
+    if (!email || !email.includes("@")) {
+      emailErr1.textContent = pickText("请输入有效邮箱", "Please enter a valid email", "有効なメールを入力してください", "유효한 이메일을 입력하세요");
+      emailErr1.classList.remove("hidden"); return;
+    }
+    emailErr1.classList.add("hidden");
+    const btn = document.getElementById("cxLoginSendEmail");
+    if (btn.disabled) return;
+    btn.disabled = true; btn.textContent = pickText("发送中…", "Sending…", "送信中…", "전송 중…");
+    try {
+      const r = await fetch("/api/auth/send-email-code", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
+      const data = await r.json();
+      if (!data.ok) {
+        btn.disabled = false; btn.textContent = pickText("发送验证码", "Send code", "コードを送信", "코드 전송");
+        emailErr1.textContent = data.retryAfterSec
+          ? pickText(`请等待 ${data.retryAfterSec} 秒后再发送`, `Wait ${data.retryAfterSec}s before resending`, `${data.retryAfterSec}秒後に再送`, `${data.retryAfterSec}초 후 재전송`)
+          : (data.error || pickText("发送失败", "Failed to send", "送信失敗", "전송 실패"));
+        emailErr1.classList.remove("hidden"); return;
+      }
+      _currentEmail = email;
+      _startEmailCooldown(btn);
+      emailStep1.classList.add("hidden"); emailStep2.classList.remove("hidden");
+      if (data.dev_code) {
+        emailCode.value = data.dev_code;
+        const hint = document.getElementById("cxLoginEmailDevHint");
+        if (hint) { hint.textContent = `[Dev] code: ${data.dev_code}`; hint.classList.remove("hidden"); }
+      }
+      emailCode.focus();
+    } catch {
+      btn.disabled = false; btn.textContent = pickText("发送验证码", "Send code", "コードを送信", "코드 전송");
+      emailErr1.textContent = pickText("网络错误，请重试", "Network error. Retry.", "ネットワークエラー", "네트워크 오류");
+      emailErr1.classList.remove("hidden");
+    }
+  }
+
+  async function verifyEmailCode() {
+    const code = (emailCode || {}).value.trim();
+    const name = (document.getElementById("cxLoginEmailName") || {}).value.trim();
+    if (!code || code.length !== 6) {
+      emailErr2.textContent = pickText("请输入6位验证码", "Enter the 6-digit code", "6桁のコードを入力してください", "6자리 코드를 입력하세요");
+      emailErr2.classList.remove("hidden"); return;
+    }
+    emailErr2.classList.add("hidden");
+    const btn = document.getElementById("cxLoginEmailVerify");
+    btn.disabled = true; btn.textContent = pickText("验证中…", "Verifying…", "確認中…", "확인 중…");
+    try {
+      const r = await fetch("/api/auth/verify-email-code", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: _currentEmail, code, displayName: name }) });
+      const data = await r.json();
+      if (!data.ok) {
+        const msg = data.error === "wrong_code"
+          ? pickText(`验证码错误（剩余${data.attemptsLeft || 0}次）`, `Wrong code (${data.attemptsLeft || 0} left)`, `コードが違います（残り${data.attemptsLeft || 0}回）`, `코드 오류 (${data.attemptsLeft || 0}회 남음)`)
+          : data.error === "expired"
+            ? pickText("验证码已过期，请重新发送", "Code expired. Please resend.", "コード期限切れ。再送信してください。", "코드 만료. 재전송하세요.")
+            : (data.error || pickText("验证失败", "Verification failed", "認証失敗", "인증 실패"));
+        emailErr2.textContent = msg; emailErr2.classList.remove("hidden");
+        btn.disabled = false; btn.textContent = pickText("确认登录", "Confirm", "確認", "확인");
+        return;
+      }
+      modal.remove();
+      _onLoginSuccess(data.token, data.userId, data.displayName);
+    } catch {
+      emailErr2.textContent = pickText("网络错误，请重试", "Network error. Retry.", "ネットワークエラー", "네트워크 오류");
+      emailErr2.classList.remove("hidden"); btn.disabled = false;
+      btn.textContent = pickText("确认登录", "Confirm", "確認", "확인");
+    }
+  }
+
+  const _sendEmailBtn   = document.getElementById("cxLoginSendEmail");
+  const _verifyEmailBtn = document.getElementById("cxLoginEmailVerify");
+  const _resendEmailBtn = document.getElementById("cxLoginEmailResend");
+  if (_sendEmailBtn)   _sendEmailBtn.onclick   = sendEmailCode;
+  if (_verifyEmailBtn) _verifyEmailBtn.onclick  = verifyEmailCode;
+  if (_resendEmailBtn) _resendEmailBtn.onclick  = () => { emailStep2.classList.add("hidden"); emailStep1.classList.remove("hidden"); if (emailInput) emailInput.focus(); };
+  if (emailInput)  emailInput.onkeydown  = (e) => { if (e.key === "Enter") sendEmailCode(); };
+  if (emailCode)   emailCode.onkeydown   = (e) => { if (e.key === "Enter") verifyEmailCode(); };
+
   phoneInput.focus();
 }
 

@@ -748,7 +748,7 @@ const HOTEL_TEMPLATE_ROWS = [
     starRating: 5,
     commentScore: 4.8,
     district: "CBD",
-    imageUrl: "https://images.unsplash.com/photo-1566073771259-6a8506099945?auto=format&fit=crop&w=1200&q=80",
+    imageUrl: "/api/placeholder?cat=hotel",
     tags: ["business", "airport", "view", "river", "foreign-friendly"],
     accepts_foreign_guests: true,
     basePrice: 980,
@@ -760,7 +760,7 @@ const HOTEL_TEMPLATE_ROWS = [
     starRating: 4,
     commentScore: 4.6,
     district: "Metro Hub",
-    imageUrl: "https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?auto=format&fit=crop&w=1200&q=80",
+    imageUrl: "/api/placeholder?cat=hotel",
     tags: ["metro", "budget", "family", "english-service"],
     accepts_foreign_guests: true,
     basePrice: 620,
@@ -772,7 +772,7 @@ const HOTEL_TEMPLATE_ROWS = [
     starRating: 4,
     commentScore: 4.5,
     district: "Airport Link",
-    imageUrl: "https://images.unsplash.com/photo-1445019980597-93fa8acb246c?auto=format&fit=crop&w=1200&q=80",
+    imageUrl: "/api/placeholder?cat=hotel",
     tags: ["airport", "early-flight", "transfer", "quiet"],
     accepts_foreign_guests: true,
     basePrice: 680,
@@ -784,7 +784,7 @@ const HOTEL_TEMPLATE_ROWS = [
     starRating: 5,
     commentScore: 4.7,
     district: "Historic Zone",
-    imageUrl: "https://images.unsplash.com/photo-1522798514-97ceb8c4f1c8?auto=format&fit=crop&w=1200&q=80",
+    imageUrl: "/api/placeholder?cat=hotel",
     tags: ["old-town", "culture", "couple", "walkable"],
     accepts_foreign_guests: true,
     basePrice: 860,
@@ -796,7 +796,7 @@ const HOTEL_TEMPLATE_ROWS = [
     starRating: 3,
     commentScore: 4.3,
     district: "Business Zone",
-    imageUrl: "https://images.unsplash.com/photo-1564501049412-61c2a3083791?auto=format&fit=crop&w=1200&q=80",
+    imageUrl: "/api/placeholder?cat=hotel",
     tags: ["budget", "business", "fast-checkin"],
     accepts_foreign_guests: false,
     basePrice: 420,
@@ -1881,21 +1881,21 @@ function cityLaneCandidates(cityName, language = "EN") {
       {
         name: pickPresetName("eat", 0, L(`${city}本地面馆实验室`, `${city} Local Noodle Lab`, `${city} ローカルヌードルラボ`, `${city} 로컬 누들 랩`)),
         category: L("餐厅", "Restaurant", "レストラン", "레스토랑"),
-        imageUrl: "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=food",
         score: 93,
         reason: L("地道度评分最高，且排队吞吐稳定。", "Top authenticity score with stable queue throughput.", "本場らしさの評価が最上位で、待ち行列の処理も安定。", "현지성 점수가 가장 높고 대기열 처리도 안정적입니다."),
       },
       {
         name: pickPresetName("eat", 1, L(`${city}传承饺子馆`, `${city} Heritage Dumpling House`, `${city} 伝統餃子ハウス`, `${city} 헤리티지 딤섬 하우스`)),
         category: L("餐厅", "Restaurant", "レストラン", "레스토랑"),
-        imageUrl: "https://images.unsplash.com/photo-1543353071-10c8ba85a904?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=food",
         score: 90,
         reason: L("双语菜单支持好，定金规则清晰可预期。", "Great bilingual menu support and predictable deposit policy.", "多言語メニュー対応が良く、デポジット規約も明確。", "다국어 메뉴 지원이 좋고 보증금 정책이 명확합니다."),
       },
       {
         name: pickPresetName("eat", 2, L(`${city}亲子火锅花园`, `${city} Family Hotpot Garden`, `${city} ファミリーホットポットガーデン`, `${city} 패밀리 훠궈 가든`)),
         category: L("餐厅", "Restaurant", "レストラン", "레스토랑"),
-        imageUrl: "https://images.unsplash.com/photo-1515003197210-e0cd71810b5f?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=travel",
         score: 88,
         reason: L("亲子就座与过敏约束匹配度最高。", "Best fit for family seating and allergy constraints.", "家族席とアレルギー条件への適合度が高い。", "가족 좌석과 알레르기 조건에 가장 잘 맞습니다."),
       },
@@ -1904,21 +1904,21 @@ function cityLaneCandidates(cityName, language = "EN") {
       {
         name: pickPresetName("travel", 0, L(`${city}滨江精选酒店`, `${city} Riverside Premium Hotel`, `${city} リバーサイドプレミアムホテル`, `${city} 리버사이드 프리미엄 호텔`)),
         category: L("酒店", "Hotel", "ホテル", "호텔"),
-        imageUrl: "https://images.unsplash.com/photo-1566073771259-6a8506099945?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=travel",
         score: 91,
         reason: L("接驳上车点稳定，支持礼宾接管。", "Reliable pickup point with concierge handoff support.", "乗車ポイントが安定しており、コンシェルジュ引き継ぎに対応。", "픽업 지점이 안정적이고 컨시어지 인계 지원이 가능합니다."),
       },
       {
         name: pickPresetName("travel", 1, L(`${city}机场极速接驳`, `${city} Airport Fast Transfer`, `${city} 空港ファストトランスファー`, `${city} 공항 패스트 트랜스퍼`)),
         category: L("机场接送", "Airport Transfer", "空港送迎", "공항 이동"),
-        imageUrl: "https://images.unsplash.com/photo-1436491865332-7a61a109cc05?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=travel",
         score: 89,
         reason: L("晚高峰拥堵下仍有最高准点概率。", "Highest on-time probability under evening congestion.", "夕方の渋滞下でも最も高い定時到着確率。", "저녁 혼잡 시간에도 가장 높은 정시 도착 확률."),
       },
       {
         name: pickPresetName("travel", 2, L(`${city}地铁+打车省钱线`, `${city} Metro + Taxi Saver`, `${city} 地下鉄+タクシー節約ルート`, `${city} 지하철+택시 절약 루트`)),
         category: L("交通组合", "Transport Mix", "交通ミックス", "교통 혼합"),
-        imageUrl: "https://images.unsplash.com/photo-1502877338535-766e1452684a?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=travel",
         score: 86,
         reason: L("在到达时间可弹性时，性价比最好。", "Best cost-performance for flexible arrival windows.", "到着時間に余裕がある場合の費用対効果が最良。", "도착 시간이 유연할 때 비용 효율이 가장 좋습니다."),
       },
@@ -1927,21 +1927,21 @@ function cityLaneCandidates(cityName, language = "EN") {
       {
         name: L("ACT 委托支付防护", "ACT Delegated Card Guard", "ACT 委任カードガード", "ACT 위임결제 가드"),
         category: L("支付安全", "Payment Safety", "決済セーフティ", "결제 안전"),
-        imageUrl: "https://images.unsplash.com/photo-1556740749-887f6717d7e4?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=travel",
         score: 95,
         reason: L("可拦截高风险交易并保护免密上限。", "High-risk interception and no-pin cap protection.", "高リスク取引の遮断とNo-PIN上限保護に有効。", "고위험 거래 차단 및 무PIN 한도 보호에 효과적."),
       },
       {
         name: L("MCP 合同监控", "MCP Contract Watch", "MCP 契約ウォッチ", "MCP 계약 모니터"),
         category: L("稳定性", "Reliability", "信頼性", "신뢰성"),
-        imageUrl: "https://images.unsplash.com/photo-1451187580459-43490279c0fa?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=travel",
         score: 90,
         reason: L("最适合做 SLA 诊断与供应商兜底可视化。", "Best for SLA diagnostics and provider fallback visibility.", "SLA診断とプロバイダーフォールバック可視化に最適。", "SLA 진단과 공급자 대체 경로 가시화에 최적."),
       },
       {
         name: L("退款与证据控制台", "Refund & Evidence Console", "返金・証憑コンソール", "환불·증빙 콘솔"),
         category: L("售后", "After-sales", "アフターサポート", "애프터서비스"),
-        imageUrl: "https://images.unsplash.com/photo-1450101499163-c8848c66ca85?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=travel",
         score: 87,
         reason: L("退款和售后争议的可追溯性最强。", "Strongest traceability for refunds and support disputes.", "返金・サポート紛争時の追跡性が最も高い。", "환불 및 지원 분쟁 시 추적성이 가장 높습니다."),
       },
@@ -4737,8 +4737,8 @@ function normalizeCandidateItem(raw, laneType = "eat") {
   const category = String(raw.category || (laneType === "travel" ? "Transport" : "Restaurant")).trim();
   const fallbackImage =
     laneType === "travel"
-      ? "https://images.unsplash.com/photo-1436491865332-7a61a109cc05?auto=format&fit=crop&w=1200&q=80"
-      : "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?auto=format&fit=crop&w=1200&q=80";
+      ? "/api/placeholder?cat=default"
+      : "/api/placeholder?cat=food";
   return {
     name,
     category,
@@ -4824,8 +4824,8 @@ function asCandidateRowsFromGaodePois(pois = [], laneType = "eat") {
           category: laneType === "travel" ? "POI" : "Restaurant",
           imageUrl:
             laneType === "travel"
-              ? "https://images.unsplash.com/photo-1502877338535-766e1452684a?auto=format&fit=crop&w=1200&q=80"
-              : "https://images.unsplash.com/photo-1515003197210-e0cd71810b5f?auto=format&fit=crop&w=1200&q=80",
+              ? "/api/placeholder?cat=default"
+              : "/api/placeholder?cat=default",
           score: Math.max(72, 94 - idx * 4),
           reason: poi && poi.address ? `Live POI from map: ${poi.address}` : "Live POI from map.",
         },
@@ -4857,7 +4857,7 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         name,
         category: L("火锅", "Hotpot", "火鍋", "훠궈"),
         score: 95,
-        imageUrl: "https://images.unsplash.com/photo-1544148103-0773bf10d330?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=food",
         reason: L("匹配火锅偏好，支持预约与代付。", "Matches hotpot preference with reservation + delegated pay support.", "火鍋嗜好に一致し、予約と委任決済に対応。", "훠궈 선호에 맞고 예약/위임결제를 지원합니다."),
         paymentFriendly: "alipay,wechat,card_delegate",
         englishMenu: true,
@@ -4872,7 +4872,7 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         name,
         category: L("清真", "Halal", "ハラール", "할랄"),
         score: 94,
-        imageUrl: "https://images.unsplash.com/photo-1544025162-d76694265947?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=food",
         reason: L("优先满足清真约束，且英文点单更友好。", "Prioritizes halal constraints with better English ordering.", "ハラール条件を優先し、英語注文も比較的容易。", "할랄 제약을 우선하며 영어 주문도 비교적 용이합니다."),
         paymentFriendly: "alipay,wechat",
         englishMenu: true,
@@ -4887,7 +4887,7 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         name,
         category: L("素食", "Vegetarian", "精進料理", "채식"),
         score: 93,
-        imageUrl: "https://images.unsplash.com/photo-1512621776951-a57141f2eefd?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=default",
         reason: L("符合素食需求并保留可执行订位链路。", "Fits vegetarian needs while keeping executable booking flow.", "精進条件に合致し、実行可能な予約フローを維持。", "채식 요구에 맞고 실행 가능한 예약 흐름을 유지합니다."),
         paymentFriendly: "alipay,wechat,card_delegate",
         englishMenu: true,
@@ -4902,7 +4902,7 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         name,
         category: L("咖啡茶饮", "Cafe & Tea", "カフェ・ティー", "카페·티"),
         score: 90,
-        imageUrl: "https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=default",
         reason: L("适合轻量会面，等待时间通常更短。", "Good for lightweight meetups with usually shorter wait.", "軽い会合に向き、待ち時間が比較的短い。", "가벼운 미팅에 적합하며 대기 시간이 비교적 짧습니다."),
         paymentFriendly: "alipay,wechat",
         englishMenu: true,
@@ -4917,7 +4917,7 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         name,
         category: L("面馆", "Noodles", "麺類", "면요리"),
         score: 92,
-        imageUrl: "https://images.unsplash.com/photo-1611270629569-8b357cb88da9?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=default",
         reason: L("与你的面食偏好直接匹配。", "Direct match to your noodle preference.", "麺系の嗜好に直接一致。", "면 요리 선호와 직접 일치합니다."),
         paymentFriendly: "alipay,wechat",
         englishMenu: true,
@@ -4936,7 +4936,7 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         name: fastRide,
         category: L("机场接送", "Airport Transfer", "空港送迎", "공항 이동"),
         score: 93,
-        imageUrl: "https://images.unsplash.com/photo-1436491865332-7a61a109cc05?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=default",
         reason: L("时限场景下准点率更优。", "Higher on-time probability for time-bound trips.", "時限制約シーンで定時率が高い。", "시간 제약 상황에서 정시 도착 확률이 높습니다."),
         riskLevel: "medium",
       });
@@ -4948,7 +4948,7 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
             : L("地铁2号线 + 机场联络线", "Metro Line 2 + Airport Link", "地下鉄2号線 + 空港連絡線", "지하철 2호선 + 공항 링크"),
         category: L("交通组合", "Transport Mix", "交通ミックス", "교통 혼합"),
         score: 88,
-        imageUrl: "https://images.unsplash.com/photo-1502877338535-766e1452684a?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=default",
         reason: L("成本更优，适合时间弹性场景。", "Better cost efficiency for flexible arrival windows.", "コスト効率が高く、時間に余裕がある場合に適合。", "비용 효율이 높아 시간 여유가 있을 때 적합합니다."),
         riskLevel: "medium",
       });
@@ -4964,7 +4964,7 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         name: hotel,
         category: L("酒店", "Hotel", "ホテル", "호텔"),
         score: 91,
-        imageUrl: "https://images.unsplash.com/photo-1566073771259-6a8506099945?auto=format&fit=crop&w=1200&q=80",
+        imageUrl: "/api/placeholder?cat=default",
         reason: L("外宾友好度高，接驳与沟通成本低。", "High foreign-visitor friendliness with low coordination cost.", "訪日客対応が高く、連携コストが低い。", "외국인 친화도가 높고 연계 비용이 낮습니다."),
       });
     }
@@ -5234,7 +5234,7 @@ function buildSolutionRecommendation(taskId = null, intentHint = null, cityOverr
       id: "eat-specific-fastlane",
       type: "eat",
       title: L(`${eatPrimary.name} 即刻订位`, `${eatPrimary.name} immediate reservation`, `${eatPrimary.name} 即時予約`, `${eatPrimary.name} 즉시 예약`),
-      imagePath: eatPrimary.imageUrl || "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?auto=format&fit=crop&w=1200&q=80",
+      imagePath: eatPrimary.imageUrl || "/api/placeholder?cat=default",
       prompt: L(
         `去 ${eatPrimary.name}，用${transportModeEat}前往并完成排队、订位、代付和双语导航。`,
         `Go to ${eatPrimary.name} via ${transportModeEat}, and complete queue check, reservation, delegated pay, and bilingual navigation.`,
@@ -5289,7 +5289,7 @@ function buildSolutionRecommendation(taskId = null, intentHint = null, cityOverr
       id: "dinner-hotel-combo",
       type: "eat",
       title: L(`${eatSecondary.name} 晚餐 + 返回酒店`, `${eatSecondary.name} dinner + return hotel`, `${eatSecondary.name} 夕食 + ホテル帰着`, `${eatSecondary.name} 저녁 + 호텔 복귀`),
-      imagePath: eatSecondary.imageUrl || eatPrimary.imageUrl || "https://images.unsplash.com/photo-1515003197210-e0cd71810b5f?auto=format&fit=crop&w=1200&q=80",
+      imagePath: eatSecondary.imageUrl || eatPrimary.imageUrl || "/api/placeholder?cat=default",
       prompt: L(
         `在 ${eatSecondary.name} 完成晚餐后，安排 ${hotelName} 回程并交付全套凭证。`,
         `Finish dinner at ${eatSecondary.name}, then arrange return to ${hotelName} with full proof package.`,
@@ -5341,7 +5341,7 @@ function buildSolutionRecommendation(taskId = null, intentHint = null, cityOverr
       id: "airport-sla-lane",
       type: "travel",
       title: L(`${hotelName} -> 机场 · ${transferPrimary.name || transportModeTrip}`, `${hotelName} -> airport via ${transferPrimary.name || transportModeTrip}`, `${hotelName} -> 空港 · ${transferPrimary.name || transportModeTrip}`, `${hotelName} -> 공항 · ${transferPrimary.name || transportModeTrip}`),
-      imagePath: transferPrimary.imageUrl || hotelPrimary.imageUrl || "https://images.unsplash.com/photo-1468071174046-657d9d351a40?auto=format&fit=crop&w=1200&q=80",
+      imagePath: transferPrimary.imageUrl || hotelPrimary.imageUrl || "/api/placeholder?cat=default",
       prompt: L(
         `从 ${hotelName} 出发，使用 ${transferPrimary.name || transportModeTrip} 方案到机场，自动锁单与支付并交付二维码。`,
         `Depart from ${hotelName}, use ${transferPrimary.name || transportModeTrip} to airport, auto-lock and pay, then deliver QR proof.`,
@@ -8793,6 +8793,78 @@ const server = http.createServer(async (req, res) => {
       return writeJson(res, 200, { imageUrl });
     }
 
+    // ── GET /api/placeholder — local SVG placeholder image by category ──────
+    if (req.method === "GET" && pathname === "/api/placeholder") {
+      const params = new URL(req.url, "http://x").searchParams;
+      const cat = String(params.get("cat") || "default").slice(0, 20);
+      const label = String(params.get("label") || "").slice(0, 30).replace(/[<>&"]/g, "");
+      const configs = {
+        hotel:   { bg1: "#1a4b7a", bg2: "#2d7dc4", icon: "🏨", color: "#fff" },
+        food:    { bg1: "#7a3a1a", bg2: "#c4622d", icon: "🍜", color: "#fff" },
+        travel:  { bg1: "#1a6b3a", bg2: "#2daa6b", icon: "🏔️", color: "#fff" },
+        taxi:    { bg1: "#4a3a7a", bg2: "#7a62c4", icon: "🚕", color: "#fff" },
+        default: { bg1: "#2a4a6a", bg2: "#4a7aaa", icon: "📍", color: "#fff" },
+      };
+      const cfg = configs[cat] || configs.default;
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 250" width="400" height="250">
+  <defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:${cfg.bg1}"/><stop offset="100%" style="stop-color:${cfg.bg2}"/></linearGradient></defs>
+  <rect width="400" height="250" fill="url(#g)"/>
+  <text x="200" y="120" font-size="64" text-anchor="middle" dominant-baseline="middle">${cfg.icon}</text>
+  ${label ? `<text x="200" y="195" font-size="16" text-anchor="middle" fill="${cfg.color}" opacity="0.9" font-family="sans-serif">${label}</text>` : ""}
+</svg>`;
+      res.writeHead(200, { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400" });
+      res.end(svg);
+      return;
+    }
+
+    // ── POST /api/rag/images — batch Wikipedia image lookup ─────────────────
+    if (req.method === "POST" && pathname === "/api/rag/images") {
+      const body = await readBody(req);
+      const queries = Array.isArray(body.queries) ? body.queries.slice(0, 10) : [];
+      const results = {};
+
+      const fetchWikiThumb = (term) => new Promise((resolve) => {
+        // Build candidate search terms: full name → Chinese-only → first word
+        const cleaned = term.replace(/\(.*?\)/g, "").replace(/\s*[\·•]\s*.*/, "").trim();
+        const firstWord = cleaned.split(/[\s，,、]/)[0].trim();
+        const candidates = [...new Set([cleaned, firstWord].filter(Boolean))];
+        let found = false;
+        let done = 0;
+        if (!candidates.length) return resolve(null);
+        candidates.forEach((candidate) => {
+          const wikiTitle = encodeURIComponent(candidate.replace(/\s+/g, "_"));
+          const hasChinese = /[\u4e00-\u9fa5]/.test(candidate);
+          const lang = hasChinese ? "zh" : "en";
+          const wikiUrl = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${wikiTitle}`;
+          const req2 = https.get(wikiUrl, { headers: { "User-Agent": "CrossX-Travel-App/1.0 (contact@crossx.ai)" } }, (r) => {
+            let buf = "";
+            r.on("data", (d) => { buf += d; });
+            r.on("end", () => {
+              done++;
+              try {
+                const d = JSON.parse(buf);
+                const url = d?.thumbnail?.source || null;
+                if (url && !found) { found = true; resolve(url); }
+              } catch {}
+              if (done === candidates.length && !found) resolve(null);
+            });
+          });
+          req2.on("error", () => { done++; if (done === candidates.length && !found) resolve(null); });
+          req2.setTimeout(4000, () => req2.destroy());
+        });
+      });
+
+      await Promise.all(queries.map(async ({ id, q, city, cat }) => {
+        if (!id || !q) return;
+        const term = String(q).trim().slice(0, 80);
+        let url = await fetchWikiThumb(term);
+        // Fallback: if place name fails, try city name
+        if (!url && city) url = await fetchWikiThumb(String(city));
+        if (url) results[id] = url;
+      }));
+      return writeJson(res, 200, { results });
+    }
+
     if (req.method === "GET" && pathname === "/api/rag/status") {
       const store = ragEngine.loadStore();
       const chunks = store.chunks || [];
@@ -10659,13 +10731,9 @@ const server = http.createServer(async (req, res) => {
       await _delay(600);
       const hotelPois = await queryAmapPoi(cityZh, "hotel").catch(() => null);
 
-      const FOOD_IMGS = [
-        "https://images.unsplash.com/photo-1525755662778-989d0524087e?auto=format&fit=crop&w=1000&q=80",
-        "https://images.unsplash.com/photo-1515003197210-e0cd71810b5f?auto=format&fit=crop&w=1000&q=80",
-        "https://images.unsplash.com/photo-1563245372-f21724e3856d?auto=format&fit=crop&w=1000&q=80",
-      ];
-      const HOTEL_IMGS = ["https://images.unsplash.com/photo-1566073771259-6a8506099945?auto=format&fit=crop&w=1000&q=80"];
-      const ATTR_IMGS  = ["https://images.unsplash.com/photo-1533929736458-ca588d08c8be?auto=format&fit=crop&w=1000&q=80"];
+      const FOOD_IMGS  = ["/api/placeholder?cat=food", "/api/placeholder?cat=food", "/api/placeholder?cat=food"];
+      const HOTEL_IMGS = ["/api/placeholder?cat=hotel"];
+      const ATTR_IMGS  = ["/api/placeholder?cat=travel"];
 
       const amapNav     = (name) => `https://uri.amap.com/search?keyword=${encodeURIComponent(name + " " + cityZh)}&sourceApplication=crossx`;
       const ctripHotel  = (name) => `https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(name)}`;
