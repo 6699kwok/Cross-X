@@ -16,6 +16,11 @@
 
 const { test } = require("node:test");
 const assert   = require("node:assert/strict");
+const fs       = require("node:fs");
+const os       = require("node:os");
+const path     = require("node:path");
+
+process.env.CROSSX_DATA_DIR = process.env.CROSSX_DATA_DIR || fs.mkdtempSync(path.join(os.tmpdir(), "crossx-test-"));
 
 // ── 1. SSE stage-timer cd() — interval leak fix ───────────────────────────────
 
@@ -176,6 +181,13 @@ test("detectIntentLLM — regex: travel axis is default", async () => {
   assert.equal(r.axis, "travel");
 });
 
+test("detectIntentLLM — regex extracts English apostrophe city destinations", async () => {
+  const r = await detectIntentLLM("Plan a 2-day Xi'an trip in English", {});
+  assert.equal(r._source, "regex");
+  assert.equal(r.destination, "Xi'an");
+  assert.equal(r.axis, "travel");
+});
+
 test("detectIntentLLM — falls back gracefully on LLM timeout/error", async () => {
   const orig = global.fetch;
   global.fetch = async () => { throw Object.assign(new Error("net"), { name: "TimeoutError" }); };
@@ -301,6 +313,13 @@ test("profile — concurrent saves don't lose tripCount", async () => {
   // Sequential (profile.js is sync in-memory)
   for (let i = 0; i < 5; i++) saveProfile(id, {}, null);
   assert.equal(loadProfile(id).tripCount, 5);
+});
+
+test("trip history — missing deviceId does not fall back to shared demo history", () => {
+  const { insertTrip, getRecentTrips } = require("../src/services/db");
+  insertTrip({ deviceId: "demo", city: "Shanghai", area: "Pudong", intent: "eat", place: "Shared Demo Place", amount: 88 });
+  assert.deepEqual(getRecentTrips(null, 3), []);
+  assert.deepEqual(getRecentTrips("", 3), []);
 });
 
 // ── 7. scrubPii — multiple patterns in one string ─────────────────────────────

@@ -9,20 +9,68 @@
  * Falls back to regex on timeout or parse error.
  */
 
+// intent.js is the intent-extraction bridge between raw user language and the rest
+// of the planning pipeline. It sits between cheap regex heuristics and the heavier
+// planner stages, providing a small structured summary of what the user seems to want.
 const { openAIRequest } = require("./openai");
+const { sanitizeOperationalError } = require("../utils/safeError");
 
 // ── Regex fallback (original detectIntentAxis logic) ──────────────────────────
 function _detectIntentAxisRegex(message) {
-  if (/餐厅|美食|好吃|推荐.*吃|吃什么|特色菜|小吃|eat|restaurant|food|dining|meal/i.test(message)) return "food";
-  if (/景点|游览|门票|博物馆|景区|打卡|scenic|attraction|museum|sightseeing/i.test(message)) return "activity";
-  if (/酒店|住宿|宾馆|民宿|hotel|hostel|stay|accommodation/i.test(message)) return "stay";
+  const text = String(message || "");
+  const hasTravelFrame = /\b(plan|trip|itinerary|travel)\b|(?:\d+\s*(?:day|days|night|nights))|行程|旅行|旅游|玩\d+天|\d+天/i.test(text);
+  const hasStay = /酒店|住宿|宾馆|民宿|\bhotel\b|\bhostel\b|\bstay\b|accommodation/i.test(text);
+  const hasFood = /餐厅|美食|好吃|推荐.*吃|吃什么|特色菜|小吃|\beat\b|restaurant|food|dining|meal|brunch|supper|snack|taste|cuisine/i.test(text);
+  const hasActivity = /景点|游览|门票|博物馆|景区|打卡|scenic|attraction|museum|sightseeing|tour|landmark/i.test(text);
+  const hasTransport = /机票|航班|飞机|高铁|火车|机场|地铁|打车|交通|接送|flight|airport|plane|rail|train|taxi|metro|transfer|pickup|drop-?off/i.test(text);
+  if (hasTransport) return "travel";
+  if ((hasFood && hasStay) || (hasFood && hasActivity) || (hasStay && hasActivity)) return "travel";
+  if (hasStay) return "stay";
+  if (hasFood) return "food";
+  if (hasActivity) return "activity";
+  if (hasTravelFrame) return "travel";
   return "travel";
+}
+
+function _extractDestinationRegex(message) {
+  const text = String(message || "").trim();
+  if (!text) return null;
+
+  const zhMatch = text.match(/(?:去|到|前往|出发去|飞往)\s*([一-龥]{2,10})(?=玩|旅|游|看|走|参观|出发|\s|，|。|$)/);
+  if (zhMatch && zhMatch[1]) return zhMatch[1].trim();
+
+  const STOP_WORDS = /^(English|Chinese|Japanese|Korean|Mandarin)$/i;
+  const normalize = (value) => String(value || "")
+    .trim()
+    .replace(/\s{2,}/g, " ")
+    .replace(/^["']+|["']+$/g, "");
+  const keep = (value) => {
+    const cleaned = normalize(value);
+    if (!cleaned || STOP_WORDS.test(cleaned)) return null;
+    return cleaned;
+  };
+
+  const enPatterns = [
+    /\b(?:plan|trip|travel|stay|itinerary)\s+(?:a\s+\d+-day\s+)?([A-Z][A-Za-z' -]{1,40}?)\s+(?:trip|travel|stay|itinerary|plan)\b/i,
+    /\b(?:find|need|want|book)\s+(?:a\s+\d+-day\s+)?([A-Z][A-Za-z' -]{1,40}?)\s+stay\s+plan\b/i,
+    /\b(?:trip|travel|stay|itinerary|plan)\s+(?:in|for|to)\s+([A-Z][A-Za-z' -]{1,40}?)(?=\s+(?:in\s+English|in\s+Chinese|with|for|under|on|this|next)|[,.!?]|$)/i,
+    /\b([A-Z][A-Za-z' -]{1,40}?)\s+(?:trip|travel)\b/i,
+    /\b([A-Z][A-Za-z' -]{1,40}?)\s+stay\s+plan\b/i,
+    /\b(?:visit|going to|travel to|trip to)\s+([A-Z][A-Za-z' -]{1,40}?)(?=\s+(?:in\s+English|in\s+Chinese|with|for|under|on|this|next)|[,.!?]|$)/i,
+  ];
+  for (const pattern of enPatterns) {
+    const match = text.match(pattern);
+    const kept = keep(match && match[1]);
+    if (kept) return kept;
+  }
+
+  return null;
 }
 
 function _fallbackResult(message) {
   return {
     axis: _detectIntentAxisRegex(message),
-    destination: null,
+    destination: _extractDestinationRegex(message),
     duration_days: null,
     pax: 2,
     budget_per_day: null,
@@ -64,6 +112,9 @@ JSON 字段：
  * @param {string} opts.baseUrl
  * @returns {Promise<{axis:string, destination:string|null, duration_days:number|null, pax:number, budget_per_day:number|null, special_needs:string[], _source:string}>}
  */
+// detectIntentLLM() is intentionally narrow in scope: classify axis, basic travel
+// parameters, and coarse preference signals. It should not expand into full planning
+// logic, which belongs to planner modules downstream.
 async function detectIntentLLM(message, { apiKey, model, baseUrl } = {}) {
   if (!apiKey || !message) return _fallbackResult(message || "");
 
@@ -114,12 +165,11 @@ async function detectIntentLLM(message, { apiKey, model, baseUrl } = {}) {
       _source: "llm",
     };
 
-    const prefKeys = Object.keys(preferences).join(",") || "none";
-    console.log(`[intent] axis=${result.axis} dest=${result.destination} days=${result.duration_days} pax=${result.pax} prefs=[${prefKeys}] src=llm`);
+    console.log("[intent] intent parsed via llm");
     return result;
 
   } catch (e) {
-    console.warn("[intent] parse error — using regex fallback:", e.message);
+    console.warn("[intent] parse error — using regex fallback:", sanitizeOperationalError(e, "intent_parse_failed"));
     return _fallbackResult(message);
   }
 }

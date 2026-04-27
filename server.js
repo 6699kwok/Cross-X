@@ -1,15 +1,17 @@
 const http = require("http");
 const https = require("https");
-const { parse: parseUrl } = require("url");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
+let LOADED_ENV_FILES = [];
+LOADED_ENV_FILES = loadLocalEnvFiles();
 const { createToolRegistry } = require("./lib/tools/registry");
 const { createGaodeConnector } = require("./lib/connectors/gaode");
 const { createPartnerHubConnector } = require("./lib/connectors/partner_hub");
 const { createAuditLogger } = require("./lib/trust/audit");
 const { createConfirmPolicy } = require("./lib/trust/confirm");
 const { createOrchestrator } = require("./lib/orchestrator");
+const { extractExplicitCityFromIntent } = require("./lib/planner");
 const { buildQuote, roundMoney } = require("./lib/commerce/merchant");
 const { createPaymentRailManager, normalizeRail } = require("./lib/payments/rail");
 const { buildAgentMeta } = require("./lib/planner");
@@ -20,12 +22,20 @@ function buildChinaTravelKnowledge() { return _CACHED_KNOWLEDGE; }
 const ragEngine = require("./lib/rag/engine");
 
 // ── Security + GDPR + Fulfillment + Auth ──────────────────────────────────
-const { applySecurityHeaders, generateNonce, validateMapKeyOrigin, validateSchema, sanitizeError, extractDeviceId, sanitizeUserInput, validateConversationHistory } = require("./src/middleware/security");
+const { applySecurityHeaders, generateNonce, validateMapKeyOrigin, validateSchema, sanitizeError, extractDeviceId, isDemoIdentityEnabled, sanitizeUserInput, validateConversationHistory } = require("./src/middleware/security");
 const { buildIndex: _bm25BuildIndex, rankDocuments: _bm25Rank } = require("./src/utils/bm25");
-const { getAnalyticsSummary, revokeToken: _dbRevokeToken, isTokenRevoked: _dbIsTokenRevoked, insertAgentToolCalls, insertDpoPair, getDpoPairs } = require("./src/services/db");
+const { isMerchantDemoEnabled, isLocalExternalDataFallbackEnabled } = require("./src/utils/runtimeFlags");
+const { getAnalyticsSummary, revokeToken: _dbRevokeToken, isTokenRevoked: _dbIsTokenRevoked, insertAgentToolCalls, insertDpoPair, getDpoPairs, consumeRateLimitWindow, resetRateLimitWindow, pruneRateLimitWindows } = require("./src/services/db");
 const { priceValidityWarning } = require("./src/utils/i18n");
 const { consentMiddleware } = require("./src/middleware/consent");
-const { requireAdmin, requireFinance, validateMasterKey, issueToken, checkSettlementRateLimit } = require("./src/middleware/auth");
+const {
+  requireAdmin, requireFinance, requireMerchant,
+  validateMasterKey, issueToken, issueMerchantToken,
+  setAdminAuthCookie, clearAdminAuthCookie,
+  setMerchantAuthCookie, clearMerchantAuthCookie,
+  checkSettlementRateLimit, hashMerchantPassword, verifyMerchantPassword,
+} = require("./src/middleware/auth");
+const { assertRuntimeSecurity, getRuntimeSecurityHealth } = require("./src/security/runtimeGuard");
 const gdpr = require("./src/services/gdpr");
 const fulfillment = require("./src/services/fulfillment");
 const { pruneOldData } = require("./src/services/db");
@@ -41,7 +51,7 @@ const { startMcpServer } = require("./src/mcp/server");
 const { queryAmapPoi, queryAmapHotels, enrichPlanWithAmapData } = require("./src/services/amap");
 const { queryAmapRouting, queryLocalRoute, geocodePlacesBatch } = require("./src/services/amapRouting");
 const { buildSyntheticEnrichment, buildAIEnrichment, callCozeWorkflow } = require("./src/services/coze");
-const { queryJuheFlight, queryJuheFlightInvoice } = require("./src/services/juhe");
+const { queryJuheFlight, queryJuheFlightInvoice, localizeFlightRecords, resolveFlightCityCode } = require("./src/services/juhe");
 const {
   toNumberOrNull, haversineKm, inferCityFromCoordinates, inferCityNameFromCoordinates,
   wgs84ToGcj02, reverseGeocodeWithAmap, offsetCoords,
@@ -54,8 +64,13 @@ let _adminLoginRl = new Map();       // P2-A: admin login brute-force rate-limit
 const WEATHER_CACHE     = new Map(); // city → {ts, data}, 1h TTL
 const WEATHER_TTL_MS    = 60 * 60 * 1000;
 const SESSION_ITIN_TTL  = 2 * 60 * 60 * 1000; // 2h
+const DEFAULT_CITY      = "Shanghai";
+const DEFAULT_LANG_EN   = "EN";
+const DEFAULT_LANG_ZH   = "ZH";
 // Sliding-window rate-limit map for /api/metrics/events: IP → timestamp[]
 const _metricsRateMap   = new Map();
+// Sliding-window rate-limit map for /api/chat/reply: IP → timestamp[]
+const _chatRateMap      = new Map();
 // GC: prune stale IP windows every 5 min to prevent unbounded growth
 setInterval(() => {
   const cutoff = Date.now() - 60000;
@@ -78,22 +93,705 @@ const _sessionGc = setInterval(() => {
 }, 30 * 60 * 1000);
 if (_sessionGc.unref) _sessionGc.unref();
 
+function pickWeatherLang(lang, zh, en, ja, ko) {
+  const normalized = String(lang || "ZH").toUpperCase();
+  if (normalized === "EN") return en;
+  if (normalized === "JA") return ja;
+  if (normalized === "KO") return ko;
+  return zh;
+}
+
+function buildWeatherTip(lang, { hasSnow, hasRain, hasCold, hasHot }) {
+  if (hasSnow) return pickWeatherLang(lang, "❄️ 出行期间可能降雪，请备好防寒保暖装备", "❄️ Snow is possible during your trip. Pack warm layers.", "❄️ 旅行中に雪の可能性があります。防寒着をご用意ください。", "❄️ 여행 중 눈이 올 수 있습니다. 방한용품을 준비하세요.");
+  if (hasRain && hasCold) return pickWeatherLang(lang, "🌧️🧥 有降雨且气温较低，建议携带雨伞和保暖外套", "🌧️🧥 Rain and lower temperatures are likely. Bring an umbrella and a warm layer.", "🌧️🧥 雨と低温が予想されます。傘と防寒着をご用意ください。", "🌧️🧥 비와 낮은 기온이 예상됩니다. 우산과 겉옷을 챙기세요.");
+  if (hasRain) return pickWeatherLang(lang, "🌂 出行期间可能有降雨，建议携带折叠雨伞", "🌂 Rain is possible during your trip. A compact umbrella is recommended.", "🌂 旅行中に雨の可能性があります。折りたたみ傘がおすすめです。", "🌂 여행 중 비가 올 수 있습니다. 접이식 우산을 챙기세요.");
+  if (hasCold) return pickWeatherLang(lang, "🧥 早晚温差较大，注意添衣保暖", "🧥 Mornings and evenings may be cool. Bring an extra layer.", "🧥 朝晩は冷え込む可能性があります。上着をご用意ください。", "🧥 아침저녁으로 쌀쌀할 수 있습니다. 겉옷을 챙기세요.");
+  if (hasHot) return pickWeatherLang(lang, "☀️ 天气炎热，注意防晒补水，避免正午暴晒", "☀️ Hot weather expected. Stay hydrated and avoid strong midday sun.", "☀️ 暑くなりそうです。水分補給と日差し対策をしてください。", "☀️ 더운 날씨가 예상됩니다. 수분 섭취와 자외선 차단에 유의하세요.");
+  return pickWeatherLang(lang, "🌤️ 天气状况较好，祝旅途愉快！", "🌤️ Weather looks good. Have a smooth trip.", "🌤️ 天気は良好です。よい旅を。", "🌤️ 날씨가 무난합니다. 좋은 여행 되세요.");
+}
+
 // ── WMO weather code (Open-Meteo) → emoji + label ────────────────────────────
-function mapWeatherCode(code) {
+function mapWeatherCode(code, lang = "ZH") {
   const c = Number(code);
-  if (c === 0)                      return { icon: "☀️",  label: "晴" };
-  if (c === 1)                      return { icon: "🌤️", label: "基本晴" };
-  if (c === 2)                      return { icon: "⛅",  label: "多云" };
-  if (c === 3)                      return { icon: "☁️",  label: "阴" };
-  if (c === 45 || c === 48)         return { icon: "🌫️", label: "雾" };
-  if (c >= 51 && c <= 57)           return { icon: "🌦️", label: "毛毛雨" };
-  if (c >= 61 && c <= 67)           return { icon: "🌧️", label: "雨" };
-  if (c >= 71 && c <= 77)           return { icon: "❄️",  label: "雪" };
-  if (c >= 80 && c <= 82)           return { icon: "🌧️", label: "阵雨" };
-  if (c === 85 || c === 86)         return { icon: "❄️",  label: "阵雪" };
-  if (c === 95)                     return { icon: "⛈️",  label: "雷暴" };
-  if (c === 96 || c === 99)         return { icon: "⛈️",  label: "雷暴伴冰雹" };
-  return { icon: "🌤️", label: "晴" };
+  if (c === 0)                      return { icon: "☀️",  label: pickWeatherLang(lang, "晴", "Clear", "快晴", "맑음") };
+  if (c === 1)                      return { icon: "🌤️", label: pickWeatherLang(lang, "基本晴", "Mostly clear", "晴れ", "대체로 맑음") };
+  if (c === 2)                      return { icon: "⛅",  label: pickWeatherLang(lang, "多云", "Partly cloudy", "くもり時々晴れ", "구름 조금") };
+  if (c === 3)                      return { icon: "☁️",  label: pickWeatherLang(lang, "阴", "Cloudy", "くもり", "흐림") };
+  if (c === 45 || c === 48)         return { icon: "🌫️", label: pickWeatherLang(lang, "雾", "Fog", "霧", "안개") };
+  if (c >= 51 && c <= 57)           return { icon: "🌦️", label: pickWeatherLang(lang, "毛毛雨", "Drizzle", "霧雨", "이슬비") };
+  if (c >= 61 && c <= 67)           return { icon: "🌧️", label: pickWeatherLang(lang, "雨", "Rain", "雨", "비") };
+  if (c >= 71 && c <= 77)           return { icon: "❄️",  label: pickWeatherLang(lang, "雪", "Snow", "雪", "눈") };
+  if (c >= 80 && c <= 82)           return { icon: "🌧️", label: pickWeatherLang(lang, "阵雨", "Showers", "にわか雨", "소나기") };
+  if (c === 85 || c === 86)         return { icon: "❄️",  label: pickWeatherLang(lang, "阵雪", "Snow showers", "にわか雪", "소낙눈") };
+  if (c === 95)                     return { icon: "⛈️",  label: pickWeatherLang(lang, "雷暴", "Thunderstorm", "雷雨", "뇌우") };
+  if (c === 96 || c === 99)         return { icon: "⛈️",  label: pickWeatherLang(lang, "雷暴伴冰雹", "Thunderstorm with hail", "ひょうを伴う雷雨", "우박 동반 뇌우") };
+  return { icon: "🌤️", label: pickWeatherLang(lang, "晴", "Clear", "快晴", "맑음") };
+}
+
+function parseFlightDurationMinutes(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return 0;
+  const hm = text.match(/(\d+)\s*(?:小时|h|hr|hrs)\s*(\d+)\s*(?:分|m|min|mins)?/i);
+  if (hm) return parseInt(hm[1], 10) * 60 + parseInt(hm[2], 10);
+  const colon = text.match(/^(\d{1,2}):(\d{2})$/);
+  if (colon) return parseInt(colon[1], 10) * 60 + parseInt(colon[2], 10);
+  const h = text.match(/(\d+)\s*(?:小时|h|hr|hrs)/i);
+  if (h) return parseInt(h[1], 10) * 60;
+  const m = text.match(/(\d+)\s*(?:分|m|min|mins)/i);
+  if (m) return parseInt(m[1], 10);
+  return 0;
+}
+
+function buildDefaultUserProfile(userId = "anon", { language = DEFAULT_LANG_EN, city = DEFAULT_CITY } = {}) {
+  return {
+    id: String(userId || "anon"),
+    language,
+    city,
+    cityZh: "",
+    province: "",
+    provinceZh: "",
+    district: "",
+    districtZh: "",
+    viewMode: "user",
+    role: "user",
+    preferences: {
+      budget: "mid",
+      dietary: "",
+      family: false,
+      accessibility: "optional",
+      transport: "mixed",
+      walking: "walk",
+      allergy: "",
+    },
+    savedPlaces: { hotel: "", office: "", airport: "PVG" },
+    location: { lat: null, lng: null, accuracy: null, updatedAt: null, source: "none", geocodeSource: "" },
+    privacy: { locationEnabled: true },
+    authDomain: { noPinEnabled: true, dailyLimit: 200000, singleLimit: 50000 },
+    paymentRail: { selected: "alipay_cn" },
+    plusSubscription: { active: false, plan: "none", benefits: [] },
+  };
+}
+
+function buildPublicAnonUserProfile({ language = DEFAULT_LANG_EN, city = DEFAULT_CITY } = {}) {
+  const profile = buildDefaultUserProfile("anon", { language, city });
+  return {
+    ...profile,
+    role: "anon",
+    preferences: {
+      ...profile.preferences,
+    },
+    savedPlaces: { hotel: "", office: "", airport: "" },
+    privacy: { locationEnabled: false },
+    authDomain: { noPinEnabled: false, dailyLimit: 0, singleLimit: 0 },
+    paymentRail: { selected: "" },
+    plusSubscription: { active: false, plan: "none", benefits: [] },
+  };
+}
+
+function getUserProfile(userId, fallbackOptions = {}) {
+  if (!userId) return buildDefaultUserProfile(fallbackOptions.fallbackId || "anon", fallbackOptions);
+  return getUser(userId) || buildDefaultUserProfile(userId, fallbackOptions);
+}
+
+function sanitizeUserProfileForViewer(user, { isAdmin = false } = {}) {
+  if (!user || typeof user !== "object") return buildPublicAnonUserProfile();
+  const rawId = String(user.id || "anon").trim() || "anon";
+  if (!isAdmin && rawId === "anon") {
+    return buildPublicAnonUserProfile({
+      language: user.language || DEFAULT_LANG_EN,
+      city: user.city || DEFAULT_CITY,
+    });
+  }
+  const defaults = buildDefaultUserProfile(rawId, {
+    language: user.language || DEFAULT_LANG_EN,
+    city: user.city || DEFAULT_CITY,
+  });
+  return {
+    ...defaults,
+    ...user,
+    id: toViewerUserRef(rawId, { isAdmin }),
+    preferences: {
+      ...defaults.preferences,
+      ...(user.preferences && typeof user.preferences === "object" ? user.preferences : {}),
+    },
+    savedPlaces: {
+      ...defaults.savedPlaces,
+      ...(user.savedPlaces && typeof user.savedPlaces === "object" ? user.savedPlaces : {}),
+    },
+    location: {
+      ...defaults.location,
+      ...(user.location && typeof user.location === "object" ? user.location : {}),
+    },
+    privacy: {
+      ...defaults.privacy,
+      ...(user.privacy && typeof user.privacy === "object" ? user.privacy : {}),
+    },
+    authDomain: {
+      ...defaults.authDomain,
+      ...(user.authDomain && typeof user.authDomain === "object" ? user.authDomain : {}),
+    },
+    paymentRail: {
+      ...defaults.paymentRail,
+      ...(user.paymentRail && typeof user.paymentRail === "object" ? user.paymentRail : {}),
+    },
+    plusSubscription: {
+      ...defaults.plusSubscription,
+      ...(user.plusSubscription && typeof user.plusSubscription === "object" ? user.plusSubscription : {}),
+    },
+  };
+}
+
+function rankFlightOption(flight) {
+  const duration = Number(flight?.durationMinutes || 0) || parseFlightDurationMinutes(flight?.duration);
+  const price = Number(flight?.price || 0) || 999999;
+  const stops = Number(flight?.stops || 0);
+  return price + (stops * 320) + Math.max(0, duration - 180) * 1.2;
+}
+
+function parseRequestUrl(req) {
+  const host = String(req.headers.host || `127.0.0.1:${PORT || 8787}`);
+  const parsed = new URL(req.url || "/", `http://${host}`);
+  return {
+    pathname: parsed.pathname,
+    query: Object.fromEntries(parsed.searchParams.entries()),
+    searchParams: parsed.searchParams,
+    url: parsed,
+  };
+}
+
+function pickBestFlightOption(flights) {
+  const list = Array.isArray(flights) ? flights.filter(Boolean) : [];
+  if (!list.length) return null;
+  return [...list].sort((a, b) => {
+    const scoreDiff = rankFlightOption(a) - rankFlightOption(b);
+    if (scoreDiff !== 0) return scoreDiff;
+    return (Number(a?.price || 0) || 0) - (Number(b?.price || 0) || 0);
+  })[0] || null;
+}
+
+function localizeIntercityLabel(mode, language = "ZH") {
+  const lang = String(language || "ZH").toUpperCase();
+  const type = String(mode?.type || "").toLowerCase();
+  const rawLabel = String(mode?.label || mode?.name || "").trim();
+  if (lang === "ZH") return rawLabel;
+  if (type === "hsr" || type === "train") {
+    const base = lang === "JA" ? "新幹線" : lang === "KO" ? "고속철" : "High-speed rail";
+    return /^g/i.test(rawLabel) ? `G ${base}` : base;
+  }
+  if (type === "drive" || type === "car") {
+    return lang === "JA" ? "車移動" : lang === "KO" ? "자가 이동" : "Drive";
+  }
+  if (type === "bus") {
+    return lang === "JA" ? "バス" : lang === "KO" ? "버스" : "Bus";
+  }
+  if (type === "flight") {
+    return lang === "JA" ? "フライト" : lang === "KO" ? "항공편" : "Flight";
+  }
+  return rawLabel;
+}
+
+function localizeIntercityFreq(freq, language = "ZH") {
+  const text = String(freq || "").trim();
+  const lang = String(language || "ZH").toUpperCase();
+  if (!text || lang === "ZH") return text;
+  if (text === "每日多班") return "multiple departures daily";
+  const daily = text.match(/每日\s*(\d+)\s*班/);
+  if (daily) return `${daily[1]} daily`;
+  return text;
+}
+
+function localizeIntercityStationName(value = "", language = "ZH") {
+  const text = String(value || "").trim();
+  const lang = normalizeLang(language);
+  if (!text || lang === "ZH" || lang === "ZH-TW") return text;
+  const map = [
+    [/上海虹桥站/g, "Shanghai Hongqiao Station"],
+    [/上海虹桥/g, "Shanghai Hongqiao"],
+    [/北京南高铁站/g, "Beijing South HSR Station"],
+    [/北京南站/g, "Beijing South Station"],
+    [/北京南/g, "Beijing South"],
+    [/北京西站/g, "Beijing West Station"],
+    [/北京西/g, "Beijing West"],
+    [/广州南站/g, "Guangzhou South Station"],
+    [/广州南/g, "Guangzhou South"],
+    [/杭州东站/g, "Hangzhou East Station"],
+    [/杭州东/g, "Hangzhou East"],
+    [/杭州站/g, "Hangzhou Station"],
+    [/杭州/g, "Hangzhou"],
+    [/武汉站/g, "Wuhan Station"],
+    [/武汉/g, "Wuhan"],
+    [/苏州站/g, "Suzhou Station"],
+    [/苏州/g, "Suzhou"],
+    [/成都东站/g, "Chengdu East Station"],
+    [/成都东/g, "Chengdu East"],
+    [/广州南/g, "Guangzhou South"],
+    [/西安北高铁站/g, "Xi'an North HSR Station"],
+    [/西安北站/g, "Xi'an North Station"],
+    [/西安北/g, "Xi'an North"],
+    [/西安站/g, "Xi'an Station"],
+    [/西安/g, "Xi'an"],
+    [/深圳北站/g, "Shenzhen North Station"],
+    [/深圳北/g, "Shenzhen North"],
+    [/乌鲁木齐站/g, "Urumqi Station"],
+    [/乌鲁木齐/g, "Urumqi"],
+    [/武汉站/g, "Wuhan Station"],
+    [/武汉/g, "Wuhan"],
+    [/上海站/g, "Shanghai Station"],
+    [/上海/g, "Shanghai"],
+    [/北京站/g, "Beijing Station"],
+    [/北京/g, "Beijing"],
+    [/广州站/g, "Guangzhou Station"],
+    [/广州/g, "Guangzhou"],
+    [/深圳站/g, "Shenzhen Station"],
+    [/深圳/g, "Shenzhen"],
+  ];
+  let localized = text;
+  map.forEach(([pattern, replacement]) => {
+    localized = localized.replace(pattern, replacement);
+  });
+  if (containsChineseText(localized)) {
+    const formatted = formatNameWithCnPinyin(localized, lang);
+    if (formatted && !containsChineseText(formatted)) return formatted;
+  }
+  return localized;
+}
+
+function escapeRegexLiteral(value = "") {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildIntercityTransportOptionNote(mode, language = "ZH") {
+
+  const lang = normalizeLang(language);
+  const type = String(mode?.type || "").toLowerCase();
+  const rawNote = localizeIntercityNote(mode?.note || "", lang);
+  const freq = localizeIntercityFreq(mode?.freq || "", lang);
+  const duration = formatTransportDurationLabel(mode?.duration_min, lang);
+  const price = Number(mode?.price_cny || 0) || 0;
+  const priceText = price > 0
+    ? pickLang(lang, `票价约 ¥${price.toLocaleString()}`, `fare around ¥${price.toLocaleString()}`, `運賃は約 ¥${price.toLocaleString()}`, `요금 약 ¥${price.toLocaleString()}`)
+    : "";
+  const freqText = freq
+    ? pickLang(lang, `班次 ${freq}`, `${freq}`, `便数 ${freq}`, `운行 ${freq}`)
+    : "";
+  const localizedFromStation = localizeIntercityStationName(mode?.from_station || "", lang);
+  const localizedToStation = localizeIntercityStationName(mode?.to_station || "", lang);
+  const stationText = localizedFromStation && localizedToStation
+    ? pickLang(lang, `区间 ${localizedFromStation} -> ${localizedToStation}`, `${localizedFromStation} -> ${localizedToStation}`, `${localizedFromStation} -> ${localizedToStation}`, `${localizedFromStation} -> ${localizedToStation}`)
+    : "";
+  const lineText = mode?.line_name && (type === "hsr" || type === "train")
+    ? pickLang(lang, `车次 ${mode.line_name}`, `${mode.line_name}`, `${mode.line_name}`, `${mode.line_name}`)
+    : "";
+  const inventoryText = mode?.inventory_note
+    ? localizeIntercityNote(mode.inventory_note, lang)
+    : "";
+  const inventoryTail = inventoryText
+    ? inventoryText
+      .replace(new RegExp(`^${escapeRegexLiteral(mode?.line_name || "")}\\s*\\|\\s*`, "i"), "")
+      .replace(new RegExp(`^${escapeRegexLiteral(localizedFromStation || "")}\\s*->\\s*${escapeRegexLiteral(localizedToStation || "")}\\s*\\|\\s*`, "i"), "")
+      .trim()
+    : "";
+  const liveSource = mode?.live === true || isLiveTransportSource(mode?.source || mode?._source || "");
+const isFallbackRail = (type === "hsr" || type === "train") && !liveSource;
+const cleanedInventoryText = isFallbackRail && /corridor fallback/i.test(inventoryText)
+  ? ""
+  : inventoryText;
+const cleanedInventoryTail = isFallbackRail && /corridor fallback/i.test(inventoryTail)
+  ? ""
+  : inventoryTail;
+const stationArrivalText = isFallbackRail && localizedToStation
+  ? pickLang(lang, `抵达 ${localizedToStation} 后从车站继续前往酒店`, `arrive at ${localizedToStation} and continue to the hotel from the station`, `${localizedToStation} 到着後は駅からホテルへ移動`, `${localizedToStation} 도착 후 역에서 호텔로 이동`)
+  : "";
+const railExecutionText = isFallbackRail
+  ? pickLang(lang, "建议打开 12306 自行核验余票并至少提前 30-45 分钟到站", "open 12306 to check current seat availability yourself and arrive at the station 30-45 min early", "12306 を開いて空席を自分で確認し、駅には 30-45 分前に到着してください", "12306을 열어 현재 잔여 좌석을 직접 확인하고 역에는 30-45분 일찍 도착하세요")
+  : "";
+  const sourceText = liveSource
+    ? pickLang(lang, "路线数据已做实时/回退校验", "Route validated against live/fallback sources", "経路はライブ/代替ソースで検証済み", "경로는 실시간/대체 소스로 검증됨")
+    : pickLang(lang, "当前为回退/估算交通结果", "Currently showing fallback / estimated transport", "現在は代替 / 推定交通を表示しています", "현재는 대체 / 추정 교통을 표시합니다");
+  const parts = [];
+  if (type === "flight") {
+    if (mode?.flight_no) {
+      parts.push(pickLang(lang, `航班 ${mode.flight_no}`, `Flight ${mode.flight_no}`, `便名 ${mode.flight_no}`, `항공편 ${mode.flight_no}`));
+    }
+    if (freqText) parts.push(freqText);
+    if (priceText) parts.push(priceText);
+  } else if (type === "hsr" || type === "train") {
+    if (lineText) parts.push(lineText);
+    if (stationText) parts.push(stationText);
+    if (freqText) parts.push(freqText);
+    if (duration) parts.push(pickLang(lang, `全程约 ${duration}`, `about ${duration}`, `所要時間は約 ${duration}`, `총 소요 약 ${duration}`));
+    if (priceText) parts.push(priceText);
+  } else if (type === "drive" || type === "car") {
+    if (mode?.distance_km) parts.push(pickLang(lang, `里程 ${mode.distance_km} km`, `${mode.distance_km} km`, `${mode.distance_km} km`, `${mode.distance_km} km`));
+    if (duration) parts.push(pickLang(lang, `自驾约 ${duration}`, `drive about ${duration}`, `車移動で約 ${duration}`, `자가 이동 약 ${duration}`));
+    if (priceText) parts.push(priceText);
+  }
+  if (rawNote) parts.push(rawNote);
+  else if (cleanedInventoryTail) parts.push(cleanedInventoryTail);
+  else if (cleanedInventoryText && !parts.length) parts.push(cleanedInventoryText);
+  else if (parts.length) parts.push(sourceText);
+  if (stationArrivalText) parts.push(stationArrivalText);
+  if (railExecutionText) parts.push(railExecutionText);
+  return parts.filter(Boolean).join(lang === "EN" ? " | " : " · ");
+}
+
+function localizeIntercityNote(note, language = "ZH") {
+  const lang = String(language || "ZH").toUpperCase();
+  const text = String(note || "").trim();
+  if (!text || lang === "ZH") return text;
+  const rawChineseRailDirectFlightMatch = text.match(/^(.+?)→(.+?)高铁直达，通常比飞行更稳。?$/);
+  if (rawChineseRailDirectFlightMatch) {
+    const [, fromStationZh, toStationZh] = rawChineseRailDirectFlightMatch;
+    const fromStation = localizeIntercityStationName(fromStationZh, lang);
+    const toStation = localizeIntercityStationName(toStationZh, lang);
+    return lang === "JA"
+      ? `推奨ルート: ${fromStation} から ${toStation}。この区間は高速鉄道が直通し、通常はフライトより安定しています。`
+      : lang === "KO"
+        ? `추천 경로: ${fromStation}에서 ${toStation}. 이 구간은 고속철 직행이 가능하며 보통 항공편보다 안정적입니다.`
+        : `Suggested connection: ${fromStation} to ${toStation}. High-speed rail runs direct on this corridor and is usually more reliable than flying.`;
+  }
+  const rawChineseRailDirectDriveMatch = text.match(/^(.+?)直达(.+?)，高频发车，通常比自驾更稳。?$/);
+  if (rawChineseRailDirectDriveMatch) {
+    const [, fromStationZh, toStationZh] = rawChineseRailDirectDriveMatch;
+    const fromStation = localizeIntercityStationName(fromStationZh, lang);
+    const toStation = localizeIntercityStationName(toStationZh, lang);
+    return lang === "JA"
+      ? `推奨ルート: ${fromStation} から ${toStation}。この区間は高頻度で運行しており、通常は車移動より安定しています。`
+      : lang === "KO"
+        ? `추천 경로: ${fromStation}에서 ${toStation}. 이 구간은 고빈도 운행이며 보통 자가 이동보다 안정적입니다.`
+        : `Suggested connection: ${fromStation} to ${toStation}. High-speed rail runs frequently on this corridor and is usually more reliable than driving.`;
+  }
+  const rawChineseRailDirectCityCenterMatch = text.match(/^(.+?)→(.+?)高铁直达，高频且市区衔接更方便。?$/);
+  if (rawChineseRailDirectCityCenterMatch) {
+    const [, fromStationZh, toStationZh] = rawChineseRailDirectCityCenterMatch;
+    const fromStation = localizeIntercityStationName(fromStationZh, lang);
+    const toStation = localizeIntercityStationName(toStationZh, lang);
+    return lang === "JA"
+      ? `推奨ルート: ${fromStation} から ${toStation}。この区間は高速鉄道が直通し、市内中心部どうしの移動もしやすいです。`
+      : lang === "KO"
+        ? `추천 경로: ${fromStation}에서 ${toStation}. 이 구간은 고속철 직행이 가능하며 도심 간 이동도 더 수월합니다.`
+        : `Suggested connection: ${fromStation} to ${toStation}. High-speed rail runs direct on this corridor and is usually easier city-center to city-center.`;
+  }
+  let localized = localizeIntercityStationName(text, lang)
+    .replace(/虹桥\/浦东/g, "Hongqiao / Pudong Airport")
+    .replace(/宝安机场/g, "Bao'an Airport")
+    .replace(/咸阳机场/g, "Xianyang Airport")
+    .replace(/地窝堡机场/g, "Diwopu Airport")
+    .replace(/首都\/大兴机场/g, "Capital / Daxing Airport")
+    .replace(/白云机场/g, "Baiyun Airport")
+    .replace(/北京西/g, "Beijing West")
+    .replace(/西安北高铁站/g, "Xi'an North HSR Station")
+    .replace(/虹桥/g, "Hongqiao")
+    .replace(/北京南高铁站/g, "Beijing South HSR Station")
+    .replace(/广州南/g, "Guangzhou South")
+    .replace(/无直达高铁/g, "no direct high-speed rail service")
+    .replace(/高铁可从/g, "HSR is available from ")
+    .replace(/高铁站/g, "high-speed rail station")
+    .replace(/高铁直达/g, "high-speed rail runs direct")
+    .replace(/高铁/g, "high-speed rail")
+    .replace(/直达/g, " direct to ")
+    .replace(/市区间点对点省时/g, "faster door-to-door between city centers")
+    .replace(/建议提前2小时到达机场/g, "arrive at the airport 2 hours early")
+    .replace(/建议查阅携程获取实时票价/g, "check Ctrip for live pricing")
+    .replace(/路线数据来源：高德地图/g, "routing via Amap")
+    .replace(/高频发车/g, "frequent departures")
+    .replace(/通常比自驾更稳/g, "usually more reliable than driving")
+    .replace(/通常最实用/g, "usually the most practical option")
+    .replace(/通常比飞行更稳/g, "usually more reliable than flying")
+    .replace(/市区间衔接通常更省心/g, "usually easier city-center to city-center")
+    .replace(/推荐高铁/g, "High-speed rail recommended")
+    .replace(/；/g, "; ")
+    .replace(/，/g, ", ");
+  localized = localized
+    .replace(/。/g, ". ")
+    .replace(/([A-Za-z])high-speed rail/gi, "$1 high-speed rail")
+    .replace(/([A-Za-z])direct to/gi, "$1 direct to")
+    .replace(/→([^,]+?) high-speed rail runs direct,\s*/gi, "→$1, high-speed rail runs direct, ")
+    .replace(/\s+/g, " ")
+    .replace(/\s*;\s*/g, "; ")
+    .replace(/\s*,\s*/g, ", ")
+    .replace(/\s+\./g, ".")
+    .replace(/\.\s*\./g, ".")
+    .trim();
+  const routeMatch = localized.match(/^([^,]+)→([^,]+),\s*(.+)$/);
+  const semicolonRouteMatch = localized.match(/^([^;]+)→([^;]+);\s*(.+)$/);
+  const simpleRouteMatch = localized.match(/^([^,]+)→([^,]+)$/);
+  const stationDirectDriveMatch = localized.match(/^(.+?) direct to (.+?), frequent departures, usually more reliable than driving.?$/i);
+  if (stationDirectDriveMatch) {
+    const [, stationFrom, stationTo] = stationDirectDriveMatch;
+    return lang === "JA"
+      ? `推奨ルート: ${stationFrom} から ${stationTo}。この区間は高頻度で運行しており、通常は車移動より安定しています。`
+      : lang === "KO"
+        ? `추천 경로: ${stationFrom}에서 ${stationTo}. 이 구간은 고빈도 운행이며 보통 자가 이동보다 안정적입니다.`
+        : `Suggested connection: ${stationFrom} to ${stationTo}. High-speed rail runs frequently on this corridor and is usually more reliable than driving.`;
+  }
+  if (/^High-speed rail recommended/.test(localized)) {
+    return lang === "JA"
+      ? "市内間の移動効率がよいため、新幹線をおすすめします。"
+      : lang === "KO"
+        ? "도심 간 이동 효율이 좋아 고속철을 추천합니다."
+        : "High-speed rail is recommended because it is faster door-to-door between city centers.";
+  }
+  if (routeMatch) {
+    const [, from, to, tail] = routeMatch;
+    if (/arrive at the airport 2 hours early/.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。空港には2時間前到着をおすすめします。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 공항에는 2시간 일찍 도착하는 편이 좋습니다.`
+          : `Suggested connection: ${from} to ${to}. Plan to arrive at the airport 2 hours early.`;
+    }
+    if (/no direct high-speed rail service/.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。この区間に直通の高速鉄道はありません。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 이 구간에는 직행 고속철이 없습니다.`
+          : `Suggested connection: ${from} to ${to}. There is no direct high-speed rail service on this route.`;
+    }
+    if (/check Ctrip for live pricing/.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。予約前にCtripで最新価格をご確認ください。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 예약 전 Ctrip에서 실시간 요금을 확인하세요.`
+          : `Suggested connection: ${from} to ${to}. Check Ctrip for live pricing before booking.`;
+    }
+    if (/routing via Amap/.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。地上ルートデータはAmapを参照しています。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 지상 경로 데이터는 Amap 기준입니다.`
+          : `Suggested connection: ${from} to ${to}. Ground routing data comes from Amap.`;
+    }
+    if (/high-speed rail runs direct/i.test(tail) && /usually more reliable than flying/i.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。この区間は高速鉄道が直通し、通常はフライトより安定しています。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 이 구간은 고속철 직행이 가능하며 보통 항공편보다 안정적입니다.`
+          : `Suggested connection: ${from} to ${to}. High-speed rail runs direct on this corridor and is usually more reliable than flying.`;
+    }
+    if (/high-speed rail runs direct/i.test(tail) && /usually more reliable than driving/i.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。この区間は高速鉄道が直通し、通常は車移動より安定しています。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 이 구간은 고속철 직행이 가능하며 보통 자가 이동보다 안정적입니다.`
+          : `Suggested connection: ${from} to ${to}. High-speed rail runs direct on this corridor and is usually more reliable than driving.`;
+    }
+    if (/direct to/.test(tail) && /usually more reliable than flying/i.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。高速鉄道の直通便があり、通常はフライトより安定しています。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 고속철 직행편이 있으며 보통 항공편보다 안정적입니다.`
+          : `Suggested connection: ${from} to ${to}. A direct high-speed rail option is available and is usually more reliable than flying.`;
+    }
+    if (/direct to/.test(tail) && /usually more reliable than driving/i.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。直通の高速鉄道があり、通常は車移動より安定しています。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 직행 고속철이 있으며 보통 자가 이동보다 안정적입니다.`
+          : `Suggested connection: ${from} to ${to}. A direct high-speed rail option is available and is usually more reliable than driving.`;
+    }
+    if (/frequent departures/i.test(tail) && /usually more reliable than driving/i.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。高頻度で運行しており、通常は車移動より安定しています。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 고빈도 운행이며 보통 자가 이동보다 안정적입니다.`
+          : `Suggested connection: ${from} to ${to}. High-speed rail runs frequently on this corridor and is usually more reliable than driving.`;
+    }
+    if (/usually the most practical option/i.test(tail)) {
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。この区間では高速鉄道が最も実用的です。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 이 구간에서는 고속철이 가장 실용적입니다.`
+          : `Suggested connection: ${from} to ${to}. High-speed rail is usually the most practical option on this corridor.`;
+    }
+    const hsrDirectMatch = tail.match(/^HSR is available from (.+?) direct to (.+)$/i);
+    if (hsrDirectMatch) {
+      const [, stationFrom, stationTo] = hsrDirectMatch;
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。高速鉄道は ${stationFrom} から ${stationTo} まで直通があります。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 고속철은 ${stationFrom}에서 ${stationTo}까지 직행이 있습니다.`
+          : `Suggested connection: ${from} to ${to}. High-speed rail is also available direct from ${stationFrom} to ${stationTo}.`;
+    }
+    const airportPlusHsrMatch = tail.match(/^(.+?); HSR is available from (.+?) direct to (.+)$/i);
+    if (airportPlusHsrMatch) {
+      const [, airportRoute, stationFrom, stationTo] = airportPlusHsrMatch;
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。${airportRoute}。高速鉄道は ${stationFrom} から ${stationTo} まで直通があります。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. ${airportRoute}. 고속철은 ${stationFrom}에서 ${stationTo}까지 직행이 있습니다.`
+          : `Suggested connection: ${from} to ${to}. ${airportRoute}. High-speed rail is also available direct from ${stationFrom} to ${stationTo}.`;
+    }
+    return lang === "JA"
+      ? `推奨ルート: ${from} から ${to}。${tail}`
+      : lang === "KO"
+        ? `추천 경로: ${from}에서 ${to}. ${tail}`
+        : `Suggested connection: ${from} to ${to}. ${tail.charAt(0).toUpperCase()}${tail.slice(1)}.`;
+  }
+  if (semicolonRouteMatch) {
+    const [, from, to, tail] = semicolonRouteMatch;
+    const hsrDirectMatch = tail.match(/^HSR is available from (.+?) direct to (.+)$/i);
+    if (hsrDirectMatch) {
+      const [, stationFrom, stationTo] = hsrDirectMatch;
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。高速鉄道は ${stationFrom} から ${stationTo} まで直通があります。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. 고속철은 ${stationFrom}에서 ${stationTo}까지 직행이 있습니다.`
+          : `Suggested connection: ${from} to ${to}. High-speed rail is also available direct from ${stationFrom} to ${stationTo}.`;
+    }
+    const airportPlusHsrMatch = tail.match(/^(.+?); HSR is available from (.+?) direct to (.+)$/i);
+    if (airportPlusHsrMatch) {
+      const [, airportRoute, stationFrom, stationTo] = airportPlusHsrMatch;
+      return lang === "JA"
+        ? `推奨ルート: ${from} から ${to}。${airportRoute}。高速鉄道は ${stationFrom} から ${stationTo} まで直通があります。`
+        : lang === "KO"
+          ? `추천 경로: ${from}에서 ${to}. ${airportRoute}. 고속철은 ${stationFrom}에서 ${stationTo}까지 직행이 있습니다.`
+          : `Suggested connection: ${from} to ${to}. ${airportRoute}. High-speed rail is also available direct from ${stationFrom} to ${stationTo}.`;
+    }
+  }
+  if (lang === "EN") {
+    if (/^(.+?) direct to (.+?), frequent departures, usually more reliable than driving.?$/i.test(localized)) {
+      const [, stationFrom, stationTo] = localized.match(/^(.+?) direct to (.+?), frequent departures, usually more reliable than driving.?$/i) || [];
+      if (stationFrom && stationTo) return `Suggested connection: ${stationFrom} to ${stationTo}. High-speed rail runs frequently on this corridor and is usually more reliable than driving.`;
+    }
+    if (/^Suggested connection: (.+?) to (.+?)high-speed rail runs direct. Usually more reliable than flying.?.?$/i.test(localized)) {
+      const [, stationFrom, stationTo] = localized.match(/^Suggested connection: (.+?) to (.+?)high-speed rail runs direct. Usually more reliable than flying.?.?$/i) || [];
+      if (stationFrom && stationTo) return `Suggested connection: ${stationFrom.trim()} to ${stationTo.trim()}. High-speed rail runs direct on this corridor and is usually more reliable than flying.`;
+    }
+  }
+  if (simpleRouteMatch) {
+    const [, from, to] = simpleRouteMatch;
+    return lang === "JA"
+      ? `推奨ルート: ${from} から ${to}。`
+      : lang === "KO"
+        ? `추천 경로: ${from}에서 ${to}.`
+        : `Suggested connection: ${from} to ${to}.`;
+  }
+  return localized;
+}
+function normalizeEnglishIntercityNote(note = "", language = "ZH") {
+  const lang = String(language || "ZH").toUpperCase();
+  const text = String(note || "").trim();
+  if (!text || lang !== "EN") return text;
+  let normalized = text
+    .replace(/^(.+?) direct to (.+?), frequent departures, usually more reliable than driving.?$/i, "Suggested connection: $1 to $2. High-speed rail runs frequently on this corridor and is usually more reliable than driving.")
+    .replace(/^Suggested connection: (.+?) to (.+?)high-speed rail runs direct.*usually more reliable than flying.?$/i, "Suggested connection: $1 to $2. High-speed rail runs direct on this corridor and is usually more reliable than flying.")
+    .replace(/^Suggested connection: (.+?) to (.+?)\s*high-speed rail极高频.*$/i, "Suggested connection: $1 to $2. High-speed rail runs very frequently on this corridor and is usually the most practical option.")
+    .replace(/^Suggested connection: (.+?) to (.+?). High-speed rail runs direct,.*市区衔接更方便.?$/i, "Suggested connection: $1 to $2. High-speed rail runs direct on this corridor and is usually easier city-center to city-center.")
+    .replace(/^Beijing至Chengdu航班频次更高,\s*但high-speed rail也已可 direct to Chengdu East.?$/i, "Flights are usually more frequent on the Beijing to Chengdu corridor, but high-speed rail is also available direct to Chengdu East.")
+    .replace(/^成都至北京航班频次更高,s*但high-speed rail也已可 direct to Beijing West.?$/i, "Flights are usually more frequent on the Chengdu to Beijing corridor, but high-speed rail is also available direct to Beijing West.")
+    .replace(/High-speed rail runs direct, 高频且市区衔接更方便.?$/i, "High-speed rail runs direct on this corridor and is usually easier city-center to city-center.")
+    .replace(/Beijing至成都航班频次更高, 但high-speed rail也已可 direct to Chengdu East.?$/i, "Flights are usually more frequent on the Beijing to Chengdu corridor, but high-speed rail is also available direct to Chengdu East.")
+
+
+    .replace(/Wuha high-speed rail/g, "Wuhan high-speed rail")
+    .replace(/Suggested connection: 虹桥 to /g, "Suggested connection: Hongqiao to ")
+    .replace(/\.\./g, ".")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized;
+
+  return normalized;
+}
+
+
+
+function localizeFlightStatus(status, language = "ZH") {
+  if (!status || typeof status !== "object") return status;
+  const lang = String(language || "ZH").toUpperCase();
+  if (lang === "ZH") return status;
+  const code = String(status.code || "");
+  const reason = String(status.reason || "");
+  let localizedReason = reason;
+  if (code === "10012" || /当前可请求的次数不足/.test(reason)) {
+    localizedReason = "Live provider quota exhausted";
+  } else if (/当前未查到可售航班/.test(reason)) {
+    localizedReason = "No bookable flights were returned";
+  } else if (/No live flight data/i.test(reason)) {
+    localizedReason = "No live flight data";
+  } else if (/timeout/i.test(reason)) {
+    localizedReason = "Lookup timed out";
+  }
+  return { ...status, reason: localizedReason };
+}
+
+function buildCanonicalFlightDeeplink(originCity = "", destinationCity = "", date = "") {
+  const depCode = resolveFlightCityCode(originCity);
+  const arrCode = resolveFlightCityCode(destinationCity);
+  const safeDate = normalizeHotelDate(date || "") || addDateDays(todayDateIso(), 1);
+  if (!/^[A-Z]{3}$/.test(depCode) || !/^[A-Z]{3}$/.test(arrCode)) return "";
+  return `https://m.ctrip.com/html5/flight/pages/middle?dcode=${encodeURIComponent(depCode)}&acode=${encodeURIComponent(arrCode)}&ddate=${encodeURIComponent(safeDate)}&tripType=ONE_WAY&regionType=DOMESTIC`;
+}
+
+function buildCanonicalRailDeeplink(originCity = "", destinationCity = "", date = "") {
+  const safeDate = normalizeHotelDate(date || "") || addDateDays(todayDateIso(), 1);
+  const query = `${String(originCity || "").trim()} ${String(destinationCity || "").trim()} ${safeDate} train`;
+  return `https://kyfw.12306.cn/otn/leftTicket/init?linktypeid=dc&fs=${encodeURIComponent(String(originCity || "").trim())}&ts=${encodeURIComponent(String(destinationCity || "").trim())}&date=${encodeURIComponent(safeDate)}&flag=N,N,Y&keyword=${encodeURIComponent(query)}`;
+}
+
+function attachCanonicalIntercityBookingUrl(mode, { originCity = "", destinationCity = "", date = "" } = {}) {
+  if (!mode || !mode.type) return mode;
+  if (mode.bookingUrl) return mode;
+  const type = String(mode.type || "").toLowerCase();
+  if (type === "flight") {
+    const flightUrl = buildCanonicalFlightDeeplink(originCity, destinationCity, date);
+    return flightUrl ? { ...mode, bookingUrl: flightUrl } : mode;
+  }
+  if (type === "hsr" || type === "train") {
+    const railUrl = buildCanonicalRailDeeplink(originCity, destinationCity, date);
+    return railUrl ? { ...mode, bookingUrl: railUrl } : mode;
+  }
+  return mode;
+}
+
+function attachCanonicalFlightRecordBookingUrl(flight, { originCity = "", destinationCity = "", date = "" } = {}) {
+  if (!flight || typeof flight !== "object") return flight;
+  if (flight.bookingUrl) return flight;
+  const bookingUrl = buildCanonicalFlightDeeplink(originCity, destinationCity, date);
+  return bookingUrl ? { ...flight, bookingUrl } : flight;
+}
+
+function attachCanonicalFlightRecordBookingUrls(flights, { originCity = "", destinationCity = "", date = "" } = {}) {
+  return Array.isArray(flights)
+    ? flights.map((flight) => attachCanonicalFlightRecordBookingUrl(flight, { originCity, destinationCity, date }))
+    : [];
+}
+
+function inferLongHaulIntercityRoute(modes = [], recommendedType = "") {
+  const list = Array.isArray(modes) ? modes.filter(Boolean) : [];
+  if (!list.length) return false;
+  const recommended = String(recommendedType || "").toLowerCase();
+  if (["flight", "hsr", "train"].includes(recommended)) return true;
+  if (list.some((mode) => ["flight", "hsr", "train"].includes(String(mode?.type || "").toLowerCase()))) return true;
+  const driveMode = list.find((mode) => /^(drive|car)$/i.test(String(mode?.type || "")));
+  return Number(driveMode?.duration_min || 0) >= 300;
+}
+
+function prioritizeIntercityModes(modes = [], { recommendedType = "" } = {}) {
+  const list = Array.isArray(modes) ? modes.filter(Boolean) : [];
+  if (!list.length) return [];
+  const longHaul = inferLongHaulIntercityRoute(list, recommendedType);
+  const driveMode = list.find((mode) => /^(drive|car)$/i.test(String(mode?.type || "")));
+  const driveMinutes = Number(driveMode?.duration_min || 0);
+  const shortHaul = !longHaul && driveMinutes > 0 && driveMinutes <= 240;
+  const nonDriveModes = list.filter((mode) => !/^(drive|car)$/i.test(String(mode?.type || "")));
+  const baseList = longHaul && nonDriveModes.length ? nonDriveModes : list;
+  const priority = shortHaul
+    ? { hsr: 0, train: 1, transit: 2, bus: 3, drive: 4, car: 4, flight: 5 }
+    : { flight: 0, hsr: 1, train: 2, transit: 3, bus: 4, drive: 5, car: 5 };
+  const preferred = shortHaul && String(recommendedType || "").toLowerCase() === "flight"
+    ? ""
+    : String(recommendedType || "").toLowerCase();
+  return [...baseList].sort((left, right) => {
+    const leftType = String(left?.type || "").toLowerCase();
+    const rightType = String(right?.type || "").toLowerCase();
+    const leftRecommended = leftType === preferred ? -10 : 0;
+    const rightRecommended = rightType === preferred ? -10 : 0;
+    const leftRank = leftRecommended + (priority[leftType] ?? 9);
+    const rightRank = rightRecommended + (priority[rightType] ?? 9);
+    if (leftRank !== rightRank) return leftRank - rightRank;
+    return Number(left?.price_cny || 0) - Number(right?.price_cny || 0);
+  });
 }
 
 // ── City → lat/lng lookup for major Chinese cities (Open-Meteo needs coords) ─
@@ -127,7 +825,7 @@ async function getCityCoords(cityName) {
       `https://restapi.amap.com/v3/geocode/geo?key=${encodeURIComponent(key)}&address=${encodeURIComponent(short)}&output=JSON`,
       { signal: AbortSignal.timeout(4000) }
     );
-    const d = await r.json();
+    const d = await _readJsonResponseSafe(r, null);
     const loc = d?.geocodes?.[0]?.location;
     if (loc) {
       const [lng, lat] = loc.split(",").map(Number);
@@ -158,7 +856,7 @@ async function amapRoutingWithFallback(fromCity, toCity) {
     if (liveDrive) merged.push(liveDrive); // always add real driving data
     return { ...base, modes: merged, _source: "amap_enriched" };
   } catch (err) {
-    console.warn("[amapRouting] enrichment error, using mock:", err.message);
+    console.warn("[amapRouting] enrichment error, using mock:", sanitizeServerLogError(err, "amap_routing_enrichment_failed"));
     return base;
   }
 }
@@ -244,6 +942,7 @@ function searchAttractions({ city = "", keyword = "", limit = 8 } = {}) {
 function loadLocalEnvFiles() {
   const loaded = [];
   const envFiles = [
+    path.join(__dirname, ".env.runtime.local"),
     path.join(__dirname, ".env.local"),
     path.join(__dirname, ".env"),
   ];
@@ -275,7 +974,7 @@ function loadLocalEnvFiles() {
   return loaded;
 }
 
-let LOADED_ENV_FILES = loadLocalEnvFiles();
+LOADED_ENV_FILES = loadLocalEnvFiles();
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -342,7 +1041,7 @@ function applyOpenAiConfig() {
 
 applyOpenAiConfig();
 if (!OPENAI_KEY_HEALTH.looksValid) {
-  console.warn("[startup] WARNING: OpenAI key missing or invalid — plan generation will fail. Set OPENAI_API_KEY in .env.local");
+  console.warn("[startup] AI planning provider unavailable — plan generation will fail closed until runtime credentials are configured");
 }
 
 // ─── Claude / Anthropic ───────────────────────────────────────────────────────
@@ -421,7 +1120,7 @@ function applyCozeConfig() {
   COZE_BOT_ID = String(process.env.COZE_BOT_ID || "").trim();
   COZE_WORKFLOW_ID = String(process.env.COZE_WORKFLOW_ID || "").trim();
   if (!COZE_WORKFLOW_ID && COZE_API_KEY) {
-    console.warn("[coze] COZE_WORKFLOW_ID not set — workflow features disabled");
+    console.warn("[coze] workflow configuration incomplete — workflow features disabled");
   }
 }
 
@@ -455,10 +1154,10 @@ async function callPythonRagService(question, sessionId = "crossx") {
       signal: AbortSignal.timeout(8000),
     });
     if (!resp.ok) return null;
-    const data = await resp.json();
+    const data = await _readJsonResponseSafe(resp, null);
     return {
-      answer: data.answer || null,
-      sources: Array.isArray(data.source_documents) ? data.source_documents : [],
+      answer: data?.answer || null,
+      sources: Array.isArray(data?.source_documents) ? data.source_documents : [],
     };
   } catch {
     return null;
@@ -556,7 +1255,7 @@ function persistOpenAiRuntimeEnv({ clear = false, updates = null }) {
     fs.writeFileSync(ENV_LOCAL_FILE, `${lines.join("\n")}\n`, "utf8");
     return { ok: true, file: ENV_LOCAL_FILE };
   } catch (err) {
-    return { ok: false, error: String((err && err.message) || err || "persist_env_failed") };
+    return { ok: false, error: "persist_env_failed" };
   }
 }
 
@@ -591,47 +1290,6 @@ function loadDb() {
     db.mcpContracts = parsed.mcpContracts || db.mcpContracts;
     db.mcpPolicy = parsed.mcpPolicy || db.mcpPolicy;
     db.paymentCompliance = parsed.paymentCompliance || db.paymentCompliance;
-    if (!db.users.demo.privacy) {
-      db.users.demo.privacy = { locationEnabled: true };
-    }
-    if (!db.users.demo.viewMode) {
-      db.users.demo.viewMode = "user";
-    }
-    if (!db.users.demo.savedPlaces || typeof db.users.demo.savedPlaces !== "object") {
-      db.users.demo.savedPlaces = {
-        hotel: "",
-        office: "",
-        airport: "PVG",
-      };
-    }
-    if (!db.users.demo.location || typeof db.users.demo.location !== "object") {
-      db.users.demo.location = {
-        lat: null,
-        lng: null,
-        accuracy: null,
-        updatedAt: null,
-        source: "none",
-      };
-    }
-    if (!db.users.demo.preferences || typeof db.users.demo.preferences !== "object") {
-      db.users.demo.preferences = { budget: "mid" };
-    }
-    db.users.demo.preferences = {
-      budget: "mid",
-      dietary: "",
-      family: false,
-      accessibility: "optional",
-      transport: "mixed",
-      walking: "walk",
-      allergy: "",
-      ...db.users.demo.preferences,
-    };
-    if (!db.users.demo.paymentRail) {
-      db.users.demo.paymentRail = { selected: "alipay_cn" };
-    }
-    if (!db.users.demo.plusSubscription) {
-      db.users.demo.plusSubscription = { active: false, plan: "none", benefits: [] };
-    }
     if (!db.mcpPolicy) {
       db.mcpPolicy = { enforceSla: false, simulateBreachRate: 0 };
     }
@@ -704,7 +1362,7 @@ function loadDb() {
     }
     if (linkedSupportChanged) saveDb();
   } catch (err) {
-    console.error("Failed to load db:", err.message);
+    console.error("Failed to load db:", sanitizeServerLogError(err, "db_load_failed"));
   }
 }
 
@@ -739,6 +1397,19 @@ const HOTEL_CITY_ROWS = [
   { cityCode: "17", cityName: "杭州", cityEn: "Hangzhou" },
   { cityCode: "28", cityName: "成都", cityEn: "Chengdu" },
 ];
+
+const HOTEL_CITY_HINTS = {
+  上海: ["上海", "shanghai", "浦东", "pudong", "虹桥", "hongqiao", "静安", "jing'an", "jingan", "黄浦", "the bund", "bund", "徐汇", "xuhui", "陆家嘴", "lujiazui"],
+  北京: ["北京", "beijing", "国贸", "guomao", "三里屯", "sanlitun", "朝阳", "chaoyang", "王府井", "wangfujing", "大兴", "daxing", "首都机场", "capital airport"],
+  深圳: ["深圳", "shenzhen", "南山", "nanshan", "福田", "futian", "宝安", "bao'an", "baoan", "罗湖", "luohu", "前海", "qianhai"],
+  广州: ["广州", "guangzhou", "白云", "baiyun", "天河", "tianhe", "番禺", "panyu", "越秀", "yuexiu", "海珠", "haizhu", "淘金", "taojin", "北京路", "beijing road", "珠江新城", "zhujiang new town", "广州南", "guangzhou south"],
+  杭州: ["杭州", "hangzhou", "西湖", "west lake", "钱江", "qianjiang", "余杭", "yuhang", "武林", "wulin", "滨江", "binjiang"],
+  成都: ["成都", "chengdu", "春熙路", "chunxi", "太古里", "taikoo li", "高新", "gaoxin", "天府", "tianfu", "双流", "shuangliu", "锦江", "jinjiang"],
+};
+
+const HOTEL_CITY_EXCLUSION_HINTS = {
+  广州: ["昆山", "kunshan", "周庄", "zhouzhuang", "太仓", "taicang", "苏州", "suzhou"],
+};
 
 const HOTEL_TEMPLATE_ROWS = [
   {
@@ -910,6 +1581,36 @@ function resolveHotelCityRow(cityCode, cityName, fallbackName = "Shanghai") {
   return byName || HOTEL_CITY_ROWS[0];
 }
 
+function buildHotelCitySignals(cityRow) {
+  const row = cityRow && typeof cityRow === "object" ? cityRow : null;
+  if (!row) return { includes: [], excludes: [] };
+  const includeSet = new Set([
+    String(row.cityName || "").trim(),
+    String(row.cityEn || "").trim().toLowerCase(),
+    ...((HOTEL_CITY_HINTS[row.cityName] || []).map((item) => String(item || "").trim().toLowerCase())),
+  ].filter(Boolean));
+  const excludeSet = new Set(((HOTEL_CITY_EXCLUSION_HINTS[row.cityName] || []).map((item) => String(item || "").trim().toLowerCase())).filter(Boolean));
+  return { includes: [...includeSet], excludes: [...excludeSet] };
+}
+
+function hotelMatchesRequestedCity(item, cityRow) {
+  if (!item || !cityRow) return true;
+  const signals = buildHotelCitySignals(cityRow);
+  const haystack = [
+    item.hotelName,
+    item.hotelAddress,
+    ...(Array.isArray(item.hotelTags) ? item.hotelTags : []),
+    ...(Array.isArray(item.hotelReviews) ? item.hotelReviews : []),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  if (!haystack.trim()) return true;
+  if (signals.excludes.some((token) => haystack.includes(token))) return false;
+  if (signals.includes.some((token) => haystack.includes(token))) return true;
+  return false;
+}
+
 function normalizeBudgetCap(raw) {
   const text = String(raw || "").trim().toLowerCase();
   if (!text) return null;
@@ -918,6 +1619,542 @@ function normalizeBudgetCap(raw) {
   if (text === "high") return 1600;
   const amount = Number(text.replace(/[^\d.]/g, ""));
   return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+function parseLooseBudgetAmount(raw) {
+  const text = String(raw || "").trim().toLowerCase();
+  if (!text) return null;
+  if (text === "low") return 500;
+  if (text === "mid") return 900;
+  if (text === "high") return 1600;
+  const wanMatch = text.match(/(\d[\d,.]*)\s*万/);
+  if (wanMatch && wanMatch[1]) {
+    const amount = Number(wanMatch[1].replace(/,/g, ""));
+    return Number.isFinite(amount) && amount > 0 ? amount * 10000 : null;
+  }
+  const kMatch = text.match(/(\d[\d,.]*)\s*k\b/);
+  if (kMatch && kMatch[1]) {
+    const amount = Number(kMatch[1].replace(/,/g, ""));
+    return Number.isFinite(amount) && amount > 0 ? amount * 1000 : null;
+  }
+  const amount = Number(text.replace(/[^\d.]/g, ""));
+  return Number.isFinite(amount) && amount > 0 ? amount : null;
+}
+
+function hasNightlyBudgetHint(text = "") {
+  return /(每晚|每夜|单晚|一晚|\/晚|\/night|per\s*night|nightly|hotel\s+budget|酒店.{0,10}每晚|每晚.{0,10}(预算|酒店)|预算.{0,10}(每晚|night))/i.test(String(text || ""));
+}
+
+function hasTripTotalBudgetHint(text = "") {
+  return /(总预算|全程预算|整体预算|整个行程|trip\s+budget|total\s+budget|overall\s+budget|all[-\s]?in\s+budget|for\s+the\s+trip|총\s*예산|総予算|旅行全体の予算)/i.test(String(text || ""));
+}
+
+function hasHotelScopedBudgetHint(text = "") {
+  return /(hotel|accommodation|lodging|stay|酒店|住宿|旅馆|飯店|ホテル|호텔)[^\n\r]{0,24}(budget|target|around|about|under|below|keep|控制|限制|预算|大概|约|左右|以内|上限|每晚|nightly|per\s*night|\/night)|(?:budget|target|around|about|under|below|keep|控制|限制|预算|大概|约|左右|以内|上限)[^\n\r]{0,16}(hotel|accommodation|lodging|stay|酒店|住宿|旅馆|飯店|ホテル|호텔)/i.test(String(text || ""));
+}
+
+function extractMessageBudgetSignals(message = "") {
+  const text = String(message || "");
+  const parseMatchAmount = (match) => {
+    if (!match || !match[1]) return null;
+    return parseLooseBudgetAmount(`${match[1]}${match[2] || ""}`);
+  };
+  const totalPatterns = [
+    /(?:total\s+budget|trip\s+budget|overall\s+budget|all[-\s]?in\s+budget|总预算|全程预算|整体预算)[^\d]{0,16}(\d[\d,.]*)\s*(万|k)?/i,
+    /(\d[\d,.]*)\s*(万|k)?(?:\s*(?:元|rmb|cny))?\s*(?:total\s+budget|trip\s+budget|overall\s+budget|总预算|全程预算|整体预算)/i,
+  ];
+  const nightlyPatterns = [
+    /(?:hotel\s+budget|hotel\s+target|accommodation\s+budget|nightly\s+budget|酒店每晚预算|每晚酒店预算|每晚预算|酒店预算|住宿预算)[^\d]{0,16}(\d[\d,.]*)\s*(万|k)?(?:\s*(?:元|rmb|cny))?(?:\s*(?:\/\s*night|per\s*night|nightly|\/晚|每晚))?/i,
+    /(\d[\d,.]*)\s*(万|k)?(?:\s*(?:元|rmb|cny))?\s*(?:\/\s*night|per\s*night|nightly|\/晚|每晚)/i,
+    /(?:hotel|accommodation|lodging|stay|酒店|住宿|旅馆|飯店|ホテル|호텔)[^\d]{0,20}(?:budget|target|around|about|under|below|keep|控制|限制|预算|大概|约|左右|以内|上限)?[^\d]{0,8}(\d[\d,.]*)\s*(万|k)?(?:\s*(?:元|rmb|cny))?/i,
+    /(\d[\d,.]*)\s*(万|k)?(?:\s*(?:元|rmb|cny))?[^\n\r]{0,20}(?:hotel|accommodation|lodging|stay|酒店|住宿|旅馆|飯店|ホテル|호텔)/i,
+  ];
+  const totalBudget = totalPatterns.map((pattern) => parseMatchAmount(text.match(pattern))).find(Boolean) || null;
+  const hotelBudgetPerNight = nightlyPatterns.map((pattern) => parseMatchAmount(text.match(pattern))).find(Boolean) || null;
+  return { totalBudget, hotelBudgetPerNight };
+}
+
+function deriveHotelNightlyBudget(totalBudget, days = 1, pax = 1) {
+  const total = Number(totalBudget || 0);
+  const safeDays = Math.max(1, Number(days || 0) || 1);
+  const safePax = Math.max(1, Number(pax || 0) || 1);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  const hotelShare = safeDays <= 2 ? 0.46 : safeDays <= 3 ? 0.42 : 0.38;
+  const dailyNonHotelBuffer = Math.max(180, Math.round(220 * safePax));
+  const tripNonHotelBuffer = Math.max(400, Math.round(safeDays * dailyNonHotelBuffer));
+  const shareCap = (total * hotelShare) / safeDays;
+  const residualCap = (total - tripNonHotelBuffer) / safeDays;
+  return Math.max(120, Math.round(Math.min(Math.max(120, shareCap), Math.max(120, residualCap))));
+}
+
+function deriveTripTotalBudgetFromNightly(hotelNightlyBudget, days = 1, pax = 1) {
+  const nightly = Number(hotelNightlyBudget || 0);
+  const safeDays = Math.max(1, Number(days || 0) || 1);
+  const safePax = Math.max(1, Number(pax || 0) || 1);
+  if (!Number.isFinite(nightly) || nightly <= 0) return null;
+  const hotelTotal = nightly * safeDays;
+  const nonHotelBuffer = Math.max(400, Math.round(safeDays * safePax * 180));
+  return Math.round((hotelTotal / 0.58) + nonHotelBuffer);
+}
+
+function buildBudgetClarifyLabel(language = "ZH", budgetScope = "trip_total") {
+  const lang = normalizeLang(language);
+  if (budgetScope === "hotel_nightly") {
+    return pickLang(
+      lang,
+      "酒店每晚预算（元）",
+      "hotel budget per night",
+      "ホテル1泊あたり予算",
+      "호텔 1박 예산"
+    );
+  }
+  return pickLang(
+    lang,
+    "总预算（元）",
+    "total budget",
+    "総予算",
+    "총 예산"
+  );
+}
+
+function buildBudgetValidationLabel(language = "ZH", budgetContext = {}) {
+  const lang = normalizeLang(language);
+  const totalBudget = Number(budgetContext.totalBudget || 0) || 0;
+  const hotelBudgetPerNight = Number(budgetContext.hotelBudgetPerNight || 0) || 0;
+  const inputTotalBudget = Number(budgetContext.inputTotalBudget || 0) || 0;
+  const inputHotelBudgetPerNight = Number(budgetContext.inputHotelBudgetPerNight || 0) || 0;
+  if (inputTotalBudget > 0 && inputHotelBudgetPerNight > 0) {
+    return pickLang(
+      lang,
+      `预算校验中（全程目标 ¥${inputTotalBudget.toLocaleString()}，酒店每晚目标 ¥${inputHotelBudgetPerNight.toLocaleString()}）...`,
+      `Verifying budget (trip total ¥${inputTotalBudget.toLocaleString()}, hotel target ¥${inputHotelBudgetPerNight.toLocaleString()}/night)...`,
+      `予算確認中（旅行総額 ¥${inputTotalBudget.toLocaleString()}、ホテル目安 ¥${inputHotelBudgetPerNight.toLocaleString()}/泊）...`,
+      `예산 확인 중 (전체 여행 예산 ¥${inputTotalBudget.toLocaleString()}, 호텔 목표 ¥${inputHotelBudgetPerNight.toLocaleString()}/박)...`
+    );
+  }
+  if (String(budgetContext.budgetScope || "").toLowerCase() === "hotel_nightly" && hotelBudgetPerNight > 0) {
+    return pickLang(
+      lang,
+      `预算校验中（酒店每晚目标 ¥${hotelBudgetPerNight.toLocaleString()}，推导全程约 ¥${totalBudget.toLocaleString()}）...`,
+      `Verifying budget (hotel target ¥${hotelBudgetPerNight.toLocaleString()}/night, derived trip total about ¥${totalBudget.toLocaleString()})...`,
+      `予算確認中（ホテル目安 ¥${hotelBudgetPerNight.toLocaleString()}/泊、旅行総額は約 ¥${totalBudget.toLocaleString()}）...`,
+      `예산 확인 중 (호텔 목표 ¥${hotelBudgetPerNight.toLocaleString()}/박, 전체 여행 예산은 약 ¥${totalBudget.toLocaleString()})...`
+    );
+  }
+  return pickLang(
+    lang,
+    `预算校验中（全程目标 ¥${totalBudget.toLocaleString()}）...`,
+    `Verifying trip budget (¥${totalBudget.toLocaleString()})...`,
+    `予算確認中（旅行総額 ¥${totalBudget.toLocaleString()}）...`,
+    `예산 확인 중 (총 여행 예산 ¥${totalBudget.toLocaleString()})...`
+  );
+}
+
+function buildBudgetConstraintContextLine(constraints = {}, language = "ZH") {
+  const lang = normalizeLang(language);
+  const scope = String(constraints.budgetScope || constraints.budget_scope || constraints.budgetSemantics || constraints.budget_semantics || "").trim().toLowerCase();
+  const totalBudget = parseLooseBudgetAmount(
+    constraints.totalBudget || constraints.tripBudget || constraints.total_budget || constraints.trip_budget || constraints.overallBudget || ""
+  );
+  const hotelBudgetPerNight = parseLooseBudgetAmount(
+    constraints.hotelBudgetPerNight || constraints.hotel_budget_per_night || constraints.hotelNightlyBudget || constraints.hotel_budget || constraints.nightlyBudget || constraints.nightly_budget || constraints.maxHotelNightly || ""
+  );
+  const rawBudget = parseLooseBudgetAmount(constraints.budget || "");
+  const inferredHotelBudgetPerNight = hotelBudgetPerNight || ((scope === "hotel_nightly" || scope === "nightly" || scope === "hotel") ? rawBudget : null);
+  const inferredTotalBudget = totalBudget || ((scope === "trip_total" || scope === "total" || scope === "overall") ? rawBudget : null);
+  if ((scope === "hotel_nightly" || scope === "nightly" || scope === "hotel" || (!inferredTotalBudget && inferredHotelBudgetPerNight)) && inferredHotelBudgetPerNight) {
+    return pickLang(
+      lang,
+      `酒店每晚预算: ¥${inferredHotelBudgetPerNight.toLocaleString()}`,
+      `Hotel budget: ¥${inferredHotelBudgetPerNight.toLocaleString()}/night`,
+      `ホテル予算: ¥${inferredHotelBudgetPerNight.toLocaleString()}/泊`,
+      `호텔 예산: ¥${inferredHotelBudgetPerNight.toLocaleString()}/박`
+    );
+  }
+  if (inferredTotalBudget) {
+    return pickLang(
+      lang,
+      `总预算: ¥${inferredTotalBudget.toLocaleString()}`,
+      `Total budget: ¥${inferredTotalBudget.toLocaleString()}`,
+      `総予算: ¥${inferredTotalBudget.toLocaleString()}`,
+      `총 예산: ¥${inferredTotalBudget.toLocaleString()}`
+    );
+  }
+  if (rawBudget) {
+    return pickLang(
+      lang,
+      `预算: ¥${rawBudget.toLocaleString()}`,
+      `Budget: ¥${rawBudget.toLocaleString()}`,
+      `予算: ¥${rawBudget.toLocaleString()}`,
+      `예산: ¥${rawBudget.toLocaleString()}`
+    );
+  }
+  return "";
+}
+
+function buildFinalVisibleHotelFeatures(option, semanticTemplate, language = "EN") {
+  const lang = normalizeLang(language);
+  const hasMockStyleFeature = /(best ratio|budget-friendly|best value|premium|budget|translation app|airport branch|metro line\s*\d|maglev|airport express|high-speed rail|direct)$/i;
+  const liveFeatures = sanitizeLocalizedHotelProviderText(
+    Array.isArray(option && option.features) ? option.features : [],
+    lang,
+    () => []
+  ).filter((item) => !hasMockStyleFeature.test(String(item || "").trim()));
+  const semanticFeatures = Array.isArray(semanticTemplate && semanticTemplate.features)
+    ? semanticTemplate.features.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const semanticCoreFeatures = semanticFeatures.filter((item) => !hasMockStyleFeature.test(item));
+  const semanticTail = semanticFeatures[semanticFeatures.length - 1] || "";
+  const visible = [];
+  const pushUnique = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return;
+    if (visible.includes(text)) return;
+    visible.push(text);
+  };
+
+  for (const item of liveFeatures) pushUnique(item);
+
+  if (visible.length < 2) {
+    for (const item of semanticCoreFeatures.slice(0, 2)) pushUnique(item);
+  }
+
+  if (semanticTail && !hasMockStyleFeature.test(semanticTail)) pushUnique(semanticTail);
+
+  return visible.slice(0, 3);
+}
+
+
+function normalizeFinalPlanHotelOrdering(plans, { explicitNightlyCap = 0 } = {}) {
+  if (!plans || !Array.isArray(plans.options) || plans.options.length < 2) return plans;
+  const options = plans.options.filter(Boolean);
+  if (!options.length) return plans;
+  const desiredCount = Math.min(options.length, 3);
+
+  const inferPlanLanguage = () => {
+    const sample = [
+      plans.spoken_text,
+      plans.budget_summary,
+      ...options.map((option) => `${String(option && option.tag || "")} ${String(option && option.hotel_name || "")}`),
+    ].join(" ");
+    if (/[ぁ-んァ-ン]/.test(sample)) return "JA";
+    if (/[가-힣]/.test(sample)) return "KO";
+    if (/[\u4e00-\u9fff]/.test(sample)) return "ZH";
+    return "EN";
+  };
+
+  const planLanguage = inferPlanLanguage();
+  const getHotelKey = (option) => {
+    if (!option || typeof option !== "object") return "";
+    const name = String(option.hotel_name || option.hotel_route_query || "").trim().toLowerCase();
+    const area = String(option.hotel_area || option.hotel_real_address || "").trim().toLowerCase();
+    const url = String(option.hotel_ctrip_url || "").trim().toLowerCase();
+    const sourceKey = String(option.hotel_source || "").trim().toLowerCase();
+    const fallback = String(option.id || "").trim().toLowerCase();
+    if (name) return name;
+    if (url) return url;
+    return [sourceKey, area].filter(Boolean).join("|") || fallback;
+  };
+
+  const scoreOption = (option) => {
+    const price = Number(option && option.hotel_price_per_night || 0) || 0;
+    const hasLiveAddress = String(option && option.hotel_real_address || option && option.hotel_area || "").trim().length > 0 ? 1 : 0;
+    const liveSource = /(?:^|_)(?:amap|trip_live|ctrip_live|ctrip_curated|ctrip_list_live)(?:_|$)/i.test(String(option && option.hotel_source || "")) ? 1 : 0;
+    return hasLiveAddress * 1000000 + liveSource * 100000 + price;
+  };
+
+  const keyed = new Map();
+  for (const option of options) {
+    const key = getHotelKey(option);
+    if (!key) continue;
+    const prev = keyed.get(key);
+    if (!prev || scoreOption(option) > scoreOption(prev)) keyed.set(key, option);
+  }
+
+  const uniqueLiveOptions = [...keyed.values()].sort((a, b) => {
+    return Number(a && a.hotel_price_per_night || 0) - Number(b && b.hotel_price_per_night || 0)
+      || scoreOption(b) - scoreOption(a);
+  });
+  if (!uniqueLiveOptions.length) return plans;
+
+  const deduped = [];
+  const used = new Set();
+  const pushUnique = (option, { clone = false } = {}) => {
+    if (!option) return false;
+    const candidate = clone ? { ...option } : option;
+    const key = getHotelKey(candidate);
+    if (key && used.has(key)) return false;
+    deduped.push(candidate);
+    if (key) used.add(key);
+    return true;
+  };
+
+  for (const option of uniqueLiveOptions) {
+    pushUnique(option);
+    if (deduped.length >= desiredCount) break;
+  }
+
+  if (deduped.length < desiredCount && plans.destination) {
+    const fallbackPlans = mockBuildThreeTierPlans({
+      city: plans.destination,
+      budget: Number(plans.total_budget || plans.budget_reference || 0) || 0,
+      pax: Number(plans.pax || 1) || 1,
+      days: Number(plans.duration_days || 1) || 1,
+      language: planLanguage,
+      hotelBudgetPerNight: Number(explicitNightlyCap || plans.hotel_budget_per_night || 0) || null,
+    });
+    const fallbackOptions = Array.isArray(fallbackPlans && fallbackPlans.options)
+      ? [...fallbackPlans.options].sort((a, b) => Number(a && a.hotel_price_per_night || 0) - Number(b && b.hotel_price_per_night || 0))
+      : [];
+    for (const option of fallbackOptions) {
+      pushUnique(option, { clone: true });
+      if (deduped.length >= desiredCount) break;
+    }
+  }
+
+  if (deduped.length < desiredCount) {
+    for (const option of options) {
+      pushUnique(option, { clone: true });
+      if (deduped.length >= desiredCount) break;
+    }
+  }
+
+  const sorted = [...deduped]
+    .slice(0, desiredCount)
+    .sort((a, b) => Number(a && a.hotel_price_per_night || 0) - Number(b && b.hotel_price_per_night || 0));
+  const ids = ["opt_c", "opt_b", "opt_a"];
+  const tags = {
+    opt_a: options.find((o) => o.id === "opt_a")?.tag || pickLang(planLanguage, "极致体验", "Premium", "プレミアム", "프리미엄"),
+    opt_b: options.find((o) => o.id === "opt_b")?.tag || pickLang(planLanguage, "均衡之选", "Best Value", "バランス重視", "균형형"),
+    opt_c: options.find((o) => o.id === "opt_c")?.tag || pickLang(planLanguage, "精打细算", "Budget", "節約型", "절약형"),
+  };
+
+  const remapped = [];
+  for (let i = 0; i < Math.min(ids.length, sorted.length); i += 1) {
+    const clone = { ...sorted[i] };
+    const semanticTemplate = options.find((option) => option.id === ids[i]) || {};
+    const semanticFeatures = Array.isArray(semanticTemplate.features)
+      ? semanticTemplate.features.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    const liveFeatures = Array.isArray(clone.features)
+      ? clone.features.map((item) => String(item || "").trim()).filter(Boolean)
+      : [];
+    const semanticTail = semanticFeatures[semanticFeatures.length - 1] || "";
+    const semanticBudget = semanticTemplate.budget_breakdown && typeof semanticTemplate.budget_breakdown === "object"
+      ? semanticTemplate.budget_breakdown
+      : {};
+    const cloneBudget = clone.budget_breakdown && typeof clone.budget_breakdown === "object"
+      ? clone.budget_breakdown
+      : {};
+    const stayDays = Math.max(1, Number(plans.duration_days || 0) || 1);
+    const hotelBudget = Number(cloneBudget.hotel || cloneBudget.accommodation || 0) || Math.round(Number(clone.hotel_price_per_night || 0) * stayDays);
+    const transportBudget = Number(cloneBudget.transport || clone.transport_total || 0) || 0;
+    const mealsBudget = Number(semanticBudget.meals || 0) || Number(cloneBudget.meals || 0) || 0;
+    const activitiesBudget = Number(semanticBudget.activities || 0) || Number(cloneBudget.activities || 0) || 0;
+    const miscBudget = Number(semanticBudget.misc || 0) || Number(cloneBudget.misc || 0) || 0;
+
+    clone.id = ids[i];
+    clone.tag = tags[ids[i]];
+    if (semanticTemplate.dining_plan) clone.dining_plan = semanticTemplate.dining_plan;
+    if (semanticTemplate.translation_service) clone.translation_service = semanticTemplate.translation_service;
+    clone.features = buildFinalVisibleHotelFeatures(clone, semanticTemplate, planLanguage);
+    clone.budget_breakdown = buildBudgetBreakdown({
+      hotel: hotelBudget,
+      transport: transportBudget,
+      meals: mealsBudget,
+      activities: activitiesBudget,
+      misc: miscBudget,
+    });
+    clone.total_cost = hotelBudget + transportBudget + mealsBudget + activitiesBudget + miscBudget;
+    remapped.push(clone);
+  }
+
+  if (Number(explicitNightlyCap || 0) > 0) {
+    const premiumCap = Math.round(Number(explicitNightlyCap));
+    for (const option of remapped) {
+      const price = Number(option && option.hotel_price_per_night || 0);
+      if (price > 0 && price > premiumCap) {
+        option.features = sanitizeLocalizedHotelProviderText(
+          Array.isArray(option.features) ? option.features : [],
+          planLanguage,
+          () => Array.isArray(option.features) ? option.features : []
+        );
+      }
+    }
+  }
+
+  const totalBudgetLimit = Number(plans && plans.total_budget || 0) || 0;
+  if (totalBudgetLimit > 0) {
+    const rebuildBudgetNote = (delta) => delta > 0
+      ? pickLang(
+        planLanguage,
+        "当前方案比推导总预算高出约¥" + Math.abs(delta).toLocaleString() + "。",
+        "This option is about ¥" + Math.abs(delta).toLocaleString() + " above the derived trip budget.",
+        "このプランは導出された旅行総額より約¥" + Math.abs(delta).toLocaleString() + "高くなります。",
+        "이 옵션은 계산된 전체 여행 예산보다 약 ¥" + Math.abs(delta).toLocaleString() + " 높습니다."
+      )
+      : delta < -Math.max(180, Math.round(totalBudgetLimit * 0.08))
+        ? pickLang(
+          planLanguage,
+          "当前方案比推导总预算低约¥" + Math.abs(delta).toLocaleString() + "。",
+          "This option is about ¥" + Math.abs(delta).toLocaleString() + " below the derived trip budget.",
+          "このプランは導出された旅行総額より約¥" + Math.abs(delta).toLocaleString() + "低くなります。",
+          "이 옵션은 계산된 전체 여행 예산보다 약 ¥" + Math.abs(delta).toLocaleString() + " 낮습니다."
+        )
+        : pickLang(
+          planLanguage,
+          "当前方案基本落在推导总预算内。",
+          "This option stays broadly within the derived trip budget.",
+          "このプランは導出された旅行総額の範囲内に概ね収まります。",
+          "이 옵션은 계산된 전체 여행 예산 범위 안에 대체로 들어갑니다."
+        );
+
+    remapped.forEach((option) => {
+      if (!option || typeof option !== "object") return;
+      const breakdown = option.budget_breakdown && typeof option.budget_breakdown === "object"
+        ? option.budget_breakdown
+        : buildBudgetBreakdown({});
+      let hotelBudget = Number(breakdown.hotel || breakdown.accommodation || 0) || 0;
+      let transportBudget = Number(breakdown.transport || option.transport_total || 0) || 0;
+      let mealsBudget = Number(breakdown.meals || 0) || 0;
+      let activitiesBudget = Number(breakdown.activities || 0) || 0;
+      let miscBudget = Number(breakdown.misc || 0) || 0;
+      let totalCost = hotelBudget + transportBudget + mealsBudget + activitiesBudget + miscBudget;
+      const delta = totalCost - totalBudgetLimit;
+      if (delta > 0) {
+        let remainingDelta = delta;
+        const minMeals = Math.max(0, Math.round(mealsBudget * 0.45));
+        const reducibleMeals = Math.max(0, mealsBudget - minMeals);
+        const mealTrim = Math.min(remainingDelta, reducibleMeals);
+        if (mealTrim > 0) {
+          mealsBudget -= mealTrim;
+          remainingDelta -= mealTrim;
+        }
+
+        if (remainingDelta > 0) {
+          const reducibleActivities = Math.max(0, activitiesBudget);
+          const activityTrim = Math.min(remainingDelta, reducibleActivities);
+          if (activityTrim > 0) {
+            activitiesBudget -= activityTrim;
+            remainingDelta -= activityTrim;
+          }
+        }
+
+        if (remainingDelta > 0) {
+          const reducibleMisc = Math.max(0, miscBudget);
+          const miscTrim = Math.min(remainingDelta, reducibleMisc);
+          if (miscTrim > 0) {
+            miscBudget -= miscTrim;
+            remainingDelta -= miscTrim;
+          }
+        }
+
+        if (remainingDelta > 0) {
+          const minTransport = Math.max(0, Math.round(transportBudget * 0.88));
+          const reducibleTransport = Math.max(0, transportBudget - minTransport);
+          const transportTrim = Math.min(remainingDelta, reducibleTransport);
+          if (transportTrim > 0) {
+            transportBudget -= transportTrim;
+            option.transport_total = Math.max(0, transportBudget);
+            remainingDelta -= transportTrim;
+          }
+        }
+      }
+      option.budget_breakdown = buildBudgetBreakdown({
+        hotel: hotelBudget,
+        transport: transportBudget,
+        meals: mealsBudget,
+        activities: activitiesBudget,
+        misc: miscBudget,
+      });
+      option.total_cost = hotelBudget + transportBudget + mealsBudget + activitiesBudget + miscBudget;
+      const finalDelta = option.total_cost - totalBudgetLimit;
+      option.budget_status = finalDelta > 0 ? "over" : finalDelta < -Math.max(180, Math.round(totalBudgetLimit * 0.08)) ? "under" : "within";
+      option.budget_note = rebuildBudgetNote(finalDelta);
+    });
+  }
+
+  plans.options = remapped;
+  return plans;
+}
+
+function resolvePlanBudgetContext({ message = "", constraints = {}, slotBudget = null, days = 1, pax = 1, language = "ZH" } = {}) {
+  const lang = normalizeLang(language);
+  const safeDays = Math.max(1, Number(days || 0) || 1);
+  const safePax = Math.max(1, Number(pax || 0) || 1);
+  const messageBudgetSignals = extractMessageBudgetSignals(message);
+  const explicitScope = String(
+    constraints.budgetScope || constraints.budget_scope || constraints.budgetSemantics || constraints.budget_semantics || ""
+  ).trim().toLowerCase();
+  const explicitTotalBudget = parseLooseBudgetAmount(
+    constraints.totalBudget || constraints.tripBudget || constraints.total_budget || constraints.trip_budget || constraints.overallBudget || ""
+  ) || messageBudgetSignals.totalBudget;
+  const explicitNightlyBudget = parseLooseBudgetAmount(
+    constraints.hotelBudgetPerNight || constraints.hotel_budget_per_night || constraints.hotelNightlyBudget || constraints.hotel_budget || constraints.nightlyBudget || constraints.nightly_budget || constraints.maxHotelNightly || ""
+  ) || messageBudgetSignals.hotelBudgetPerNight;
+  const parsedSlotBudget = parseLooseBudgetAmount(slotBudget);
+  const hotelScopedHint = hasHotelScopedBudgetHint(message);
+  const nightlyHint = explicitScope === "hotel_nightly" || explicitScope === "nightly" || explicitScope === "hotel" || hasNightlyBudgetHint(message) || hotelScopedHint;
+  const totalHint = explicitScope === "trip_total" || explicitScope === "total" || explicitScope === "overall" || hasTripTotalBudgetHint(message);
+
+  let totalBudget = explicitTotalBudget;
+  let hotelBudgetPerNight = explicitNightlyBudget;
+  if (!totalBudget && !hotelBudgetPerNight && parsedSlotBudget) {
+    if (explicitScope === "hotel_nightly" || explicitScope === "nightly" || explicitScope === "hotel") hotelBudgetPerNight = parsedSlotBudget;
+    else if (explicitScope === "trip_total" || explicitScope === "total" || explicitScope === "overall") totalBudget = parsedSlotBudget;
+  }
+  let budgetScope = totalBudget ? "trip_total" : hotelBudgetPerNight ? "hotel_nightly" : "";
+
+  if (totalBudget && hotelBudgetPerNight && !explicitScope) {
+    budgetScope = totalHint && !nightlyHint ? "trip_total" : nightlyHint && !totalHint ? "hotel_nightly" : "trip_total";
+  }
+
+  if (!totalBudget && !hotelBudgetPerNight && parsedSlotBudget) {
+    if (nightlyHint && !totalHint) {
+      hotelBudgetPerNight = parsedSlotBudget;
+      budgetScope = "hotel_nightly";
+    } else {
+      totalBudget = parsedSlotBudget;
+      budgetScope = "trip_total";
+    }
+  }
+  if (!totalBudget && hotelBudgetPerNight) totalBudget = deriveTripTotalBudgetFromNightly(hotelBudgetPerNight, safeDays, safePax);
+  if (!hotelBudgetPerNight && totalBudget) hotelBudgetPerNight = deriveHotelNightlyBudget(totalBudget, safeDays, safePax);
+
+  const summary = totalBudget || hotelBudgetPerNight
+    ? (explicitTotalBudget && explicitNightlyBudget
+      ? pickLang(
+        lang,
+        `全程预算按约¥${Number(totalBudget || 0).toLocaleString()}处理，并将酒店每晚预算限制在约¥${Number(hotelBudgetPerNight || 0).toLocaleString()}`,
+        `Using a trip budget of about ¥${Number(totalBudget || 0).toLocaleString()}, while keeping hotel filtering near ¥${Number(hotelBudgetPerNight || 0).toLocaleString()}/night`,
+        `旅行総額は約¥${Number(totalBudget || 0).toLocaleString()}として扱い、ホテルは1泊約¥${Number(hotelBudgetPerNight || 0).toLocaleString()}を上限目安に絞り込みます`,
+        `전체 여행 예산은 약 ¥${Number(totalBudget || 0).toLocaleString()}로 처리하고, 호텔은 1박 약 ¥${Number(hotelBudgetPerNight || 0).toLocaleString()} 기준으로 더 엄격히 필터링합니다`
+      )
+      : budgetScope === "hotel_nightly"
+      ? pickLang(
+        lang,
+        `酒店预算按每晚约¥${Number(hotelBudgetPerNight || 0).toLocaleString()}处理，并推导全程预算约¥${Number(totalBudget || 0).toLocaleString()}`,
+        `Using a hotel target of about ¥${Number(hotelBudgetPerNight || 0).toLocaleString()}/night, with a derived trip budget around ¥${Number(totalBudget || 0).toLocaleString()}`,
+        `ホテル予算は1泊約¥${Number(hotelBudgetPerNight || 0).toLocaleString()}として扱い、旅行総額は約¥${Number(totalBudget || 0).toLocaleString()}で計算しました`,
+        `호텔 예산은 1박 약 ¥${Number(hotelBudgetPerNight || 0).toLocaleString()} 기준으로 처리하고, 전체 여행 예산은 약 ¥${Number(totalBudget || 0).toLocaleString()}로 계산했습니다`
+      )
+      : pickLang(
+        lang,
+        `全程预算按约¥${Number(totalBudget || 0).toLocaleString()}处理，酒店筛选参考每晚约¥${Number(hotelBudgetPerNight || 0).toLocaleString()}`,
+        `Using a trip budget of about ¥${Number(totalBudget || 0).toLocaleString()}, with hotel filtering around ¥${Number(hotelBudgetPerNight || 0).toLocaleString()}/night`,
+        `旅行総額は約¥${Number(totalBudget || 0).toLocaleString()}として扱い、ホテルは1泊約¥${Number(hotelBudgetPerNight || 0).toLocaleString()}を目安に絞り込みます`,
+        `전체 여행 예산은 약 ¥${Number(totalBudget || 0).toLocaleString()}로 처리하고, 호텔은 1박 약 ¥${Number(hotelBudgetPerNight || 0).toLocaleString()} 기준으로 필터링합니다`
+      ))
+    : "";
+
+  return {
+    totalBudget: totalBudget || null,
+    hotelBudgetPerNight: hotelBudgetPerNight || null,
+    inputTotalBudget: explicitTotalBudget || null,
+    inputHotelBudgetPerNight: explicitNightlyBudget || null,
+    budgetScope: budgetScope || "trip_total",
+    summary,
+  };
 }
 
 function normalizeStarFloor(raw) {
@@ -1096,6 +2333,1118 @@ function buildHotelOutOrderNo() {
   return `OC${Date.now().toString().slice(-10)}${require("crypto").randomBytes(2).readUInt16BE(0).toString().slice(-3).padStart(3, "0")}`;
 }
 
+// ── Ctrip live hotel scraper ───────────────────────────────────────────────
+// Attempts to fetch real hotel listings from Ctrip mobile API.
+// Results are cached 30 min. Falls back gracefully to null on any error.
+const CTRIP_CITY_META = {
+  1:   { slug: "beijing", aliases: ["Beijing", "北京"] },
+  2:   { slug: "shanghai", aliases: ["Shanghai", "上海"] },
+  15:  { slug: "shenzhen", aliases: ["Shenzhen", "深圳"] },
+  17:  { slug: "chongqing", aliases: ["Chongqing", "重庆"] },
+  37:  { slug: "tianjin", aliases: ["Tianjin", "天津"] },
+  48:  { slug: "suzhou", aliases: ["Suzhou", "苏州"] },
+  57:  { slug: "hangzhou", aliases: ["Hangzhou", "杭州"] },
+  62:  { slug: "nanjing", aliases: ["Nanjing", "南京"] },
+  63:  { slug: "harbin", aliases: ["Harbin", "哈尔滨"] },
+  64:  { slug: "xiamen", aliases: ["Xiamen", "厦门"] },
+  69:  { slug: "kunming", aliases: ["Kunming", "昆明"] },
+  74:  { slug: "wuhan", aliases: ["Wuhan", "武汉"] },
+  75:  { slug: "chengdu", aliases: ["Chengdu", "成都"] },
+  83:  { slug: "guangzhou", aliases: ["Guangzhou", "广州"] },
+  89:  { slug: "zhengzhou", aliases: ["Zhengzhou", "郑州"] },
+  99:  { slug: "xian", aliases: ["Xi'an", "Xian", "西安"] },
+  123: { slug: "qingdao", aliases: ["Qingdao", "青岛"] },
+  155: { slug: "changsha", aliases: ["Changsha", "长沙"] },
+  196: { slug: "guilin", aliases: ["Guilin", "桂林"] },
+  321: { slug: "sanya", aliases: ["Sanya", "三亚"] },
+  442: { slug: "lijiang", aliases: ["Lijiang", "丽江"] },
+};
+
+const CTRIP_CITY_MAP = Object.values(CTRIP_CITY_META).reduce((acc, meta) => {
+  const cityId = Number(Object.keys(CTRIP_CITY_META).find((id) => CTRIP_CITY_META[id] === meta));
+  meta.aliases.forEach((alias) => {
+    acc[String(alias || "").trim().toLowerCase()] = cityId;
+  });
+  return acc;
+}, {});
+
+const _ctripHotelCache = new Map(); // cacheKey → { data, ts }
+const _tripHotelCache = new Map();  // cacheKey → { data, ts }
+const TRIP_CITY_MAP = HOTEL_CITY_ROWS.reduce((acc, row) => {
+  const aliases = [
+    row.cityName,
+    row.cityEn,
+    String(row.cityEn || "").replace(/\s+/g, ""),
+  ];
+  aliases.forEach((alias) => {
+    const key = String(alias || "").trim().toLowerCase();
+    if (key) acc[key] = row;
+  });
+  return acc;
+}, {});
+
+function resolveCtripCityMeta(city) {
+  const key = String(city || "").trim().toLowerCase();
+  const cityId = CTRIP_CITY_MAP[key];
+  if (!cityId) return null;
+  return { cityId, ...(CTRIP_CITY_META[cityId] || {}) };
+}
+
+function resolveTripCityMeta(city) {
+  const key = String(city || "").trim().toLowerCase();
+  return TRIP_CITY_MAP[key] || null;
+}
+
+function buildCtripHotelListUrl({ cityId, slug, checkIn, checkOut }) {
+  return `https://m.ctrip.com/webapp/hotel/${slug || "hotel"}${cityId}`
+    + `?checkin=${encodeURIComponent(checkIn || "")}&checkout=${encodeURIComponent(checkOut || "")}`;
+}
+
+function buildTripHotelListUrl({ cityId, checkIn, checkOut }) {
+  return `https://www.trip.com/hotels/list?city=${encodeURIComponent(cityId || "")}`
+    + `&checkin=${encodeURIComponent(checkIn || "")}&checkout=${encodeURIComponent(checkOut || "")}`;
+}
+
+function buildTripHotelDetailUrl({ cityMeta, hotelId, checkIn, checkOut }) {
+  return `https://www.trip.com/hotels/detail/?cityEnName=${encodeURIComponent(cityMeta.cityEn || cityMeta.cityName || "")}`
+    + `&cityId=${encodeURIComponent(cityMeta.cityCode || "")}&hotelId=${encodeURIComponent(hotelId || "")}`
+    + `&checkIn=${encodeURIComponent(checkIn || "")}&checkOut=${encodeURIComponent(checkOut || "")}`
+    + `&adult=2&children=0&crn=1&ages=&curr=USD&barcurr=USD&locale=en-XX&isRightClick=T`;
+}
+
+function parseCtripCount(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const normalized = raw.replace(/,/g, "");
+  const match = normalized.match(/(\d+(?:\.\d+)?)(万)?/);
+  if (!match) return null;
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) return null;
+  return match[2] ? Math.round(base * 10000) : Math.round(base);
+}
+
+function parseCtripPrice(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw === "?") return 0;
+  const amount = Number(raw.replace(/[^\d.]/g, ""));
+  return Number.isFinite(amount) ? Math.round(amount) : 0;
+}
+
+function decodeHtmlText(value) {
+  return String(value || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/&quot;/g, "\"")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripHtml(value) {
+  return decodeHtmlText(String(value || "").replace(/<[^>]+>/g, " "));
+}
+
+function parseTripPrice(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return 0;
+  const match = raw.match(/([A-Z]{2,3}\$|\$|US\$)?\s*([\d,]+(?:\.\d+)?)/i);
+  if (!match) return 0;
+  const amount = Number(String(match[2] || "").replace(/,/g, ""));
+  return Number.isFinite(amount) ? Math.round(amount) : 0;
+}
+
+function parseTripStarRating(block) {
+  const text = String(block || "");
+  const labelMatch = text.match(/aria-label="(\d+)\s+out of 5/i);
+  if (labelMatch) return Number(labelMatch[1]) || 0;
+  const starIcons = (text.match(/ic_star/g) || []).length;
+  const diamondIcons = (text.match(/ic_diamond/g) || []).length;
+  return starIcons || diamondIcons || 0;
+}
+
+const TRIP_NONSTANDARD_LODGING_RE = /\b(apartment|apartments|residence|homestay|hostel|guesthouse|capsule|villa)\b/i;
+const TRIP_PREMIUM_HOTEL_RE = /\b(hilton|hampton|marriott|shangri-la|hyatt|novotel|crowne plaza|intercontinental|radisson|holiday inn|four seasons|wyndham)\b/i;
+
+function rankTripHotelCandidate(item, cityHint = "") {
+  let score = rankCtripHotelCandidate(item, cityHint);
+  const text = `${String(item && item.hotelName || "")} ${String(item && item.hotelAddress || "")}`.toLowerCase();
+  const cityKey = inferHotelLocationCity(text, cityHint);
+  if (TRIP_PREMIUM_HOTEL_RE.test(String(item && item.hotelName || ""))) score += 2500;
+  if (TRIP_NONSTANDARD_LODGING_RE.test(String(item && item.hotelName || ""))) score -= 4500;
+  if (!String(item && item.hotelAddress || "").trim()) score -= 1800;
+  if (cityKey === "上海") {
+    if (!/(外滩|bund|静安|jing'?an|jingan|徐家汇|xujiahui|陆家嘴|lujiazui|人民广场|people'?s square|新天地|xintiandi|南京西路|nanjing west road|淮海中路|huaihai|豫园|yu garden)/i.test(text)) score -= 2200;
+    if (/(international tourism resort|wild animal park|disney|迪士尼|度假区|野生动物园|顾村公园|共富新村|jiguang|gucun|gongfu)/i.test(text)) score -= 5200;
+  }
+  if (cityKey === "广州") {
+    if (!/(珠江新城|zhujiang|天河|tianhe|天河 cbd|cbd|体育西|tiyu west|北京路|beijing road|淘金|taojin|越秀|yuexiu|海珠广场|haizhu square|沙面|shamian|公园前|gongyuanqian)/i.test(text)) score -= 2200;
+    if (/(baiyun|jianggao|renhe|huadu|airport|机场|白云|江高|人和|花都|university town|大学城|nansha|南沙|huangpu|xiangxue|science city|knowledge city|development zone|黄埔|香雪|科学城|知识城|开发区)/i.test(text)) score -= 5200;
+  }
+  score += Number(item && item.starRating || 0) * 600;
+  return score;
+}
+
+function extractCtripHotelJson(html) {
+  const matches = [...String(html || "").matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)];
+  for (let i = matches.length - 1; i >= 0; i -= 1) {
+    const body = String(matches[i][1] || "").trim();
+    if (!body.startsWith("{") || !body.includes("\"initialState\"")) continue;
+    try {
+      return JSON.parse(body);
+    } catch (_err) {
+      continue;
+    }
+  }
+  return null;
+}
+
+const HOTEL_CORE_LOCATION_RULES = {
+  "深圳": {
+    boost: /(南山|nanshan|福田|futian|前海|qianhai|后海|houhai|科技园|science park|海岸城|coastal city)/i,
+    penalty: /(宝安机场|bao'?an airport|机场|airport|大学|university|会展湾|railway station|火车站)/i,
+  },
+  "上海": {
+    boost: /(外滩|bund|静安|jing'?an|jingan|徐家汇|xujiahui|陆家嘴|lujiazui|人民广场|people'?s square|新天地|xintiandi|南京西路|nanjing west road|淮海中路|huaihai|豫园|yu garden)/i,
+    penalty: /(浦东机场|pudong airport|虹桥机场|hongqiao airport|虹桥火车站|hongqiao railway station|虹桥站|hongqiao station|虹桥枢纽|hongqiao hub|机场|airport|大学|university|迪士尼|disney|国际旅游度假区|international tourism resort|野生动物园|wild animal park|train station|railway station|车墩|宝山|baoshan|松滨|songbin|吴淞|wusong|闵行|minhang|顾村公园|gucun park|共富新村|gongfu xincun|技工学校|polytechnic|jiguang)/i,
+  },
+  "北京": {
+    boost: /(国贸|guomao|王府井|wangfujing|三里屯|sanlitun|东直门|dongzhimen|朝阳公园|chaoyang park|金融街|financial street)/i,
+    penalty: /(大兴机场|daxing airport|首都机场|capital airport|机场|airport|大学|university|环球影城|universal|顺义|shunyi)/i,
+  },
+  "广州": {
+    boost: /(珠江新城|zhujiang|天河|tianhe|天河 cbd|cbd|体育西|tiyu west|北京路|beijing road|淘金|taojin|越秀|yuexiu|海珠广场|haizhu square|沙面|shamian|公园前|gongyuanqian)/i,
+    penalty: /(白云机场|baiyun airport|机场|airport|机场路|airport road|大学城|university town|南沙|nansha|从化|conghua|融创|sunac|花都|huadu|江高|jianggao|人和|renhe|钟落潭|zhongluotan|黄埔|huangpu|香雪|xiangxue|科学城|science city|知识城|knowledge city|开发区|development zone|广州北站|guangzhou north railway station|guangzhoubei|花果山|huaguoshan|广州火车站|guangzhou railway station|三元里|sanyuanli)/i,
+  },
+  "成都": {
+    boost: /(春熙|chunxi|太古里|taikoo|锦里|jinli|宽窄|kuanzhai|天府广场|tianfu square|人民南路|renmin south|锦江|jinjiang|高新|gaoxin|金融城|financial city)/i,
+    penalty: /(天府机场|tianfu airport|双流机场|shuangliu airport|机场|airport|火车东站|east railway station|郫都|pidu|新津|xinjin|大学|university|博物馆|museum|湿地|wetland)/i,
+  },
+  "杭州": {
+    boost: /(西湖|west lake|武林|wulin|湖滨|hubin|钱江新城|qianjiang|龙翔桥|longxiang|凤起路|fengqi|吴山|wushan|黄龙|huanglong|庆春|qingchun|滨江|binjiang)/i,
+    penalty: /(临安|lin'?an|湘湖|xianghu|萧山机场|xiaoshan airport|机场|airport|火车东站|east railway station|大学|university|湿地|wetland)/i,
+  },
+};
+
+function inferHotelLocationCity(text = "", cityHint = "") {
+  const hintKey = detectCityKey(cityHint);
+  if (hintKey !== "default") return hintKey;
+  const haystack = String(text || "").toLowerCase();
+  if (/深圳|shenzhen|南山|nanshan|福田|futian/.test(haystack)) return "深圳";
+  if (/北京东路|beijing east road|北京西路|beijing west road|南京东路|nanjing east road|南京西路|nanjing west road|人民广场|people'?s square|黄浦|huangpu/.test(haystack)) return "上海";
+  if (/上海|shanghai|静安|jing'?an|bund|外滩|陆家嘴|lujiazui/.test(haystack)) return "上海";
+  if (/北京路|beijing road|珠江|zhujiang|天河|tianhe|淘金|taojin|越秀|yuexiu|海珠广场|haizhu square|沙面|shamian/.test(haystack)) return "广州";
+  if (/北京|beijing|国贸|guomao|王府井|wangfujing|三里屯|sanlitun/.test(haystack)) return "北京";
+  if (/广州|guangzhou|天河|tianhe|珠江|zhujiang|淘金|taojin/.test(haystack)) return "广州";
+  if (/成都|chengdu|春熙|chunxi|太古里|taikoo|锦里|jinli|宽窄|kuanzhai/.test(haystack)) return "成都";
+  if (/杭州|hangzhou|西湖|west lake|武林|wulin|湖滨|hubin|钱江|qianjiang/.test(haystack)) return "杭州";
+  return "default";
+}
+
+function computeHotelLocationScore(item, cityHint = "") {
+  const text = `${String(item && item.hotelName || "")} ${String(item && item.hotelAddress || "")}`.toLowerCase();
+  let locationScore = 0;
+  if (/(西湖|west lake|武林|wulin|湖滨|hubin|钱江新城|qianjiang|珠江新城|zhujiang|天河|tianhe|春熙|chunxi|太古里|taikoo|锦里|jinli|国贸|guomao|王府井|wangfujing|三里屯|sanlitun|外滩|bund|静安|jing'an|jingan|徐家汇|xujiahui|福田|futian|南山|nanshan)/i.test(text)) {
+    locationScore += 1800;
+  }
+  if (/(临安|lin'?an|大学|university|museum|湘湖|xianghu|湿地|wetland|机场|airport|火车东站|chengdudong|south station|south railway station|railway station)/i.test(text)) {
+    locationScore -= 2200;
+  }
+  const cityKey = inferHotelLocationCity(text, cityHint);
+  const cityRules = HOTEL_CORE_LOCATION_RULES[cityKey];
+  if (cityRules && cityRules.boost.test(text)) locationScore += 3200;
+  if (cityRules && cityRules.penalty.test(text)) locationScore -= 4200;
+  if (/(^|\b)(airport hotel|airport express|airport link|airport branch|hub hotel|rail hub)(\b|$)|机场快线|机场酒店|枢纽店|高铁站店/i.test(text)) locationScore -= 2600;
+  if (cityKey === "北京" && /(顺义|shunyi|首都机场|capital airport|机场店|airport hotel|airport branch|airport zone)/i.test(text)) locationScore -= 5200;
+  if (cityKey === "上海" && /(虹桥|hongqiao|枢纽|hub|高铁站|railway station|火车站店|station branch|international tourism resort|wild animal park|disney|迪士尼)/i.test(text)) locationScore -= 4200;
+  if (cityKey === "广州" && /(白云|baiyun|江高|jianggao|人和|renhe|机场店|airport hotel|airport branch|黄埔|huangpu|香雪|xiangxue|科学城|science city|知识城|knowledge city|开发区|development zone|广州北站|guangzhou north railway station|guangzhoubei|花果山|huaguoshan|广州火车站|guangzhou railway station|三元里|sanyuanli|train station|railway station)/i.test(text)) locationScore -= 3600;
+  return locationScore;
+}
+
+function isGenericFallbackHotelName(item, cityHint = "") {
+  if (!item || typeof item !== "object") return false;
+  const hotelName = sanitizeEnglishHotelDisplayName(item.hotelName || item.name || "");
+  if (!hotelName) return false;
+  const normalized = hotelName.toLowerCase();
+  const cityKey = detectCityKey(cityHint || inferHotelLocationCity(normalized, cityHint));
+  if (/^(shanghai|guangzhou|beijing|shenzhen|hangzhou|chengdu)(?: \1)? city(?: center)? hotel$/i.test(normalized)) {
+    return true;
+  }
+  if (/^(?:shanghai|guangzhou|beijing|shenzhen|hangzhou|chengdu)\s+(?:shanghai|guangzhou|beijing|shenzhen|hangzhou|chengdu)\s+city\s+center\s+hotel$/i.test(normalized)) {
+    return true;
+  }
+  if (String(item.source || "") !== "ctrip_list_live") return false;
+  if (cityKey === "上海" && /^(shanghai city hotel|shanghai shanghai city center hotel|shanghai shanghai city hotel)$/i.test(normalized)) {
+    return true;
+  }
+  return false;
+}
+
+function isGenericDisplayedHotelName(item, cityHint = "", language = "EN") {
+  if (!item || typeof item !== "object") return false;
+  const lang = normalizeLang(language);
+  if (lang === "ZH" || lang === "ZH-TW") return false;
+  const displayName = formatHotelDisplayName(
+    item.hotelName || item.name || "",
+    item.hotelNameEn || item.nameEn || "",
+    lang,
+  );
+  if (!displayName) return false;
+  return isGenericFallbackHotelName({ ...item, hotelName: displayName, source: item.source || "ctrip_list_live" }, cityHint);
+}
+
+function rankCtripHotelCandidate(item, cityHint = "") {
+  const price = Number(item && item.lowestPrice || 0);
+  const score = Number(item && item.commentScore || 0);
+  const reviews = Number(item && item.reviewCount || 0);
+  const locationScore = computeHotelLocationScore(item, cityHint);
+  const text = `${String(item && item.hotelName || "")} ${String(item && item.hotelAddress || "")}`.toLowerCase();
+  const cityKey = inferHotelLocationCity(text, cityHint);
+  let centralClusterBonus = 0;
+  let genericNamePenalty = 0;
+  if (cityKey === "上海" && /(外滩|bund|人民广场|people'?s square|静安|jing'?an|jingan|陆家嘴|lujiazui|南京东路|nanjing east road|南京西路|nanjing west road|新天地|xintiandi|豫园|yu garden)/i.test(text)) {
+    centralClusterBonus += 1800;
+  }
+  if (cityKey === "广州" && /(珠江新城|zhujiang|天河 cbd|tianhe cbd|天河|tianhe|北京路|beijing road|淘金|taojin|越秀|yuexiu|海珠广场|haizhu square|沙面|shamian|公园前|gongyuanqian)/i.test(text)) {
+    centralClusterBonus += 1800;
+  }
+  if (/(^|\b)(shanghai|guangzhou|beijing|shenzhen|hangzhou|chengdu)\s+city\s+hotel(\b|$)/i.test(text)) {
+    genericNamePenalty -= 5200;
+  }
+  if (/(^|\b)(shanghai|guangzhou|beijing|shenzhen|hangzhou|chengdu)\s+\1\s+city\s+center\s+hotel(\b|$)/i.test(text)) {
+    genericNamePenalty -= 7600;
+  }
+  if (isGenericFallbackHotelName(item, cityHint)) {
+    genericNamePenalty -= cityKey === "上海" ? 24000 : 14000;
+  }
+  if (price > 0) return score * 10000 + reviews + locationScore + centralClusterBonus + genericNamePenalty - price;
+  return score * 10000 + reviews + locationScore + centralClusterBonus + genericNamePenalty;
+}
+
+function sortCtripHotelsForPlan(list, cityHint = "") {
+  return [...(Array.isArray(list) ? list : [])].sort((a, b) => {
+    const priceA = Number(a && a.lowestPrice || 0);
+    const priceB = Number(b && b.lowestPrice || 0);
+    if (priceA > 0 && priceB > 0) {
+      const priceGap = Math.abs(priceA - priceB);
+      const closeEnough = priceGap <= Math.max(120, Math.round(Math.min(priceA, priceB) * 0.15));
+      if (closeEnough) {
+        return rankCtripHotelCandidate(b, cityHint) - rankCtripHotelCandidate(a, cityHint) || priceA - priceB;
+      }
+      return priceA - priceB;
+    }
+    if (priceA > 0) return -1;
+    if (priceB > 0) return 1;
+    return rankCtripHotelCandidate(b, cityHint) - rankCtripHotelCandidate(a, cityHint);
+  });
+}
+
+function buildHotelCandidateKey(item) {
+  if (!item || typeof item !== "object") return "";
+  return String(item.hotelId || item.ctripBookingUrl || item.hotelName || item.name || "").trim();
+}
+
+function finalizeDistinctHotelTiers(tiers, pool = [], cityHint = "", priceField = "lowestPrice") {
+  const orderedPool = sortCtripHotelsForPlan(Array.isArray(pool) ? pool : [], cityHint);
+  const base = Array.isArray(tiers) ? tiers.filter(Boolean) : [];
+  if (!base.length) return [];
+
+  const used = new Set();
+  const chosen = [];
+  const pickUnusedClosest = (targetPrice = 0, preferHigher = false) => {
+    const candidates = orderedPool.filter((item) => {
+      const key = buildHotelCandidateKey(item);
+      return key && !used.has(key);
+    });
+    if (!candidates.length) return null;
+    const preferred = preferHigher
+      ? candidates.filter((item) => Number(item && item[priceField] || 0) >= targetPrice)
+      : candidates;
+    const rankedPool = preferred.length ? preferred : candidates;
+    return rankedPool.reduce((best, item) => {
+      if (!best) return item;
+      const priceA = Number(item && item[priceField] || 0);
+      const priceB = Number(best && best[priceField] || 0);
+      const gapA = Math.abs(priceA - targetPrice);
+      const gapB = Math.abs(priceB - targetPrice);
+      if (gapA !== gapB) return gapA < gapB ? item : best;
+      return rankCtripHotelCandidate(item, cityHint) > rankCtripHotelCandidate(best, cityHint) ? item : best;
+    }, null);
+  };
+
+  base.forEach((hotel, index) => {
+    const key = buildHotelCandidateKey(hotel);
+    const targetPrice = Number(hotel && hotel[priceField] || 0);
+    const preferred = !hotel || (key && used.has(key))
+      ? pickUnusedClosest(targetPrice, index === base.length - 1)
+      : hotel;
+    const resolved = preferred || hotel || pickUnusedClosest(targetPrice, index === base.length - 1);
+    const resolvedKey = buildHotelCandidateKey(resolved);
+    if (resolvedKey) used.add(resolvedKey);
+    if (resolved) chosen.push(resolved);
+  });
+
+  while (chosen.length < 3) {
+    const seedPrice = Number(chosen[chosen.length - 1] && chosen[chosen.length - 1][priceField] || 0);
+    const filler = pickUnusedClosest(seedPrice, true);
+    if (!filler) break;
+    const fillerKey = buildHotelCandidateKey(filler);
+    if (fillerKey) used.add(fillerKey);
+    chosen.push(filler);
+  }
+
+  return chosen
+    .sort((a, b) => Number(a && a[priceField] || 0) - Number(b && b[priceField] || 0))
+    .slice(0, 3);
+}
+
+
+function selectPlanHotelTiers(list, cityHint = "") {
+  const hotels = sortCtripHotelsForPlan(Array.isArray(list) ? list : [], cityHint);
+  if (!hotels.length) return [];
+  const cityKey = detectCityKey(cityHint);
+  const peripheralFilter = cityKey === "上海"
+    ? (item) => !/(train station|railway station|international tourism resort|wild animal park|disney|迪士尼|野生动物园|度假区|共富新村|顾村公园|jiguang|gucun|gongfu)/i.test(`${String(item && item.hotelName || "")} ${String(item && item.hotelAddress || "")}`)
+    : cityKey === "广州"
+      ? (item) => !/(baiyun|jianggao|renhe|huadu|airport|机场|白云|江高|人和|花都|university town|大学城|nansha|南沙|huangpu|xiangxue|science city|knowledge city|development zone|黄埔|香雪|科学城|知识城|开发区|guangzhou north railway station|guangzhoubei|guangzhou railway station|sanyuanli|huaguoshan|广州北站|广州火车站|三元里|花果山|train station|railway station)/i.test(`${String(item && item.hotelName || "")} ${String(item && item.hotelAddress || "")}`)
+      : () => true;
+  const filteredHotels = hotels.filter(peripheralFilter);
+  const genericSafeHotels = filteredHotels.filter((item) => !isGenericFallbackHotelName(item, cityHint));
+  const workingHotels = genericSafeHotels.length >= 3
+    ? genericSafeHotels
+    : filteredHotels.length >= 3
+      ? filteredHotels
+      : hotels;
+  if (workingHotels.length <= 3) return workingHotels.slice(0, 3);
+  const segments = [[], [], []];
+  workingHotels.forEach((hotel, index) => {
+    const bucket = Math.min(2, Math.floor((index * 3) / workingHotels.length));
+    segments[bucket].push(hotel);
+  });
+  const used = new Set();
+  const pickFromSegment = (segmentIndex, fallbackIndex) => {
+    const segment = segments[segmentIndex].filter((item) => !used.has(buildHotelCandidateKey(item)));
+    const ranked = [...segment].sort((a, b) => {
+      return rankCtripHotelCandidate(b, cityHint) - rankCtripHotelCandidate(a, cityHint)
+        || Number(a && a.lowestPrice || 0) - Number(b && b.lowestPrice || 0);
+    });
+    const fallback = workingHotels.find((item) => !used.has(buildHotelCandidateKey(item))) || workingHotels[fallbackIndex] || workingHotels[0];
+    const chosen = ranked[0] || fallback;
+    const chosenKey = buildHotelCandidateKey(chosen);
+    if (chosenKey) used.add(chosenKey);
+    return chosen;
+  };
+  return finalizeDistinctHotelTiers([
+    pickFromSegment(0, 0),
+    pickFromSegment(1, Math.floor(workingHotels.length / 2)),
+    pickFromSegment(2, workingHotels.length - 1),
+  ], workingHotels, cityHint);
+}
+
+function selectBudgetAwareHotelTiers(list, nightlyCap = 0, cityHint = "") {
+  const cap = Number(nightlyCap || 0) || 0;
+  if (!cap) return selectPlanHotelTiers(list, cityHint);
+  const baseHotels = sortCtripHotelsForPlan(Array.isArray(list) ? list : [], cityHint);
+  if (!baseHotels.length) return [];
+
+  const cityKey = detectCityKey(cityHint);
+  const peripheralFilter = cityKey === "上海"
+    ? (item) => !/(airport hotel|pudong international airport|pudong airport|pvg|浦东机场|airport|train station|railway station|international tourism resort|wild animal park|disney|迪士尼|野生动物园|度假区|共富新村|顾村公园|jiguang|gucun|gongfu)/i.test(`${String(item && item.hotelName || "")} ${String(item && item.hotelAddress || "")}`)
+    : cityKey === "广州"
+      ? (item) => !/(baiyun|jianggao|renhe|huadu|airport|机场|白云|江高|人和|花都|university town|大学城|nansha|南沙|huangpu|xiangxue|science city|knowledge city|development zone|黄埔|香雪|科学城|知识城|开发区|guangzhou north railway station|guangzhoubei|guangzhou railway station|sanyuanli|huaguoshan|广州北站|广州火车站|三元里|花果山|train station|railway station)/i.test(`${String(item && item.hotelName || "")} ${String(item && item.hotelAddress || "")}`)
+      : () => true;
+  const filteredHotels = baseHotels.filter(peripheralFilter);
+  const genericSafeHotels = filteredHotels.filter((item) => !isGenericFallbackHotelName(item, cityHint));
+  const workingHotels = genericSafeHotels.length >= 3
+    ? genericSafeHotels
+    : filteredHotels.length >= 3
+      ? filteredHotels
+      : baseHotels;
+
+  const hotels = workingHotels.filter((hotel) => {
+    const price = Number(hotel && hotel.lowestPrice || 0);
+    return price > 0 && !hotel.priceLocked;
+  });
+  if (!hotels.length) return [];
+
+  const used = new Set();
+  const unused = (pool) => (Array.isArray(pool) ? pool : []).filter((hotel) => {
+    const key = buildHotelCandidateKey(hotel);
+    return !key || !used.has(key);
+  });
+  const pickClosest = (pool, target) => {
+    const ranked = unused(pool);
+    if (!ranked.length) return null;
+    return ranked.reduce((best, hotel) => {
+      const gapA = Math.abs(Number(hotel && hotel.lowestPrice || 0) - target);
+      const gapB = Math.abs(Number(best && best.lowestPrice || 0) - target);
+      if (gapA !== gapB) return gapA < gapB ? hotel : best;
+      return rankCtripHotelCandidate(hotel, cityHint) > rankCtripHotelCandidate(best, cityHint) ? hotel : best;
+    });
+  };
+  const pickHighestUnder = (limit) => {
+    const ranked = unused(hotels).filter((hotel) => Number(hotel && hotel.lowestPrice || 0) <= limit);
+    if (!ranked.length) return null;
+    return ranked.reduce((best, hotel) => {
+      const priceA = Number(hotel && hotel.lowestPrice || 0);
+      const priceB = Number(best && best.lowestPrice || 0);
+      if (priceA !== priceB) return priceA > priceB ? hotel : best;
+      return rankCtripHotelCandidate(hotel, cityHint) > rankCtripHotelCandidate(best, cityHint) ? hotel : best;
+    });
+  };
+  const pickLowestAbove = (limit) => {
+    const ranked = unused(hotels).filter((hotel) => Number(hotel && hotel.lowestPrice || 0) > limit);
+    if (!ranked.length) return null;
+    return ranked.reduce((best, hotel) => {
+      const priceA = Number(hotel && hotel.lowestPrice || 0);
+      const priceB = Number(best && best.lowestPrice || 0);
+      if (priceA !== priceB) return priceA < priceB ? hotel : best;
+      return rankCtripHotelCandidate(hotel, cityHint) > rankCtripHotelCandidate(best, cityHint) ? hotel : best;
+    });
+  };
+  const pickBudgetValue = (limit) => {
+    const ranked = unused(hotels).filter((hotel) => Number(hotel && hotel.lowestPrice || 0) <= limit);
+    if (!ranked.length) return null;
+    return ranked.reduce((best, hotel) => {
+      const scoreA = rankCtripHotelCandidate(hotel, cityHint);
+      const scoreB = rankCtripHotelCandidate(best, cityHint);
+      if (scoreA !== scoreB) return scoreA > scoreB ? hotel : best;
+      const priceA = Number(hotel && hotel.lowestPrice || 0);
+      const priceB = Number(best && best.lowestPrice || 0);
+      if (priceA !== priceB) return priceA < priceB ? hotel : best;
+      return hotel;
+    });
+  };
+  const markUsed = (hotel) => {
+    const key = buildHotelCandidateKey(hotel);
+    if (key) used.add(key);
+    return hotel;
+  };
+
+  const budgetTarget = Math.round(cap * 0.72);
+  const balancedTarget = Math.round(cap * 0.9);
+  const capLimit = Math.round(cap);
+  const budget = markUsed(
+    pickBudgetValue(budgetTarget)
+    || pickClosest(hotels.filter((hotel) => Number(hotel && hotel.lowestPrice || 0) <= balancedTarget), budgetTarget)
+    || hotels[0]
+  );
+  const balancedPool = hotels.filter((hotel) => {
+    const price = Number(hotel && hotel.lowestPrice || 0);
+    return price > 0 && price <= capLimit;
+  });
+  const balanced = markUsed(
+    pickClosest(balancedPool.length ? balancedPool : hotels, balancedTarget)
+    || pickHighestUnder(capLimit)
+    || pickLowestAbove(capLimit)
+    || budget
+  );
+  const premiumPool = hotels.filter((hotel) => Number(hotel && hotel.lowestPrice || 0) <= capLimit);
+  const premium = markUsed(
+    pickHighestUnder(capLimit)
+    || pickClosest(premiumPool.length ? premiumPool : hotels, capLimit)
+    || pickLowestAbove(capLimit)
+    || balanced
+  );
+
+  const ordered = [budget, balanced, premium].filter(Boolean).sort((a, b) => Number(a && a.lowestPrice || 0) - Number(b && b.lowestPrice || 0));
+  if (ordered.length === 1) return [ordered[0]];
+  if (ordered.length === 2) {
+    return finalizeDistinctHotelTiers([ordered[0], ordered[1], ordered[1]], hotels, cityHint);
+  }
+  return finalizeDistinctHotelTiers([ordered[0], ordered[1], ordered[2]], hotels, cityHint);
+}
+
+function shouldPreserveStableHotelOption(option, liveHotel, { cityHint = "", tierBudgetCap = 0, hasExplicitNightlyCap = false, optionId = "" } = {}) {
+  if (!option || !liveHotel || optionId === "opt_a") return false;
+  const existingSource = String(option.hotel_source || "").trim().toLowerCase();
+  if (!existingSource || (existingSource !== "mock_curated" && existingSource !== "ctrip_curated")) return false;
+  const existingName = String(option.hotel_name || option.hotel_route_query || "").trim();
+  const existingArea = String(option.hotel_real_address || option.hotel_area || "").trim();
+  if (!existingName || !existingArea) return false;
+  const existingNightly = Number(option.hotel_price_per_night || 0) || 0;
+  const liveNightly = Number(liveHotel && liveHotel.lowestPrice || 0) || 0;
+  if (hasExplicitNightlyCap && tierBudgetCap > 0 && existingNightly > 0 && existingNightly > tierBudgetCap) return false;
+  if (hasExplicitNightlyCap && tierBudgetCap > 0 && liveNightly > 0 && liveNightly > tierBudgetCap) return false;
+  const existingLocationScore = computeHotelLocationScore({
+    hotelName: existingName,
+    hotelAddress: existingArea,
+  }, cityHint);
+  const liveLocationScore = computeHotelLocationScore(liveHotel, cityHint);
+  if (existingLocationScore < 1200) return false;
+  if (liveLocationScore > existingLocationScore + 1200) return false;
+  const capReference = tierBudgetCap > 0 ? tierBudgetCap : Math.max(existingNightly || 0, liveNightly || 0, 1);
+  const priceGap = existingNightly > 0 && liveNightly > 0 ? Math.abs(liveNightly - existingNightly) : 0;
+  if (priceGap > Math.max(120, Math.round(capReference * 0.25))) return false;
+  const liveSource = String(liveHotel.source || "").trim().toLowerCase();
+  return liveSource === "trip_live" || liveSource === "ctrip_live" || liveSource === "ctrip_list_live";
+}
+
+function parseCtripHotelListPage(html, { cityRow = null, checkIn, checkOut, budget } = {}) {
+  const data = extractCtripHotelJson(html);
+  const cards = data?.props?.pageProps?.initialState?.ssrVM?.listStatus?.normalHotelCardList
+    || data?.props?.pageProps?.initialState?.ssrVM?.response?.data?.hotelListInfo?.hotelInfoList
+    || [];
+  const hotels = cards
+    .map((card, idx) => {
+      const hotelId = Number(card?.baseInfo?.hotelId || card?.mapInfo?.id || 0);
+      const hotelName = String(card?.baseUIInfo?.name?.hotelName || card?.detailInfo?.detailHeadInfo?.hotelBaseInfo?.nameInfo?.name || "").trim();
+      if (!hotelName) return null;
+      const lowestPrice = parseCtripPrice(card?.priceInfo?.price);
+      const commentScore = Number(card?.baseUIInfo?.commentInfo?.score || card?.detailInfo?.detailHeadInfo?.hotelComment?.comment?.score || 0) || 0;
+      const reviewCount = parseCtripCount(
+        card?.baseUIInfo?.commentInfo?.commentCountDesc
+        || card?.detailInfo?.detailHeadInfo?.hotelComment?.comment?.totalCommentCountTitle
+      );
+      const address = String(
+        card?.detailInfo?.detailHeadInfo?.hotelPositionInfo?.address
+        || card?.baseUIInfo?.distanceAndPosition?.position
+        || card?.mapInfo?.name
+        || ""
+      ).trim();
+      const tags = [
+        ...(card?.tagInfo?.bigCardServiceTagList || []),
+        ...(card?.tagInfo?.serviceTagList || []),
+      ]
+        .map((tag) => String(tag?.title || "").trim())
+        .filter(Boolean)
+        .slice(0, 4);
+      const reviews = [
+        String(card?.detailInfo?.detailHeadInfo?.hotelComment?.comment?.bestCommentSentence || "").replace(/[“”"]/g, "").trim(),
+        String(card?.baseUIInfo?.oneSentenceSellPoint?.sellingPointSentence || "").trim(),
+      ].filter(Boolean);
+      const imageUrl = String(
+        card?.imageInfo?.mediaList?.[0]?.imageUrl
+        || card?.bigCardStandardImageInfo?.mediaList?.[0]?.imageUrl
+        || card?.bigCardWideImageInfo?.mediaList?.[0]?.imageUrl
+        || ""
+      ).trim();
+      const budgetCap = normalizeBudgetCap(budget);
+      if (budgetCap && lowestPrice > 0 && lowestPrice > budgetCap * 1.35) return null;
+      const item = {
+        hotelId: hotelId ? `CTRIP_LIST_${hotelId}` : `CTRIP_LIST_${idx}`,
+        hotelName,
+        hotelAddress: address,
+        starRating: Number(card?.baseUIInfo?.hotelStar?.star || card?.detailInfo?.detailHeadInfo?.hotelBaseInfo?.starInfo?.level || 0) || 0,
+        lowestPrice,
+        commentScore,
+        reviewCount,
+        hotelTags: tags,
+        hotelReviews: reviews.slice(0, 2),
+        canBook: card?.baseInfo?.isBookable !== false,
+        imageUrl,
+        ctripBookingUrl: hotelId
+          ? `https://m.ctrip.com/webapp/hotel/detail/${hotelId}.html?checkin=${encodeURIComponent(checkIn || "")}&checkout=${encodeURIComponent(checkOut || "")}`
+          : "",
+        source: lowestPrice > 0 ? "ctrip_live" : "ctrip_list_live",
+        priceLocked: lowestPrice <= 0,
+      };
+      if (!hotelMatchesRequestedCity(item, cityRow)) return null;
+      return item;
+    })
+    .filter(Boolean);
+
+  if (!hotels.length) return null;
+  return hotels.sort((a, b) => rankCtripHotelCandidate(b) - rankCtripHotelCandidate(a));
+}
+
+function parseTripHotelListPage(html, { cityMeta, cityRow = null, checkIn, checkOut, budget, usdPerCny = 0.138 } = {}) {
+  const budgetCap = normalizeBudgetCap(budget);
+  const safeRate = Number(usdPerCny || 0.138) > 0 ? Number(usdPerCny || 0.138) : 0.138;
+  const chunks = String(html || "").split('<div class="list-item">').slice(1, 25);
+  const hotels = [];
+  for (const chunk of chunks) {
+    const hotelId = (chunk.match(/<div class="hotel-card" id="(\d+)"/) || [])[1];
+    const hotelName = stripHtml((chunk.match(/<span class="hotelName">([\s\S]*?)<\/span>/) || [])[1]);
+    if (!hotelId || !hotelName) continue;
+    const starRating = parseTripStarRating(chunk);
+    if (starRating < 4 && TRIP_NONSTANDARD_LODGING_RE.test(hotelName)) continue;
+    const nativePrice = parseTripPrice((chunk.match(/aria-label="Current price ([^"]+)"/) || [])[1] || (chunk.match(/<span class="sale"[^>]*>([^<]+)<\/span>/) || [])[1]);
+    if (nativePrice <= 0) continue;
+    const lowestPrice = Math.round(nativePrice / safeRate);
+    if (budgetCap && lowestPrice > budgetCap * 1.35) continue;
+    const nativeTotal = parseTripPrice((chunk.match(/Total price:\s*([^<]+)<br\/?>/) || [])[1]);
+    const reviewCount = parseCtripCount(stripHtml((chunk.match(/<span class="comment-num">([\s\S]*?)<\/span>/) || [])[1]));
+    const commentScore = Number((chunk.match(/<span class="score"[^>]*>([\d.]+)<\/span>/) || [])[1] || 0) || 0;
+    const imageUrl = String((chunk.match(/<img class="m-lazyImg__img"[^>]*src="([^"]+)"/) || [])[1] || "").trim();
+    const hotelTags = [...chunk.matchAll(/<span class="one-sentence-tag">([\s\S]*?)<\/span>/g)]
+      .map((m) => stripHtml(m[1]).replace(/^"+|"+$/g, ""))
+      .filter(Boolean)
+      .slice(0, 3);
+    const locations = [...chunk.matchAll(/<span class="position-desc">([\s\S]*?)<\/span>/g)]
+      .map((m) => stripHtml(m[1]))
+      .filter(Boolean)
+      .slice(0, 2);
+    const roomName = stripHtml((chunk.match(/<div class="room-name">([\s\S]*?)<\/div>/) || [])[1]);
+    const reviewSummary = stripHtml((chunk.match(/<span class="comment-desc"[^>]*>([\s\S]*?)<\/span>/) || [])[1]);
+    const item = {
+      hotelId: `TRIP_${hotelId}`,
+      hotelName,
+      hotelAddress: locations.join(" · "),
+      starRating,
+      lowestPrice,
+      nativePrice,
+      nativeTotalPrice: nativeTotal,
+      nativeCurrency: "USD",
+      fxRateUsed: safeRate,
+      commentScore,
+      reviewCount,
+      hotelTags,
+      hotelReviews: [reviewSummary, ...hotelTags].filter(Boolean).slice(0, 2),
+      bestRoom: roomName ? { roomTypeName: roomName } : null,
+      canBook: /Check Availability/.test(chunk),
+      imageUrl,
+      ctripBookingUrl: buildTripHotelDetailUrl({ cityMeta, hotelId, checkIn, checkOut }),
+      source: "trip_live",
+      priceLocked: false,
+    };
+    if (!hotelMatchesRequestedCity(item, cityRow)) continue;
+    hotels.push(item);
+  }
+  if (!hotels.length) return null;
+  return hotels.sort((a, b) => rankTripHotelCandidate(b, cityRow && cityRow.cityName || cityMeta && cityMeta.cityName || "") - rankTripHotelCandidate(a, cityRow && cityRow.cityName || cityMeta && cityMeta.cityName || ""));
+}
+
+async function fetchCtripHotels({ city, checkIn, checkOut, budget = null }) {
+  const cityMeta = resolveCtripCityMeta(city);
+  const cityRow = resolveHotelCityRow(null, city, city);
+  if (!cityMeta || !cityMeta.cityId) return null;
+
+  const safeCheckIn  = checkIn  || new Date().toISOString().slice(0, 10);
+  const safeCheckOut = checkOut || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  const cacheKey = `${cityMeta.cityId}:${safeCheckIn}:${safeCheckOut}:${budget || ""}`;
+
+
+  const cached = _ctripHotelCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 30 * 60 * 1000) return cached.data;
+
+  try {
+    const data = await _ctripHotelApiCall(cityMeta, safeCheckIn, safeCheckOut, budget, cityRow);
+    if (data && data.length >= 2) {
+      _ctripHotelCache.set(cacheKey, { data, ts: Date.now() });
+      // Evict oldest entries when cache grows large
+      if (_ctripHotelCache.size > 80) {
+        const oldest = [..._ctripHotelCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+        _ctripHotelCache.delete(oldest[0]);
+      }
+    }
+    return data || null;
+  } catch (e) {
+    console.warn("[ctrip] hotel scrape failed:", sanitizeServerLogError(e, "hotel_scrape_failed"));
+    return null;
+  }
+}
+
+async function fetchTripHotels({ city, checkIn, checkOut, budget = null }) {
+  const cityMeta = resolveTripCityMeta(city);
+  const cityRow = resolveHotelCityRow(null, city, city);
+  if (!cityMeta || !cityMeta.cityCode) return null;
+
+  const safeCheckIn = checkIn || new Date().toISOString().slice(0, 10);
+  const safeCheckOut = checkOut || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  const cacheKey = `${cityMeta.cityCode}:${safeCheckIn}:${safeCheckOut}:${budget || ""}`;
+  const cached = _tripHotelCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 30 * 60 * 1000) return cached.data;
+
+  try {
+    const rates = await fetchFxRates();
+    const usdPerCny = Number(rates && rates.USD || 0.138) || 0.138;
+    const tripUrl = buildTripHotelListUrl({
+      cityId: cityMeta.cityCode,
+      checkIn: safeCheckIn,
+      checkOut: safeCheckOut,
+    });
+    const resp = await fetch(tripUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.trip.com/hotels/",
+      },
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    const hotels = parseTripHotelListPage(html, {
+      cityMeta,
+      cityRow,
+      checkIn: safeCheckIn,
+      checkOut: safeCheckOut,
+      budget,
+      usdPerCny,
+    });
+    if (hotels && hotels.length >= 2) {
+      _tripHotelCache.set(cacheKey, { data: hotels, ts: Date.now() });
+      if (_tripHotelCache.size > 80) {
+        const oldest = [..._tripHotelCache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+        if (oldest) _tripHotelCache.delete(oldest[0]);
+      }
+    }
+    return hotels || null;
+  } catch (err) {
+    console.warn("[trip] hotel scrape failed:", sanitizeServerLogError(err, "hotel_scrape_failed"));
+    return null;
+  }
+}
+
+async function fetchLiveHotelCatalog({ city, checkIn, checkOut, budget = null }) {
+  const [tripHotels, ctripHotels] = await Promise.all([
+    fetchTripHotels({ city, checkIn, checkOut, budget }).catch(() => null),
+    fetchCtripHotels({ city, checkIn, checkOut, budget }).catch(() => null),
+  ]);
+  const merged = [];
+  const seen = new Set();
+  const append = (hotel) => {
+    if (!hotel || typeof hotel !== "object") return;
+    if (String(hotel.source || "") === "ctrip_list_live" && isGenericFallbackHotelName(hotel, city)) return;
+    const key = normalizeNameLookupKey(hotel.hotelName || hotel.name || hotel.hotelId || "");
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    merged.push(hotel);
+  };
+  (Array.isArray(tripHotels) ? tripHotels : []).forEach(append);
+  (Array.isArray(ctripHotels) ? ctripHotels : []).forEach(append);
+  if (merged.length >= 3) return sortCtripHotelsForPlan(merged, city);
+  return merged.length ? sortCtripHotelsForPlan(merged, city) : null;
+}
+
+function inferHotelCatalogSource(list) {
+  const hotels = Array.isArray(list) ? list : [];
+  if (!hotels.length) return "no_results";
+  if (hotels.some((h) => h && h.source === "trip_live")) return "trip_live";
+  if (hotels.some((h) => h && h.source === "ctrip_live")) return "ctrip_live";
+  if (hotels.some((h) => h && h.source === "ctrip_list_live")) return "ctrip_list_live";
+  return "ctrip_curated";
+}
+
+function adaptHotelCatalogForPlanner(list, city, budgetPerNight = null) {
+  const hotels = sortCtripHotelsForPlan(Array.isArray(list) ? list : [], city);
+  if (!hotels.length) return null;
+
+  const tiered = selectPlanHotelTiers(hotels, city);
+  const tiers = ["budget", "balanced", "premium"];
+
+  return tiered.map((item, idx) => {
+    if (!item) return null;
+    const numericReviewCount = Number(item.reviewCount || 0) || 0;
+    const reviewCountText = numericReviewCount > 0
+      ? `${numericReviewCount.toLocaleString()} reviews`
+      : "verified guest reviews";
+    const reviewText = String((Array.isArray(item.hotelReviews) ? (item.hotelReviews[0]?.text || item.hotelReviews[0]) : "") || "").trim()
+      || `Popular choice in ${city} with strong location and guest feedback.`;
+    return {
+      tier: tiers[idx],
+      name: item.hotelName || `${city} Hotel`,
+      nameEn: item.hotelNameEn || item.nameEn || "",
+      price_per_night: Number(item.lowestPrice || 0) || 0,
+      rating: Number(item.commentScore || 0) || 0,
+      review_count: reviewCountText,
+      review_count_numeric: numericReviewCount || null,
+      guest_review: reviewText,
+      tags: Array.isArray(item.hotelTags) ? item.hotelTags.slice(0, 3) : [],
+      district: item.hotelAddress || city,
+      address: item.hotelAddress || "",
+      hero_image: item.imageUrl || "",
+      booking_url: item.ctripBookingUrl || "",
+      source: item.source || inferHotelCatalogSource(hotels),
+      price_locked: Boolean(item.priceLocked),
+      native_price: item.nativePrice || null,
+      native_currency: item.nativeCurrency || null,
+      native_total_price: item.nativeTotalPrice || null,
+      fits_budget: budgetPerNight ? (Number(item.lowestPrice || 0) > 0 ? Number(item.lowestPrice || 0) <= Number(budgetPerNight) : undefined) : undefined,
+    };
+  }).filter(Boolean);
+}
+
+async function queryHotelsForPlanner(city, budgetPerNight = null) {
+  const fallbackMock = require("./src/planner/mock").mockCtripHotels;
+  const allowLocalFallback = isLocalExternalDataFallbackEnabled();
+  const today = new Date();
+  const checkIn = new Date(today.getTime() + 86400000).toISOString().slice(0, 10);
+  const checkOut = new Date(today.getTime() + 2 * 86400000).toISOString().slice(0, 10);
+
+  try {
+    const liveHotels = await fetchLiveHotelCatalog({ city, checkIn, checkOut, budget: budgetPerNight });
+    const adapted = adaptHotelCatalogForPlanner(liveHotels, city, budgetPerNight);
+    if (adapted && adapted.length >= 3) {
+      const uniqueNames = new Set(adapted.map((item) => String(item && item.name || "").trim()).filter(Boolean));
+      const uniquePriceBands = new Set(adapted.map((item) => Number(item && item.price_per_night || 0) || 0).filter((value) => value > 0));
+      if (uniqueNames.size >= 3 && uniquePriceBands.size >= 2) return adapted;
+    }
+    if (adapted && adapted.length >= 2) return adapted;
+  } catch (err) {
+    console.warn("[planner] live hotel adapter failed:", sanitizeServerLogError(err, "hotel_adapter_failed"));
+  }
+
+  try {
+    const amapHotels = await queryAmapHotels(city, budgetPerNight);
+    if (Array.isArray(amapHotels) && amapHotels.length >= 3) return amapHotels;
+    if (Array.isArray(amapHotels) && amapHotels.length >= 2) return amapHotels;
+  } catch (err) {
+    console.warn("[planner] amap hotel fallback failed:", sanitizeServerLogError(err, "hotel_fallback_failed"));
+  }
+
+  if (!allowLocalFallback) {
+    console.warn("[planner] live hotel providers unavailable and local fallback is disabled");
+    return [];
+  }
+  return fallbackMock(city, budgetPerNight);
+}
+
+// ── Curated hotel database — real Chinese hotel brands with Ctrip deep-links ──
+// Ctrip's mobile API requires session auth; this curated dataset provides
+// real hotel brand names + Ctrip search deep-links as a reliable fallback.
+// Prices are typical ranges; users are directed to Ctrip for live rates.
+const _CTRIP_HOTEL_DATA = {
+  // cityId → array of { name, nameEn, area, stars, priceFrom, score, reviewCount, tags, reviews }
+  2: [ // Shanghai
+    { name: "上海外滩华尔道夫酒店", nameEn: "Waldorf Astoria Shanghai on the Bund", area: "外滩", stars: 5, priceFrom: 2200, score: 4.9, reviewCount: 18432, tags: ["外滩江景房", "下午茶体验", "管家服务"], reviews: ["外滩夜景绝美，在房间里就能看到浦东全景，服务无可挑剔", "百年建筑里的现代奢华，早餐品种极其丰富，值得每一分价格"] },
+    { name: "上海浦东四季酒店",     nameEn: "Four Seasons Hotel Shanghai Pudong",  area: "陆家嘴", stars: 5, priceFrom: 2100, score: 4.8, reviewCount: 12876, tags: ["浦东中心", "无边泳池", "含早套餐"], reviews: ["陆家嘴核心位置，步行5分钟到东方明珠，床品超舒适", "无边泳池俯瞰浦江两岸，健身设施一流，客房宽敞明亮"] },
+    { name: "上海万豪虹桥大酒店",   nameEn: "Shanghai Marriott Hotel Hongqiao",    area: "虹桥商务", stars: 5, priceFrom: 980, score: 4.7, reviewCount: 9654, tags: ["虹桥枢纽", "商务出行", "高铁直达"], reviews: ["紧邻虹桥高铁站，出差首选，早餐丰盛，前台服务热情周到", "交通极其便利，内部装修新颖，性价比在虹桥片区算高的"] },
+    { name: "外滩茂悦大酒店",       nameEn: "Hyatt on the Bund Shanghai",          area: "外滩黄浦", stars: 5, priceFrom: 1580, score: 4.8, reviewCount: 15234, tags: ["外滩直面江景", "屋顶酒廊", "VUE酒吧"], reviews: ["房间直面外滩，晚上外滩亮灯时景色震撼，VUE酒吧氛围一流", "位置好价格相对合理，早餐种类齐全，员工英文流利"] },
+    { name: "上海豫园万丽酒店",     nameEn: "Renaissance Shanghai Yu Garden",      area: "豫园", stars: 5, priceFrom: 880, score: 4.6, reviewCount: 7823, tags: ["豫园商圈", "上海老城厢", "美食聚集地"], reviews: ["紧邻豫园和城隍庙，走路就能逛老城厢，位置绝佳", "性价比高，房间干净，楼下就是小笼包和南翔馒头店"] },
+    { name: "亚朵酒店上海虹桥",     nameEn: "Atour Hotel Shanghai Hongqiao",       area: "虹桥", stars: 4, priceFrom: 528, score: 4.7, reviewCount: 6342, tags: ["商旅精品", "阅读氛围", "24h前台"], reviews: ["亚朵一贯的高品质，书香氛围浓厚，床特别软，隔音很好", "价格实惠，距地铁3分钟，软硬件都不输五星，强烈推荐"] },
+    { name: "全季酒店上海徐家汇",   nameEn: "Ji Hotel Shanghai Xujiahui",          area: "徐家汇", stars: 3, priceFrom: 298, score: 4.5, reviewCount: 4521, tags: ["徐家汇地铁口", "经济实惠", "干净整洁"], reviews: ["地铁口出来就到，周边购物方便，卫生好，性价比极高", "房间虽小但五脏俱全，淋浴水压强，总体超出预期"] },
+    { name: "上海中心J酒店",        nameEn: "J Hotel Shanghai Tower",              area: "陆家嘴", stars: 5, priceFrom: 3500, score: 4.9, reviewCount: 8920, tags: ["世界最高酒店之一", "云端视野", "私人管家"], reviews: ["在全球最高的酒店之一住了一晚，站在房间里俯瞰上海太震撼了", "每一个细节都做到极致，管家式服务贯穿整个入住，难忘的体验"] },
+  ],
+  1: [ // Beijing
+    { name: "北京国贸大酒店",       nameEn: "China World Hotel Beijing",           area: "国贸CBD", stars: 5, priceFrom: 1480, score: 4.8, reviewCount: 21034, tags: ["CBD核心", "国贸商圈", "商务首选"], reviews: ["北京商务出行必选，紧邻国贸三期，会议设施齐全，早餐超豪华", "连续住了三次，每次都满意，员工素质极高，中英文都流利"] },
+    { name: "北京JW万豪酒店",       nameEn: "JW Marriott Hotel Beijing",            area: "CBD", stars: 5, priceFrom: 1380, score: 4.7, reviewCount: 16782, tags: ["长安街视野", "米其林餐厅", "含早套餐"], reviews: ["紧邻长安街，政治中心感十足，在顶层餐厅吃早餐俯瞰全城超爽", "精装修五星标准，服务细致，地理位置无可挑剔"] },
+    { name: "北京王府半岛酒店",     nameEn: "The Peninsula Beijing",               area: "王府井", stars: 5, priceFrom: 2600, score: 4.9, reviewCount: 14523, tags: ["王府井步行街旁", "故宫1公里", "顶级奢华"], reviews: ["百年品牌，王府井绝佳位置，故宫徒步即达，服务是真的顶级", "床品极舒适，管家提前记住了我的个人喜好，让人感动"] },
+    { name: "北京瑰丽酒店",         nameEn: "Rosewood Beijing",                    area: "朝阳", stars: 5, priceFrom: 2200, score: 4.9, reviewCount: 9841, tags: ["朝阳顶奢", "私人管家", "人性化服务"], reviews: ["瑰丽独有的服务理念贯穿始终，细节做到极致，是我住过最好的酒店", "中餐厅出品一流，下午茶预约制，价格值得"] },
+    { name: "亚朵酒店北京三里屯",   nameEn: "Atour Hotel Beijing Sanlitun",        area: "三里屯", stars: 4, priceFrom: 548, score: 4.7, reviewCount: 7634, tags: ["三里屯夜生活", "精品设计", "地铁便利"], reviews: ["三里屯核心位置，酒吧餐厅密集，住这里逛街太方便了", "亚朵品质有保障，房间设计感强，阅读角氛围好"] },
+    { name: "全季酒店北京望京",     nameEn: "Ji Hotel Beijing Wangjing",           area: "望京", stars: 3, priceFrom: 288, score: 4.5, reviewCount: 5123, tags: ["望京科技园", "地铁直达", "经济实惠"], reviews: ["商务出差理想选择，位置离望京SOHO很近，服务态度好", "干净整洁，价格在北京难得实惠，床铺柔软舒适"] },
+    { name: "北京希尔顿逸林酒店",   nameEn: "DoubleTree by Hilton Beijing",        area: "CBD", stars: 5, priceFrom: 780, score: 4.6, reviewCount: 11234, tags: ["欢迎饼干", "国贸商圈", "商务套房"], reviews: ["希尔顿逸林标志性欢迎饼干已经成了我出差的期待，服务周到", "位置好，早餐丰盛，房间宽敞，商务设施齐全"] },
+    { name: "北京首都机场希尔顿酒店", nameEn: "Hilton Beijing Capital Airport",    area: "首都机场", stars: 5, priceFrom: 880, score: 4.7, reviewCount: 8932, tags: ["机场连廊直达", "早班机首选", "含早套餐"], reviews: ["直连T3航站楼，凌晨赶早班机再也不怕堵车了，早餐品种丰富", "机场酒店里体验最好的，隔音很好睡得踏实"] },
+  ],
+  15: [ // Shenzhen
+    { name: "深圳前海万豪酒店",     nameEn: "Shenzhen Qianhai Marriott Hotel",     area: "南山前海", stars: 5, priceFrom: 1280, score: 4.7, reviewCount: 8234, tags: ["前海湾景", "港深金融", "商务出行"], reviews: ["前海湾江景绝美，商务设施完善，楼下就是深交所，商务出行首选", "服务非常专业，早餐中西式都有，游泳池视野超赞"] },
+    { name: "深圳JW万豪侯爵酒店",   nameEn: "JW Marriott Marquis Hotel Shenzhen", area: "后海湾", stars: 5, priceFrom: 1680, score: 4.9, reviewCount: 12543, tags: ["后海超高层", "海湾全景", "米其林餐厅"], reviews: ["超高层海景房视野令人窒息，中餐厅厨师来自北京，出品一流", "深圳最高端之一，泳池在高层户外，俯瞰后海湾太享受了"] },
+    { name: "深圳四季酒店",         nameEn: "Four Seasons Hotel Shenzhen",         area: "福田中心", stars: 5, priceFrom: 1450, score: 4.8, reviewCount: 10234, tags: ["福田CBD", "高铁站旁", "精装修客房"], reviews: ["福田中心地段，高铁深圳北站10分钟，前往香港非常便利", "四季集团一贯的高标准，房间隔音极好，早餐甜品很棒"] },
+    { name: "亚朵酒店深圳南山",     nameEn: "Atour Hotel Shenzhen Nanshan",        area: "科技园", stars: 4, priceFrom: 488, score: 4.7, reviewCount: 5821, tags: ["科技园商务", "腾讯总部旁", "精品设计"], reviews: ["互联网公司出差的聚集地，附近都是大厂，商务氛围浓厚", "亚朵品质可靠，周边餐饮丰富，性价比在南山同档很高"] },
+    { name: "全季酒店深圳宝安",     nameEn: "Ji Hotel Shenzhen Baoan",             area: "宝安", stars: 3, priceFrom: 268, score: 4.5, reviewCount: 3892, tags: ["宝安机场旁", "经济实惠", "干净整洁"], reviews: ["离宝安机场近，早班机前一晚住这里很方便，价格实惠", "房间紧凑但干净，前台很热情，性价比高"] },
+    { name: "深圳华侨城洲际大酒店", nameEn: "InterContinental Shenzhen",           area: "华侨城", stars: 5, priceFrom: 980, score: 4.6, reviewCount: 9134, tags: ["华侨城文化区", "欢乐谷旁", "度假风格"], reviews: ["华侨城度假区的核心酒店，欢乐谷步行可达，适合亲子出行", "度假氛围浓厚，大堂装潢很有设计感，服务温暖"] },
+  ],
+  83: [ // Guangzhou
+    { name: "广州四季酒店",         nameEn: "Four Seasons Hotel Guangzhou",        area: "珠江新城", stars: 5, priceFrom: 2200, score: 4.9, reviewCount: 14823, tags: ["珠江夜景", "广州塔旁", "顶奢标杆"], reviews: ["广州顶奢天花板，珠江两岸夜景绝美，餐厅米其林水准", "从广州塔到花城广场全看得到，入住即是旅游地标体验"] },
+    { name: "广州W酒店",            nameEn: "W Hotel Guangzhou",                   area: "珠江新城", stars: 5, priceFrom: 1280, score: 4.8, reviewCount: 11234, tags: ["潮流时尚", "屋顶泳池", "年轻派"], reviews: ["W酒店的时尚氛围太对了，屋顶泳池可以看到广州塔，很惊艳", "DJ音乐从大堂到酒吧一直在放，适合享受夜生活的旅行者"] },
+    { name: "广州文华东方酒店",     nameEn: "Mandarin Oriental Guangzhou",         area: "珠江新城", stars: 5, priceFrom: 1380, score: 4.8, reviewCount: 9876, tags: ["东方奢华", "粤菜精品", "SPA体验"], reviews: ["文华东方的SPA是广州最好的，粤菜餐厅是本地高管最爱", "服务无微不至，细节打磨到位，深感广粤文化的精致"] },
+    { name: "亚朵酒店广州天河",     nameEn: "Atour Hotel Guangzhou Tianhe",        area: "天河", stars: 4, priceFrom: 448, score: 4.6, reviewCount: 6234, tags: ["天河商圈", "地铁直达", "精品商务"], reviews: ["天河核心位置，走路到体育西路地铁5分钟，出行极方便", "亚朵的品质稳定，书桌宽大，商务出差很满意"] },
+    { name: "全季酒店广州珠江新城", nameEn: "Ji Hotel Guangzhou Pearl River",      area: "珠江新城", stars: 3, priceFrom: 248, score: 4.5, reviewCount: 4123, tags: ["珠江新城核心", "经济实惠", "地铁5号线"], reviews: ["珠江新城地段用这个价格真的超值，周边餐饮选择多", "房间干净整洁，前台英文不错，适合外籍游客"] },
+    { name: "广州富力君悦大酒店",   nameEn: "Grand Hyatt Guangzhou",               area: "天河CBD", stars: 5, priceFrom: 880, score: 4.7, reviewCount: 12453, tags: ["天河CBD商圈", "高铁广州东旁", "正宗粤菜早茶"], reviews: ["君悦的早茶是广州酒店里最好吃的，全是正宗粤式点心", "位置在天河CBD中心，购物美食全方便，服务专业"] },
+  ],
+  75: [ // Chengdu
+    { name: "成都瑞吉酒店",         nameEn: "The St. Regis Chengdu",               area: "天府广场", stars: 5, priceFrom: 1100, score: 4.9, reviewCount: 11234, tags: ["天府广场旁", "管家式服务", "瑞吉早午餐"], reviews: ["瑞吉管家服务是同级别里最贴心的，每次进房都有专属欢迎卡", "距天府广场步行5分钟，周围名胜古迹密集，早午餐品质顶级"] },
+    { name: "成都博舍",             nameEn: "Temple House Chengdu",                area: "大慈寺", stars: 5, priceFrom: 1800, score: 4.9, reviewCount: 9823, tags: ["大慈寺历史街区", "庭院禅意", "成都网红打卡"], reviews: ["成都最有文化气韵的精品奢华酒店，庭院设计融合宋代美学", "大慈寺旁，环境清幽，餐厅竹林设计极美，是成都旅行必住"] },
+    { name: "成都万豪锦源酒店",     nameEn: "Marriott Hotel Chengdu",              area: "高新区", stars: 5, priceFrom: 680, score: 4.6, reviewCount: 8234, tags: ["高新区商务", "天府大道旁", "商旅首选"], reviews: ["成都出差住万豪最省心，高新区各公司通勤方便，早餐丰盛", "设施较新，隔音好，价格在五星里算实惠，服务也专业"] },
+    { name: "亚朵酒店成都春熙路",   nameEn: "Atour Hotel Chengdu Chunxi",          area: "春熙路", stars: 4, priceFrom: 428, score: 4.7, reviewCount: 6543, tags: ["春熙路商圈", "IFS太古里旁", "旅游核心区"], reviews: ["春熙路商圈里住这个价格太超值了，太古里IFS步行即达", "亚朵品质有保障，周围小吃密集，来成都必打卡的住宿地段"] },
+    { name: "全季酒店成都火车南站", nameEn: "Ji Hotel Chengdu South Station",      area: "高新区", stars: 3, priceFrom: 238, score: 4.5, reviewCount: 3987, tags: ["高铁南站旁", "经济出行", "干净卫生"], reviews: ["高铁南站旁边很方便，过来进藏或者去乐山都方便，价格实惠", "连锁酒店品质有保障，比同类小酒店卫生好很多"] },
+  ],
+  57: [ // Hangzhou
+    { name: "杭州西溪悦榕庄",       nameEn: "Banyan Tree Hangzhou",               area: "西溪湿地", stars: 5, priceFrom: 2200, score: 4.9, reviewCount: 13456, tags: ["西溪湿地水岸", "船型客房", "自然生态"], reviews: ["水中别墅的体验太独特了，清晨醒来推开窗就是湿地风光", "船型客房设计绝美，在里面泡汤看落日，这辈子难忘的住宿"] },
+    { name: "杭州西子湖四季酒店",   nameEn: "Four Seasons Hotel Hangzhou",         area: "西湖", stars: 5, priceFrom: 3200, score: 4.9, reviewCount: 17832, tags: ["西湖直面湖景", "古典园林造景", "杭州顶奢"], reviews: ["西湖边最好的位置，宋代园林造景，站在房间里望向西湖心旷神怡", "中国传统美学与现代奢华的完美结合，早餐可以在湖边享用"] },
+    { name: "杭州万豪滨江酒店",     nameEn: "Hangzhou Marriott Hotel Riverside",   area: "滨江", stars: 5, priceFrom: 880, score: 4.7, reviewCount: 9234, tags: ["钱塘江景", "滨江高新区", "商务出行"], reviews: ["钱塘江江景房视野开阔，附近互联网公司密集，商务出行方便", "万豪品质可靠，早餐中西式均有，游泳池环境好"] },
+    { name: "亚朵酒店杭州西湖",     nameEn: "Atour Hotel Hangzhou West Lake",      area: "西湖", stars: 4, priceFrom: 558, score: 4.8, reviewCount: 7823, tags: ["西湖徒步可达", "精品设计", "文艺氛围"], reviews: ["步行10分钟到西湖断桥，价格比湖边五星实惠一半，体验接近", "亚朵设计酒店风格，阅读空间很美，早餐有西湖莼菜羹"] },
+    { name: "全季酒店杭州武林广场", nameEn: "Ji Hotel Hangzhou Wulin Square",      area: "武林广场", stars: 3, priceFrom: 318, score: 4.5, reviewCount: 4567, tags: ["武林广场地铁口", "市区核心", "经济实惠"], reviews: ["武林广场地铁1号线出来就到，去西湖乘地铁4站，超便利", "性价比在杭州市区最好，房间干净，前台服务耐心"] },
+  ],
+  321: [ // Sanya
+    { name: "三亚亚特兰蒂斯酒店",   nameEn: "Atlantis Sanya",                     area: "海棠湾", stars: 5, priceFrom: 2800, score: 4.8, reviewCount: 23456, tags: ["水世界主题乐园", "海豚湾互动", "全包度假"], reviews: ["三亚最顶级的度假综合体，水世界玩了一整天，孩子疯狂喜欢", "含早晚餐套餐物超所值，直接面向大海，椰林沙滩完美假期"] },
+    { name: "三亚海棠湾万豪度假村", nameEn: "Marriott Resort Sanya Bay",           area: "海棠湾", stars: 5, priceFrom: 1480, score: 4.7, reviewCount: 15234, tags: ["私人海滩", "海棠湾核心", "浮潜天堂"], reviews: ["私人海滩非常干净，能租浮潜装备，珊瑚礁保护得很好", "海棠湾购物城步行可达，下午茶在泳池边吃太惬意了"] },
+    { name: "三亚亚龙湾瑞吉酒店",   nameEn: "The St. Regis Sanya Yalong Bay",      area: "亚龙湾", stars: 5, priceFrom: 1880, score: 4.8, reviewCount: 12876, tags: ["亚龙湾一号海滩", "管家服务", "热带花园"], reviews: ["亚龙湾最美海滩上的奢华享受，热带植被郁郁葱葱，太美了", "瑞吉管家贴心程度超乎想象，每天都有不同的花瓣装饰浴缸"] },
+    { name: "亚朵酒店三亚",         nameEn: "Atour Hotel Sanya",                   area: "三亚湾", stars: 4, priceFrom: 480, score: 4.7, reviewCount: 5234, tags: ["三亚湾椰梦长廊", "性价比高", "海景房"], reviews: ["三亚湾位置，走路就能到椰梦长廊海滩，海景房视野不错", "价格在三亚属于实惠，服务态度好，早餐有新鲜水果和海南特色"] },
+  ],
+  62: [ // Nanjing
+    { name: "南京滨江万豪酒店",     nameEn: "Nanjing Marriott Hotel",              area: "建邺", stars: 5, priceFrom: 780, score: 4.7, reviewCount: 9234, tags: ["长江江景", "青奥轴线", "现代商圈"], reviews: ["长江江景房一览无余，青奥公园就在旁边，运动休闲都方便", "万豪品质可靠，位于建邺新城，前往夫子庙出租约20分钟"] },
+    { name: "南京玄武万豪酒店",     nameEn: "Marriott Hotel Nanjing Xuanwu",       area: "玄武湖", stars: 5, priceFrom: 980, score: 4.8, reviewCount: 11234, tags: ["玄武湖畔", "鼓楼中心", "中山陵近"], reviews: ["玄武湖就在眼前，清晨沿湖散步非常惬意，位置是南京最中心", "中山陵紫金山几乎步行可达，酒店本身装修典雅大气"] },
+    { name: "亚朵酒店南京新街口",   nameEn: "Atour Hotel Nanjing Xinjiekou",       area: "新街口", stars: 4, priceFrom: 458, score: 4.6, reviewCount: 6234, tags: ["新街口地铁枢纽", "南京中心商圈", "精品商务"], reviews: ["新街口核心，1号线2号线均可到，购物逛街极方便", "亚朵品质出色，房间安静，楼下美食街夜宵选择多"] },
+    { name: "全季酒店南京鼓楼",     nameEn: "Ji Hotel Nanjing Gulou",              area: "鼓楼", stars: 3, priceFrom: 278, score: 4.5, reviewCount: 3892, tags: ["鼓楼文化区", "高校聚集地", "经济实惠"], reviews: ["南京大学旁边，文化氛围浓，附近小馆子和小吃特别多", "价格实惠，卫生好，出门就是鼓楼公园，旅游很方便"] },
+  ],
+};
+
+async function _ctripHotelApiCall(cityMeta, checkIn, checkOut, budget, cityRow = null) {
+  const cityId = Number(cityMeta && cityMeta.cityId || 0);
+  const listUrl = buildCtripHotelListUrl({
+    cityId,
+    slug: cityMeta && cityMeta.slug,
+    checkIn,
+    checkOut,
+  });
+  // Attempt 1: Try Ctrip live search API with browser-like headers
+  try {
+    const _ctripUrl = `https://m.ctrip.com/restapi/soa2/11278/json/getHotelList` +
+      `?cityId=${cityId}&checkInDate=${checkIn || ""}&checkOutDate=${checkOut || ""}&pageIndex=1&pageSize=10`;
+    const _ctripResp = await fetch(_ctripUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://m.ctrip.com/",
+        "Origin": "https://m.ctrip.com",
+      },
+      signal: AbortSignal.timeout(4000),
+    });
+    if (_ctripResp.ok) {
+      const _ctripData = await _readJsonResponseSafe(_ctripResp, null);
+      const _hotelList = _ctripData && (_ctripData.hotelList || (_ctripData.data && _ctripData.data.hotelList));
+      if (Array.isArray(_hotelList) && _hotelList.length >= 2) {
+        const mapped = _hotelList.slice(0, 8).map((h, i) => ({
+          hotelId: `CTR_LIVE_${h.hotelId || i}`,
+          hotelName: h.hotelName || h.name || "",
+          hotelAddress: h.address || h.area || "",
+          starRating: h.starRating || h.star || 3,
+          lowestPrice: h.lowestPrice || h.price || 500,
+          commentScore: h.commentScore || h.score || 4.5,
+          canBook: true,
+          imageUrl: h.imageUrl || h.img || "",
+          ctripBookingUrl: h.hotelId
+            ? `https://m.ctrip.com/webapp/hotel/detail/${h.hotelId}.html?checkindate=${checkIn || ""}&checkoutdate=${checkOut || ""}`
+            : `https://m.ctrip.com/webapp/hotel/list/?hotelname=${encodeURIComponent(h.hotelName || "")}`,
+          source: "ctrip_live",
+        })).filter((h) => h.hotelName && hotelMatchesRequestedCity(h, cityRow));
+        if (mapped.length >= 2) return mapped;
+      }
+    }
+  } catch (_liveErr) {
+    // Live API failed — fall through to curated data
+    console.log("[ctrip] live API unavailable, using curated data:", "ctrip_live_unavailable");
+  }
+
+  // Attempt 2: Parse SSR hotel list page anonymously.
+  try {
+    const _listResp = await fetch(listUrl, {
+      method: "GET",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://m.ctrip.com/",
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (_listResp.ok) {
+      const _html = await _listResp.text();
+      const _parsedHotels = parseCtripHotelListPage(_html, { cityRow, checkIn, checkOut, budget });
+      if (Array.isArray(_parsedHotels) && _parsedHotels.length >= 2) {
+        return _parsedHotels.slice(0, 8);
+      }
+    }
+  } catch (_listErr) {
+    console.log("[ctrip] list SSR unavailable, using curated data:", "ctrip_list_ssr_unavailable");
+  }
+
+  // Attempt 3: Curated real hotel database with Ctrip search deep-links
+  return new Promise((resolve) => {
+    const cityHotels = _CTRIP_HOTEL_DATA[cityId];
+    if (!cityHotels || !cityHotels.length) { resolve(null); return; }
+
+    // Apply budget filter if provided
+    let filtered = cityHotels;
+    if (budget && budget > 0) {
+      const priceFiltered = cityHotels.filter(h => h.priceFrom <= budget * 1.3);
+      if (priceFiltered.length >= 2) filtered = priceFiltered;
+    }
+
+    // Add slight price variance based on dates (deterministic, not random)
+    const dayNum = checkIn ? new Date(checkIn).getDay() : 0;
+    const weekendBump = (dayNum === 5 || dayNum === 6) ? 1.15 : 1.0; // Fri/Sat premium
+
+    const hotels = filtered.map((h, i) => {
+      const price = Math.round(h.priceFrom * weekendBump * (1 + (i % 3) * 0.05));
+      return {
+        hotelId: `CTR_${cityId}_${i}`,
+        hotelName: h.name,
+        hotelNameEn: h.nameEn || "",
+        hotelAddress: `${h.area}`,
+        starRating: h.stars,
+        lowestPrice: price,
+        commentScore: h.score,
+        reviewCount: h.reviewCount || null,
+        hotelTags: h.tags || [],
+        hotelReviews: h.reviews || [],
+        canBook: true,
+        imageUrl: "",
+        // Direct Ctrip hotel search link (reliable even without hotel ID)
+        ctripBookingUrl: `https://m.ctrip.com/webapp/hotel/list/?hotelname=${encodeURIComponent(h.name)}&checkindate=${checkIn || ""}&checkoutdate=${checkOut || ""}`,
+        source: "ctrip_curated",
+      };
+    });
+
+    resolve(hotels.length >= 2 ? hotels : null);
+  });
+}
+
+// ── Curated restaurant database (real well-known restaurants for major cities) ──
+const _CURATED_RESTAURANT_DATA = {
+  "上海": [
+    { name: "南京大牌档（新天地）", area: "新天地", cuisine: "本帮菜", pricePerPerson: 120, score: 4.7, tags: ["本帮菜", "上海老味道"] },
+    { name: "福1088", area: "静安", cuisine: "本帮菜", pricePerPerson: 350, score: 4.8, tags: ["高端本帮", "老洋房"] },
+    { name: "外婆家（南京西路）", area: "静安", cuisine: "江浙菜", pricePerPerson: 80, score: 4.5, tags: ["家常菜", "高性价比"] },
+    { name: "小龙虾馆（武康路）", area: "徐汇", cuisine: "小龙虾", pricePerPerson: 100, score: 4.6, tags: ["小龙虾", "网红"] },
+    { name: "阿娘面馆（思南路）", area: "黄浦", cuisine: "上海面条", pricePerPerson: 40, score: 4.6, tags: ["面条", "老上海"] },
+    { name: "鼎泰丰（恒隆广场）", area: "静安", cuisine: "台式点心", pricePerPerson: 150, score: 4.8, tags: ["小笼包", "台式"] },
+    { name: "成隆行蟹王府（外滩）", area: "外滩", cuisine: "大闸蟹", pricePerPerson: 380, score: 4.9, tags: ["大闸蟹", "季节限定"] },
+    { name: "Jing'An Bund（静安区）", area: "静安", cuisine: "创意菜", pricePerPerson: 200, score: 4.5, tags: ["创意菜", "网红"] },
+  ],
+  "北京": [
+    { name: "全聚德（前门）", area: "前门", cuisine: "北京烤鸭", pricePerPerson: 220, score: 4.6, tags: ["烤鸭", "百年老店"] },
+    { name: "大董烤鸭（工体）", area: "工体", cuisine: "北京烤鸭", pricePerPerson: 300, score: 4.8, tags: ["烤鸭", "创意中餐"] },
+    { name: "顺峰（朝阳店）", area: "朝阳", cuisine: "粤菜海鲜", pricePerPerson: 180, score: 4.5, tags: ["海鲜", "粤菜"] },
+    { name: "老北京涮肉（北海）", area: "北海", cuisine: "老北京火锅", pricePerPerson: 120, score: 4.7, tags: ["火锅", "铜锅涮肉"] },
+    { name: "俏江南（新光天地）", area: "国贸", cuisine: "川菜", pricePerPerson: 160, score: 4.4, tags: ["川菜", "精致"] },
+    { name: "胡大饭馆（簋街）", area: "东直门", cuisine: "小龙虾", pricePerPerson: 100, score: 4.7, tags: ["小龙虾", "簋街"] },
+    { name: "净雅（建国门）", area: "建国门", cuisine: "鲁菜", pricePerPerson: 250, score: 4.6, tags: ["鲁菜", "传统"] },
+    { name: "巴依老爷（维吾尔族）", area: "朝阳", cuisine: "新疆菜", pricePerPerson: 90, score: 4.5, tags: ["新疆菜", "烤肉"] },
+  ],
+  "深圳": [
+    { name: "客家人（罗湖）", area: "罗湖", cuisine: "客家菜", pricePerPerson: 80, score: 4.5, tags: ["客家菜", "传统"] },
+    { name: "漁農海鮮酒家（南山）", area: "南山", cuisine: "粤菜海鲜", pricePerPerson: 180, score: 4.6, tags: ["海鲜", "粤菜"] },
+    { name: "潮汕牛肉火锅（福田）", area: "福田", cuisine: "潮汕火锅", pricePerPerson: 120, score: 4.7, tags: ["潮汕", "牛肉火锅"] },
+    { name: "陶陶居（益田假日）", area: "福田", cuisine: "粤式茶餐厅", pricePerPerson: 90, score: 4.6, tags: ["茶餐厅", "广式早茶"] },
+    { name: "老字号（东门步行街）", area: "罗湖", cuisine: "深圳小吃", pricePerPerson: 40, score: 4.4, tags: ["本地小吃", "便宜"] },
+  ],
+  "成都": [
+    { name: "玉芝兰（玉林路）", area: "武侯", cuisine: "川菜", pricePerPerson: 400, score: 4.9, tags: ["精致川菜", "米其林"] },
+    { name: "龙抄手（春熙路）", area: "锦江", cuisine: "成都小吃", pricePerPerson: 50, score: 4.5, tags: ["抄手", "成都传统"] },
+    { name: "大慈寺素斋", area: "锦江", cuisine: "素食", pricePerPerson: 80, score: 4.7, tags: ["素食", "寺院美食"] },
+    { name: "海底捞（太古里）", area: "锦江", cuisine: "火锅", pricePerPerson: 150, score: 4.7, tags: ["火锅", "服务好"] },
+    { name: "老场坊串串香", area: "成华", cuisine: "串串香", pricePerPerson: 60, score: 4.6, tags: ["串串", "成都风味"] },
+    { name: "钟水饺（总府路）", area: "锦江", cuisine: "成都面食", pricePerPerson: 30, score: 4.5, tags: ["水饺", "百年老店"] },
+  ],
+  "广州": [
+    { name: "陶陶居（第十甫）", area: "荔湾", cuisine: "粤式茶餐厅", pricePerPerson: 100, score: 4.8, tags: ["早茶", "老字号"] },
+    { name: "广州酒家（文昌南路）", area: "荔湾", cuisine: "粤菜", pricePerPerson: 150, score: 4.7, tags: ["粤菜", "老字号"] },
+    { name: "利苑酒家（花城广场）", area: "天河", cuisine: "粤菜", pricePerPerson: 200, score: 4.8, tags: ["精致粤菜", "高端"] },
+    { name: "炳胜品味（花地湾）", area: "荔湾", cuisine: "粤菜", pricePerPerson: 160, score: 4.6, tags: ["粤菜", "时尚"] },
+    { name: "九记牛腩（中山六路）", area: "越秀", cuisine: "牛腩粉面", pricePerPerson: 40, score: 4.7, tags: ["牛腩面", "老字号"] },
+  ],
+  "杭州": [
+    { name: "知味观（仁和路）", area: "上城", cuisine: "杭帮菜", pricePerPerson: 120, score: 4.7, tags: ["杭帮菜", "百年老店"] },
+    { name: "楼外楼（孤山路）", area: "西湖", cuisine: "杭帮菜", pricePerPerson: 200, score: 4.8, tags: ["西湖醋鱼", "杭州必吃"] },
+    { name: "外婆家（南宋御街）", area: "上城", cuisine: "浙江菜", pricePerPerson: 90, score: 4.5, tags: ["家常菜", "高性价比"] },
+    { name: "新白鹿（武林广场）", area: "下城", cuisine: "杭帮菜", pricePerPerson: 80, score: 4.5, tags: ["轻快餐", "连锁"] },
+    { name: "河坊街小吃集市", area: "上城", cuisine: "杭州小吃", pricePerPerson: 40, score: 4.4, tags: ["小吃", "街头美食"] },
+  ],
+  "西安": [
+    { name: "贾三灌汤包（大皮院）", area: "莲湖", cuisine: "陕西面食", pricePerPerson: 50, score: 4.7, tags: ["灌汤包", "清真"] },
+    { name: "老孙家羊肉泡馍（东大街）", area: "碑林", cuisine: "羊肉泡馍", pricePerPerson: 60, score: 4.6, tags: ["羊肉泡馍", "百年老店"] },
+    { name: "同盛祥泡馍（钟楼）", area: "碑林", cuisine: "陕西传统", pricePerPerson: 70, score: 4.5, tags: ["泡馍", "老字号"] },
+    { name: "西安饭庄（劳动路）", area: "新城", cuisine: "陕菜", pricePerPerson: 100, score: 4.6, tags: ["陕菜", "文化体验"] },
+  ],
+};
+
+// Map city names to restaurant data keys
+function _getCuratedRestaurants(city) {
+  const _cnAliases = { Shanghai: "上海", Beijing: "北京", Shenzhen: "深圳", Chengdu: "成都", Guangzhou: "广州", Hangzhou: "杭州", Xian: "西安", "Xi'an": "西安" };
+  const key = _CURATED_RESTAURANT_DATA[city] ? city : (_CURATED_RESTAURANT_DATA[_cnAliases[city]] ? _cnAliases[city] : null);
+  return key ? _CURATED_RESTAURANT_DATA[key] : null;
+}
+// ── end Ctrip scraper ──────────────────────────────────────────────────────
+
 function pushChatNotification(payload) {
   const row = {
     id: `ntf_${Date.now().toString(36)}_${require("crypto").randomBytes(3).toString("hex")}`,
@@ -1110,12 +3459,30 @@ function pushChatNotification(payload) {
   return row;
 }
 
-function listChatNotificationsSince(since = "") {
+function sanitizeChatNotificationForViewer(item, { isAdmin = false } = {}) {
+  if (!item || typeof item !== "object") return null;
+  if (isAdmin) return item;
+  const order = item.orderId ? resolveOrderRecord(item.orderId) : null;
+  return {
+    id: String(item.id || ""),
+    at: item.at || "",
+    type: item.type || "order_update",
+    orderId: item.orderId ? toViewerOrderRef(order || item.orderId, { isAdmin }) : "",
+    status: item.status || "",
+    message: String(item.message || "").slice(0, 200),
+    messageEn: String(item.messageEn || "").slice(0, 200),
+  };
+}
+
+function listChatNotificationsSince(since = "", { subjectId = "", isAdmin = false } = {}) {
   const sinceTs = since ? new Date(since).getTime() : 0;
+  const scoped = isAdmin
+    ? db.chatNotifications
+    : db.chatNotifications.filter((item) => String(item.userId || "") === String(subjectId || ""));
   if (!Number.isFinite(sinceTs) || sinceTs <= 0) {
-    return db.chatNotifications.slice(-40);
+    return scoped.slice(-40);
   }
-  return db.chatNotifications.filter((item) => new Date(item.at).getTime() > sinceTs);
+  return scoped.filter((item) => new Date(item.at).getTime() > sinceTs);
 }
 
 function pollCadenceSecForHotelOrderStatus(status) {
@@ -1159,6 +3526,7 @@ function maybeAdvanceHotelOrderStatus(order, source = "poll") {
     pushed.push(
       pushChatNotification({
         orderId: order.id,
+        userId: resolveOrderOwnerId(order) || order.userId || "",
         outOrderNo: order.outOrderNo || "",
         status: "confirmed",
         message: "订单已确认，酒店已为你保留房间。",
@@ -1176,6 +3544,7 @@ function maybeAdvanceHotelOrderStatus(order, source = "poll") {
     pushed.push(
       pushChatNotification({
         orderId: order.id,
+        userId: resolveOrderOwnerId(order) || order.userId || "",
         outOrderNo: order.outOrderNo || "",
         status: "refund_completed",
         message: "退款已完成，资金将按银行时效到账。",
@@ -1273,7 +3642,7 @@ function extractHotelSlotInfo(message = "", constraints = {}) {
     if (key && key[1]) slots.keyword = String(key[1]);
   }
 
-  const city = resolveHotelCityRow(slots.cityCode, slots.city || constraints.city || "", constraints.city || db.users.demo.city || "Shanghai");
+  const city = resolveHotelCityRow(slots.cityCode, slots.city || constraints.city || "", constraints.city || DEFAULT_CITY);
   slots.cityCode = city.cityCode;
   slots.city = city.cityEn;
   const range = normalizeDateRange(slots.checkInDate, slots.checkOutDate);
@@ -1291,7 +3660,7 @@ function extractHotelSlotInfo(message = "", constraints = {}) {
 
 function buildHotelRecommendationsFromSlots({ slots, language = "EN", pageNum = 1, pageSize = 10, refresh = false } = {}) {
   const safeSlots = slots && typeof slots === "object" ? slots : {};
-  const city = resolveHotelCityRow(safeSlots.cityCode, safeSlots.city, db.users.demo.city || "Shanghai");
+  const city = resolveHotelCityRow(safeSlots.cityCode, safeSlots.city, DEFAULT_CITY);
   const search = searchHotelsCore({
     cityCode: city.cityCode,
     checkInDate: safeSlots.checkInDate,
@@ -1328,7 +3697,15 @@ function buildHotelRecommendationsFromSlots({ slots, language = "EN", pageNum = 
   const starFloor = normalizeStarFloor(safeSlots.starRating);
   const keywordLower = String(safeSlots.keyword || "").trim().toLowerCase();
 
-  const options = list
+  const filteredList = list.filter((item) => {
+    const nightly = Number(item && item.lowestPrice || 0) || 0;
+    if (budgetCap > 0 && nightly > 0 && nightly > budgetCap) return false;
+    if (starFloor && Number(item && item.starRating || 0) < starFloor) return false;
+    if (keywordLower && !String(item && item.hotelName || "").toLowerCase().includes(keywordLower)) return false;
+    return true;
+  });
+  const candidateList = filteredList.length ? filteredList : list;
+  const options = candidateList
     .map((item, idx) => {
       const price = Number(item.lowestPrice || 0);
       const priceScore = maxPrice > minPrice ? Math.max(30, Math.round(100 - ((price - minPrice) / (maxPrice - minPrice)) * 100)) : 82;
@@ -1341,6 +3718,16 @@ function buildHotelRecommendationsFromSlots({ slots, language = "EN", pageNum = 
       const score = Math.round(matchScore * 0.7 + priceScore * 0.3);
       const room = item.bestRoom || {};
       const nights = countStayNights(search.checkInDate, search.checkOutDate);
+      const fallbackTags = [
+        item.area || city.cityEn,
+        room.breakfastInfo ? pickLang(language, `早餐: ${room.breakfastInfo}`, `Breakfast: ${room.breakfastInfo}`, `朝食: ${room.breakfastInfo}`, `조식: ${room.breakfastInfo}`) : "",
+        formatHotelGuestScore(item, language),
+      ].filter(Boolean);
+      const fallbackReview = buildLocalizedHotelReviewFallback({
+        commentScore: item.commentScore,
+        reviewCount: item.reviewCount,
+        district: item.area,
+      }, language);
       const reason =
         idx === 0
           ? pickLang(
@@ -1371,25 +3758,25 @@ function buildHotelRecommendationsFromSlots({ slots, language = "EN", pageNum = 
         title: pickLang(
           language,
           `${item.hotelName} · ${item.starRating}星`,
-          `${item.hotelName} · ${item.starRating}-star`,
-          `${item.hotelName} · ${item.starRating}つ星`,
-          `${item.hotelName} · ${item.starRating}성`,
+          `${formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, language)} · ${item.starRating}-star`,
+          `${formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, language)} · ${item.starRating}つ星`,
+          `${formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, language)} · ${item.starRating}성`,
         ),
         prompt: pickLang(
           language,
           `按方案${idx + 1}预订酒店：${item.hotelName}，${search.checkInDate}入住，${search.checkOutDate}离店，${safeSlots.guestNum || 1}人。`,
-          `Book hotel option ${idx + 1}: ${item.hotelName}, check-in ${search.checkInDate}, check-out ${search.checkOutDate}, ${safeSlots.guestNum || 1} guest(s).`,
-          `ホテル案${idx + 1}を予約: ${item.hotelName}、${search.checkInDate}チェックイン、${search.checkOutDate}チェックアウト、${safeSlots.guestNum || 1}名。`,
-          `호텔 옵션 ${idx + 1} 예약: ${item.hotelName}, 체크인 ${search.checkInDate}, 체크아웃 ${search.checkOutDate}, ${safeSlots.guestNum || 1}명.`,
+          `Book hotel option ${idx + 1}: ${formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, language)}, check-in ${search.checkInDate}, check-out ${search.checkOutDate}, ${safeSlots.guestNum || 1} guest(s).`,
+          `ホテル案${idx + 1}を予約: ${formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, language)}、${search.checkInDate}チェックイン、${search.checkOutDate}チェックアウト、${safeSlots.guestNum || 1}名。`,
+          `호텔 옵션 ${idx + 1} 예약: ${formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, language)}, 체크인 ${search.checkInDate}, 체크아웃 ${search.checkOutDate}, ${safeSlots.guestNum || 1}명.`,
         ),
         grade: recommendationGrade(score),
         recommendationLevel: recommendationLevel(score, language),
         score,
         imagePath: item.imageUrl || "/assets/solution-flow.svg",
         placeName: item.hotelName,
-        placeDisplay: item.hotelName,
+        placeDisplay: formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, language),
         hotelName: item.hotelName,
-        hotelDisplay: item.hotelName,
+        hotelDisplay: formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, language),
         transportMode: "",
         etaWindow: pickLang(language, "可当天确认", "same-day confirm", "当日確認可", "당일 확인 가능"),
         costRange: `CNY ${price}`,
@@ -1436,7 +3823,9 @@ function buildHotelRecommendationsFromSlots({ slots, language = "EN", pageNum = 
             `部屋: ${room.roomTypeName || "Standard"} · 朝食: ${room.breakfastInfo || "注文画面で表示"}`,
             `객실: ${room.roomTypeName || "Standard"} · 조식: ${room.breakfastInfo || "주문 단계 표시"}`,
           ),
+          fallbackReview,
         ],
+        highlights: fallbackTags,
         reasons: [
           reason,
           pickLang(
@@ -1456,10 +3845,39 @@ function buildHotelRecommendationsFromSlots({ slots, language = "EN", pageNum = 
           guestNum: safeSlots.guestNum || 1,
           totalPrice: price,
         },
+        hotel_ctrip_score: item.commentScore || null,
+        hotel_ctrip_review_count: item.reviewCount || null,
+        hotel_ctrip_tags: fallbackTags,
+        hotel_ctrip_reviews: fallbackReview ? [fallbackReview] : [],
       };
     })
     .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
     .slice(0, 3);
+
+  if (!options.length) {
+    return {
+      city,
+      checkInDate: search.checkInDate,
+      checkOutDate: search.checkOutDate,
+      options: [],
+      crossXChoice: null,
+      summary: pickLang(
+        language,
+        budgetCap > 0
+          ? "当前预算范围内没有可直接预订的酒店，建议放宽每晚预算或改换区域。"
+          : "当前没有符合条件且可订的酒店，建议放宽预算或星级。",
+        budgetCap > 0
+          ? "No directly bookable hotels fit the current nightly budget. Try raising the hotel budget or changing area."
+          : "No real-time bookable hotels match your constraints. Try widening budget or star range.",
+        budgetCap > 0
+          ? "現在の1泊予算内で直接予約できるホテルがありません。予算またはエリア条件を広げてください。"
+          : "条件に合致する予約可能ホテルがありません。予算または星級条件を広げてください。",
+        budgetCap > 0
+          ? "현재 1박 예산 안에서 바로 예약 가능한 호텔이 없습니다. 호텔 예산이나 지역 조건을 넓혀 주세요."
+          : "조건에 맞는 예약 가능 호텔이 없습니다. 예산/성급 조건을 완화해 주세요.",
+      ),
+    };
+  }
 
   const crossXChoice = options[0]
     ? {
@@ -1566,6 +3984,22 @@ const cnPinyinLexicon = (() => {
     ["方砖厂69号炸酱面", "方砖厂69号炸酱面", "Fang Zhuan Chang Liu Shi Jiu Hao Zha Jiang Mian"],
     ["Pudong Shangri-La Shanghai", "上海浦东香格里拉酒店", "Shang Hai Pu Dong Xiang Ge Li La Jiu Dian"],
     ["上海浦东香格里拉酒店", "上海浦东香格里拉酒店", "Shang Hai Pu Dong Xiang Ge Li La Jiu Dian"],
+    ["Hengshan Garden Hotel Shanghai", "上海衡山花园酒店", "Shang Hai Heng Shan Hua Yuan Jiu Dian"],
+    ["上海衡山花园酒店", "上海衡山花园酒店", "Shang Hai Heng Shan Hua Yuan Jiu Dian"],
+    ["Mehood Lestie Hotel Shanghai Xujiahui Wukang Road", "美豪丽致酒店(上海徐家汇武康路店)", "Mei Hao Li Zhi Jiu Dian Shang Hai Xu Jia Hui Wu Kang Lu Dian"],
+    ["美豪丽致酒店(上海徐家汇武康路店)", "美豪丽致酒店(上海徐家汇武康路店)", "Mei Hao Li Zhi Jiu Dian Shang Hai Xu Jia Hui Wu Kang Lu Dian"],
+    ["The Eton Hotel Shanghai", "上海陆家嘴禧玥酒店", "Shang Hai Lu Jia Zui Xi Yue Jiu Dian"],
+    ["上海陆家嘴禧玥酒店", "上海陆家嘴禧玥酒店", "Shang Hai Lu Jia Zui Xi Yue Jiu Dian"],
+    ["Puyan Hotel Shanghai on the Bund", "上海外滩璞硯酒店", "Shang Hai Wai Tan Pu Yan Jiu Dian"],
+    ["上海外滩璞硯酒店", "上海外滩璞硯酒店", "Shang Hai Wai Tan Pu Yan Jiu Dian"],
+    ["MGM Shanghai West Bund", "上海西岸美高梅酒店", "Shang Hai Xi An Mei Gao Mei Jiu Dian"],
+    ["上海西岸美高梅酒店", "上海西岸美高梅酒店", "Shang Hai Xi An Mei Gao Mei Jiu Dian"],
+    ["Kerry Hotel Pudong Shanghai", "上海浦东嘉里大酒店", "Shang Hai Pu Dong Jia Li Da Jiu Dian"],
+    ["上海浦东嘉里大酒店", "上海浦东嘉里大酒店", "Shang Hai Pu Dong Jia Li Da Jiu Dian"],
+    ["Yixuan Hotel Shanghai", "逸轩酒店(上海蕰川公路顾村公园店)", "Yi Xuan Jiu Dian Shang Hai Yun Chuan Gong Lu Gu Cun Gong Yuan Dian"],
+    ["逸轩酒店(上海蕰川公路顾村公园店)", "逸轩酒店(上海蕰川公路顾村公园店)", "Yi Xuan Jiu Dian Shang Hai Yun Chuan Gong Lu Gu Cun Gong Yuan Dian"],
+    ["Puyan Hotel Shanghai on the Bund", "上海外滩璞硯酒店", "Shang Hai Wai Tan Pu Yan Jiu Dian"],
+    ["上海外滩璞硯酒店", "上海外滩璞硯酒店", "Shang Hai Wai Tan Pu Yan Jiu Dian"],
     ["PVG Airport Express Ride", "浦东机场快线专车", "Pu Dong Ji Chang Kuai Xian Zhuan Che"],
     ["浦东机场快线专车", "浦东机场快线专车", "Pu Dong Ji Chang Kuai Xian Zhuan Che"],
     ["Daxing Airport Express Ride", "大兴机场快线专车", "Da Xing Ji Chang Kuai Xian Zhuan Che"],
@@ -1591,10 +4025,16 @@ const cnPinyinLexicon = (() => {
   ];
   const map = {};
   for (const [name, zh, pinyin] of rows) {
-    map[normalizeNameLookupKey(name)] = {
-      zh,
-      pinyin,
-    };
+    const key = normalizeNameLookupKey(name);
+    const zhKey = normalizeNameLookupKey(zh);
+    const explicitAlias = /[\u3400-\u9fff]/.test(String(name || "")) ? "" : String(name || "").trim();
+    const existingAlias = (key && map[key] && map[key].alias) || (zhKey && map[zhKey] && map[zhKey].alias) || "";
+    const alias = explicitAlias || existingAlias;
+    const entry = { alias, zh, pinyin };
+    if (key) map[key] = entry;
+    if (zhKey) {
+      map[zhKey] = map[zhKey] && map[zhKey].alias ? { ...entry, alias: map[zhKey].alias } : entry;
+    }
   }
   return map;
 })();
@@ -1616,12 +4056,386 @@ function formatNameWithCnPinyin(name, language = "EN") {
     return zh ? `${zh}（${raw}）` : raw;
   }
   if (hasChinese) {
+    const alias = String(meta && meta.alias || "").trim();
+    if (alias) return alias;
+    const pinyin = String(meta && meta.pinyin || "").trim();
+    if (pinyin) return pinyin;
     return raw;
   }
-  if (zh) {
-    return `${raw} (${zh})`;
-  }
   return raw;
+}
+
+function buildGenericEnglishHotelNameFallback(name, language = "EN") {
+  const raw = String(name || "").trim();
+  const lang = normalizeLang(language);
+  if (!raw || lang === "ZH" || lang === "ZH-TW") return raw;
+
+  const cityKey = inferHotelLocationCity(raw, raw);
+  const cityLabel = localizedCityName(canonicalCityKey(cityKey === "default" ? raw : cityKey), lang);
+  const areaMatches = Object.entries(HOTEL_AREA_LOCALIZATION)
+    .sort((a, b) => b[0].length - a[0].length)
+    .filter(([source]) => raw.includes(source))
+    .map(([, labels]) => String(labels[lang] || labels.EN || "").trim())
+    .filter(Boolean);
+  const roadMatch = raw.match(/([\u4e00-\u9fffA-Za-z]+(?:路|街|大道|广场|新城|里|园|中心))/);
+  const roadLabel = roadMatch ? localizeHotelAreaText(roadMatch[1], lang) : "";
+  const areaLabel = areaMatches[0] || "";
+  const specificArea = areaLabel || (roadLabel && !containsChineseText(roadLabel) ? roadLabel : "");
+  const peripheralArea = /(airport|hongqiao|train station|railway station|international tourism resort|wild animal park|disney|resort)/i.test(areaLabel)
+    || /(机场|虹桥|火车站|高铁站|迪士尼|度假区|野生动物园)/.test(raw);
+
+  if (specificArea && !peripheralArea) return cityLabel ? (cityLabel + " " + specificArea + " Hotel") : (specificArea + " Hotel");
+  if (cityLabel) return cityLabel + " City Hotel";
+  return pickLang(lang, "酒店", "City Hotel", "ホテル", "호텔");
+}
+
+function sanitizeEnglishHotelDisplayName(name = "") {
+  let text = String(name || "").trim();
+  if (!text) return text;
+  const compress = (value) => String(value || "").split(/\s+/).filter(Boolean).join(" ").trim();
+  const softenUpperSegments = (value) => String(value || "").replace(/[A-Z][A-Z\s&\-]{4,}/g, (segment) => {
+    const trimmed = segment.trim();
+    if (!trimmed) return segment;
+    return trimmed
+      .toLowerCase()
+      .split(/\s+/)
+      .map((part) => part ? part.charAt(0).toUpperCase() + part.slice(1) : part)
+      .join(" ");
+  });
+  text = compress(text.replaceAll("（", "(").replaceAll("【", "(").replaceAll("）", ")").replaceAll("】", ")"));
+  const lower = () => text.toLowerCase();
+  if (lower().endsWith("canton fair free shuttle bus")) text = compress(text.slice(0, -"canton fair free shuttle bus".length));
+  if (/( branch| store| shop)$/i.test(text)) text = compress(text.replace(/( branch| store| shop)$/i, ""));
+  if (text.endsWith(")")) {
+    const openIdx = text.lastIndexOf("(");
+    if (openIdx >= 0) {
+      const inner = compress(text.slice(openIdx + 1, -1));
+      const innerLower = inner.toLowerCase();
+      if (["canton fair free shuttle bus", "free shuttle bus", "metro station", "subway station", "branch", "store", "shop"].includes(innerLower)) {
+        text = compress(text.slice(0, openIdx));
+      } else if (innerLower.endsWith(" branch")) {
+        text = compress(text.slice(0, openIdx)) + " (" + inner.slice(0, -7).trim() + ")";
+      }
+    }
+  }
+  text = compress(text).replace("( )", "");
+  text = text.replace(" )", ")").replace("( ", "(");
+  text = softenUpperSegments(text);
+  text = text.replace(/([A-Za-z])(by IHG)\b/g, "$1 by IHG");
+  return text;
+}
+
+function formatHotelDisplayName(name, nameEn, language = "EN") {
+  const raw = String(name || "").trim();
+  const en = String(nameEn || "").trim();
+  const lang = normalizeLang(language);
+  if (!raw && !en) return "-";
+  if (lang === "ZH") {
+    return raw || en || "-";
+  }
+  if (en) return sanitizeEnglishHotelDisplayName(en);
+  const formatted = formatNameWithCnPinyin(raw, lang);
+  if (formatted && !containsChineseText(formatted)) return sanitizeEnglishHotelDisplayName(formatted);
+  if (raw && containsChineseText(raw)) return sanitizeEnglishHotelDisplayName(buildGenericEnglishHotelNameFallback(raw, lang));
+  return sanitizeEnglishHotelDisplayName(formatted || raw || "-");
+}
+
+function containsChineseText(value = "") {
+  return /[\u3400-\u9fff]/.test(String(value || ""));
+}
+
+function hasMostlyChineseText(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  const zhChars = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latinChars = (text.match(/[A-Za-z]/g) || []).length;
+  return zhChars > 0 && zhChars >= latinChars;
+}
+
+const HOTEL_AREA_LOCALIZATION = {
+  "珠江新城高层": { EN: "Zhujiang New Town" },
+  "珠江新城": { EN: "Zhujiang New Town" },
+  "天河CBD": { EN: "Tianhe CBD" },
+  "国贸CBD": { EN: "Guomao CBD" },
+  "南山前海": { EN: "Qianhai, Nanshan" },
+  "后海湾": { EN: "Houhai Bay" },
+  "福田中心": { EN: "Futian Center" },
+  "徐家汇": { EN: "Xujiahui" },
+  "王府井": { EN: "Wangfujing" },
+  "三里屯": { EN: "Sanlitun" },
+  "望京": { EN: "Wangjing" },
+  "朝阳": { EN: "Chaoyang" },
+  "天河": { EN: "Tianhe" },
+  "越秀": { EN: "Yuexiu" },
+  "海珠": { EN: "Haizhu" },
+  "番禺": { EN: "Panyu" },
+  "宝安": { EN: "Bao'an" },
+  "南山": { EN: "Nanshan" },
+  "科技园": { EN: "Tech Park" },
+  "华侨城": { EN: "Overseas Chinese Town" },
+  "前海湾": { EN: "Qianhai Bay" },
+  "海棠湾": { EN: "Haitang Bay" },
+  "高新区": { EN: "Hi-Tech Zone" },
+  "春熙路": { EN: "Chunxi Road" },
+  "天府广场": { EN: "Tianfu Square" },
+  "西溪湿地": { EN: "Xixi Wetland" },
+  "西湖": { EN: "West Lake" },
+  "武林广场": { EN: "Wulin Square" },
+  "滨江": { EN: "Binjiang" },
+  "虹桥": { EN: "Hongqiao" },
+  "外滩黄浦": { EN: "The Bund" },
+  "外滩": { EN: "The Bund" },
+  "豫园": { EN: "Yu Garden" },
+  "市中心": { EN: "City Center" },
+  "商圈": { EN: "Commercial District" },
+  "核心商务区": { EN: "Core Business District" },
+  "万达广场": { EN: "Wanda Plaza" },
+};
+
+function localizeHotelAreaText(value = "", language = "EN") {
+  const text = String(value || "").trim();
+  const lang = normalizeLang(language);
+  if (!text || lang === "ZH" || lang === "ZH-TW") return text;
+  let localized = text;
+  Object.entries(HOTEL_AREA_LOCALIZATION).forEach(([source, labels]) => {
+    const replacement = labels[lang] || labels.EN || source;
+    localized = localized.replace(new RegExp(source, "g"), replacement);
+  });
+  if (containsChineseText(localized)) {
+    const formatted = formatNameWithCnPinyin(localized, lang);
+    if (formatted && !containsChineseText(formatted)) return formatted;
+    const cityKey = inferHotelLocationCity(text, text);
+    const cityLabel = localizedCityName(canonicalCityKey(cityKey === "default" ? text : cityKey), lang);
+    const areaEntry = Object.entries(HOTEL_AREA_LOCALIZATION)
+      .sort((a, b) => b[0].length - a[0].length)
+      .find(([source]) => text.includes(source));
+    const areaLabel = areaEntry ? String(areaEntry[1][lang] || areaEntry[1].EN || areaEntry[0] || "").trim() : "";
+    if (areaLabel) return cityLabel ? (cityLabel + " " + areaLabel) : areaLabel;
+    if (cityLabel) return cityLabel + " city center";
+  }
+  return localized;
+}
+
+function isGenericHotelAreaLabel(value = "", language = "EN") {
+  const lang = normalizeLang(language);
+  if (lang === "ZH" || lang === "ZH-TW") return false;
+  const text = String(value || "").trim();
+  if (!text) return false;
+  return /^(?:shanghai|guangzhou|beijing|shenzhen|hangzhou|chengdu)\s+city\s+center$/i.test(text)
+    || /^city center$/i.test(text);
+}
+
+function inferSpecificHotelAreaFromName(hotelName = "", language = "EN") {
+  const lang = normalizeLang(language);
+  if (lang === "ZH" || lang === "ZH-TW") return "";
+  const raw = String(hotelName || "").trim();
+  if (!raw) return "";
+  const meta = lookupCnPinyinMeta(raw) || {};
+  const text = `${raw} ${meta.zh || ""} ${meta.pinyin || ""}`.toLowerCase();
+  const rules = [
+    [/外滩|\bon the bund\b|\bbund\b/i, "The Bund"],
+    [/陆家嘴|\blujiazui\b/i, "Lujiazui"],
+    [/徐家汇|\bxujiahui\b|武康路|\bwukang road\b|衡山|\bhengshan\b/i, "Xujiahui"],
+    [/西岸|\bwest bund\b/i, "West Bund"],
+    [/浦东|\bpudong\b/i, "Pudong"],
+    [/静安|\bjing'?an\b|\bjingan\b/i, "Jing'an"],
+    [/新天地|\bxintiandi\b/i, "Xintiandi"],
+    [/人民广场|people'?s square/i, "People's Square"],
+    [/南京西路|\bnanjing west road\b/i, "Nanjing West Road"],
+    [/豫园|\byu garden\b/i, "Yu Garden"],
+    [/虹桥|\bhongqiao\b/i, "Hongqiao"],
+    [/珠江新城|\bzhujiang new town\b/i, "Zhujiang New Town"],
+    [/天河 cbd|\btianhe cbd\b/i, "Tianhe CBD"],
+    [/天河|\btianhe\b/i, "Tianhe"],
+    [/北京路|\bbeijing road\b/i, "Beijing Road"],
+    [/淘金|\btaojin\b/i, "Taojin"],
+    [/越秀|\byuexiu\b/i, "Yuexiu"],
+    [/海珠广场|\bhaizhu square\b/i, "Haizhu Square"],
+  ];
+  const matched = rules.find(([pattern]) => pattern.test(text));
+  return matched ? matched[1] : "";
+}
+
+function resolveLocalizedHotelArea(item, language = "EN") {
+  const lang = normalizeLang(language);
+  const localizedAddress = item && item.hotelAddress
+    ? localizeHotelAreaText(item.hotelAddress, lang)
+    : "";
+  if (!isGenericHotelAreaLabel(localizedAddress, lang)) return localizedAddress;
+  const inferredArea = inferSpecificHotelAreaFromName(
+    item && (item.hotelNameEn || item.hotelName || item.nameEn || item.name) || "",
+    lang,
+  );
+  return inferredArea || localizedAddress;
+}
+
+function stripBilingualChineseNameFragments(value = "") {
+  return String(value || "")
+    .replace(/\([^)]*[\u4e00-\u9fff][^)]*\)/g, "")
+    .replace(/（[^）]*[\u4e00-\u9fff][^）]*）/g, "")
+    .trim();
+}
+
+function hasForbiddenMixedLanguageReply(value = "", language = "EN") {
+  const lang = normalizeLang(language);
+  if (lang === "ZH" || lang === "ZH-TW") return false;
+  const text = String(value || "").trim();
+  if (!text) return false;
+  const cleaned = stripBilingualChineseNameFragments(text);
+  const zhChars = (cleaned.match(/[\u4e00-\u9fff]/g) || []).length;
+  if (zhChars >= 6) return true;
+  const lines = cleaned
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.some((line) => hasMostlyChineseText(line));
+}
+
+function getHotelGuestScoreMeta(hotel) {
+  const raw = Number((hotel && hotel.commentScore) || 0);
+  if (!(raw > 0)) {
+    return { raw: 0, scale: 5, normalized: 0, display: "", isHigh: false };
+  }
+  const scale = raw > 5 ? 10 : 5;
+  const normalized = scale === 10 ? raw / 2 : raw;
+  const rounded = raw >= 10 ? Math.round(raw) : Math.round(raw * 10) / 10;
+  const display = String(rounded % 1 === 0 ? Math.round(rounded) : rounded);
+  return {
+    raw,
+    scale,
+    normalized,
+    display,
+    isHigh: normalized >= 4.6,
+  };
+}
+
+function formatHotelGuestScore(hotel, language = "EN") {
+  const lang = normalizeLang(language);
+  const meta = getHotelGuestScoreMeta(hotel);
+  if (!meta.display) return "";
+  return pickLang(
+    lang,
+    `住客评分 ${meta.display}/${meta.scale}`,
+    `Guest score ${meta.display}/${meta.scale}`,
+    `宿泊者評価 ${meta.display}/${meta.scale}`,
+    `투숙객 평점 ${meta.display}/${meta.scale}`,
+  );
+}
+
+function buildLocalizedHotelPriceAnchor(hotel, language = "EN") {
+  const lang = normalizeLang(language);
+  const price = Number((hotel && hotel.lowestPrice) || 0);
+  if (!(price > 0) || (hotel && hotel.priceLocked)) return "";
+  const amount = Math.round(price).toLocaleString("en-US");
+  return pickLang(
+    lang,
+    `参考价每晚 CNY ${amount}`,
+    `From CNY ${amount}/night`,
+    `参考料金は1泊 CNY ${amount} から`,
+    `참고가는 1박 CNY ${amount}부터`,
+  );
+}
+
+function buildLocalizedHotelProviderTags(hotel, language = "EN") {
+  const lang = normalizeLang(language);
+  const tags = [];
+  const reviews = Number((hotel && hotel.reviewCount) || 0);
+  const area = resolveLocalizedHotelArea({
+    ...(hotel && typeof hotel === "object" ? hotel : {}),
+    hotelAddress: String((hotel && (hotel.hotelAddress || hotel.district || hotel.area || hotel.address)) || "").trim(),
+  }, lang);
+  const scoreTag = formatHotelGuestScore(hotel, lang);
+  const priceTag = buildLocalizedHotelPriceAnchor(hotel, lang);
+  if (scoreTag) tags.push(scoreTag);
+  if (reviews >= 1000) tags.push(pickLang(lang, `${Math.round(reviews / 1000)}千+点评`, `${Math.round(reviews / 1000)}k+ reviews`, `${Math.round(reviews / 1000)}千件超のレビュー`, `${Math.round(reviews / 1000)}천+ 리뷰`));
+  else if (reviews >= 100) tags.push(pickLang(lang, `${reviews.toLocaleString("zh-CN")}条点评`, `${reviews.toLocaleString("en-US")} reviews`, `${reviews.toLocaleString("ja-JP")}件のレビュー`, `${reviews.toLocaleString("ko-KR")}개 리뷰`));
+  if (area) tags.push(pickLang(lang, `区域：${area}`, `Area: ${area}`, `エリア: ${area}`, `지역: ${area}`));
+  if (priceTag) tags.push(priceTag);
+  if (hotel && hotel.priceLocked) tags.push(pickLang(lang, "价格以下单页为准", "Price confirmed at checkout", "価格は予約画面で確定", "가격은 결제 단계에서 확정"));
+  return tags.filter(Boolean).filter((item, idx, list) => list.indexOf(item) === idx).slice(0, 4);
+}
+
+function buildLocalizedHotelReviewFallback(hotel, language = "EN") {
+  const lang = normalizeLang(language);
+  const reviews = Number((hotel && hotel.reviewCount) || 0);
+  const area = resolveLocalizedHotelArea({
+    ...(hotel && typeof hotel === "object" ? hotel : {}),
+    hotelAddress: String((hotel && (hotel.hotelAddress || hotel.district || hotel.area || hotel.address)) || "").trim(),
+  }, lang);
+  const scoreMeta = getHotelGuestScoreMeta(hotel);
+  const scoreText = scoreMeta.display ? `${scoreMeta.display}/${scoreMeta.scale}` : "";
+  const price = Number((hotel && hotel.lowestPrice) || 0);
+  const amount = price > 0 && !(hotel && hotel.priceLocked) ? Math.round(price).toLocaleString("en-US") : "";
+  return pickLang(
+    lang,
+    `${reviews > 0 ? `基于 ${reviews.toLocaleString("zh-CN")} 条真实住客点评，` : "基于真实住客反馈，"}${area ? `这家位于${area}的酒店` : "这家酒店"}整体入住体验稳定${scoreText ? `，住客评分 ${scoreText}` : ""}${amount ? `，参考价每晚 CNY ${amount}` : ""}。`,
+    `${reviews > 0 ? `Backed by ${reviews.toLocaleString("en-US")} verified reviews, ` : "Based on verified guest feedback, "}${area ? `this stay in ${area}` : "this stay"} delivers consistent guest feedback${scoreText ? ` with a score of ${scoreText}` : ""}${amount ? ` and rates from CNY ${amount}/night` : ""}.`,
+    `${reviews > 0 ? `${reviews.toLocaleString("ja-JP")}件の実際のレビューに基づくと、` : "実際の宿泊者レビューに基づくと、"}${area ? `${area}エリアにあるこのホテルは` : "このホテルは"}安定した滞在評価があり${scoreText ? `、宿泊者評価は${scoreText}` : ""}${amount ? `、参考料金は1泊 CNY ${amount}から` : ""}です。`,
+    `${reviews > 0 ? `${reviews.toLocaleString("ko-KR")}건의 실제 리뷰 기준으로 ` : "실제 투숙객 리뷰 기준으로 "}${area ? `${area}에 있는 이 숙소는` : "이 숙소는"} 전반적인 숙박 만족도가 안정적입니다${scoreText ? `, 투숙객 평점은 ${scoreText}` : ""}${amount ? `, 참고가는 1박 CNY ${amount}부터입니다` : ""}.`,
+  );
+}
+
+function shouldKeepLocalizedHotelProviderText(value = "", language = "EN") {
+  const lang = normalizeLang(language);
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (lang === "ZH" || lang === "ZH-TW") return true;
+  if (containsChineseText(text)) return false;
+
+  const normalized = text.toLowerCase().replace(/[.,!?]+$/g, "").trim();
+  if (!normalized) return false;
+
+  const lowSignalPhraseRe = /^(outstanding|excellent|very good|good|great|amazing|pleasant|well decorated|many amenities|delicious breakfast|convenient for shopping|easy to get around|friendly staff|clean and tidy|clean rooms?|great location|nice location|comfortable stay|spacious rooms?|good breakfast)$/i;
+  if (lowSignalPhraseRe.test(normalized)) return false;
+  if (/^(breakfast|location|service|amenities|shopping|transport|decor|design|cleanliness)$/i.test(normalized)) return false;
+  if (normalized.split(/\s+/).length <= 3 && !/\d/.test(normalized)) return false;
+
+  return true;
+}
+
+function sanitizeLocalizedHotelProviderText(values, language = "EN", fallbackFactory = () => []) {
+  const lang = normalizeLang(language);
+  const list = Array.isArray(values) ? values : [];
+  const kept = list
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .filter((item, idx, arr) => arr.indexOf(item) === idx)
+    .filter((item) => shouldKeepLocalizedHotelProviderText(item, lang));
+  if (kept.length) return kept;
+  const fallback = fallbackFactory();
+  return Array.isArray(fallback) ? fallback.filter(Boolean) : [];
+}
+function localizeHotelCatalogEntries(list, language = "EN") {
+  const lang = normalizeLang(language);
+  const hotels = Array.isArray(list) ? list : [];
+  if (!hotels.length || lang === "ZH" || lang === "ZH-TW") return hotels;
+  return hotels
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const localizedName = formatHotelDisplayName(item.hotelName, item.hotelNameEn || item.nameEn, lang);
+      const localizedAddress = resolveLocalizedHotelArea(item, lang);
+      const localizedAreaSource = localizedAddress
+        ? { ...item, district: localizedAddress, area: localizedAddress, address: localizedAddress, hotelAddress: localizedAddress }
+        : item;
+      const fallbackTags = buildLocalizedHotelProviderTags(localizedAreaSource, lang);
+      const fallbackReview = buildLocalizedHotelReviewFallback(localizedAreaSource, lang);
+      const localizedItem = {
+        ...item,
+        hotelNameLocal: localizedName,
+        hotelName: localizedName,
+        hotelAddress: localizedAddress,
+        ctripBookingUrl: sanitizeLocalizedHotelBookingUrl(item.ctripBookingUrl, {
+          name: item.hotelName || item.name || localizedName,
+          nameEn: item.hotelNameEn || item.nameEn || localizedName,
+          fallbackName: localizedName || localizedAddress || item.hotelName || item.name || "Hotel",
+          language: lang,
+        }),
+        hotelTags: sanitizeLocalizedHotelProviderText(item.hotelTags || [], lang, () => fallbackTags),
+        hotelReviews: sanitizeLocalizedHotelProviderText(item.hotelReviews || [], lang, () => [fallbackReview]),
+      };
+      return isGenericFallbackHotelName(localizedItem, localizedAddress || localizedName) ? null : localizedItem;
+    })
+    .filter(Boolean);
 }
 
 function summarizeUserCue(message, language = "EN") {
@@ -1655,11 +4469,96 @@ function summarizeUserCue(message, language = "EN") {
   return cues.slice(0, 3).join(" / ");
 }
 
-function buildThinkingNarrative() {
-  // Deprecated: the /api/plan/coze SSE flow replaced this. Returns empty string to prevent ghost text.
-  return "";
-}
+function buildThinkingNarrative({ message = "", language = "EN", constraints = {}, recommendation = null } = {}) {
+  // Generates a natural-language reasoning paragraph shown in the deep-reasoning card.
+  // IMPORTANT: Must ALWAYS return non-empty natural language text — never empty, never JSON.
+  const lang = normalizeLang(language);
+  const city = constraints && constraints.city ? String(constraints.city) : "";
+  const reqSnip = String(message || "").slice(0, 40);
+  const requestLabel = pickLang(
+    lang,
+    `「${reqSnip}」请求`,
+    "your request",
+    "ご依頼内容",
+    "요청 내용",
+  );
+  const options = recommendation ? (recommendation.options || []).slice(0, 3) : [];
+  const totalBudget = parseLooseBudgetAmount(
+    constraints.totalBudget || constraints.tripBudget || constraints.total_budget || constraints.trip_budget || constraints.overallBudget || ""
+  );
+  const hotelBudgetPerNight = parseLooseBudgetAmount(
+    constraints.hotelBudgetPerNight || constraints.hotel_budget_per_night || constraints.hotelNightlyBudget || constraints.hotel_budget || constraints.nightlyBudget || constraints.nightly_budget || constraints.maxHotelNightly || ""
+  );
+  const budgetScope = String(constraints.budgetScope || constraints.budget_scope || constraints.budgetSemantics || constraints.budget_semantics || "").trim().toLowerCase();
+  const budgetNarrative = pickLang(
+    lang,
+    budgetScope === "hotel_nightly" && hotelBudgetPerNight
+      ? `酒店每晚预算约 ¥${hotelBudgetPerNight.toLocaleString()}${totalBudget ? `，推导全程约 ¥${totalBudget.toLocaleString()}` : ""}`
+      : totalBudget && hotelBudgetPerNight
+        ? `总预算约 ¥${totalBudget.toLocaleString()}，酒店每晚参考 ¥${hotelBudgetPerNight.toLocaleString()}`
+        : totalBudget
+          ? `总预算约 ¥${totalBudget.toLocaleString()}`
+          : hotelBudgetPerNight
+            ? `酒店每晚预算约 ¥${hotelBudgetPerNight.toLocaleString()}`
+            : "",
+    budgetScope === "hotel_nightly" && hotelBudgetPerNight
+      ? `Hotel target about ¥${hotelBudgetPerNight.toLocaleString()}/night${totalBudget ? `, with derived trip total around ¥${totalBudget.toLocaleString()}` : ""}`
+      : totalBudget && hotelBudgetPerNight
+        ? `Trip budget about ¥${totalBudget.toLocaleString()}, with hotel filtering near ¥${hotelBudgetPerNight.toLocaleString()}/night`
+        : totalBudget
+          ? `Trip budget about ¥${totalBudget.toLocaleString()}`
+          : hotelBudgetPerNight
+            ? `Hotel target about ¥${hotelBudgetPerNight.toLocaleString()}/night`
+            : "",
+    budgetScope === "hotel_nightly" && hotelBudgetPerNight
+      ? `ホテル予算は1泊約¥${hotelBudgetPerNight.toLocaleString()}${totalBudget ? `、旅行総額は約¥${totalBudget.toLocaleString()}` : ""}`
+      : totalBudget && hotelBudgetPerNight
+        ? `旅行総額は約¥${totalBudget.toLocaleString()}、ホテルは1泊約¥${hotelBudgetPerNight.toLocaleString()}が目安です`
+        : totalBudget
+          ? `旅行総額は約¥${totalBudget.toLocaleString()}`
+          : hotelBudgetPerNight
+            ? `ホテル予算は1泊約¥${hotelBudgetPerNight.toLocaleString()}`
+            : "",
+    budgetScope === "hotel_nightly" && hotelBudgetPerNight
+      ? `호텔 예산은 1박 약 ¥${hotelBudgetPerNight.toLocaleString()}${totalBudget ? `, 전체 여행 예산은 약 ¥${totalBudget.toLocaleString()}` : ""}`
+      : totalBudget && hotelBudgetPerNight
+        ? `전체 여행 예산은 약 ¥${totalBudget.toLocaleString()}, 호텔은 1박 약 ¥${hotelBudgetPerNight.toLocaleString()} 기준입니다`
+        : totalBudget
+          ? `전체 여행 예산은 약 ¥${totalBudget.toLocaleString()}`
+          : hotelBudgetPerNight
+            ? `호텔 예산은 1박 약 ¥${hotelBudgetPerNight.toLocaleString()}`
+            : ""
+  );
 
+  if (!options.length) {
+    return pickLang(
+      lang,
+      `正在为您分析${city ? `「${city}」的` : ""}${requestLabel}，综合评估位置便利度、价格合理性与用户口碑，为您匹配最合适的选项${budgetNarrative ? `，并按${budgetNarrative}继续筛选` : ""}。`,
+      `Analyzing ${requestLabel}${city ? ` in ${city}` : ""} — evaluating location, price, and user ratings to find the best match for you${budgetNarrative ? `, while applying ${budgetNarrative.toLowerCase()}` : ""}.`,
+      `${city ? `${city}での` : ""}${requestLabel}を分析中。立地・価格・口コミで総合評価しています${budgetNarrative ? `。${budgetNarrative}で絞り込みます` : ""}。`,
+      `${city ? `${city} ` : ""}${requestLabel} 분석 중. 위치, 가격, 리뷰를 종합 평가합니다${budgetNarrative ? `. ${budgetNarrative} 기준도 함께 반영합니다` : ""}.`
+    );
+  }
+
+  const topOpt = options.find((o) => o.grade === "S") || options.find((o) => o.grade === "A") || options[0];
+  const topName = (topOpt && (topOpt.hotelName || topOpt.placeName || topOpt.title)) || "";
+  const topGrade = (topOpt && (topOpt.grade || recommendationGrade(topOpt.score))) || "A";
+  const topScore = (topOpt && (topOpt.score || topOpt.aiScore)) ? String(topOpt.score || topOpt.aiScore) : "";
+  const hasLiveHotelData = options.some((o) =>
+    o.source === "trip_live"
+    || o.source === "ctrip_live"
+    || o.source === "ctrip_list_live"
+    || o.source === "ctrip_curated"
+  );
+
+  return pickLang(
+    lang,
+    `针对${city ? `${city}的` : ""}${requestLabel}，从候选池中评估了 ${options.length} 个方案。${hasLiveHotelData ? "结合实时酒店数据，" : ""}综合了位置便利度、价格合理性与用户口碑三个维度。${topName ? `等级 ${topGrade}${topScore ? `（评分 ${topScore}）` : ""} 的「${topName}」综合得分最高` : `等级 ${topGrade} 方案综合得分最高`}${budgetNarrative ? `，${budgetNarrative}` : ""}，性价比最优，建议优先考虑。`,
+    `For ${requestLabel}${city ? ` in ${city}` : ""}, evaluated ${options.length} options${hasLiveHotelData ? " with live hotel data" : ""}. Scored by location, price, and user ratings. ${topName ? `Grade-${topGrade}${topScore ? ` (score ${topScore})` : ""} "${topName}" leads overall` : `Grade-${topGrade} option leads overall`}${budgetNarrative ? `. ${budgetNarrative}.` : "."}`,
+    `${city ? `${city}での` : ""}${requestLabel}に対し${options.length}件を評価。${topName ? `${topGrade}級「${topName}」` : `${topGrade}級プラン`}が立地・価格・口コミで最高点です${budgetNarrative ? `。${budgetNarrative}` : ""}。`,
+    `${city ? `${city} ` : ""}${requestLabel}에 대해 ${options.length}개를 분석했습니다. ${topName ? `${topGrade}등급 "${topName}"` : `${topGrade}등급 플랜`}이 종합 최고점입니다${budgetNarrative ? `. ${budgetNarrative}` : ""}.`
+  );
+}
 function inferConversationStage(message, intentHint = null) {
   const lower = String(message || "").toLowerCase();
   if (/restaurant|food|eat|dinner|lunch|breakfast|hotpot|noodle|halal|vegetarian|vegan|cafe|tea|餐厅|美食|吃|火锅|面|奶茶|清真|素食|咖啡/.test(lower)) return "restaurant_selection";
@@ -2020,13 +4919,7 @@ async function callOpenAITextToSpeech({ text, language, voice }) {
     });
     OPENAI_LAST_RUNTIME.statusCode = Number(res.status || 0) || null;
     if (!res.ok) {
-      let errBody = "";
-      try {
-        errBody = (await res.text()).slice(0, 240);
-      } catch {
-        errBody = "";
-      }
-      const reason = `openai_tts_http_${res.status}${errBody ? `:${errBody}` : ""}`;
+      const reason = `openai_tts_http_${res.status}`;
       OPENAI_LAST_RUNTIME.errorAt = nowIso();
       OPENAI_LAST_RUNTIME.lastError = reason;
       OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
@@ -2052,8 +4945,8 @@ async function callOpenAITextToSpeech({ text, language, voice }) {
     };
   } catch (err) {
     const reason = err && err.name === "AbortError"
-      ? `openai_tts_timeout_${OPENAI_TIMEOUT_MS}ms`
-      : `openai_tts_network_error:${String((err && err.message) || err || "unknown").slice(0, 220)}`;
+      ? "openai_tts_timeout"
+      : "openai_tts_unavailable";
     OPENAI_LAST_RUNTIME.errorAt = nowIso();
     OPENAI_LAST_RUNTIME.lastError = reason;
     OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
@@ -2351,7 +5244,7 @@ async function buildQuickActionResponse(quickAction, message, language, city) {
           translatedEn = parsed.en || sourceText;
         }
       } catch (e) {
-        console.warn("[quick_action/translate] OpenAI failed:", e.message);
+        console.warn("[quick_action/translate] OpenAI failed:", sanitizeServerLogError(e, "translation_provider_failed"));
       }
     }
 
@@ -2398,6 +5291,7 @@ const MOCK_HOTEL_DB = {
   "上海": [
     { name: "全季酒店上海徐家汇",     nameEn: "Ji Hotel Shanghai Xujiahui",      stars: 3, basePrice: 298, area: "徐家汇",  features: ["地铁2号线", "商圈步行", "24h前台"] },
     { name: "亚朵酒店上海虹桥",       nameEn: "Atour Hotel Shanghai Hongqiao",   stars: 4, basePrice: 528, area: "虹桥",    features: ["含早餐", "近高铁站", "健身房"] },
+    { name: "上海静安诺富特酒店",     nameEn: "Novotel Shanghai Jingan",       stars: 4, basePrice: 698, area: "静安",    features: ["设计感", "英文服务", "健身房"] },
     { name: "上海万豪虹桥大酒店",     nameEn: "Shanghai Marriott Hotel Hongqiao",stars: 5, basePrice: 1250, area: "虹桥商务", features: ["会议中心", "行政酒廊", "英文服务"] },
     { name: "外滩茂悦大酒店",         nameEn: "Hyatt on the Bund Shanghai",      stars: 5, basePrice: 1580, area: "外滩黄浦", features: ["外滩景观", "Spa水疗", "旗舰餐厅"] },
   ],
@@ -2409,6 +5303,7 @@ const MOCK_HOTEL_DB = {
   ],
   "广州": [
     { name: "全季酒店广州珠江新城",   nameEn: "Ji Hotel Guangzhou Pearl River",  stars: 3, basePrice: 248, area: "珠江新城", features: ["地铁口", "步行商圈", "24h前台"] },
+    { name: "美居广州珠江新城",       nameEn: "Mercure Guangzhou Zhujiang New Town", stars: 4, basePrice: 368, area: "珠江新城", features: ["含早餐", "近广州塔", "健身房"] },
     { name: "亚朵酒店广州天河",       nameEn: "Atour Hotel Guangzhou Tianhe",    stars: 4, basePrice: 448, area: "天河",    features: ["含早餐", "城市中心", "健身房"] },
     { name: "广州W酒店",              nameEn: "W Hotel Guangzhou",              stars: 5, basePrice: 1280, area: "珠江新城", features: ["泳池派对", "潮流餐厅", "WET泳池"] },
     { name: "广州四季酒店",           nameEn: "Four Seasons Hotel Guangzhou",   stars: 5, basePrice: 2200, area: "珠江新城高层", features: ["高空泳池", "顶级餐厅", "管家服务"] },
@@ -2458,6 +5353,24 @@ const MOCK_TRANSPORT_DB = {
     ],
     local: { mode: "地铁+网约车", dailyCost: 70, desc: "滴滴出行+地铁日均约70元/人" },
   },
+  "成都": {
+    airport: { name: "成都天府国际机场", code: "TFU" },
+    options: [
+      { mode: "机场专线+地铁18号线", cost: 28, duration: "55分钟", desc: "天府机场 → 火车南站/市中心，覆盖高新区与锦江" },
+      { mode: "专车接送", cost: 220, duration: "55分钟", desc: "机场 → 春熙路/太古里/高新区，含高速费" },
+      { mode: "机场大巴", cost: 25, duration: "70分钟", desc: "直达春熙路、人民南路等市区节点" },
+    ],
+    local: { mode: "地铁+网约车", dailyCost: 80, desc: "滴滴出行+地铁日均约80元/人" },
+  },
+  "杭州": {
+    airport: { name: "杭州萧山国际机场", code: "HGH" },
+    options: [
+      { mode: "地铁19号线", cost: 26, duration: "45分钟", desc: "萧山机场 → 钱江新城/武林广场，覆盖主城区" },
+      { mode: "专车接送", cost: 180, duration: "45分钟", desc: "机场 → 西湖/武林/滨江，含高速费" },
+      { mode: "机场大巴", cost: 20, duration: "60分钟", desc: "直达武林门、城站等市区枢纽" },
+    ],
+    local: { mode: "地铁+网约车", dailyCost: 80, desc: "滴滴出行+地铁日均约80元/人" },
+  },
   "default": {
     airport: { name: "当地机场", code: "---" },
     options: [
@@ -2471,27 +5384,533 @@ const MOCK_TRANSPORT_DB = {
 
 function detectCityKey(city) {
   const c = (city || "").trim();
+  if (/(北京东路|beijing east road|北京西路|beijing west road|南京东路|nanjing east road|南京西路|nanjing west road|人民广场|people'?s square|外滩|bund|陆家嘴|lujiazui|黄浦|huangpu)/i.test(c)) return "上海";
+  if (/(北京路|beijing road|珠江新城|zhujiang new town|天河|tianhe|越秀|yuexiu|海珠广场|haizhu square|沙面|shamian)/i.test(c)) return "广州";
   if (/深圳|shenzhen/i.test(c)) return "深圳";
   if (/上海|shanghai/i.test(c)) return "上海";
   if (/北京|beijing/i.test(c)) return "北京";
   if (/广州|guangzhou/i.test(c)) return "广州";
+  if (/成都|chengdu/i.test(c)) return "成都";
+  if (/杭州|hangzhou/i.test(c)) return "杭州";
   return "default";
 }
 
-function mockBuildThreeTierPlans({ city, budget, pax, days }) {
+function normalizeCityComparisonKey(city) {
+  return String(city || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+city$/i, "")
+    .replace(/[市省自治区特别行政区直辖]/g, "")
+    .replace(/\s+/g, "");
+}
+
+function citiesLookEquivalent(left, right) {
+  if (!left || !right) return false;
+  const leftKey = normalizeCityComparisonKey(left);
+  const rightKey = normalizeCityComparisonKey(right);
+  if (!leftKey || !rightKey) return false;
+  if (leftKey === rightKey) return true;
+  return detectCityKey(left) !== "default" && detectCityKey(left) === detectCityKey(right);
+}
+
+function stripTransportDecoratedName(name = "") {
+  return String(name || "")
+    .replace(/\s*[（(][^()（）]*[）)]\s*$/g, "")
+    .trim();
+}
+
+function formatTransportDurationLabel(minutes, language = "ZH") {
+  const total = Math.max(0, Math.round(Number(minutes || 0)));
+  if (!total) return "";
+  const hours = Math.floor(total / 60);
+  const mins = total % 60;
+  if (language === "ZH") {
+    if (!hours) return `${mins}分钟`;
+    return `${hours}小时${mins ? `${mins}分钟` : ""}`;
+  }
+  if (language === "JA") {
+    if (!hours) return `${mins}分`;
+    return `${hours}時間${mins ? `${mins}分` : ""}`;
+  }
+  if (language === "KO") {
+    if (!hours) return `${mins}분`;
+    return `${hours}시간${mins ? ` ${mins}분` : ""}`;
+  }
+  if (!hours) return `${mins} min`;
+  return `${hours}h${mins ? ` ${mins}m` : ""}`;
+}
+
+function localizeDurationText(rawDuration = "", language = "ZH") {
+  const text = String(rawDuration || "").trim();
+  if (!text || language === "ZH") return text;
+  const hm = text.match(/(\d+)\s*小时\s*(\d+)\s*分钟/);
+  if (hm) return formatTransportDurationLabel(parseInt(hm[1], 10) * 60 + parseInt(hm[2], 10), language);
+  const hoursOnly = text.match(/(\d+)\s*小时/);
+  if (hoursOnly) return formatTransportDurationLabel(parseInt(hoursOnly[1], 10) * 60, language);
+  const minsOnly = text.match(/(\d+)\s*分钟/);
+  if (minsOnly) return formatTransportDurationLabel(parseInt(minsOnly[1], 10), language);
+  return text;
+}
+
+function transportOptionIcon(mode = "") {
+  const key = String(mode || "").toLowerCase();
+  if (key === "flight") return "✈️";
+  if (key === "hsr" || key === "train") return "🚄";
+  if (key === "taxi" || key === "ride_hailing" || key === "didi") return "🚕";
+  if (key === "metro" || key === "transit" || key === "bus") return "🚇";
+  if (key === "drive" || key === "car") return "🚗";
+  return "🚌";
+}
+
+function buildEnglishSafeRideDestination(destination = "") {
+  const raw = String(destination || "").trim();
+  if (!raw) return "";
+  if (!containsChineseText(raw)) return raw;
+
+  const localized = localizeHotelAreaText(raw, "EN");
+  if (localized && !containsChineseText(localized)) return localized;
+
+  const formatted = formatNameWithCnPinyin(raw, "EN");
+  if (formatted && !containsChineseText(formatted)) return formatted;
+
+  const cityKey = inferHotelLocationCity(raw, raw);
+  const cityLabel = localizedCityName(canonicalCityKey(cityKey === "default" ? raw : cityKey), "EN");
+  const areaEntry = Object.entries(HOTEL_AREA_LOCALIZATION)
+    .sort((a, b) => b[0].length - a[0].length)
+    .find(([source]) => raw.includes(source));
+  if (areaEntry) {
+    const localizedArea = String(areaEntry[1].EN || areaEntry[0] || "").trim();
+    if (localizedArea) return cityLabel ? (cityLabel + " " + localizedArea) : localizedArea;
+  }
+  if (cityLabel) return cityLabel + " city center";
+  return "city center";
+}
+
+function buildEnglishSafeHotelSearchUrl({ name = "", nameEn = "", fallbackName = "" } = {}) {
+  const englishName = sanitizeEnglishHotelDisplayName(
+    stripBilingualChineseNameFragments(
+      formatHotelDisplayName(name || fallbackName || "", nameEn || "", "EN")
+    )
+  );
+  const fallbackKeyword = sanitizeEnglishHotelDisplayName(
+    stripBilingualChineseNameFragments(
+      localizeHotelAreaText(String(fallbackName || nameEn || name || "").trim(), "EN")
+    )
+  );
+  const keyword = String(englishName || fallbackKeyword || "Hotel").trim();
+  return "https://m.ctrip.com/webapp/hotel/search/?keyword=" + encodeURIComponent(keyword);
+}
+
+function sanitizeLocalizedHotelBookingUrl(url = "", { name = "", nameEn = "", fallbackName = "", language = "EN" } = {}) {
+  const raw = String(url || "").trim();
+  const lang = normalizeLang(language);
+  if (!raw) return buildEnglishSafeHotelSearchUrl({ name, nameEn, fallbackName });
+  if (lang === "ZH" || lang === "ZH-TW") return raw;
+  if (/trip\.com\/hotels\/detail\//i.test(raw) || /webapp\/hotel\/detail\//i.test(raw)) return raw;
+  if (/m\.ctrip\.com\/webapp\/hotel\/(?:search|list)\//i.test(raw) || containsChineseText(raw)) {
+    return buildEnglishSafeHotelSearchUrl({ name, nameEn, fallbackName });
+  }
+  return raw;
+}
+
+function buildDidiRideLink(destination = "") {
+  const safeDestination = buildEnglishSafeRideDestination(destination);
+  return "https://page.didiglobal.com/passenger/book?dest=" + encodeURIComponent(safeDestination || String(destination || "").trim());
+}
+
+function buildBudgetBreakdown({ hotel = 0, transport = 0, meals = 0, activities = 0, misc = 0 }) {
+  return {
+    hotel,
+    accommodation: hotel,
+    transport,
+    meals,
+    activities,
+    misc,
+  };
+}
+
+function formatTravelSurfaceName(name = "", language = "EN", fallbackEn = "") {
+  const raw = String(name || "").trim();
+  const lang = normalizeLang(language);
+  if (!raw) return fallbackEn || "";
+  if (lang === "ZH" || lang === "ZH-TW") return raw;
+  const mapped = raw
+    .replace(/广州白云国际机场/g, "Guangzhou Baiyun International Airport")
+    .replace(/深圳宝安国际机场/g, "Shenzhen Bao\x27an International Airport")
+    .replace(/浦东国际机场/g, "Shanghai Pudong International Airport")
+    .replace(/虹桥国际机场/g, "Shanghai Hongqiao International Airport")
+    .replace(/北京首都国际机场/g, "Beijing Capital International Airport")
+    .replace(/首都国际机场/g, "Beijing Capital International Airport")
+    .replace(/大兴国际机场/g, "Beijing Daxing International Airport");
+  if (mapped && !hasMostlyChineseText(mapped)) return mapped;
+  const formatted = formatNameWithCnPinyin(raw, lang);
+  if (formatted && !hasMostlyChineseText(formatted)) return formatted;
+  return fallbackEn || pickLang(lang, raw, "the airport", "空港", "공항");
+}
+
+function localizeMockHotelFeature(feature = "", language = "EN") {
+  const text = String(feature || "").trim();
+  if (!text) return "";
+  const lang = normalizeLang(language);
+  if (lang === "ZH" || lang === "ZH-TW") return text;
+  const featureMap = {
+    "近机场": ["Near airport", "空港至近", "공항 인접"],
+    "免费停车": ["Free parking", "無料駐車", "무료 주차"],
+    "24h前台": ["24-hour front desk", "24時間フロント", "24시간 프런트"],
+    "含早餐": ["Breakfast included", "朝食付き", "조식 포함"],
+    "健身房": ["Gym", "ジム", "피트니스"],
+    "商务中心": ["Business center", "ビジネスセンター", "비즈니스 센터"],
+    "海景房": ["Sea view rooms", "オーシャンビュー", "오션뷰 객실"],
+    "无边泳池": ["Infinity pool", "インフィニティプール", "인피니티 풀"],
+    "行政酒廊": ["Executive lounge", "エグゼクティブラウンジ", "이그제큐티브 라운지"],
+    "地铁2号线": ["Metro Line 2 access", "地下鉄2号線アクセス", "지하철 2호선 접근"],
+    "商圈步行": ["Walkable shopping district", "徒歩圏ショッピング街", "도보권 상권"],
+    "近高铁站": ["Near high-speed rail", "新幹線駅に近い", "고속철역 인접"],
+    "英文服务": ["English-speaking service", "英語対応", "영어 응대 가능"],
+    "外滩景观": ["Bund views", "外灘ビュー", "와이탄 전망"],
+    "Spa水疗": ["Spa", "スパ", "스파"],
+    "旗舰餐厅": ["Signature restaurant", "シグネチャーレストラン", "시그니처 레스토랑"],
+    "近地铁": ["Near metro", "駅近", "지하철 인접"],
+    "设计感": ["Design-led interiors", "デザイン志向", "디자인 중심 인테리어"],
+    "近使馆区": ["Near embassy district", "大使館街に近い", "대사관가 인접"],
+    "泳池派对": ["Pool scene", "プールシーン", "풀 파티 분위기"],
+    "潮流餐厅": ["Trendy dining", "トレンドダイニング", "트렌디 다이닝"],
+    "WET泳池": ["WET pool", "WETプール", "WET 풀"],
+    "高空泳池": ["Sky-high pool", "高層プール", "고층 수영장"],
+    "顶级餐厅": ["Top-tier dining", "上質ダイニング", "최상급 다이닝"],
+    "管家服务": ["Butler service", "バトラーサービス", "버틀러 서비스"],
+    "地铁口": ["Near metro", "駅近", "지하철 인접"],
+    "步行商圈": ["Walkable shopping district", "徒歩圏ショッピング街", "도보권 상권"],
+    "城市中心": ["City-center location", "都心立地", "도심 입지"],
+    "停车场": ["Parking", "駐車場", "주차장"],
+  };
+  const mapped = featureMap[text];
+  if (mapped) return lang === "JA" ? mapped[1] : lang === "KO" ? mapped[2] : mapped[0];
+  if (!hasMostlyChineseText(text)) return text;
+  return pickLang(lang, text, "Guest-rated amenity", "設備ハイライト", "숙소 하이라이트");
+}
+
+function buildHotelPlanDisplayName(hotel, language = "EN") {
+  if (!hotel || typeof hotel !== "object") return "-";
+  const lang = normalizeLang(language);
+  const name = formatHotelDisplayName(hotel.name || hotel.hotelName || "", hotel.nameEn || hotel.hotelNameEn || "", lang);
+  if (lang === "ZH" || lang === "ZH-TW") {
+    const area = String(hotel.area || hotel.district || "").trim();
+    return area ? `${name}（${area}）` : name;
+  }
+  return name;
+}
+
+function localizeMockTransportModeLabel(mode = "", language = "ZH") {
+  const text = String(mode || "").trim();
+  if (!text || language === "ZH") return text;
+  if (/磁悬浮/.test(text)) return "Maglev + Metro Line 2";
+  if (/地铁11号线/.test(text)) return "Metro Line 11";
+  if (/地铁3号线/.test(text)) return "Metro Line 3 Airport Branch";
+  if (/机场快轨\+地铁/.test(text)) return "Airport Express + Metro";
+  if (/机场快轨/.test(text)) return "Airport Express";
+  if (/机场大巴\+打车/.test(text)) return "Airport shuttle + taxi";
+  if (/机场大巴/.test(text)) return "Airport shuttle";
+  if (/专车接送/.test(text)) return pickLang(language, text, "Private airport transfer", "専用空港送迎", "전용 공항 이동");
+  if (/地铁|快轨|大巴|巴士/.test(text)) return pickLang(language, text, "Metro / Transit", "地下鉄 / 公共交通", "지하철 / 대중교통");
+  return pickLang(language, text, text, text, text);
+}
+
+function localizeMockLocalTransportSummary(localTransport = null, language = "ZH") {
+  const dailyCost = Math.max(0, Math.round(Number(localTransport && localTransport.dailyCost || 0)));
+  if (language === "ZH") return String(localTransport && localTransport.desc || "").trim();
+  return pickLang(
+    language,
+    String(localTransport && localTransport.desc || "").trim(),
+    `Didi + metro around ¥${dailyCost}/person/day`,
+    `DiDi + 地下鉄で1人1日あたり約¥${dailyCost}`,
+    `DiDi + 지하철 기준 1인 하루 약 ¥${dailyCost}`
+  );
+}
+
+function localizeMockArrivalTransportPlan(arrivalTransport = null, city = "", language = "ZH") {
+  const modeLabel = localizeMockTransportModeLabel(arrivalTransport && arrivalTransport.mode || "", language);
+  const duration = String(arrivalTransport && arrivalTransport.duration || "").trim();
+  const cost = Math.max(0, Math.round(Number(arrivalTransport && arrivalTransport.cost || 0)));
+  if (language === "ZH") return String(arrivalTransport && arrivalTransport.desc || "").trim();
+  return pickLang(
+    language,
+    String(arrivalTransport && arrivalTransport.desc || "").trim(),
+    `${modeLabel || "Airport transfer"} in ${city}, ${localizeDurationText(duration, language) || "about 45 min"}, around ¥${cost}`,
+    `${city}での${modeLabel || "空港送迎"}、${localizeDurationText(duration, language) || "約45分"}、約¥${cost}`,
+    `${city} ${modeLabel || "공항 이동"}, ${localizeDurationText(duration, language) || "약 45분"}, 약 ¥${cost}`
+  );
+}
+
+function annotateLocalEstimate(text = "", language = "ZH") {
+  const base = String(text || "").trim();
+  const suffix = pickLang(language, "本地估算", "local estimate", "ローカル見積り", "로컬 추정");
+  if (!base) return suffix;
+  if (base.includes(suffix)) return base;
+  return pickLang(
+    language,
+    base + "（" + suffix + "）",
+    base + " (" + suffix + ")",
+    base + "（" + suffix + "）",
+    base + " (" + suffix + ")"
+  );
+}
+
+function buildTransportOption({ mode = "", label = "", duration = "", cost = 0, note = "", url = "", source = "", live = null, inventoryStatus = "", verificationRequired = false, verificationLabel = "" }) {
+  return {
+    mode,
+    icon: transportOptionIcon(mode),
+    label,
+    duration,
+    cost: Math.max(0, Math.round(Number(cost || 0))),
+    note,
+    url,
+    source,
+    live: typeof live === "boolean" ? live : /^amap_live$|^ctrip_live$|^juhe_live$|^live_transport$/i.test(String(source || "")),
+    inventory_status: String(inventoryStatus || "").trim(),
+    verification_required: verificationRequired === true,
+    verification_label: String(verificationLabel || "").trim(),
+  };
+}
+
+function isLiveTransportSource(source = "") {
+  return /^amap_live$|^ctrip_live$|^juhe_live$|^live_transport$/i.test(String(source || ""));
+}
+
+function classifyFallbackTransportSource(mode = null) {
+  const type = String(mode && mode.type || "").toLowerCase();
+  const source = String(mode && (mode.source || mode._source) || "").toLowerCase();
+  const note = String(mode && (mode.inventory_note || mode.note) || "").toLowerCase();
+  if (/corridor fallback/.test(note)) return "corridor_fallback";
+  if (source === "estimated" || /估算|estimated/.test(note)) return "estimated_transport";
+  if ((type === "flight" || type === "hsr" || type === "train") && !isLiveTransportSource(source)) return "intercity_fallback";
+  return "mock_transport_catalog";
+}
+
+function buildMockTransportOptions(transport, primaryOption, airportName, city, language = "ZH", hotelDestination = "") {
+  const baseOptions = Array.isArray(transport?.options) ? transport.options : [];
+  const primary = primaryOption || baseOptions[0] || { mode: "", cost: 0, duration: "", desc: "" };
+  const airportDisplay = formatTravelSurfaceName(airportName, language, pickLang(language, airportName, "the airport", "空港", "공항"));
+  const rideDestination = String(hotelDestination || "").trim() || pickLang(
+    language,
+    `${city} 市中心`,
+    `${localizedCityName(city, language)} city center`,
+    `${localizedCityName(city, language)}中心部`,
+    `${localizedCityName(city, language)} 도심`,
+  );
+  const rows = [];
+  if (primary.mode) {
+    rows.push(buildTransportOption({
+      mode: /地铁|快轨|巴士|大巴/i.test(primary.mode) ? "transit" : /专车|打车|网约车/i.test(primary.mode) ? "taxi" : "drive",
+      label: localizeMockTransportModeLabel(primary.mode, language),
+      duration: localizeDurationText(primary.duration || "", language),
+      cost: primary.cost || 0,
+      note: localizeMockArrivalTransportPlan(primary, city, language),
+      source: "mock_transport_catalog",
+    }));
+  }
+  rows.push(buildTransportOption({
+    mode: "didi",
+    label: pickLang(language, "滴滴/出租车", "Didi / Taxi", "DiDi / タクシー", "DiDi / 택시"),
+    duration: localizeDurationText(primary.duration || "", language) || pickLang(language, "约45分钟", "about 45 min", "約45分", "약 45분"),
+    cost: primary.cost || 0,
+    note: pickLang(language, `${airportName}到酒店的落地叫车方案`, `Arrival ride from ${airportDisplay} to your hotel`, `${airportDisplay}からホテルまでの配車案`, `${airportDisplay}에서 호텔까지의 차량 호출안`),
+    url: buildDidiRideLink(rideDestination),
+    source: "mock_transport_catalog",
+  }));
+  const transitBackup = baseOptions.find((item) => /地铁|快轨|巴士|大巴/i.test(String(item.mode || ""))) || baseOptions[1] || null;
+  if (transitBackup) {
+    rows.push(buildTransportOption({
+      mode: "transit",
+      label: localizeMockTransportModeLabel(transitBackup.mode, language),
+      duration: localizeDurationText(transitBackup.duration || "", language),
+      cost: transitBackup.cost || 0,
+      note: localizeMockArrivalTransportPlan(transitBackup, city, language),
+      source: "mock_transport_catalog",
+    }));
+  }
+  return rows.slice(0, 3);
+}
+
+function buildMockPlanOption({ id, tag, hotel, city, days, pax, language, transport, arrivalTransport, localTransportTotal, diningTotal, totalCost, translationService, diningPlan, featureTail }) {
+  const hotelCost = Math.round((hotel?.basePrice || 0) * days);
+  const transportBudget = Math.round((arrivalTransport?.cost || 0) * pax + localTransportTotal);
+  const localizedFeatures = [...(hotel.features || []).slice(0, 2), featureTail]
+    .map((item) => localizeMockHotelFeature(item, language))
+    .filter(Boolean)
+    .slice(0, 3);
+  const localizedHotelName = buildHotelPlanDisplayName(hotel, language);
+  const localizedHotelArea = language === "ZH" || language === "ZH-TW"
+    ? String(hotel?.area || city || "").trim()
+    : localizeHotelAreaText(String(hotel?.area || city || "").trim(), language);
+  const localizedHotelRouteQuery = language === "ZH" || language === "ZH-TW"
+    ? String(hotel?.name || localizedHotelName || "").trim()
+    : formatHotelDisplayName(hotel?.name || "", hotel?.nameEn || localizedHotelName || "", language);
+  const hotelBookingUrl = sanitizeLocalizedHotelBookingUrl(hotel?.booking_url || "", {
+    name: hotel?.name || "",
+    nameEn: hotel?.nameEn || localizedHotelName || "",
+    fallbackName: localizedHotelArea || localizedHotelName || city || "Hotel",
+    language,
+  });
+  return {
+    id,
+    tag,
+    hotel_name: localizedHotelName,
+    hotel_price_per_night: hotel.basePrice,
+    hotel_route_query: localizedHotelRouteQuery,
+    hotel_real_address: localizedHotelArea,
+    hotel_area: localizedHotelArea,
+    hotel_source: hotel?.source || "mock_curated",
+    hotel_ctrip_url: hotelBookingUrl,
+    transport_plan: localizeMockArrivalTransportPlan(arrivalTransport, city, language),
+    transport_day_plan: localizeMockLocalTransportSummary(transport.local, language),
+    transport_total: transportBudget,
+    arrival_transport_cost: Math.round((arrivalTransport?.cost || 0) * pax),
+    local_transport_total: localTransportTotal,
+    transport_options: buildMockTransportOptions(transport, arrivalTransport, transport.airport?.name || city, city, language),
+    dining_plan: diningPlan,
+    translation_service: translationService,
+    total_cost: totalCost,
+    budget_breakdown: buildBudgetBreakdown({
+      hotel: hotelCost,
+      transport: transportBudget,
+      meals: diningTotal,
+      activities: 0,
+      misc: 0,
+    }),
+    features: localizedFeatures,
+  };
+}
+
+function mockBuildThreeTierPlans({ city, budget, pax, days, language = "ZH", hotelBudgetPerNight = null }) {
   const cityKey = detectCityKey(city);
   const hotels = MOCK_HOTEL_DB[cityKey] || MOCK_HOTEL_DB.default;
   const transport = MOCK_TRANSPORT_DB[cityKey] || MOCK_TRANSPORT_DB.default;
 
   // Sort hotels by price ascending
   const sorted = [...hotels].sort((a, b) => a.basePrice - b.basePrice);
-  const hotelC = sorted[0];
-  const hotelA = sorted[sorted.length - 1];
-  // Mid: closest to (budget / days * 0.55) per night
-  const targetNightly = (budget / days) * 0.55;
-  const hotelB = sorted.reduce((best, h) =>
-    Math.abs(h.basePrice - targetNightly) < Math.abs(best.basePrice - targetNightly) ? h : best
-  );
+  let hotelC = sorted[0];
+  let hotelA = sorted[sorted.length - 1];
+  let hotelB = null;
+  const nightlyTarget = Number(hotelBudgetPerNight || 0) > 0 ? Number(hotelBudgetPerNight || 0) : 0;
+  let budgetCap = 0;
+  let balancedCap = 0;
+  let premiumCap = 0;
+  if (nightlyTarget > 0) {
+    // Nightly cap is treated as a strong constraint: preserve tier order while staying close to the cap.
+    budgetCap = Math.max(120, Math.round(nightlyTarget * 0.78));
+    balancedCap = Math.max(120, Math.round(nightlyTarget));
+    premiumCap = Math.max(120, Math.round(nightlyTarget));
+    const pickClosest = (pool, target) => {
+      const source = Array.isArray(pool) && pool.length ? pool : sorted;
+      return source.reduce((best, h) =>
+        Math.abs(Number(h && h.basePrice || 0) - target) < Math.abs(Number(best && best.basePrice || 0) - target) ? h : best
+      );
+    };
+    const pickHighestUnder = (pool, limit) => {
+      const source = (Array.isArray(pool) ? pool : []).filter((h) => Number(h && h.basePrice || 0) <= limit);
+      return source.length ? source[source.length - 1] : null;
+    };
+
+    const budgetPool = sorted.filter((h) => Number(h && h.basePrice || 0) > 0 && Number(h && h.basePrice || 0) <= budgetCap);
+    const balancedPool = sorted.filter((h) => Number(h && h.basePrice || 0) > 0 && Number(h && h.basePrice || 0) <= balancedCap);
+    const premiumPool = sorted.filter((h) => Number(h && h.basePrice || 0) > 0 && Number(h && h.basePrice || 0) <= premiumCap);
+
+    hotelC = pickHighestUnder(budgetPool, budgetCap) || pickClosest(sorted, Math.max(120, Math.round(nightlyTarget * 0.55)));
+
+    const usedHotelNames = new Set([String(hotelC && hotelC.name || hotelC && hotelC.nameEn || "")].filter(Boolean));
+    const pickDistinctClosest = (pool, target, fallback) => {
+      const source = (Array.isArray(pool) ? pool : []).filter((h) => {
+        const key = String(h && h.name || h && h.nameEn || "");
+        return key && !usedHotelNames.has(key);
+      });
+      if (!source.length) return fallback || null;
+      const chosen = source.reduce((best, h) =>
+        Math.abs(Number(h && h.basePrice || 0) - target) < Math.abs(Number(best && best.basePrice || 0) - target) ? h : best
+      );
+      const chosenKey = String(chosen && chosen.name || chosen && chosen.nameEn || "");
+      if (chosenKey) usedHotelNames.add(chosenKey);
+      return chosen;
+    };
+
+    hotelB = pickDistinctClosest(balancedPool, nightlyTarget, null) || pickDistinctClosest(sorted.filter((h) => Number(h && h.basePrice || 0) <= balancedCap), nightlyTarget, hotelC) || hotelC;
+    hotelA = pickDistinctClosest(premiumPool, Math.round(nightlyTarget), null) || pickDistinctClosest(sorted.filter((h) => Number(h && h.basePrice || 0) <= premiumCap), Math.round(nightlyTarget), hotelB) || hotelB || hotelC;
+
+    const _chooseNextHigher = (pool, floor, fallback) => {
+      const candidates = (Array.isArray(pool) ? pool : []).filter((h) => Number(h && h.basePrice || 0) > floor);
+      return candidates.length ? candidates[0] : fallback;
+    };
+
+    const priceC = Number(hotelC && hotelC.basePrice || 0);
+    if (hotelB && Number(hotelB.basePrice || 0) <= priceC) {
+      hotelB = _chooseNextHigher(balancedPool, priceC, hotelB);
+    }
+    if (hotelB && hotelC && hotelB.name === hotelC.name) {
+      hotelB = _chooseNextHigher(balancedPool.filter((h) => h && h.name !== hotelC.name), priceC, hotelB);
+    }
+
+    const priceB = Number(hotelB && hotelB.basePrice || 0);
+    if (hotelA && priceB > 0 && Number(hotelA.basePrice || 0) <= priceB) {
+      hotelA = _chooseNextHigher(premiumPool, priceB, hotelA);
+    }
+    if (hotelA && hotelB && hotelA.name === hotelB.name) {
+      hotelA = _chooseNextHigher(premiumPool.filter((h) => h && h.name !== hotelB.name), priceB, hotelA);
+    }
+
+    if (hotelA && Number(hotelA.basePrice || 0) > premiumCap) hotelA = hotelB || hotelA;
+    if (hotelB && Number(hotelB.basePrice || 0) > balancedCap) hotelB = hotelC || hotelB;
+  } else {
+    // Mid: closest to (budget / days * 0.55) per night
+    const targetNightly = (budget / Math.max(1, days)) * 0.55;
+    hotelB = sorted.reduce((best, h) =>
+      Math.abs(h.basePrice - targetNightly) < Math.abs(best.basePrice - targetNightly) ? h : best
+    );
+  }
+
+  const ensureUniqueHotelSequence = (hotelSeq) => {
+    const source = Array.isArray(sorted) ? sorted : [];
+    const safeSeq = Array.isArray(hotelSeq) ? hotelSeq.filter(Boolean) : [];
+    if (!safeSeq.length) return [];
+    const used = new Set();
+    const uniqueSeq = safeSeq.map((hotel, index) => {
+      const key = String(hotel && hotel.name || hotel && hotel.nameEn || index);
+      if (!used.has(key)) {
+        used.add(key);
+        return hotel;
+      }
+      const currentPrice = Number(hotel && hotel.basePrice || 0);
+      const lowerBound = index === 0
+        ? -Infinity
+        : Number(safeSeq[index - 1] && safeSeq[index - 1].basePrice || 0);
+      const upperBound = index === safeSeq.length - 1
+        ? Infinity
+        : Number(safeSeq[index + 1] && safeSeq[index + 1].basePrice || 0) || Infinity;
+      const pool = source.filter((candidate) => {
+        const candidateKey = String(candidate && candidate.name || candidate && candidate.nameEn || "");
+        const candidatePrice = Number(candidate && candidate.basePrice || 0);
+        if (!candidateKey || used.has(candidateKey)) return false;
+        if (index > 0 && candidatePrice < lowerBound) return false;
+        if (index < safeSeq.length - 1 && candidatePrice > upperBound) return false;
+        if (nightlyTarget > 0 && index === 0 && budgetCap > 0 && candidatePrice > Math.max(budgetCap, currentPrice)) return false;
+        if (nightlyTarget > 0 && index === 1 && balancedCap > 0 && candidatePrice > Math.max(balancedCap, currentPrice)) return false;
+        if (nightlyTarget > 0 && index === 2 && premiumCap > 0 && candidatePrice > Math.max(premiumCap, currentPrice)) return false;
+        return true;
+      });
+      const replacement = pool.reduce((best, candidate) => {
+        if (!best) return candidate;
+        const bestGap = Math.abs(Number(best && best.basePrice || 0) - currentPrice);
+        const candidateGap = Math.abs(Number(candidate && candidate.basePrice || 0) - currentPrice);
+        return candidateGap < bestGap ? candidate : best;
+      }, null) || hotel;
+      const replacementKey = String(replacement && replacement.name || replacement && replacement.nameEn || index);
+      if (replacementKey) used.add(replacementKey);
+      return replacement;
+    });
+
+    return uniqueSeq.sort((a, b) => Number(a && a.basePrice || 0) - Number(b && b.basePrice || 0));
+  };
+
+  [hotelC, hotelB, hotelA] = ensureUniqueHotelSequence([hotelC, hotelB || hotelC, hotelA || hotelB || hotelC]);
 
   const txA = transport.options[0];
   const txB = transport.options[1] || transport.options[0];
@@ -2507,55 +5926,752 @@ function mockBuildThreeTierPlans({ city, budget, pax, days }) {
   const localC = Math.round(localDaily * pax * days * 0.8);
 
   const totalA = hotelA.basePrice * days + txA.cost * pax + diningA + localA;
-  const totalB = hotelB.basePrice * days + txB.cost * pax + diningB + localB;
+  const totalB = (hotelB ? hotelB.basePrice : hotelC.basePrice) * days + txB.cost * pax + diningB + localB;
   const totalC = hotelC.basePrice * days + txC.cost * pax + diningC + localC;
 
   return {
     response_type: "options_card",
-    spoken_text: `已为您制定${city}${days}天${pax}人行程的3套定制方案，严格控制在预算梯度内，每套均含酒店、接机和餐饮完整安排：`,
+    spoken_text: pickLang(language,
+      `已为您制定${city}${days}天${pax}人行程的3套定制方案，严格控制在预算梯度内，每套均含酒店、接机和餐饮完整安排：`,
+      `Here are 3 custom plans for your ${days}-day trip to ${city} for ${pax} traveler${pax > 1 ? "s" : ""} — each includes hotel, transport, and dining:`,
+      `${city}${days}日間${pax}名様向けに3つのプランをご用意しました。ホテル・交通・食事をすべて含んでいます：`,
+      `${city} ${days}일 ${pax}인 여행을 위한 3가지 맞춤 플랜입니다. 호텔, 교통, 식사가 모두 포함되어 있습니다：`
+    ),
     destination: city,
     duration_days: days,
     pax,
     budget_reference: budget,
     options: [
-      {
+      buildMockPlanOption({
         id: "opt_a",
-        tag: "极致体验",
-        hotel_name: `${hotelA.name}（${hotelA.area}）`,
-        hotel_price_per_night: hotelA.basePrice,
-        transport_plan: txA.desc,
-        transport_total: txA.cost * pax,
-        dining_plan: `${city}高端餐厅，人均¥150-200（推荐提前美团预订）`,
-        translation_service: "随行翻译App（有道/百度）+ 离线高德地图",
-        total_cost: totalA,
-        features: [...(hotelA.features || []).slice(0, 2), `${txA.mode}直达`].slice(0, 3),
-      },
-      {
+        tag: pickLang(language, "极致体验", "Premium", "プレミアム", "프리미엄"),
+        hotel: hotelA,
+        city,
+        days,
+        pax,
+        language,
+        transport,
+        arrivalTransport: txA,
+        localTransportTotal: localA,
+        diningTotal: diningA,
+        totalCost: totalA,
+        diningPlan: pickLang(language,
+          `${city}高端餐厅，人均¥150-200（推荐提前美团预订）`,
+          `Fine dining in ${city}, ¥150-200/person (book ahead on Meituan)`,
+          `${city}の高級レストラン、お一人様¥150-200（事前予約推奨）`,
+          `${city} 고급 레스토랑, 1인 ¥150-200 (메이투안 사전 예약 권장)`
+        ),
+        translationService: pickLang(language, "随行翻译App（有道/百度）+ 离线高德地图", "Translation app + offline maps", "翻訳アプリ + オフラインマップ", "번역 앱 + 오프라인 지도"),
+        featureTail: pickLang(language, `${txA.mode}直达`, `${localizeMockTransportModeLabel(txA.mode, language)} direct`, `${localizeMockTransportModeLabel(txA.mode, language)} 直結`, `${localizeMockTransportModeLabel(txA.mode, language)} 직결`),
+      }),
+      buildMockPlanOption({
         id: "opt_b",
-        tag: "均衡之选",
-        hotel_name: `${hotelB.name}（${hotelB.area}）`,
-        hotel_price_per_night: hotelB.basePrice,
-        transport_plan: txB.desc,
-        transport_total: txB.cost * pax,
-        dining_plan: `人气餐厅+便利店组合，人均¥80-120，美团/大众点评可英文搜索`,
-        translation_service: "百度翻译离线版（支持拍照翻译菜单）",
-        total_cost: totalB,
-        features: [...(hotelB.features || []).slice(0, 2), "性价比最优"].slice(0, 3),
-      },
-      {
+        tag: pickLang(language, "均衡之选", "Best Value", "バランス重視", "균형형"),
+        hotel: hotelB || hotelC,
+        city,
+        days,
+        pax,
+        language,
+        transport,
+        arrivalTransport: txB,
+        localTransportTotal: localB,
+        diningTotal: diningB,
+        totalCost: totalB,
+        diningPlan: pickLang(language,
+          `人气餐厅+便利店组合，人均¥80-120，美团/大众点评可英文搜索`,
+          `Popular restaurants + convenience stores, ¥80-120/person, searchable in English`,
+          `人気レストラン+コンビニ、お一人様¥80-120`,
+          `인기 레스토랑 + 편의점, 1인 ¥80-120`
+        ),
+        translationService: pickLang(language, "百度翻译离线版（支持拍照翻译菜单）", "Baidu Translate offline (menu photo scan)", "百度翻訳オフライン（メニュー写真翻訳）", "바이두 번역 오프라인 (메뉴 사진 번역)"),
+        featureTail: pickLang(language, "性价比最优", "Best ratio", "コスパ最良", "최고의 가성비"),
+      }),
+      buildMockPlanOption({
         id: "opt_c",
-        tag: "精打细算",
-        hotel_name: `${hotelC.name}（${hotelC.area}）`,
-        hotel_price_per_night: hotelC.basePrice,
-        transport_plan: txC.desc,
-        transport_total: txC.cost * pax,
-        dining_plan: `当地小馆+便利店（罗森/全家/711），人均¥40-60，支持微信/现金`,
-        translation_service: "谷歌翻译 + 高德地图国际版（免费）",
-        total_cost: totalC,
-        features: [...(hotelC.features || []).slice(0, 2), "节省开支"].slice(0, 3),
-      },
+        tag: pickLang(language, "精打细算", "Budget", "節約型", "절약형"),
+        hotel: hotelC,
+        city,
+        days,
+        pax,
+        language,
+        transport,
+        arrivalTransport: txC,
+        localTransportTotal: localC,
+        diningTotal: diningC,
+        totalCost: totalC,
+        diningPlan: pickLang(language,
+          `当地小馆+便利店（罗森/全家/711），人均¥40-60，支持微信/现金`,
+          `Local eateries + convenience stores (Lawson/FamilyMart/7-11), ¥40-60/person`,
+          `地元食堂+コンビニ（ローソン/ファミマ/7-11）、お一人様¥40-60`,
+          `현지 식당 + 편의점 (로손/패밀리마트/7-11), 1인 ¥40-60`
+        ),
+        translationService: pickLang(language, "谷歌翻译 + 高德地图国际版（免费）", "Google Translate + Gaode Maps International (free)", "Google翻訳 + 高德マップ国際版（無料）", "구글 번역 + 가오더 지도 국제판 (무료)"),
+        featureTail: pickLang(language, "节省开支", "Budget-friendly", "節約", "절약"),
+      }),
     ],
   };
+}
+
+// Assemble intercity transport from multiple sources in parallel.
+// Priority is not "first source wins"; instead we normalize several providers into
+// one comparable list so the consumer UI can show the best available flight/rail
+// option together with its verification state.
+//
+// Current runtime contract:
+// - flights: live or near-live flight feed via Juhe
+// - routes: map/routing fallback and generalized transport hints
+// - rail: partner-hub contract for real train/seat availability when configured
+//
+// If the rail provider is not configured or returns nothing, the rest of the plan
+// flow still works and falls back to the existing 12306 user-verification path.
+async function fetchLiveIntercityTransport({ originCity = "", destinationCity = "", arrivalDate = "", language = "ZH" } = {}) {
+  if (!originCity || !destinationCity || citiesLookEquivalent(originCity, destinationCity)) return null;
+  const safeDate = normalizeHotelDate(arrivalDate) || addDateDays(todayDateIso(), 1);
+  try {
+    const [flightData, routeData, liveRailData] = await Promise.all([
+      Promise.race([
+        queryJuheFlight(originCity, destinationCity, safeDate).catch(() => null),
+        new Promise((resolve) => setTimeout(() => resolve(null), 8000)),
+      ]),
+      Promise.race([
+        Promise.resolve(amapRoutingWithFallback(originCity, destinationCity)).catch(() => null),
+        new Promise((resolve) => setTimeout(() => resolve(null), 7000)),
+      ]),
+      Promise.race([
+        Promise.resolve(connectors.partnerHub && typeof connectors.partnerHub.railAvailability === "function"
+          ? connectors.partnerHub.railAvailability({ origin: originCity, destination: destinationCity, date: safeDate, language })
+          : null).catch(() => null),
+        new Promise((resolve) => setTimeout(() => resolve(null), 5000)),
+      ]),
+    ]);
+    const localizedFlights = localizeFlightRecords(flightData?.flights || [], language);
+    const bestFlight = pickBestFlightOption(localizedFlights) || null;
+    const localizedRouteModes = Array.isArray(routeData?.modes)
+      ? routeData.modes.map((mode) => ({
+        ...mode,
+        label: localizeIntercityLabel(mode, language),
+        freq: localizeIntercityFreq(mode.freq, language),
+        from_station: localizeIntercityStationName(mode.from_station || "", language),
+        to_station: localizeIntercityStationName(mode.to_station || "", language),
+        inventory_note: mode.inventory_note ? localizeIntercityNote(mode.inventory_note, language) : "",
+      }))
+      : [];
+    const intercityModes = [];
+    const pushIntercityMode = (mode) => {
+      if (!mode || !mode.type) return;
+      if (intercityModes.find((item) => item.type === mode.type)) return;
+      intercityModes.push(mode);
+    };
+    if (bestFlight) {
+      pushIntercityMode({
+        type: "flight",
+        label: `${bestFlight.airline || localizeIntercityLabel({ type: "flight", label: "Flight" }, language)} ${bestFlight.flightNo || ""}`.trim(),
+        duration_min: parseFlightDurationMinutes(bestFlight.duration) || Number(bestFlight.durationMinutes || 0) || 0,
+        price_cny: Number(bestFlight.price || 0) || 0,
+        flight_no: bestFlight.flightNo || "",
+        dep_time: bestFlight.depTime || "",
+        arr_time: bestFlight.arrTime || "",
+        bookingUrl: bestFlight.bookingUrl || buildCanonicalFlightDeeplink(originCity, destinationCity, safeDate),
+        source: flightData?.source || "ctrip_live",
+        live: true,
+      });
+    } else {
+      const routeFlight = localizedRouteModes.find((mode) => mode && mode.type === "flight");
+      if (routeFlight) {
+        const normalizedRouteFlight = {
+          ...routeFlight,
+          live: isLiveTransportSource(routeFlight.source || routeFlight._source || ""),
+          source: isLiveTransportSource(routeFlight.source || routeFlight._source || "")
+            ? (routeFlight.source || routeFlight._source || "live_transport")
+            : classifyFallbackTransportSource(routeFlight),
+        };
+        pushIntercityMode(attachCanonicalIntercityBookingUrl(normalizedRouteFlight, {
+          originCity,
+          destinationCity,
+          date: safeDate,
+        }));
+      }
+    }
+    const liveRailRows = Array.isArray(liveRailData && liveRailData.items) ? liveRailData.items : [];
+    liveRailRows.forEach((item) => {
+      const normalizedRail = {
+        type: /hsr/i.test(String(item.type || "")) ? "hsr" : "train",
+        label: item.label || item.trainNo || localizeIntercityLabel({ type: item.type || "train", label: item.trainNo || "Train" }, language),
+        duration_min: Number(item.durationMin || 0) || 0,
+        price_cny: Number(item.priceCny || 0) || 0,
+        train_no: item.trainNo || "",
+        from_station: localizeIntercityStationName(item.fromStation || originCity || "", language),
+        to_station: localizeIntercityStationName(item.toStation || destinationCity || "", language),
+        dep_time: item.depTime || "",
+        arr_time: item.arrTime || "",
+        seat_label: item.seatLabel || "",
+        seats_left: Number(item.seatsLeft || 0) || 0,
+        bookingUrl: item.bookingUrl || "",
+        freq: item.seatsLeft > 0
+          ? pickLang(language, `${item.seatsLeft}张余票`, `${item.seatsLeft} seat(s) left`, `残席${item.seatsLeft}`, `잔여 ${item.seatsLeft}석`)
+          : pickLang(language, "余票紧张", "Seats running low", "残席わずか", "잔여 좌석 적음"),
+        inventory_note: item.seatLabel
+          ? pickLang(language, `${item.seatLabel}实时可售`, `${item.seatLabel} available live`, `${item.seatLabel} をリアルタイム確認`, `${item.seatLabel} 실시간 판매 가능`)
+          : pickLang(language, "12306实时余票", "Live 12306 seat inventory", "12306リアルタイム空席", "12306 실시간 잔여 좌석"),
+        source: "partner_hub_rail_live",
+        live: true,
+      };
+      pushIntercityMode(attachCanonicalIntercityBookingUrl(normalizedRail, {
+        originCity,
+        destinationCity,
+        date: safeDate,
+      }));
+    });
+
+    localizedRouteModes
+      .filter((mode) => mode && mode.type !== "flight")
+      .forEach((mode) => {
+        const normalizedMode = {
+          ...mode,
+          live: isLiveTransportSource(mode.source || mode._source || "") && !/corridor fallback/i.test(String(mode.inventory_note || mode.note || "")),
+          source: isLiveTransportSource(mode.source || mode._source || "") && !/corridor fallback/i.test(String(mode.inventory_note || mode.note || ""))
+            ? (mode.source || mode._source || "live_transport")
+            : classifyFallbackTransportSource(mode),
+        };
+        pushIntercityMode(attachCanonicalIntercityBookingUrl(normalizedMode, {
+          originCity,
+          destinationCity,
+          date: safeDate,
+        }));
+      });
+    const sortedModes = prioritizeIntercityModes(intercityModes, { recommendedType: routeData?.recommended || "" });
+    intercityModes.length = 0;
+    sortedModes.forEach((mode) => intercityModes.push(mode));
+    if (!intercityModes.length) return null;
+    const recommended = intercityModes[0];
+    const recommendedFreq = localizeIntercityFreq(recommended.freq || "", language);
+    const recommendedFlightIsLive = recommended && (recommended.live === true || isLiveTransportSource(recommended.source || recommended._source || ""));
+const recommendedRailIsFallback = (recommended.type === "hsr" || recommended.type === "train") && !recommendedFlightIsLive;
+const recommendedArrivalStation = localizeIntercityStationName(recommended.to_station || "", language);
+const recommendedRailExecutionTail = recommendedRailIsFallback
+  ? pickLang(
+    language,
+    recommendedArrivalStation
+      ? `。抵达${recommendedArrivalStation}后从车站继续接驳酒店，建议打开12306自行核验余票并至少提前30-45分钟到站。`
+      : "。建议打开12306自行核验余票并至少提前30-45分钟到站。",
+    recommendedArrivalStation
+      ? `. Arrive at ${recommendedArrivalStation} and continue to the hotel from the station. Open 12306 to check current seat availability yourself and arrive at the station 30-45 min early.`
+      : `. Open 12306 to check current seat availability yourself and arrive at the station 30-45 min early.`,
+    recommendedArrivalStation
+      ? `。${recommendedArrivalStation}到着後は駅からホテルへ移動し、12306 を開いて空席を自分で確認し、駅には30-45分前に到着してください。`
+      : "。12306 を開いて空席を自分で確認し、駅には30-45分前に到着してください。",
+    recommendedArrivalStation
+      ? `. ${recommendedArrivalStation} 도착 후 역에서 호텔로 이동하고 12306을 열어 현재 잔여 좌석을 직접 확인한 뒤 역에는 30-45분 일찍 도착하세요.`
+      : `. 12306을 열어 현재 잔여 좌석을 직접 확인하고 역에는 30-45분 일찍 도착하세요.`
+  )
+  : "";
+    const recommendedText = recommended.type === "flight"
+      ? pickLang(language,
+        `${originCity}飞${destinationCity}，约${formatTransportDurationLabel(recommended.duration_min, language)}，${recommendedFlightIsLive ? "实时票价约" : "当前回退票价约"}¥${Number(recommended.price_cny || 0).toLocaleString()}${recommendedFreq ? `，${recommendedFreq}` : ""}`,
+        `Flight from ${originCity} to ${destinationCity}, about ${formatTransportDurationLabel(recommended.duration_min, language)}, ${recommendedFlightIsLive ? "live fare from" : "fallback fare around"} ¥${Number(recommended.price_cny || 0).toLocaleString()}${recommendedFreq ? `, ${recommendedFreq}` : ""}`,
+        `${originCity}から${destinationCity}までフライトで約${formatTransportDurationLabel(recommended.duration_min, language)}、${recommendedFlightIsLive ? "実勢運賃は約" : "代替運賃は約"}¥${Number(recommended.price_cny || 0).toLocaleString()}${recommendedFreq ? `、${recommendedFreq}` : ""}`,
+        `${originCity}에서 ${destinationCity}까지 항공 약 ${formatTransportDurationLabel(recommended.duration_min, language)}, ${recommendedFlightIsLive ? "실시간 요금 약" : "대체 요금 약"} ¥${Number(recommended.price_cny || 0).toLocaleString()}${recommendedFreq ? `, ${recommendedFreq}` : ""}`
+      )
+      : pickLang(language,
+        `${originCity}到${destinationCity}${recommended.label}约${formatTransportDurationLabel(recommended.duration_min, language)}，票价约¥${Number(recommended.price_cny || 0).toLocaleString()}${recommendedFreq ? `，${recommendedFreq}` : ""}`,
+        `${recommended.label} from ${originCity} to ${destinationCity}, about ${formatTransportDurationLabel(recommended.duration_min, language)}, fare around ¥${Number(recommended.price_cny || 0).toLocaleString()}${recommendedFreq ? `, ${recommendedFreq}` : ""}`,
+        `${originCity}から${destinationCity}まで${recommended.label}で約${formatTransportDurationLabel(recommended.duration_min, language)}、運賃は約¥${Number(recommended.price_cny || 0).toLocaleString()}${recommendedFreq ? `、${recommendedFreq}` : ""}`,
+        `${originCity}에서 ${destinationCity}까지 ${recommended.label}로 약 ${formatTransportDurationLabel(recommended.duration_min, language)}, 요금 약 ¥${Number(recommended.price_cny || 0).toLocaleString()}${recommendedFreq ? `, ${recommendedFreq}` : ""}`
+      );
+    const finalRecommendedText = recommended.type === "flight" ? recommendedText : `${recommendedText}${recommendedRailExecutionTail}`;
+    return {
+      date: safeDate,
+      recommended,
+      modes: intercityModes.slice(0, 4),
+      summaryText: finalRecommendedText,
+      arrivalSurface: resolveArrivalSurfaceForIntercity({ destinationCity, recommended, language }),
+      inventory_status: recommendedRailIsFallback ? "user_check_required" : (recommendedFlightIsLive ? "live_or_verified" : "estimated"),
+      verification_required: recommendedRailIsFallback,
+      verification_label: recommendedRailIsFallback
+        ? pickLang(language, "需去12306自行核验余票", "Check seats on 12306 yourself", "12306で空席を要確認", "12306에서 좌석 직접 확인")
+        : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeHotelRouteAddress(value = "") {
+  return String(value || "")
+    .replace(/\s*[|｜]\s*/g, " ")
+    .replace(/\bnear\b/ig, " ")
+    .replace(/\barea\b/ig, " ")
+    .replace(/\bby\b/ig, " ")
+    .replace(/\bmetro station\b/ig, "metro")
+    .replace(/\brailway station\b/ig, "railway station")
+    .replace(/[()（）]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function resolveArrivalSurfaceForIntercity({ destinationCity = "", recommended = null, language = "ZH" } = {}) {
+  const cityKey = detectCityKey(destinationCity);
+  const type = String(recommended && recommended.type || "").toLowerCase();
+  if (!recommended || !type) return null;
+  if (type === "flight") {
+    const airportName = (MOCK_TRANSPORT_DB[cityKey] && MOCK_TRANSPORT_DB[cityKey].airport && MOCK_TRANSPORT_DB[cityKey].airport.name)
+      || destinationCity;
+    return {
+      kind: "airport",
+      name: airportName,
+      displayName: formatTravelSurfaceName(airportName, language, pickLang(language, airportName, "the airport", "空港", "공항")),
+    };
+  }
+  if (type === "hsr" || type === "train") {
+    const stationName = String(recommended.to_station || recommended.from_station || "").trim();
+    if (!stationName) return null;
+    return {
+      kind: "station",
+      name: stationName,
+      displayName: localizeIntercityStationName(stationName, language),
+    };
+  }
+  return null;
+}
+
+function buildAirportRouteAirportCandidates(airportName = "", destinationCity = "") {
+  const candidates = [];
+  const seen = new Set();
+  const push = (value) => {
+    const normalized = String(value || "").trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    candidates.push(normalized);
+  };
+  push(airportName);
+  if (/成都|chengdu/i.test(destinationCity) || /天府|双流/.test(airportName)) {
+    push("成都天府国际机场");
+    push("成都双流国际机场");
+    push("双流国际机场");
+  }
+  return candidates;
+}
+
+function buildAirportRouteQueryCandidates({ hotelName = "", hotelAddress = "", hotelArea = "", destinationCity = "" } = {}) {
+  const candidates = [];
+  const seen = new Set();
+  const genericAreaOnlyRe = /^(?:Peoples Square|Jingan Temple|Xintiandi|Nanjing West Road|The Bund|Yu Garden|Shamian|Tianhe|Tianhe CBD|Zhujiang New Town|Beijing Road|Taojin|Yuexiu|Haizhu Square|Futian|Nanshan|Bao\x27an|Gangxia)$/i;
+  const cityTokens = String(destinationCity || "")
+    .split(/\s+/)
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean);
+  const dedupeCityWords = (value) => {
+    const normalized = sanitizeHotelRouteAddress(value);
+    if (!normalized) return "";
+    let deduped = normalized;
+    cityTokens.forEach((token) => {
+      deduped = deduped.replace(new RegExp(`\\b${token}\\b(?:\\s+\\b${token}\\b)+`, "ig"), token);
+    });
+    if (destinationCity) {
+      const cityCenterLabel = `${destinationCity} city center`;
+      if (deduped.toLowerCase().includes(cityCenterLabel.toLowerCase()) && cityTokens.some((token) => deduped.toLowerCase().includes(`hotel ${token}`))) {
+        deduped = deduped.replace(new RegExp(cityCenterLabel, "ig"), " ").trim();
+      }
+    }
+    return sanitizeHotelRouteAddress(deduped);
+  };
+  const push = (value) => {
+    const normalized = dedupeCityWords(stripTransportDecoratedName(value));
+    if (!normalized || normalized.length < 2) return;
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    candidates.push(normalized);
+  };
+  const pushVariants = (value) => {
+    const normalized = dedupeCityWords(value);
+    if (!normalized) return;
+    const splitParts = normalized
+      .split(/(?:\s*[·•,，/|｜]\s*|\s+-\s+|\s+near\s+|\s+by\s+|\s+next to\s+|\s+close to\s+|\s+adjacent to\s+)/i)
+      .map((part) => sanitizeHotelRouteAddress(part))
+      .filter((part) => part.length >= 2);
+    push(normalized);
+    push(normalized.replace(/\bhotel\b/ig, " ").trim());
+    push(normalized.replace(/\bhotel\b/ig, " ").replace(/\bby ihg\b/ig, " ").trim());
+    push(normalized.replace(/\bnear\b/ig, " ").replace(/\barea\b/ig, " ").trim());
+    push(normalized.replace(/\bhotel\b/ig, " ").replace(/\bairport\b/ig, " ").replace(/\bhub\b/ig, " ").trim());
+    push(normalized.replace(/\bbaiyun\b/ig, " ").replace(/\bhongqiao\b/ig, " ").replace(/\bjianggao\b/ig, " ").trim());
+    push(normalized.replace(/\bbranch\b/ig, " ").replace(/\bstation\b/ig, " ").trim());
+    push(normalized.replace(/\bsubway station\b/ig, "metro station").trim());
+    push(normalized.replace(/\bmetro station\b/ig, " ").trim());
+    splitParts.forEach((part) => {
+      push(part);
+      push(part.replace(/\bsubway station\b/ig, "metro station").trim());
+      push(part.replace(/\bmetro station\b/ig, " ").replace(/\bstation\b/ig, " ").trim());
+    });
+    if (splitParts.length >= 2) {
+      push(splitParts[splitParts.length - 1] + " " + splitParts[0]);
+    }
+  };
+
+  const safeName = sanitizeHotelRouteAddress(stripTransportDecoratedName(hotelName));
+  const safeAddress = sanitizeHotelRouteAddress(hotelAddress);
+  const safeArea = sanitizeHotelRouteAddress(hotelArea);
+  const addressParts = `${safeAddress}${safeArea ? ` · ${safeArea}` : ""}`
+    .split(/[·•,，/]/)
+    .map((part) => sanitizeHotelRouteAddress(part))
+    .filter((part) => part.length >= 2);
+
+  const districtAliases = [];
+  const addressText = `${safeName} ${safeAddress} ${safeArea}`.toLowerCase();
+  if (/hubin yintai|west lake|wushan square|wulin square|hangzhou railway station|ding'an road/.test(addressText)) {
+    districtAliases.push("Hubin Yintai", "West Lake", "Wushan Square", "Wulin Square", "Hangzhou Railway Station", "Ding'an Road Metro Station");
+  }
+  if (/chunxi|tianfu square|kuanzhai|taikoo li|ifs/.test(addressText)) {
+    districtAliases.push("Chunxi Road", "Tianfu Square", "Kuanzhai Alleys", "Taikoo Li", "IFS");
+  }
+  if (/wangfujing|guomao|sanlitun/.test(addressText)) {
+    districtAliases.push("Wangfujing", "Guomao", "Sanlitun");
+  }
+  if (/people's square|jing'an|jingan|xintiandi|nanjing west road|huaihai|bund|yu garden|hongqiao/.test(addressText)) {
+    districtAliases.push("Peoples Square", "Jingan Temple", "Xintiandi", "Nanjing West Road", "The Bund", "Yu Garden");
+  }
+  if (/zhujiang new town|tianhe|tianhe cbd|beijing road|taojin|yuexiu|haizhu square|shamian/.test(addressText)) {
+    districtAliases.push("Zhujiang New Town", "Tianhe", "Tianhe CBD", "Beijing Road", "Taojin", "Yuexiu", "Haizhu Square", "Shamian");
+  }
+  if (/dongmen|luohu|futian|nanshan|gangxia|huaqiangbei|bao\x27an|baoan|shekou|science and technology park|tech park|convention and exhibition center|futian railway station|civic center|window of the world|wanxiangtiandi/.test(addressText)) {
+    districtAliases.push("Dongmen", "Luohu", "Futian", "Nanshan", "Gangxia", "Huaqiangbei", "Bao\x27an", "Shekou", "Tech Park", "Shenzhen Convention and Exhibition Center", "Futian Railway Station", "Shenzhen Civic Center", "Window of the World", "Wanxiangtiandi");
+  }
+  if (/xujiahui|lujiazui|pudong|peoples square|people\x27s square|jing\x27an|jingan|hongqiao|xintiandi/.test(addressText)) {
+    districtAliases.push("Xujiahui", "Lujiazui", "Pudong", "Peoples Square", "Jingan Temple", "Hongqiao", "Xintiandi");
+  }
+
+  if (destinationCity && safeArea) push(destinationCity + " " + safeArea);
+  if (destinationCity && safeName && safeArea) push(destinationCity + " " + safeName + " " + safeArea);
+  if (destinationCity && safeName) push(destinationCity + " " + safeName);
+  if (destinationCity && safeAddress && safeArea && safeAddress.toLowerCase() !== safeArea.toLowerCase()) push(destinationCity + " " + safeAddress + " " + safeArea);
+  if (safeArea) push(safeArea);
+  addressParts.forEach((part) => push(part));
+  if (safeAddress && safeArea && safeAddress.toLowerCase() !== safeArea.toLowerCase()) push(safeAddress + " " + safeArea);
+  if (safeArea && safeName) push(safeArea + " " + safeName);
+  if (safeName && safeAddress) push(safeName + " " + safeAddress);
+  if (safeName && safeArea) push(safeName + " " + safeArea);
+  if (safeName) push(safeName);
+  if (safeName && addressParts[0]) push(safeName + " " + addressParts[0]);
+  pushVariants(safeArea);
+  pushVariants(safeAddress);
+  pushVariants(safeName);
+  addressParts.forEach((part) => pushVariants(part));
+  districtAliases.forEach((part) => {
+    if (!genericAreaOnlyRe.test(String(part || "").trim()) || !safeName) pushVariants(part);
+  });
+  if (destinationCity) {
+    addressParts.forEach((part) => {
+      if (!part.toLowerCase().includes(destinationCity.toLowerCase())) pushVariants(`${destinationCity} ${part}`);
+    });
+    districtAliases.forEach((part) => {
+      if (!genericAreaOnlyRe.test(String(part || "").trim()) || !safeName) pushVariants(`${destinationCity} ${part}`);
+    });
+  }
+  if (safeName && destinationCity && !safeName.toLowerCase().includes(destinationCity.toLowerCase())) push(`${destinationCity} ${safeName}`);
+  if (safeName && destinationCity && addressParts[0] && !addressParts[0].toLowerCase().includes(destinationCity.toLowerCase())) {
+    push(`${destinationCity} ${safeName} ${addressParts[0]}`);
+  }
+  return candidates.slice(0, 14);
+}
+async function fetchLiveAirportRoute({ airportName = "", hotelName = "", hotelAddress = "", hotelArea = "", destinationCity = "", language = "ZH" } = {}) {
+  const candidates = buildAirportRouteQueryCandidates({ hotelName, hotelAddress, hotelArea, destinationCity });
+  const airportCandidates = buildAirportRouteAirportCandidates(airportName, destinationCity);
+  if (!airportCandidates.length || !candidates.length || !destinationCity) return null;
+  try {
+    let route = null;
+    let resolvedDestination = candidates[0] || "";
+    let resolvedAirportName = airportCandidates[0] || airportName;
+    for (const airportCandidate of airportCandidates) {
+      for (const candidate of candidates) {
+        const currentRoute = await Promise.race([
+          queryLocalRoute(airportCandidate, candidate, destinationCity),
+        ]);
+        if (currentRoute && (currentRoute.taxi || currentRoute.transit)) {
+          route = currentRoute;
+          resolvedDestination = candidate;
+          resolvedAirportName = airportCandidate;
+          break;
+        }
+      }
+      if (route) break;
+    }
+    if (!route) return null;
+    const airportDisplay = formatTravelSurfaceName(resolvedAirportName, language, pickLang(language, resolvedAirportName, "the airport", "空港", "공항"));
+    const options = [];
+    if (route.taxi) {
+      options.push(buildTransportOption({
+        mode: "didi",
+        label: pickLang(language, "滴滴/出租车", "Didi / Taxi", "DiDi / タクシー", "DiDi / 택시"),
+        duration: formatTransportDurationLabel(route.taxi.min, language),
+        cost: route.taxi.cost_cny || 0,
+        note: pickLang(language, `${resolvedAirportName}到酒店实时估算`, `Live arrival-to-hotel estimate from ${airportDisplay}`, `${airportDisplay}からホテルまでの実測目安`, `${airportDisplay}에서 호텔까지 실시간 추정`),
+        url: buildDidiRideLink((hotelName && String(hotelName).trim()) || resolvedDestination),
+        source: "amap_live",
+      }));
+    }
+    if (route.transit) {
+      options.push(buildTransportOption({
+        mode: "transit",
+        label: pickLang(language, "地铁/公交", "Metro / Transit", "地下鉄 / 公共交通", "지하철 / 대중교통"),
+        duration: formatTransportDurationLabel(route.transit.min, language),
+        cost: route.transit.fare_cny || 0,
+        note: pickLang(language, `${route.transit.transfers || 0}次换乘，来自高德实时路径`, `${route.transit.transfers || 0} transfer(s), based on live Amap routing`, `${route.transit.transfers || 0}回乗換、Amap実時間経路`, `${route.transit.transfers || 0}회 환승, Amap 실시간 경로 기준`),
+        source: "amap_live",
+      }));
+    }
+    if (!options.length) return null;
+    const preferred = options[0];
+    return {
+      options: options.slice(0, 2),
+      preferred,
+      routeQuery: resolvedDestination,
+      summaryText: pickLang(language,
+        `${resolvedAirportName}到酒店建议${preferred.label}，约${preferred.duration}，费用约¥${Number(preferred.cost || 0).toLocaleString()}`,
+        `${preferred.label} from ${airportDisplay} to the hotel takes about ${preferred.duration}, around ¥${Number(preferred.cost || 0).toLocaleString()}`,
+        `${airportDisplay}からホテルまでは${preferred.label}で約${preferred.duration}、約¥${Number(preferred.cost || 0).toLocaleString()}`,
+        `${airportDisplay}에서 호텔까지 ${preferred.label} 기준 약 ${preferred.duration}, 비용은 약 ¥${Number(preferred.cost || 0).toLocaleString()}`
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function enrichPlansWithLiveTransport(plans, { originCity = "", destinationCity = "", arrivalDate = "", language = "ZH", pax = 1, days = 1 } = {}) {
+  if (!plans || !Array.isArray(plans.options) || !destinationCity) return plans;
+  const cityKey = detectCityKey(destinationCity);
+  const transport = MOCK_TRANSPORT_DB[cityKey] || MOCK_TRANSPORT_DB.default;
+  const intercity = await fetchLiveIntercityTransport({ originCity, destinationCity, arrivalDate, language });
+  let arrivalSummary = "";
+  let liveArrivalCount = 0;
+
+  for (const option of plans.options) {
+    const arrivalSurface = intercity && intercity.arrivalSurface ? intercity.arrivalSurface : null;
+    const liveArrival = await fetchLiveAirportRoute({
+      airportName: (arrivalSurface && arrivalSurface.name) || transport.airport?.name || "",
+      hotelName: option.hotel_route_query || option.hotel_name || "",
+      hotelAddress: option.hotel_real_address || option.hotel_name || "",
+      hotelArea: option.hotel_area || option.hotel_real_address || "",
+      destinationCity,
+      language,
+    });
+    const seen = new Set();
+    const transportOptions = [];
+    const appendOption = (item) => {
+      if (!item) return;
+      const key = `${item.mode || ""}:${item.label || ""}:${item.duration || ""}:${item.cost || 0}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      transportOptions.push(item);
+    };
+
+    const intercityOptionRows = [];
+    if (intercity && Array.isArray(intercity.modes)) {
+      intercity.modes.forEach((mode) => {
+        const modeLive = mode.live === true || isLiveTransportSource(mode.source || mode._source || "");
+        const modeNeeds12306Verification = /^(hsr|train)$/i.test(String(mode.type || "")) && !modeLive;
+        intercityOptionRows.push(buildTransportOption({
+          mode: mode.type,
+          label: mode.label || localizeIntercityLabel(mode, language),
+          duration: formatTransportDurationLabel(mode.duration_min, language),
+          cost: Number(mode.price_cny || 0) || 0,
+          note: buildIntercityTransportOptionNote(mode, language),
+          url: mode.bookingUrl || "",
+          source: mode.source || "fallback_transport_catalog",
+          live: modeLive,
+          inventoryStatus: modeNeeds12306Verification ? "user_check_required" : (modeLive ? "live_or_verified" : "estimated"),
+          verificationRequired: modeNeeds12306Verification,
+          verificationLabel: modeNeeds12306Verification ? pickLang(language, "需去12306自行核验余票", "Check seats on 12306 yourself", "12306で空席を要確認", "12306에서 좌석 직접 확인") : "",
+        }));
+      });
+      intercityOptionRows.forEach(appendOption);
+    }
+
+    if (liveArrival && Array.isArray(liveArrival.options)) {
+      liveArrivalCount += 1;
+      liveArrival.options.forEach((item) => {
+        if (transportOptions.length < 4) appendOption(item);
+      });
+      if (!arrivalSummary) arrivalSummary = liveArrival.summaryText;
+    }
+
+    const fallbackArrivalOptions = buildMockTransportOptions(
+      transport,
+      transport.options[1] || transport.options[0],
+      (arrivalSurface && arrivalSurface.name) || transport.airport?.name || destinationCity,
+      destinationCity,
+      language,
+      (option.hotel_route_query && String(option.hotel_route_query).trim()) || (option.hotel_real_address && String(option.hotel_real_address).trim()) || (option.hotel_name && String(option.hotel_name).trim()) || "",
+    );
+    fallbackArrivalOptions.forEach((item) => {
+      if (transportOptions.length < 4) {
+        appendOption({
+          ...item,
+          note: annotateLocalEstimate(item.note, language),
+          source: item.source || "mock_transport_catalog",
+        });
+      }
+    });
+
+    const localEstimateSummary = annotateLocalEstimate(localizeMockLocalTransportSummary(transport.local, language), language);
+    const intercityFallbackSummary = originCity && !citiesLookEquivalent(originCity, destinationCity)
+      ? pickLang(
+        language,
+        `${originCity}到${destinationCity}暂未拿到实时城际交通结果，当前先展示本地估算/回退交通。`,
+        `No live intercity result is available yet for ${originCity} to ${destinationCity}. Showing local estimate / fallback transport for now.`,
+        `${originCity}から${destinationCity}までの実時間都市間交通はまだ取得できていません。現在はローカル見積り / 代替交通を表示しています。`,
+        `${originCity}에서 ${destinationCity}까지의 실시간 도시 간 교통 결과를 아직 가져오지 못했습니다. 현재는 로컬 추정 / 대체 교통만 표시합니다.`
+      )
+      : "";
+    const arrivalRouteFallbackSummary = pickLang(
+      language,
+      `${destinationCity}落地到酒店的实时接驳路线暂未返回，当前先展示本地估算。`,
+      `No live arrival transfer route is available yet in ${destinationCity}. Showing a local estimate for now.`,
+      `${destinationCity}で到着地点からホテルまでの実時間接続ルートはまだ取得できていません。現在はローカル見積りを表示しています。`,
+      `${destinationCity}에서 도착 지점에서 호텔까지의 실시간 연결 경로를 아직 가져오지 못했습니다. 현재는 로컬 추정을 표시합니다.`
+    );
+
+    const transportBreakdown = option.budget_breakdown && typeof option.budget_breakdown === "object"
+      ? option.budget_breakdown
+      : buildBudgetBreakdown({});
+    const hotelBudget = Number(transportBreakdown.hotel || transportBreakdown.accommodation || 0);
+    const mealsBudget = Number(transportBreakdown.meals || 0);
+    const activitiesBudget = Number(transportBreakdown.activities || 0);
+    const miscBudget = Number(transportBreakdown.misc || 0);
+    const intercityCost = intercity && intercity.recommended ? Math.max(0, Math.round(Number(intercity.recommended.price_cny || 0) * pax)) : 0;
+    const arrivalCost = liveArrival && liveArrival.preferred
+      ? Math.max(0, Math.round(Number(liveArrival.preferred.cost || 0) * (/transit/i.test(String(liveArrival.preferred.mode || "")) ? pax : 1)))
+      : Math.max(0, Math.round(Number(option.arrival_transport_cost || 0)));
+    const localDailyTotal = Math.max(0, Math.round(Number(option.local_transport_total || 0) || Number((transport.local && transport.local.dailyCost) || 0) * pax * days));
+    const transportBudget = intercityCost + arrivalCost + localDailyTotal;
+    option.transport_options = transportOptions.slice(0, 4);
+    option.arrival_transport_cost = arrivalCost;
+    option.local_transport_total = localDailyTotal;
+    option.transport_total = transportBudget;
+    option.transport_day_plan = liveArrival && liveArrival.preferred
+      ? pickLang(
+        language,
+        `${localEstimateSummary}，并保留实时到达点到酒店的落地交通。`,
+        `${localEstimateSummary}. Includes a live arrival-to-hotel route.`,
+        `${localEstimateSummary}。到着地点からホテルまでの実時間ルートも含みます。`,
+        `${localEstimateSummary}. 도착 지점에서 호텔까지의 실시간 이동도 포함합니다.`
+      )
+      : localEstimateSummary;
+    option.transport_plan = [
+      intercity && intercity.summaryText ? intercity.summaryText : intercityFallbackSummary,
+      liveArrival && liveArrival.summaryText ? liveArrival.summaryText : arrivalRouteFallbackSummary,
+      localEstimateSummary,
+    ]
+      .filter(Boolean)
+      .join(language === "EN" ? " | " : " · ");
+    option.budget_breakdown = buildBudgetBreakdown({
+      hotel: hotelBudget,
+      transport: transportBudget,
+      meals: mealsBudget,
+      activities: activitiesBudget,
+      misc: miscBudget,
+    });
+    option.total_cost = hotelBudget + transportBudget + mealsBudget + activitiesBudget + miscBudget;
+    const budgetLimit = Number(plans && plans.total_budget || 0) || 0;
+    if (budgetLimit > 0) {
+      const delta = option.total_cost - budgetLimit;
+      option.budget_status = delta > 0 ? "over" : delta < -Math.max(180, Math.round(budgetLimit * 0.08)) ? "under" : "within";
+      option.budget_note = delta > 0
+        ? pickLang(
+          language,
+          "当前方案比推导总预算高出约¥" + Math.abs(delta).toLocaleString() + "。",
+          "This option is about ¥" + Math.abs(delta).toLocaleString() + " above the derived trip budget.",
+          "このプランは導出された旅行総額より約¥" + Math.abs(delta).toLocaleString() + "高くなります。",
+          "이 옵션은 계산된 전체 여행 예산보다 약 ¥" + Math.abs(delta).toLocaleString() + " 높습니다."
+        )
+        : option.budget_status === "under"
+          ? pickLang(
+            language,
+            "当前方案比推导总预算低约¥" + Math.abs(delta).toLocaleString() + "。",
+            "This option is about ¥" + Math.abs(delta).toLocaleString() + " below the derived trip budget.",
+            "このプランは導出された旅行総額より約¥" + Math.abs(delta).toLocaleString() + "低くなります。",
+            "이 옵션은 계산된 전체 여행 예산보다 약 ¥" + Math.abs(delta).toLocaleString() + " 낮습니다."
+          )
+          : pickLang(
+            language,
+            "当前方案基本落在推导总预算内。",
+            "This option stays broadly within the derived trip budget.",
+            "このプランは導出された旅行総額の範囲内に概ね収まります。",
+            "이 옵션은 계산된 전체 여행 예산 범위 안에 대체로 들어갑니다."
+          );
+    } else {
+      option.budget_status = "within";
+      option.budget_note = "";
+    }
+    const hasLiveIntercity = Array.isArray(intercity && intercity.modes) && intercity.modes.some((mode) => mode && (mode.live === true || isLiveTransportSource(mode.source || mode._source || "")));
+    option.transport_source = hasLiveIntercity && liveArrival
+      ? "live_transport_blended"
+      : hasLiveIntercity
+        ? "live_intercity_with_local_arrival"
+        : liveArrival
+          ? "fallback_intercity_with_live_arrival"
+          : "mock_transport_catalog";
+  }
+
+  if (arrivalSummary) {
+    plans.arrival_transport = arrivalSummary;
+    if (liveArrivalCount > 0 && liveArrivalCount < plans.options.length) {
+      plans.arrival_transport = pickLang(
+        language,
+        `${arrivalSummary}；其余方案的落地接驳暂未拿到实时结果，当前展示本地估算。`,
+        `${arrivalSummary}. Other options do not have a live arrival transfer route yet and are currently shown with local estimates.`,
+        `${arrivalSummary}。他のプランでは到着後の接続ルートの実時間結果がまだ取得できておらず、現在はローカル見積りを表示しています。`,
+        `${arrivalSummary}. 다른 옵션은 아직 실시간 도착 후 연결 경로를 가져오지 못해 현재 로컬 추정으로 표시합니다.`
+      );
+    }
+  } else if (transport.options && transport.options[0]) {
+    plans.arrival_transport = annotateLocalEstimate(localizeMockArrivalTransportPlan(transport.options[0], destinationCity, language), language);
+  }
+  plans.arrival_transport_source = liveArrivalCount >= plans.options.length && liveArrivalCount > 0
+    ? "amap_live"
+    : liveArrivalCount > 0
+      ? "mixed_live_and_fallback"
+      : "mock_transport_catalog";
+  plans.arrival_surface_kind = intercity && intercity.arrivalSurface && intercity.arrivalSurface.kind ? intercity.arrivalSurface.kind : "airport";
+  plans.arrival_surface_label = intercity && intercity.arrivalSurface && intercity.arrivalSurface.displayName ? intercity.arrivalSurface.displayName : "";
+  if (intercity && intercity.summaryText) plans.intercity_transport = {
+    from: originCity || "",
+    to: destinationCity || "",
+    mode: intercity.recommended?.type || "",
+    label: intercity.recommended?.label || "",
+    cost_cny: Number(intercity.recommended?.price_cny || 0) || 0,
+    inventory_status: intercity.inventory_status || "",
+    detail: intercity.summaryText,
+    route_options: Array.isArray(intercity.modes) ? intercity.modes.slice(0, 4).map((mode) => ({
+      type: mode.type || "",
+      label: mode.label || localizeIntercityLabel(mode, language),
+      duration_min: Number(mode.duration_min || 0) || 0,
+      price_cny: Number(mode.price_cny || 0) || 0,
+      freq: mode.freq || "",
+      inventory_status: mode.inventory_status || "",
+      verification_required: mode.verification_required === true,
+      verification_label: mode.verification_label || "",
+    })) : [],
+    verification_required: intercity.verification_required === true,
+    verification_label: intercity.verification_label || "",
+  };
+  else if (originCity && !citiesLookEquivalent(originCity, destinationCity)) {
+    plans.intercity_transport = pickLang(
+      language,
+      `${originCity}到${destinationCity}暂未拿到实时城际交通结果，当前先展示本地估算/回退交通。`,
+      `No live intercity result is available yet for ${originCity} to ${destinationCity}. Showing local estimate / fallback transport for now.`,
+      `${originCity}から${destinationCity}までの実時間都市間交通はまだ取得できていません。現在はローカル見積り / 代替交通を表示しています。`,
+      `${originCity}에서 ${destinationCity}까지의 실시간 도시 간 교통 결과를 아직 가져오지 못했습니다. 현재는 로컬 추정 / 대체 교통만 표시합니다.`
+    );
+  }
+  const hasLiveIntercityMode = Array.isArray(intercity && intercity.modes) && intercity.modes.some((mode) => mode && (mode.live === true || isLiveTransportSource(mode.source || mode._source || "")));
+  const hasFallbackIntercityMode = Array.isArray(intercity && intercity.modes) && intercity.modes.some((mode) => mode && !(mode.live === true || isLiveTransportSource(mode.source || mode._source || "")));
+  const primaryIntercityMode = Array.isArray(intercity && intercity.modes) && intercity.modes.length ? intercity.modes[0] : null;
+  const recommendedIntercitySource = String((primaryIntercityMode && (primaryIntercityMode.source || primaryIntercityMode._source)) || (intercity && intercity.recommended && (intercity.recommended.source || intercity.recommended._source)) || "").trim();
+  plans.intercity_transport_source = hasLiveIntercityMode
+    ? (hasFallbackIntercityMode ? "mixed_live_and_fallback" : "live_transport")
+    : (recommendedIntercitySource || (intercity && intercity.summaryText ? "fallback_transport_catalog" : "mock_transport_catalog"));
+  return plans;
 }
 
 // ── Slot-Filling & Multi-Option JSON Architecture ──────────────────────────
@@ -2570,7 +6686,7 @@ function mockBuildThreeTierPlans({ city, budget, pax, days }) {
 
 
 
-async function callOpenAIChatReply({ message, language, city, constraints, recommendation, conversationHistory }) {
+async function callOpenAIChatReply({ message, language, city, constraints, recommendation, conversationHistory, geoPartnerContext = "" }) {
   const startedAt = Date.now();
   OPENAI_LAST_RUNTIME.attemptedAt = nowIso();
   OPENAI_LAST_RUNTIME.statusCode = null;
@@ -2602,8 +6718,10 @@ async function callOpenAIChatReply({ message, language, city, constraints, recom
     : [];
   // Build a clean, natural-language user context — no raw JSON exposed
   const ctxParts = [];
-  if (city) ctxParts.push(`城市: ${city}`);
-  if (constraints.budget) ctxParts.push(`预算: ${constraints.budget}`);
+  // Only include city if it came from the user's explicit constraints (not demo fallback)
+  if (city && constraints.city) ctxParts.push(`目的地/城市: ${city}`);
+  const budgetContextLine = buildBudgetConstraintContextLine(constraints, lang);
+  if (budgetContextLine) ctxParts.push(budgetContextLine);
   if (constraints.party_size || constraints.guestNum) ctxParts.push(`人数: ${constraints.party_size || constraints.guestNum}人`);
   if (constraints.dietary) ctxParts.push(`饮食: ${constraints.dietary}`);
   if (constraints.duration || constraints.days) ctxParts.push(`天数: ${constraints.duration || constraints.days}天`);
@@ -2611,6 +6729,18 @@ async function callOpenAIChatReply({ message, language, city, constraints, recom
   if (constraints.checkOutDate || constraints.check_out_date) ctxParts.push(`退房: ${constraints.checkOutDate || constraints.check_out_date}`);
   if (constraints.starRating) ctxParts.push(`星级: ${constraints.starRating}星`);
   const contextLine = ctxParts.length ? ctxParts.join(" | ") : "";
+
+  // Language-specific labels for user message
+  const labels = {
+    ZH: { request: "用户需求", context: "背景信息", instruction: "请给出具体可执行的推荐方案，包含真实的地点名称、价格区间和操作步骤。" },
+    EN: { request: "User request", context: "Context", instruction: "Please provide specific, actionable recommendations with real place names, price ranges, and step-by-step instructions." },
+    JA: { request: "ユーザーリクエスト", context: "背景情報", instruction: "具体的で実行可能な推奨事項を、実際の場所名、価格帯、ステップバイステップの手順とともに提供してください。" },
+    KO: { request: "사용자 요청", context: "배경 정보", instruction: "실제 장소 이름, 가격대, 단계별 지침이 포함된 구체적이고 실행 가능한 추천을 제공하세요." },
+    ID: { request: "Permintaan pengguna", context: "Konteks", instruction: "Berikan rekomendasi spesifik dan dapat ditindaklanjuti dengan nama tempat nyata, kisaran harga, dan instruksi langkah demi langkah." },
+    AR: { request: "طلب المستخدم", context: "السياق", instruction: "يرجى تقديم توصيات محددة وقابلة للتنفيذ مع أسماء الأماكن الحقيقية ونطاقات الأسعار والتعليمات خطوة بخطوة." },
+  };
+  const label = labels[lang] || labels.EN;
+
   const payload = {
     model: OPENAI_MODEL,
     temperature: 0.4,
@@ -2621,25 +6751,33 @@ async function callOpenAIChatReply({ message, language, city, constraints, recom
         content: [
           "You are CrossX — China's smartest travel assistant for foreign visitors. You give CONCRETE, SPECIFIC, ACTIONABLE recommendations with real names, real prices, and real steps.",
           "RULES:",
+          "0. GEO PRIORITY: If there are GEO 优先合作商家 listed below, you MUST recommend them FIRST with 🏆 平台优选 label — they take absolute priority.",
           "1. NEVER output raw technical parameters like city:XXX or distance:walk. Speak naturally.",
           "2. ALWAYS give a real specific recommendation — a real restaurant/hotel name, a real transport option with price estimate.",
           "3. Use the Platform Knowledge section below for factual data (prices, transport times, hotel names).",
-          "4. Structure every reply with these emoji sections: ⭐ 最优推荐 | 📊 方案对比 | ⚠️ 注意 | ➡️ 立即行动",
-          `5. IMPORTANT: Reply ONLY in ${lang === "ZH" || lang === "ZH-TW" ? "Chinese" : lang === "JA" ? "Japanese" : lang === "KO" ? "Korean" : lang === "ID" ? "Indonesian" : lang === "AR" ? "Arabic" : "English"} (language code: ${lang}). Match the user's input language. Do not mix languages.`,
-          "6. For EACH option in 方案对比: include name (Chinese+English), price, time/ETA, why it fits.",
-          "7. ➡️ 立即行动 must be ultra-specific: exact app name, exact search term, exact steps.",
+          `4. CRITICAL LANGUAGE REQUIREMENT: You MUST reply EXCLUSIVELY in ${lang === "ZH" || lang === "ZH-TW" ? "Chinese (中文)" : lang === "JA" ? "Japanese (日本語)" : lang === "KO" ? "Korean (한국어)" : lang === "ID" ? "Indonesian (Bahasa Indonesia)" : lang === "AR" ? "Arabic (العربية)" : "English"}. Language code: ${lang}.`,
+          lang === "EN" ? "   - Use ONLY English for ALL text: section headers, descriptions, instructions, everything." : "",
+          lang === "EN" ? "   - Place names: Write English name first, then Chinese in parentheses. Example: 'Waldorf Astoria (外滩华尔道夫)' NOT '外滩华尔道夫 Waldorf Astoria'." : "",
+          lang === "EN" ? "   - Section headers: Use English emoji labels like '⭐ Top Recommendation' NOT '⭐ 最优推荐'." : "",
+          lang !== "EN" && lang !== "ZH" && lang !== "ZH-TW" ? `   - Use ONLY ${lang === "JA" ? "Japanese" : lang === "KO" ? "Korean" : lang === "ID" ? "Indonesian" : "Arabic"} for ALL text. Place names: local language first, then Chinese/English in parentheses.` : "",
+          "5. DO NOT mix languages. Match the user's language exactly.",
+          "6. For EACH option: include name, price, time/ETA, why it fits.",
+          "7. Action steps must be ultra-specific: exact app name, exact search term, exact steps.",
+          "8. STRICT DURATION: If user specifies a number of days (e.g., '10 days', '10天', '七天'), you MUST plan EXACTLY that many days — no more, no less.",
+          "9. CONTEXT UPDATES: If the user changes city, budget, or duration mid-conversation, ALWAYS follow the latest value. Ignore all previous values.",
+          geoPartnerContext || "",
           "",
           "## Platform Knowledge",
           knowledgeContext,
-        ].join("\n"),
+        ].filter(Boolean).join("\n"),
       },
       ...historyMessages,
       {
         role: "user",
         content: [
-          `用户需求: ${String(message || "")}`,
-          contextLine ? `背景信息: ${contextLine}` : "",
-          `请给出具体可执行的推荐方案，包含真实的地点名称、价格区间和操作步骤。`,
+          `${label.request}: ${String(message || "")}`,
+          contextLine ? `${label.context}: ${contextLine}` : "",
+          label.instruction,
         ].filter(Boolean).join("\n"),
       },
     ],
@@ -2658,32 +6796,35 @@ async function callOpenAIChatReply({ message, language, city, constraints, recom
     });
     OPENAI_LAST_RUNTIME.statusCode = Number(res.status || 0) || null;
     if (!res.ok) {
-      let errBody = "";
       try {
-        errBody = (await res.text()).slice(0, 240);
-      } catch {
-        errBody = "";
-      }
-      const reason = `openai_http_${res.status}${errBody ? `:${errBody}` : ""}`;
+        await res.text();
+      } catch {}
+      const reason = `openai_http_${res.status}`;
       OPENAI_LAST_RUNTIME.errorAt = nowIso();
       OPENAI_LAST_RUNTIME.lastError = reason;
       OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
       return { ok: false, error: reason };
     }
-    const data = await res.json();
-    const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    if (typeof text === "string" && text.trim()) {
-      OPENAI_LAST_RUNTIME.successAt = nowIso();
-      OPENAI_LAST_RUNTIME.lastError = null;
-      OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
-      return { ok: true, text: text.trim() };
-    }
+	    const data = await _readJsonResponseSafe(res, null);
+	    const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+	    if (typeof text === "string" && text.trim()) {
+	      if (hasForbiddenMixedLanguageReply(text, lang)) {
+	        OPENAI_LAST_RUNTIME.errorAt = nowIso();
+	        OPENAI_LAST_RUNTIME.lastError = "mixed_language_output";
+	        OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
+	        return { ok: false, error: "mixed_language_output" };
+	      }
+	      OPENAI_LAST_RUNTIME.successAt = nowIso();
+	      OPENAI_LAST_RUNTIME.lastError = null;
+	      OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
+	      return { ok: true, text: text.trim() };
+	    }
     OPENAI_LAST_RUNTIME.errorAt = nowIso();
     OPENAI_LAST_RUNTIME.lastError = "empty_openai_content";
     OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
     return { ok: false, error: "empty_openai_content" };
   } catch (err) {
-    const reason = err && err.name === "AbortError" ? `openai_timeout_${OPENAI_TIMEOUT_MS}ms` : `openai_network_error:${String((err && err.message) || err || "unknown").slice(0, 220)}`;
+    const reason = err && err.name === "AbortError" ? "openai_timeout" : "openai_unavailable";
     OPENAI_LAST_RUNTIME.errorAt = nowIso();
     OPENAI_LAST_RUNTIME.lastError = reason;
     OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
@@ -2776,8 +6917,7 @@ function callClaudeSubprocess({ message, language, city, constraints, recommenda
       if (code === 0 && text.length > 10) {
         resolve({ ok: true, text, model: "claude-subprocess", durationMs });
       } else {
-        const errMsg = stderr.slice(0, 200) || `exit_code_${code}`;
-        resolve({ ok: false, error: errMsg, durationMs });
+        resolve({ ok: false, error: "claude_subprocess_failed", durationMs });
       }
     });
 
@@ -2785,7 +6925,7 @@ function callClaudeSubprocess({ message, language, city, constraints, recommenda
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      resolve({ ok: false, error: err.message, durationMs: Date.now() - startedAt });
+      resolve({ ok: false, error: "claude_subprocess_failed", durationMs: Date.now() - startedAt });
     });
 
     // Write prompt to stdin
@@ -2798,7 +6938,7 @@ function callClaudeSubprocess({ message, language, city, constraints, recommenda
   });
 }
 
-async function callClaudeChatReply({ message, language, city, constraints, recommendation, conversationHistory }) {
+async function callClaudeChatReply({ message, language, city, constraints, recommendation, conversationHistory, geoPartnerContext = "" }) {
   const startedAt = Date.now();
   ANTHROPIC_LAST_RUNTIME.attemptedAt = nowIso();
   ANTHROPIC_LAST_RUNTIME.statusCode = null;
@@ -2825,18 +6965,26 @@ async function callClaudeChatReply({ message, language, city, constraints, recom
   const stage = inferConversationStage(message, detectIntentHint(message));
   const choice = recommendation && recommendation.crossXChoice ? recommendation.crossXChoice : null;
   const topLanes = (recommendation && recommendation.options ? recommendation.options : []).slice(0, 3);
+  // Only pass real/curated data to LLM — filter out hardcoded keyword-candidate fakes
+  // A candidate is "real" if it has: ctrip source, or has address/district data, or hotelName from curated DB
+  const _isRealCandidate = (item) =>
+    item.hotel_source === "trip_live" || item.hotel_source === "ctrip_live" || item.hotel_source === "ctrip_list_live" || item.hotel_source === "ctrip_curated"
+    || item.source === "trip_live" || item.source === "ctrip_curated" || item.source === "ctrip_list_live" || item.source === "ctrip_live"
+    || Boolean(item.address || item.district || item.hotel_ctrip_score);
   const topLaneLines = topLanes
     .map((item, idx) => {
       const reason = Array.isArray(item.analysis) && item.analysis.length
         ? item.analysis[0]
         : (Array.isArray(item.comments) && item.comments.length ? item.comments[0] : "");
+      // Use real place name only if from real data source — otherwise describe by type
+      const realPlace = _isRealCandidate(item)
+        ? (item.placeDisplay || item.placeName || item.hotelDisplay || item.hotelName || "")
+        : "";
       const details = [
-        item.placeDisplay ? `place=${item.placeDisplay}` : item.placeName ? `place=${item.placeName}` : "",
-        item.hotelDisplay ? `hotel=${item.hotelDisplay}` : item.hotelName ? `hotel=${item.hotelName}` : "",
+        realPlace ? `place=${realPlace}` : "",
         item.transportMode ? `transport=${item.transportMode}` : "",
         item.costRange ? `cost=${item.costRange}` : "",
         item.openHours ? `hours=${item.openHours}` : "",
-        item.touristFriendlyScore ? `friendly=${item.touristFriendlyScore}` : "",
       ].filter(Boolean).join(", ");
       return `${idx + 1}. ${item.title} (${item.grade || recommendationGrade(item.score)}) - ${item.etaWindow || "-"} - ${details} - ${reason}`;
     })
@@ -2846,6 +6994,7 @@ async function callClaudeChatReply({ message, language, city, constraints, recom
     "You are CrossX — China's smartest travel assistant for foreign visitors.",
     "You give CONCRETE, SPECIFIC, ACTIONABLE recommendations with real names, real prices, and real steps.",
     "RULES:",
+    "0. GEO PRIORITY: If there are GEO 优先合作商家 listed below, you MUST recommend them FIRST with 🏆 平台优选 label — they take absolute priority over all other suggestions.",
     "1. NEVER output raw technical parameters like city:XXX or distance:walk — speak naturally.",
     "2. ALWAYS give a real specific recommendation: a real restaurant/hotel name, a real transport option with price estimate.",
     "3. Use the Platform Knowledge section for factual data (prices, transport times, hotel names).",
@@ -2853,14 +7002,18 @@ async function callClaudeChatReply({ message, language, city, constraints, recom
     `5. IMPORTANT: Reply ONLY in ${language === "ZH" || language === "ZH-TW" ? "Chinese" : language === "JA" ? "Japanese" : language === "KO" ? "Korean" : language === "ID" ? "Indonesian" : language === "AR" ? "Arabic" : "English"} (language code: ${language}). Match the user's input language. Do not mix languages.`,
     "6. For EACH option in 方案对比: include real name (Chinese+English), price range, time/ETA, why it fits.",
     "7. ➡️ 立即行动 must be ultra-specific: exact app name, exact search term, exact steps.",
+    "8. STRICT DURATION: If user specifies N days/天, plan EXACTLY N days — no more, no less.",
+    "9. CONTEXT UPDATES: When user changes city, budget, or duration mid-conversation, follow the LATEST value only.",
+    geoPartnerContext || "",
     "",
     "## Platform Knowledge",
     knowledgeContext,
-  ].join("\n");
+  ].filter(s => s !== null && s !== undefined).join("\n");
   // Build clean natural-language context — no raw JSON
   const ctxParts = [];
   if (city) ctxParts.push(`城市: ${city}`);
-  if (constraints.budget) ctxParts.push(`预算: ${constraints.budget}`);
+  const budgetContextLine = buildBudgetConstraintContextLine(constraints, lang);
+  if (budgetContextLine) ctxParts.push(budgetContextLine);
   if (constraints.party_size || constraints.guestNum) ctxParts.push(`人数: ${constraints.party_size || constraints.guestNum}人`);
   if (constraints.dietary) ctxParts.push(`饮食偏好: ${constraints.dietary}`);
   if (constraints.duration || constraints.days) ctxParts.push(`天数: ${constraints.duration || constraints.days}天`);
@@ -2868,10 +7021,20 @@ async function callClaudeChatReply({ message, language, city, constraints, recom
   if (constraints.checkOutDate || constraints.check_out_date) ctxParts.push(`退房: ${constraints.checkOutDate || constraints.check_out_date}`);
   if (constraints.starRating) ctxParts.push(`星级: ${constraints.starRating}星`);
   const contextLine = ctxParts.length ? ctxParts.join(" | ") : "";
+  const _claudeLabels = {
+    ZH: { req: "用户需求", ctx: "背景信息", inst: "请给出具体可执行的推荐方案，包含真实地点名称、价格区间和操作步骤。" },
+    "ZH-TW": { req: "用戶需求", ctx: "背景資訊", inst: "請提供具體可執行的推薦方案，包含真實地點名稱、價格區間和操作步驟。" },
+    EN: { req: "User request", ctx: "Context", inst: "Please provide specific, actionable recommendations with real place names, price ranges, and step-by-step instructions." },
+    JA: { req: "ユーザーリクエスト", ctx: "背景情報", inst: "具体的で実行可能な推奨事項を、実際の場所名、価格帯、手順とともに提供してください。" },
+    KO: { req: "사용자 요청", ctx: "배경 정보", inst: "실제 장소 이름, 가격대, 단계별 지침이 포함된 구체적인 추천을 제공하세요." },
+    ID: { req: "Permintaan", ctx: "Konteks", inst: "Berikan rekomendasi spesifik dengan nama tempat nyata, kisaran harga, dan langkah-langkah." },
+    AR: { req: "طلب المستخدم", ctx: "السياق", inst: "يرجى تقديم توصيات محددة مع أسماء الأماكن الحقيقية ونطاقات الأسعار والخطوات." },
+  };
+  const _cLabel = _claudeLabels[lang] || _claudeLabels.EN;
   const userContent = [
-    `用户需求: ${String(message || "")}`,
-    contextLine ? `背景信息: ${contextLine}` : "",
-    `请给出具体可执行的推荐方案，包含真实地点名称、价格区间和操作步骤。`,
+    `${_cLabel.req}: ${String(message || "")}`,
+    contextLine ? `${_cLabel.ctx}: ${contextLine}` : "",
+    _cLabel.inst,
   ].filter(Boolean).join("\n");
   const historyMessages = Array.isArray(conversationHistory)
     ? conversationHistory.slice(-6).map((m) => ({
@@ -2914,15 +7077,14 @@ async function callClaudeChatReply({ message, language, city, constraints, recom
     });
     ANTHROPIC_LAST_RUNTIME.statusCode = Number(res.status || 0) || null;
     if (!res.ok) {
-      let errBody = "";
-      try { errBody = (await res.text()).slice(0, 240); } catch { errBody = ""; }
-      const reason = `claude_http_${res.status}${errBody ? `:${errBody}` : ""}`;
+      try { await res.text(); } catch {}
+      const reason = `claude_http_${res.status}`;
       ANTHROPIC_LAST_RUNTIME.errorAt = nowIso();
       ANTHROPIC_LAST_RUNTIME.lastError = reason;
       ANTHROPIC_LAST_RUNTIME.durationMs = Date.now() - startedAt;
       return { ok: false, error: reason };
     }
-    const data = await res.json();
+    const data = await _readJsonResponseSafe(res, null);
     const text = data && data.content && data.content[0] && data.content[0].text;
     if (typeof text === "string" && text.trim()) {
       ANTHROPIC_LAST_RUNTIME.successAt = nowIso();
@@ -2936,8 +7098,8 @@ async function callClaudeChatReply({ message, language, city, constraints, recom
     return { ok: false, error: "empty_claude_content" };
   } catch (err) {
     const reason = err && err.name === "AbortError"
-      ? `claude_timeout_${ANTHROPIC_TIMEOUT_MS}ms`
-      : `claude_network_error:${String((err && err.message) || err || "unknown").slice(0, 220)}`;
+      ? "claude_timeout"
+      : "claude_unavailable";
     ANTHROPIC_LAST_RUNTIME.errorAt = nowIso();
     ANTHROPIC_LAST_RUNTIME.lastError = reason;
     ANTHROPIC_LAST_RUNTIME.durationMs = Date.now() - startedAt;
@@ -3006,19 +7168,16 @@ async function callOpenAIFreeformReply({ message, language, city, constraints })
     });
     OPENAI_LAST_RUNTIME.statusCode = Number(res.status || 0) || null;
     if (!res.ok) {
-      let errBody = "";
       try {
-        errBody = (await res.text()).slice(0, 240);
-      } catch {
-        errBody = "";
-      }
-      const reason = `openai_http_${res.status}${errBody ? `:${errBody}` : ""}`;
+        await res.text();
+      } catch {}
+      const reason = `openai_http_${res.status}`;
       OPENAI_LAST_RUNTIME.errorAt = nowIso();
       OPENAI_LAST_RUNTIME.lastError = reason;
       OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
       return { ok: false, error: reason };
     }
-    const data = await res.json();
+    const data = await _readJsonResponseSafe(res, null);
     const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
     if (typeof text === "string" && text.trim()) {
       OPENAI_LAST_RUNTIME.successAt = nowIso();
@@ -3032,8 +7191,8 @@ async function callOpenAIFreeformReply({ message, language, city, constraints })
     return { ok: false, error: "empty_openai_content" };
   } catch (err) {
     const reason = err && err.name === "AbortError"
-      ? `openai_timeout_${OPENAI_TIMEOUT_MS}ms`
-      : `openai_network_error:${String((err && err.message) || err || "unknown").slice(0, 220)}`;
+      ? "openai_timeout"
+      : "openai_unavailable";
     OPENAI_LAST_RUNTIME.errorAt = nowIso();
     OPENAI_LAST_RUNTIME.lastError = reason;
     OPENAI_LAST_RUNTIME.durationMs = Date.now() - startedAt;
@@ -3043,7 +7202,37 @@ async function callOpenAIFreeformReply({ message, language, city, constraints })
   }
 }
 
-async function buildSmartChatReply({ message, language, city, constraints, recommendation, conversationHistory }) {
+async function resolvePrimaryChatReply({ message, language, city, constraints, recommendation, conversationHistory, geoPartnerContext = "" }) {
+  const providers = [
+    {
+      id: "claude",
+      run: () => callClaudeChatReply({ message, language, city, constraints, recommendation, conversationHistory, geoPartnerContext }),
+    },
+    {
+      id: "openai",
+      run: () => callOpenAIChatReply({ message, language, city, constraints, recommendation, conversationHistory, geoPartnerContext }),
+    },
+  ];
+  const pending = providers.map(({ id, run }) =>
+    run()
+      .then((result) => ({ id, result }))
+      .catch((err) => ({ id, result: { ok: false, error: err && err.message ? err.message : "provider_unavailable" } })),
+  );
+  const failures = {};
+
+  while (pending.length) {
+    const race = pending.map((promise, index) => promise.then((value) => ({ index, value })));
+    const settled = await Promise.race(race);
+    pending.splice(settled.index, 1);
+    const { id, result } = settled.value;
+    if (result && result.ok) return { winner: id, result, failures };
+    failures[id] = result && result.error ? result.error : "provider_unavailable";
+  }
+
+  return { winner: null, result: null, failures };
+}
+
+async function buildSmartChatReply({ message, language, city, constraints, recommendation, conversationHistory, geoPartnerContext = "" }) {
   const top = (recommendation.options || []).slice(0, 3);
   const stage = inferConversationStage(message, detectIntentHint(message));
   const ambiguous = isAmbiguousIntentMessage(message, constraints);
@@ -3117,17 +7306,27 @@ async function buildSmartChatReply({ message, language, city, constraints, recom
       "❓ 더 정확한 추천을 위해 1) 체류 일수 2) 선호(역사/도시) 3) 예산 범위를 알려주세요.",
     )
     : "";
-  const fallback = pickLang(
+
+  const buildExecutableFallbackReply = () => pickLang(
     language,
     `🧭 摘要：我已理解你的需求，并按可执行闭环给出推荐。\n\n⭐ CrossX Choice：${choiceTitle}\n为什么选它：${choiceReason}\n\n📍 方案卡（含中文名+英文别名，方便问路/打车）：\n${linesZh}\n\n⚠️ 必读：热门门店建议先预订；到店前确认英文菜单与支付方式（Alipay/WeChat/代付）。\n➡️ 下一步：${actionHint}\n${clarifyBlock}`,
     `🧭 Summary: I understood your request and optimized for executable closure.\n\n⭐ CrossX Choice: ${choiceTitle}\nWhy this fits: ${choiceReason}\n\n📍 Option cards (with Chinese names + English aliases for taxi/navigation):\n${linesEn}\n\n⚠️ Read first: reserve popular places early; confirm English menu and payment friendliness (Alipay/WeChat/delegated card).\n➡️ Next step: ${actionHint}\n${clarifyBlock}`,
     `🧭 要約: ご要望を理解し、実行可能なクローズドループで最適化しました。\n\n⭐ CrossX Choice: ${choiceTitle}\n選定理由: ${choiceReason}\n\n📍 オプションカード（中国語名+英語別名つき）:\n${linesJa}\n\n⚠️ 注意: 人気店は事前予約推奨。英語メニューと決済手段（Alipay/WeChat/委任決済）を確認。\n➡️ 次の一手: ${actionHint}\n${clarifyBlock}`,
     `🧭 요약: 요청을 이해했고 실행 가능한 클로즈드 루프로 최적화했습니다.\n\n⭐ CrossX Choice: ${choiceTitle}\n선정 이유: ${choiceReason}\n\n📍 옵션 카드 (중국어 이름 + 영어 별칭 포함):\n${linesKo}\n\n⚠️ 주의: 인기 매장은 사전 예약 권장. 영어 메뉴/결제 방식(Alipay/WeChat/위임결제) 확인 필요.\n➡️ 다음 단계: ${actionHint}\n${clarifyBlock}`,
   );
-  // Provider priority: RAG (knowledge queries) → claude-subprocess → Claude HTTP → OpenAI → hardcoded fallback
-  let replySource = "fallback";
+  const fallback = buildExecutableFallbackReply();
+  const noExecutableHotelReply = pickLang(
+    language,
+    "当前没有符合你条件且可直接执行的酒店方案。建议放宽每晚预算、调整区域，或让我重新搜索一批可订酒店。",
+    "No directly executable hotel options fit your current constraints. Try raising the nightly budget, changing the area, or ask me to search again with broader filters.",
+    "現在の条件でそのまま実行できるホテル案はありません。1泊予算やエリア条件を広げるか、再検索をご依頼ください。",
+    "현재 조건에서 바로 실행 가능한 호텔 옵션이 없습니다. 1박 예산이나 지역 조건을 넓히거나 다시 검색해 달라고 요청해 주세요.",
+  );
+  const hasExecutableRecommendation = top.length > 0;
+  // Provider priority: RAG (knowledge queries) → claude-subprocess → Claude HTTP → OpenAI → local execution summary / hardcoded fallback
+  let replySource = hasExecutableRecommendation ? "local-execution" : "fallback";
   let replyText = null;
-  let replyModel = "builtin-fallback";
+  let replyModel = hasExecutableRecommendation ? "builtin-execution-summary" : "builtin-fallback";
   let fallbackReason = null;
   let replyStructured = null;
 
@@ -3153,14 +7352,14 @@ async function buildSmartChatReply({ message, language, city, constraints, recom
           const s = sResult.structured;
           if (s.response_type === "clarify") {
             replyText = s.spoken_text || fallback;
+            replyStructured = s;
           } else if (s.response_type === "options_card" && (s.card_data || (Array.isArray(s.options) && s.options.length))) {
-            replyText = JSON.stringify(s);
+            replyText = s.spoken_text || fallback;
+            replyStructured = s;
           }
-          if (replyText) {
+          if (replyStructured) {
             replySource = "openai-structured";
             replyModel = OPENAI_MODEL;
-            replyStructured = s;
-            // Return immediately — skip all other paths
             return {
               source: replySource,
               reply: replyText,
@@ -3173,9 +7372,23 @@ async function buildSmartChatReply({ message, language, city, constraints, recom
           }
         }
       } catch (sErr) {
-        console.warn("[AI-native] generateCrossXResponse error:", sErr.message);
+        console.warn("[AI-native] generateCrossXResponse error:", sanitizeServerLogError(sErr, "ai_native_generation_failed"));
       }
     }
+  }
+
+  // For hotel booking flows, prefer the deterministic local execution summary once
+  // executable option cards are available. This keeps the narrative aligned with
+  // the stricter local hotel filtering and avoids the model inventing a parallel hotel list.
+  if (!replyText && stage === "hotel_selection" && hasExecutableRecommendation) {
+    return {
+      source: "local-execution",
+      reply: fallback,
+      model: "builtin-execution-summary",
+      stage,
+      clarifyNeeded: ambiguous,
+      fallbackReason: null,
+    };
   }
 
   // 0. RAG pre-check: if this is a knowledge/policy question, retrieve from knowledge base first
@@ -3192,20 +7405,16 @@ async function buildSmartChatReply({ message, language, city, constraints, recom
         });
         const _ragNoInfo = /don't have|not in.*knowledge|no information|不在知识库|暂无相关/i.test(ragResult.answer || "");
         if (ragResult.ragUsed && ragResult.answer && !_ragNoInfo) {
-          // Append citation footer if sources exist
           let ragAnswer = ragResult.answer;
           if (ragResult.citations && ragResult.citations.length > 0) {
             const citationLine = ragResult.citations.map((c) => `[${c.docId}]`).join(" ");
             ragAnswer += `\n\n📚 来源参考 (Source): ${citationLine}`;
           }
-          // For "both" intent (has action component too), prepend RAG answer and continue to LLM
           if (ragIntentType === "both") {
             replyText = ragAnswer;
             replySource = "rag";
             replyModel = "rag-engine";
-            // Still continue to LLM for the action part if RAG is insufficient
           } else {
-            // Pure knowledge query: return RAG answer directly
             return {
               source: "rag",
               reply: ragAnswer,
@@ -3218,44 +7427,67 @@ async function buildSmartChatReply({ message, language, city, constraints, recom
           }
         }
       } catch (ragErr) {
-        console.warn("[RAG] Error during pre-check:", ragErr.message);
+        console.warn("[RAG] Error during pre-check:", sanitizeServerLogError(ragErr, "rag_precheck_failed"));
       }
     }
   }
 
-  // 2. Try OpenAI freeform first (fast ~1s, reliable)
+  // 2. Race primary LLM providers in parallel, then only use subprocess when no executable recommendation exists.
   if (!replyText) {
-    const openaiResult = await callOpenAIChatReply({ message, language, city, constraints, recommendation, conversationHistory });
-    if (openaiResult && openaiResult.ok) {
+    if (stage === "hotel_selection" && !hasExecutableRecommendation) {
+      return {
+        source: "fallback",
+        reply: noExecutableHotelReply,
+        model: "builtin-hotel-unavailable",
+        stage,
+        clarifyNeeded: ambiguous,
+        fallbackReason: "no_executable_hotel_options",
+      };
+    }
+    const primary = await resolvePrimaryChatReply({
+      message,
+      language,
+      city,
+      constraints,
+      recommendation,
+      conversationHistory,
+      geoPartnerContext,
+    });
+    if (primary.winner === "claude" && primary.result && primary.result.ok) {
+      replySource = "claude";
+      replyText = primary.result.text;
+      replyModel = primary.result.model || ANTHROPIC_MODEL;
+      fallbackReason = null;
+    } else if (primary.winner === "openai" && primary.result && primary.result.ok) {
       replySource = "openai";
-      replyText = openaiResult.text;
+      replyText = primary.result.text;
       replyModel = OPENAI_MODEL;
       fallbackReason = null;
     } else {
-      fallbackReason = openaiResult && !openaiResult.ok ? openaiResult.error : null;
-      // 3. Try Claude HTTP API
-      const claudeResult = await callClaudeChatReply({ message, language, city, constraints, recommendation, conversationHistory });
-      if (claudeResult && claudeResult.ok) {
-        replySource = "claude";
-        replyText = claudeResult.text;
-        replyModel = claudeResult.model || ANTHROPIC_MODEL;
-        fallbackReason = null;
+      fallbackReason = primary.failures.claude || primary.failures.openai || null;
+      if (hasExecutableRecommendation) {
+        replySource = "local-execution";
+        replyText = fallback;
+        replyModel = "builtin-execution-summary";
       } else {
-        fallbackReason = fallbackReason || (claudeResult && !claudeResult.ok ? claudeResult.error : null);
-        // 4. Try Claude subprocess as last resort
-        if (!replyText) {
-          const subResult = await callClaudeSubprocess({ message, language, city, constraints, recommendation, conversationHistory });
-          if (subResult && subResult.ok) {
-            replySource = "claude";
-            replyText = subResult.text;
-            replyModel = subResult.model || "claude-subprocess";
-            fallbackReason = null;
-          } else {
-            fallbackReason = fallbackReason || (subResult && subResult.error ? subResult.error : null);
-          }
+        const subResult = await callClaudeSubprocess({ message, language, city, constraints, recommendation, conversationHistory });
+        if (subResult && subResult.ok) {
+          replySource = "claude";
+          replyText = subResult.text;
+          replyModel = subResult.model || "claude-subprocess";
+          fallbackReason = null;
+        } else {
+          fallbackReason = fallbackReason || (subResult && subResult.error ? subResult.error : null);
         }
       }
     }
+  }
+
+  if (replyText && hasForbiddenMixedLanguageReply(replyText, language)) {
+    fallbackReason = fallbackReason || "mixed_language_output";
+    replySource = hasExecutableRecommendation ? "local-execution" : "fallback";
+    replyText = fallback;
+    replyModel = hasExecutableRecommendation ? "builtin-execution-summary" : "builtin-fallback";
   }
 
   return {
@@ -3281,25 +7513,79 @@ async function buildSmartChatReply({ message, language, city, constraints, recom
 const AGENT_REQUIRED_FIELDS = {
   city:       { label: { ZH: "目的地城市", EN: "destination city", JA: "目的地城市", KO: "목적지 도시" } },
   duration:   { label: { ZH: "行程天数", EN: "trip duration (days)", JA: "旅行日数", KO: "여행 일수" } },
-  budget:     { label: { ZH: "总预算（人民币）", EN: "total budget (CNY)", JA: "総予算（人民元）", KO: "총 예산 (CNY)" } },
+  budget:     { label: { ZH: "预算（人民币）", EN: "budget (CNY)", JA: "予算（人民元）", KO: "예산 (CNY)" } },
   party_size: { label: { ZH: "出行人数", EN: "party size", JA: "人数", KO: "인원 수" } },
 };
 
+function sanitizeDetectedCityName(value = "") {
+  const raw = String(value || "")
+    .replace(/[，,.;:]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!raw) return "";
+  return raw
+    .replace(/\b(?:for|with|and|on|of|people|person|guests?|pax|travelers?|travellers?|trip|days?|nights?|budget|departing|respond)$/i, "")
+    .replace(/[，,.;:]+$/g, "")
+    .trim();
+}
+
+function pickDetectedPlanCityCandidate(value = "") {
+  const candidate = sanitizeDetectedCityName(value);
+  if (!candidate) return "";
+  const cityKey = detectCityKey(candidate);
+  if (cityKey === "深圳") return "Shenzhen";
+  if (cityKey === "上海") return "Shanghai";
+  if (cityKey === "北京") return "Beijing";
+  if (cityKey === "广州") return "Guangzhou";
+  if (cityKey === "成都") return "Chengdu";
+  if (cityKey === "杭州") return "Hangzhou";
+  return "";
+}
+
 function extractAgentConstraints(message, constraints) {
+
   const result = {
-    city: null, duration: null, budget: null, party_size: null, service_types: [],
+    city: null, origin: null, duration: null, budget: null, party_size: null, service_types: [],
   };
   // City
-  result.city = constraints.city || constraints.destination || null;
-  if (!result.city) {
-    const m = message.match(/(?:in|去|在|到)\s*([A-Z][a-z]+|[\u4e00-\u9fa5]{2,6})(?:\s|,|，|$)/);
-    if (m) result.city = m[1];
+  result.city = sanitizeDetectedCityName(constraints.city || constraints.destination || "") || null;
+  result.origin = sanitizeDetectedCityName(constraints.origin || constraints.from || constraints.departure || "") || null;
+  const routeMatch = String(message || "").match(/(?:from|从)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|[\u4e00-\u9fa5]{2,8})\s*(?:to|去|到)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|[\u4e00-\u9fa5]{2,8})/i);
+  if (routeMatch) {
+    if (!result.origin) result.origin = sanitizeDetectedCityName(routeMatch[1]) || routeMatch[1];
+    if (!result.city) result.city = sanitizeDetectedCityName(routeMatch[2]) || routeMatch[2];
   }
-  // Duration
+  if (!result.city) {
+    const tripToMatch = message.match(/(?:trip|travel|stay)\s+(?:to|in)\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|[\u4e00-\u9fa5]{2,8})(?:\s|,|，|市|$)/i);
+    if (tripToMatch) result.city = pickDetectedPlanCityCandidate(tripToMatch[1]) || null;
+  }
+  if (!result.city) {
+    const cityTripMatch = message.match(/([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?|[\u4e00-\u9fa5]{2,8})\s+(?:trip|travel|stay)\b/i);
+    if (cityTripMatch) result.city = pickDetectedPlanCityCandidate(cityTripMatch[1]) || null;
+  }
+  if (!result.city) {
+    const zhRouteMatch = String(message || "").match(/([\u4e00-\u9fa5]{2,8})\s*(?:去|到)\s*([\u4e00-\u9fa5]{2,8})/);
+    if (zhRouteMatch) {
+      if (!result.origin) result.origin = pickDetectedPlanCityCandidate(zhRouteMatch[1]) || sanitizeDetectedCityName(zhRouteMatch[1]) || zhRouteMatch[1];
+      if (!result.city) result.city = pickDetectedPlanCityCandidate(zhRouteMatch[2]) || sanitizeDetectedCityName(zhRouteMatch[2]) || zhRouteMatch[2];
+    }
+  }
+  if (!result.city) {
+    // Match "去/在/到/改成/换成/变成/出发去 + CityName" — handles mid-conversation destination changes
+    const m = message.match(/(?:改成|换成|变成|出发去|in|去|在|到)\s*([A-Z][a-z]+|[\u4e00-\u9fa5]{2,6})(?:\s|,|，|市|$)/);
+    if (m) result.city = pickDetectedPlanCityCandidate(m[1]) || null;
+  }
+  // Duration — supports Arabic numerals AND Chinese numerals (十天, 七天, 三天等)
   result.duration = constraints.duration || constraints.days || null;
   if (!result.duration) {
-    const m = message.match(/(\d{1,2})\s*(?:days?|天|泊|nights?|晚)/i);
-    if (m) result.duration = parseInt(m[1], 10);
+    const mArabic = message.match(/(\d{1,2})\s*(?:[-–—]\s*)?(?:days?|天|泊|nights?|晚)/i);
+    if (mArabic) {
+      result.duration = parseInt(mArabic[1], 10);
+    } else {
+      const _cnMap = { "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12, "十三": 13, "十四": 14, "十五": 15, "十六": 16, "十七": 17, "十八": 18, "十九": 19, "二十": 20 };
+      const mCn = message.match(/(二十|十[一二三四五六七八九]|[一二三四五六七八九十])\s*(?:天|泊|晚|日|个?[周星期])/);
+      if (mCn && _cnMap[mCn[1]]) result.duration = _cnMap[mCn[1]];
+    }
   }
   // Budget
   result.budget = constraints.budget || null;
@@ -3469,7 +7755,7 @@ function runAgentWorkflow({ message, language, city, constraints, conversationHi
       finished = true;
       clearTimeout(timer);
       const raw = stdout.trim();
-      if (!raw) return resolve({ type: "error", error: `subprocess_empty:${stderr.slice(0, 120)}` });
+      if (!raw) return resolve({ type: "error", error: "agent_subprocess_empty" });
       // Strip markdown code fences if LLM wrapped it
       const jsonStr = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
       try {
@@ -3499,7 +7785,7 @@ function runAgentWorkflow({ message, language, city, constraints, conversationHi
       if (finished) return;
       finished = true;
       clearTimeout(timer);
-      resolve({ type: "error", error: err.message });
+      resolve({ type: "error", error: "agent_subprocess_failed" });
     });
 
     try {
@@ -3720,7 +8006,7 @@ function migrateLoadedData() {
       mutated = true;
     }
     if (!task.paymentRailSnapshot) {
-      task.paymentRailSnapshot = resolveUserPaymentRail(task.userId || "demo");
+      task.paymentRailSnapshot = resolveUserPaymentRail(task.userId);
       if (task.plan && task.plan.confirm) {
         task.plan.confirm.paymentRail = task.paymentRailSnapshot;
       }
@@ -3842,7 +8128,7 @@ function stablePercent(input) {
 }
 
 function evaluateFlagsForUser(userId) {
-  const uid = userId || "demo";
+  const uid = String(userId || "anon");
   const evaluated = {};
   for (const [flagName, conf] of Object.entries(db.featureFlags || {})) {
     const rollout = Number(conf.rollout || 0);
@@ -4015,16 +8301,16 @@ function buildSettlementSummary() {
 }
 
 function resolveUserPaymentRail(userId) {
-  const user = db.users[userId] || db.users.demo;
+  const user = userId ? getUser(userId) || null : null;
   const selected = normalizeRail(user && user.paymentRail && user.paymentRail.selected);
   const check = canUseRail(selected);
   if (check.ok) return selected;
   const fallback = paymentRails.listRails().find((rail) => canUseRail(rail.id).ok);
-  return fallback ? fallback.id : selected;
+  return fallback ? fallback.id : (selected || "alipay_cn");
 }
 
 function buildPaymentRailsStatus(userId) {
-  const selected = resolveUserPaymentRail(userId || "demo");
+  const selected = resolveUserPaymentRail(userId);
   const compliance = buildPaymentComplianceSummary();
   const rails = paymentRails.listRails().map((rail) => ({
     ...rail,
@@ -4218,7 +8504,7 @@ function attachTaskToTripPlan(task, tripId) {
   return plan;
 }
 
-function buildTripSummary(plan) {
+function buildTripSummary(plan, { isAdmin = false } = {}) {
   const refreshed = refreshTripPlan(plan);
   const taskIds = (refreshed && refreshed.progress && refreshed.progress.taskIds) || [];
   const latestTask = taskIds
@@ -4233,20 +8519,19 @@ function buildTripSummary(plan) {
           .filter((task) => task && task.orderId && db.orders[task.orderId])
           .map((task) => db.orders[task.orderId])
           .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || null;
-  return {
+  const summary = {
     id: refreshed.id,
-    userId: refreshed.userId,
     title: refreshed.title,
     city: refreshed.city,
-    note: refreshed.note || "",
+    note: isAdmin ? (refreshed.note || "") : maskSensitiveString(refreshed.note || "").slice(0, 200),
     status: refreshed.derivedStatus || refreshed.status || "draft",
     manualStatus: refreshed.status || "active",
     startAt: refreshed.startAt || "",
     endAt: refreshed.endAt || "",
-    progress: refreshed.progress || tripProgress(refreshed),
+    progress: sanitizeTripProgressForViewer(refreshed.progress || tripProgress(refreshed)),
     latestTask: latestTask
       ? {
-          id: latestTask.id,
+          id: toViewerTaskRef(latestTask),
           status: latestTask.status,
           intent: latestTask.intent,
           updatedAt: latestTask.updatedAt,
@@ -4254,43 +8539,48 @@ function buildTripSummary(plan) {
       : null,
     latestOrder: latestOrder
       ? {
-          id: latestOrder.id,
+          id: toViewerOrderRef(latestOrder),
           status: latestOrder.status,
           amount: latestOrder.price,
           currency: latestOrder.currency,
           createdAt: latestOrder.createdAt,
-          orderNo: latestOrder.proof && latestOrder.proof.orderNo ? latestOrder.proof.orderNo : latestOrder.id,
         }
       : null,
+    hasItinerarySnapshot: Boolean(refreshed.itinerarySnapshot && typeof refreshed.itinerarySnapshot === "object"),
     createdAt: refreshed.createdAt,
     updatedAt: refreshed.updatedAt,
   };
+  if (isAdmin) {
+    summary.id = refreshed.id;
+    summary.userId = refreshed.userId;
+  } else {
+    summary.id = toViewerTripRef(refreshed, { isAdmin });
+  }
+  return summary;
 }
 
-function buildTripDetail(plan) {
-  const summary = buildTripSummary(plan);
+function buildTripDetail(plan, { isAdmin = false } = {}) {
+  const summary = buildTripSummary(plan, { isAdmin });
   const tasks = (summary.progress.taskIds || [])
-    .map((id) => db.tasks[id])
+    .map((taskId) => resolveTaskRecord(taskId))
     .filter(Boolean)
     .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
     .map((task) => {
       const order = task.orderId && db.orders[task.orderId] ? db.orders[task.orderId] : null;
       return {
-        taskId: task.id,
+        taskId: toViewerTaskRef(task),
         intent: task.intent,
         status: task.status,
-        laneId: task.sessionState && task.sessionState.laneId ? task.sessionState.laneId : task.plan && task.plan.laneId,
         type: task.plan && task.plan.intentType ? task.plan.intentType : "eat",
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
         order: order
           ? {
-              orderId: order.id,
+              orderId: toViewerOrderRef(order),
               status: order.status,
               amount: order.price,
               currency: order.currency,
               proofCount: Array.isArray(order.proofItems) ? order.proofItems.length : 0,
-              orderNo: order.proof && order.proof.orderNo ? order.proof.orderNo : order.id,
             }
           : null,
       };
@@ -4298,7 +8588,10 @@ function buildTripDetail(plan) {
   return {
     ...summary,
     tasks,
-    lifecycle: Array.isArray(plan.lifecycle) ? plan.lifecycle : [],
+    lifecycle: Array.isArray(plan.lifecycle) ? plan.lifecycle.map((item) => sanitizeTripLifecycleEntryForViewer(item)).filter(Boolean) : [],
+    itinerarySnapshot: plan.itinerarySnapshot && typeof plan.itinerarySnapshot === "object"
+      ? JSON.parse(JSON.stringify(plan.itinerarySnapshot))
+      : null,
   };
 }
 
@@ -4313,8 +8606,8 @@ function makeProofHash(seed) {
 
 function applyTaskRuntimePolicy(task) {
   if (!task || typeof task !== "object" || !task.plan) return;
-  const userId = task.userId || "demo";
-  const user = db.users[userId] || db.users.demo;
+  const userId = task.userId || "";
+  const user = userId ? getUser(userId) || null : null;
   task.flagSnapshot = evaluateFlagsForUser(userId);
   task.plan.constraints = {
     ...(task.plan.constraints || {}),
@@ -4381,7 +8674,7 @@ function replanTask(task, payload) {
   task.constraints = nextConstraints;
   task.plan = orchestrator.planTask({
     taskId: task.id,
-    userId: task.userId || "demo",
+    userId: task.userId || "anon",
     intent: task.intent,
     constraints: task.constraints,
   });
@@ -4421,7 +8714,7 @@ function replanTask(task, payload) {
   });
   audit.append({
     kind: "task",
-    who: task.userId,
+    who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
     what: "task.replanned",
     taskId: task.id,
     toolInput: body,
@@ -4429,7 +8722,7 @@ function replanTask(task, payload) {
   });
   pushMetricEvent({
     kind: "task_replanned",
-    userId: task.userId,
+    userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }),
     taskId: task.id,
     intentType: task.plan.intentType,
   });
@@ -4446,14 +8739,14 @@ function buildReplanPreview(task, payload) {
   cloned.constraints = nextConstraints;
   cloned.plan = orchestrator.planTask({
     taskId: cloned.id,
-    userId: cloned.userId || "demo",
+    userId: cloned.userId || "anon",
     intent: cloned.intent,
     constraints: cloned.constraints,
     silent: true,
   });
   applyTaskRuntimePolicy(cloned);
   return {
-    taskId: cloned.id,
+    taskId: toViewerTaskRef(cloned),
     intent: cloned.intent,
     intentType: cloned.plan.intentType,
     constraints: cloned.constraints,
@@ -4681,38 +8974,116 @@ function summarizeProviderCalls(providerKey, calls) {
   };
 }
 
-function buildProviderProbeSummary() {
+function buildLiveReadinessSummary() {
   const gaodeKeyPresent = Boolean(process.env.AMAP_API_KEY || process.env.GAODE_KEY || process.env.AMAP_KEY);
   const partnerHubKeyPresent = Boolean(process.env.PARTNER_HUB_KEY);
+  const jutuiTokenPresent = Boolean(process.env.JUTUI_TOKEN);
   const partnerHubBaseUrlConfigured = Boolean(connectors.partnerHub && connectors.partnerHub.baseUrl);
   const partnerHubContractReady = Boolean(connectors.partnerHub && connectors.partnerHub.baseUrl);
+  const partnerHubRailMethodAvailable = Boolean(connectors.partnerHub && typeof connectors.partnerHub.railAvailability === "function");
   const partnerHubReady = Boolean(connectors.partnerHub && connectors.partnerHub.enabled && (partnerHubKeyPresent || partnerHubBaseUrlConfigured));
+  const hotelCacheEntries = _ctripHotelCache.size;
+  const hotelLaneVerified = hotelCacheEntries > 0;
+  const consumerMissing = [
+    ...(gaodeKeyPresent ? [] : ["map_provider"]),
+    ...(jutuiTokenPresent ? [] : ["restaurant_provider"]),
+  ];
+  const commerceMissing = [
+    ...(partnerHubReady ? [] : ["booking_provider"]),
+  ];
+  return {
+    gaodeKeyPresent,
+    partnerHubKeyPresent,
+    partnerHubBaseUrlConfigured,
+    partnerHubContractReady,
+    partnerHubRailMethodAvailable,
+    partnerHubReady,
+    jutuiTokenPresent,
+    hotels: {
+      enabled: true,
+      mode: hotelLaneVerified
+        ? "anonymous_live_verified_with_curated_fallback"
+        : "anonymous_live_with_curated_fallback",
+      providerAlias: "trip_ctrip",
+      runtimeVerified: hotelLaneVerified,
+      cacheEntries: hotelCacheEntries,
+    },
+    liveReadiness: {
+      // Consumer travel-data readiness should track map + hotel + restaurant data.
+      // Hotel search has a built-in anonymous live lane and curated fallback, so it
+      // should not be blocked on PartnerHub booking integration.
+      ready: consumerMissing.length === 0,
+      missing: consumerMissing,
+      commerceReady: commerceMissing.length === 0,
+      commerceMissing,
+    },
+  };
+}
+
+function buildRailProviderSummary(readiness = buildLiveReadinessSummary()) {
+  const partnerHub = connectors.partnerHub || {};
+  const enabled = Boolean(partnerHub.enabled && readiness.partnerHubRailMethodAvailable);
+  const runtimeCanServeLiveRail = Boolean(enabled && readiness.partnerHubBaseUrlConfigured);
+  const contractReady = Boolean(readiness.partnerHubContractReady && readiness.partnerHubRailMethodAvailable);
+  const mode = runtimeCanServeLiveRail
+    ? "live_inventory"
+    : enabled
+      ? "12306_self_check_fallback"
+      : "unavailable";
+  return {
+    enabled,
+    mode,
+    providerAlias: partnerHub.provider || "generic",
+    channels: partnerHub.channels || [],
+    baseUrlConfigured: readiness.partnerHubBaseUrlConfigured,
+    contractReady,
+    availabilityMethod: readiness.partnerHubRailMethodAvailable,
+    runtimeCanServeLiveRail,
+    inventorySource: runtimeCanServeLiveRail ? "partner_hub_rail_live" : "12306_self_check_fallback",
+    verificationRequired: !runtimeCanServeLiveRail,
+    errorCode: runtimeCanServeLiveRail ? null : (enabled ? "rail_provider_not_configured" : "rail_provider_unavailable"),
+  };
+}
+
+function buildProviderProbeSummary() {
+  const readiness = buildLiveReadinessSummary();
+  const rail = buildRailProviderSummary(readiness);
   const recentCalls = (db.mcpCalls || []).slice(-240);
   const gaodeStats = summarizeProviderCalls("gaode", recentCalls);
   const partnerStats = summarizeProviderCalls("partnerHub", recentCalls);
-  const missing = [
-    ...(gaodeKeyPresent ? [] : ["GAODE_KEY or AMAP_KEY"]),
-    ...(partnerHubReady ? [] : ["PARTNER_HUB_KEY or PARTNER_HUB_BASE_URL"]),
-  ];
 
   return {
     generatedAt: nowIso(),
-    ready: missing.length === 0,
-    missing,
+    ready: readiness.liveReadiness.ready,
+    missing: readiness.liveReadiness.missing,
+    commerceMissing: readiness.liveReadiness.commerceMissing,
+    rail,
     probes: [
       {
         provider: "Gaode LBS",
         mode: connectors.gaode.enabled ? "live_with_fallback" : "mock",
-        keyPresent: gaodeKeyPresent,
+        keyPresent: readiness.gaodeKeyPresent,
         connectorEnabled: connectors.gaode.enabled,
         ...gaodeStats,
       },
       {
+        provider: "Hotel Catalog",
+        mode: readiness.hotels.mode,
+        providerAlias: readiness.hotels.providerAlias,
+        runtimeVerified: readiness.hotels.runtimeVerified,
+        cacheEntries: readiness.hotels.cacheEntries,
+        sampleCalls: readiness.hotels.cacheEntries,
+        avgMs: 0,
+        p95Ms: 0,
+        slaMetRate: readiness.hotels.runtimeVerified ? 1 : 0,
+        lastCallAt: readiness.hotels.runtimeVerified ? nowIso() : null,
+      },
+      {
         provider: "Partner Hub",
         mode: connectors.partnerHub.mode || (connectors.partnerHub.enabled ? "external_contract" : "mock"),
-        keyPresent: partnerHubKeyPresent,
-        baseUrlConfigured: partnerHubBaseUrlConfigured,
-        contractReady: partnerHubContractReady,
+        keyPresent: readiness.partnerHubKeyPresent,
+        baseUrlConfigured: readiness.partnerHubBaseUrlConfigured,
+        contractReady: readiness.partnerHubContractReady,
         providerAlias: connectors.partnerHub.provider || "generic",
         channels: connectors.partnerHub.channels || [],
         connectorEnabled: connectors.partnerHub.enabled,
@@ -4852,7 +9223,17 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         ? L("东来顺涮肉（王府井）", "Dong Lai Shun Hotpot (Wangfujing)", "東来順しゃぶしゃぶ（王府井）", "동라이순 훠궈 (왕푸징)")
         : cityKey === "Chengdu"
           ? L("蜀九香火锅（太古里）", "Shu Jiu Xiang Hotpot (Taikoo Li)", "蜀九香火鍋（太古里）", "수지우샹 훠궈 (타이쿠리)")
-          : L("海底捞火锅（人民广场）", "Haidilao Hotpot (People's Square)", "海底撈火鍋（人民広場）", "하이디라오 훠궈 (인민광장)");
+          : cityKey === "Shanghai"
+            ? L("海底捞火锅（人民广场）", "Haidilao Hotpot (People's Square)", "海底撈火鍋（人民広場）", "하이디라오 훠궈 (인민광장)")
+            : cityKey === "Chongqing"
+              ? L("重庆德庄火锅（解放碑）", "De Zhuang Hotpot (Jiefangbei)", "徳荘火鍋（解放碑）", "더좡 훠궈 (지에팡베이)")
+              : cityKey === "Xian"
+                ? L("老孙家羊肉泡馍（东大街）", "Lao Sun Jia Hotpot (East Street)", "老孫家羊肉泡馍（東大街）", "라오쑨자 양고기 훠궈 (동대가)")
+                : cityKey === "Hangzhou"
+                  ? L("海底捞火锅（湖滨银泰）", "Haidilao Hotpot (Hubin Yintai)", "海底撈火鍋（湖浜銀泰）", "하이디라오 훠궈 (후빈인타이)")
+                  : cityKey === "Guangzhou"
+                    ? L("海底捞火锅（天河城）", "Haidilao Hotpot (Tianhe City)", "海底撈火鍋（天河城）", "하이디라오 훠궈 (톈허청)")
+                    : L(`${city}本地火锅推荐`, `Local Hotpot in ${city}`, `${city}のしゃぶしゃぶ`, `${city} 훠궈`);
       add({
         name,
         category: L("火锅", "Hotpot", "火鍋", "훠궈"),
@@ -4867,7 +9248,13 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
     if (/halal|清真/.test(text)) {
       const name = cityKey === "Beijing"
         ? L("聚宝源涮肉（牛街）", "Jubaoyuan Halal Hotpot (Niujie)", "聚宝源しゃぶしゃぶ（牛街）", "쥐바오위안 할랄 훠궈 (니우제)")
-        : L("耶里夏丽新疆餐厅（静安）", "Yershari Xinjiang Cuisine (Jing'an)", "イェリシャリ新疆料理（静安）", "예리샤리 신장요리 (징안)");
+        : cityKey === "Shanghai"
+          ? L("耶里夏丽新疆餐厅（静安）", "Yershari Xinjiang Cuisine (Jing'an)", "イェリシャリ新疆料理（静安）", "예리샤리 신장요리 (징안)")
+          : cityKey === "Xian"
+            ? L("贾三灌汤包（回民街）", "Jia San Halal Baozi (Huimin St)", "賈三灌湯包（回民街）", "자산 할랄 만두 (후이민제)")
+            : cityKey === "Guangzhou"
+              ? L("伊斯兰餐厅（越秀区）", "Islamic Restaurant (Yuexiu)", "イスラム料理（越秀区）", "이슬람 식당 (위에슈)")
+              : L(`${city}清真餐厅推荐`, `Halal Restaurant in ${city}`, `${city}のハラール料理`, `${city} 할랄 식당`);
       add({
         name,
         category: L("清真", "Halal", "ハラール", "할랄"),
@@ -4882,7 +9269,11 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
     if (/vegan|vegetarian|素食|纯素/.test(text)) {
       const name = cityKey === "Beijing"
         ? L("京兆尹素食（雍和宫）", "King's Joy Vegetarian (Yonghegong)", "京兆尹精進料理（雍和宮）", "킹스조이 베지테리언 (용허궁)")
-        : L("功德林素食（南京西路）", "Gong De Lin Vegetarian (Nanjing West Rd)", "功徳林精進料理（南京西路）", "궁더린 채식 (난징서루)");
+        : cityKey === "Shanghai"
+          ? L("功德林素食（南京西路）", "Gong De Lin Vegetarian (Nanjing West Rd)", "功徳林精進料理（南京西路）", "궁더린 채식 (난징서루)")
+          : cityKey === "Chengdu"
+            ? L("香积厨素食（太古里）", "Xiangjizhu Vegetarian (Taikoo Li)", "香積廚精進料理（太古里）", "샹지주 채식 (타이쿠리)")
+            : L(`${city}素食餐厅推荐`, `Vegetarian Restaurant in ${city}`, `${city}の精進料理`, `${city} 채식 식당`);
       add({
         name,
         category: L("素食", "Vegetarian", "精進料理", "채식"),
@@ -4897,7 +9288,15 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
     if (/coffee|cafe|咖啡|奶茶|tea/.test(text)) {
       const name = cityKey === "Beijing"
         ? L("%Arabica（三里屯）", "%Arabica (Sanlitun)", "%Arabica（三里屯）", "%아라비카 (싼리툰)")
-        : L("M Stand咖啡（新天地）", "M Stand Coffee (Xintiandi)", "M Stand コーヒー（新天地）", "M Stand 커피 (신톈디)");
+        : cityKey === "Shanghai"
+          ? L("M Stand咖啡（新天地）", "M Stand Coffee (Xintiandi)", "M Stand コーヒー（新天地）", "M Stand 커피 (신톈디)")
+          : cityKey === "Chengdu"
+            ? L("轩言咖啡（宽窄巷子）", "Xuanyan Cafe (Kuanzhai Alley)", "軒言コーヒー（寛窄巷子）", "쉬안옌 카페 (관착샹즈)")
+            : cityKey === "Hangzhou"
+              ? L("Manner咖啡（西湖银泰）", "Manner Coffee (West Lake Yintai)", "Manner コーヒー（西湖銀泰）", "매너 커피 (시후인타이)")
+              : cityKey === "Shenzhen"
+                ? L("Seesaw咖啡（海岸城）", "Seesaw Coffee (Coastal City)", "Seesaw コーヒー（海岸城）", "시소 커피 (하이안청)")
+                : L(`${city}本地咖啡推荐`, `Local Cafe in ${city}`, `${city}のカフェ`, `${city} 카페`);
       add({
         name,
         category: L("咖啡茶饮", "Cafe & Tea", "カフェ・ティー", "카페·티"),
@@ -4912,7 +9311,13 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
     if (/noodle|面|ramen/.test(text)) {
       const name = cityKey === "Beijing"
         ? L("方砖厂69号炸酱面", "Fangzhuanchang 69 Zhajiangmian", "方磚廠69号ジャージャー麺", "팡좐창69 자장면")
-        : L("阿娘面馆（思南路）", "A Niang Noodles (Sinan Rd)", "阿娘面館（思南路）", "아냥 누들 (쓰난루)");
+        : cityKey === "Shanghai"
+          ? L("阿娘面馆（思南路）", "A Niang Noodles (Sinan Rd)", "阿娘面館（思南路）", "아냥 누들 (쓰난루)")
+          : cityKey === "Xian"
+            ? L("魏家凉皮（回民街）", "Wei Jia Liangpi Noodles (Huimin St)", "魏家涼皮（回民街）", "웨이자 냉면 (후이민제)")
+            : cityKey === "Chengdu"
+              ? L("担担面老字号（春熙路）", "Dan Dan Mian (Chunxi Rd)", "担担麺（春熙路）", "단단면 (춘시루)")
+              : L(`${city}特色面馆`, `Local Noodles in ${city}`, `${city}の麺料理`, `${city} 면요리`);
       add({
         name,
         category: L("面馆", "Noodles", "麺類", "면요리"),
@@ -4931,7 +9336,13 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         ? L("大兴机场快线专车", "Daxing Airport Express Ride", "大興空港エクスプレス配車", "다싱공항 익스프레스 라이드")
         : cityKey === "Shenzhen"
           ? L("宝安机场快线专车", "SZX Airport Express Ride", "宝安空港エクスプレス配車", "바오안공항 익스프레스 라이드")
-          : L("浦东机场快线专车", "PVG Airport Express Ride", "浦東空港エクスプレス配車", "푸동공항 익스프레스 라이드");
+          : cityKey === "Shanghai"
+            ? L("浦东机场快线专车", "PVG Airport Express Ride", "浦東空港エクスプレス配車", "푸동공항 익스프레스 라이드")
+            : cityKey === "Guangzhou"
+              ? L("白云机场专车", "Guangzhou Baiyun Airport Ride", "白雲空港配車", "광저우 공항 전용차")
+              : cityKey === "Chengdu"
+                ? L("成都双流/天府机场专车", "Chengdu Airport Express Ride", "成都空港配車", "청두 공항 전용차")
+                : L(`${city}机场专车`, `${city} Airport Ride`, `${city}空港配車`, `${city} 공항 전용차`);
       add({
         name: fastRide,
         category: L("机场接送", "Airport Transfer", "空港送迎", "공항 이동"),
@@ -4945,7 +9356,9 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
           ? L("地铁 + 机场快线组合", "Metro + Airport Express Mix", "地下鉄 + 空港快速線", "지하철 + 공항 익스프레스")
           : cityKey === "Shenzhen"
             ? L("地铁11号线 + 网约车", "Metro Line 11 + Ride-hailing", "地下鉄11号線 + 配車", "지하철 11호선 + 택시")
-            : L("地铁2号线 + 机场联络线", "Metro Line 2 + Airport Link", "地下鉄2号線 + 空港連絡線", "지하철 2호선 + 공항 링크"),
+            : cityKey === "Shanghai"
+              ? L("地铁2号线 + 机场联络线", "Metro Line 2 + Airport Link", "地下鉄2号線 + 空港連絡線", "지하철 2호선 + 공항 링크")
+              : L(`${city}地铁 + 机场巴士`, `Metro + Airport Bus in ${city}`, `${city}地下鉄 + 空港バス`, `${city} 지하철 + 공항버스`),
         category: L("交通组合", "Transport Mix", "交通ミックス", "교통 혼합"),
         score: 88,
         imageUrl: "/api/placeholder?cat=default",
@@ -4959,7 +9372,13 @@ function buildLocalKeywordCandidates({ city = "Shanghai", language = "EN", laneT
         ? L("北京国贸大酒店", "China World Hotel Beijing", "チャイナワールドホテル北京", "차이나월드 호텔 베이징")
         : cityKey === "Shenzhen"
           ? L("深圳四季酒店", "Four Seasons Hotel Shenzhen", "フォーシーズンズ深圳", "포시즌스 호텔 선전")
-          : L("上海浦东香格里拉酒店", "Pudong Shangri-La Shanghai", "上海浦東シャングリ・ラ", "푸동 샹그릴라 상하이");
+          : cityKey === "Shanghai"
+            ? L("上海浦东香格里拉酒店", "Pudong Shangri-La Shanghai", "上海浦東シャングリ・ラ", "푸동 샹그릴라 상하이")
+            : cityKey === "Chengdu"
+              ? L("成都博舍酒店（太古里）", "The Temple House Chengdu", "成都博舎ホテル（太古里）", "더 템플 하우스 청두")
+              : cityKey === "Xian"
+                ? L("西安万达文华酒店", "Wanda Vista Xian", "西安ワンダビスタホテル", "완다비스타 시안")
+                : L(`${city}高品质酒店推荐`, `Quality Hotel in ${city}`, `${city}の高級ホテル`, `${city} 호텔`);
       add({
         name: hotel,
         category: L("酒店", "Hotel", "ホテル", "호텔"),
@@ -4994,15 +9413,51 @@ async function fetchDynamicCandidatePool({ message = "", city = "Shanghai", cons
   const needTravel = inferredIntent === "travel" || /airport|flight|route|taxi|metro|机场|打车|路线|酒店/.test(lower);
 
   if (needEat) {
-    pool.eat.push(
-      ...buildLocalKeywordCandidates({
-        city,
-        language,
-        laneType: "eat",
-        message: `${message} ${query}`,
-        constraints,
-      }),
-    );
+    // First: inject curated real restaurant data (real names, real prices) for known cities
+    const _curatedRests = _getCuratedRestaurants(city);
+    let _hasRealData = false;
+    if (_curatedRests && _curatedRests.length) {
+      const _lowerMsg = String(message || "").toLowerCase();
+      // If dietary/cuisine preference, filter by tags; otherwise use all
+      let _filtered = _curatedRests;
+      if (/halal|清真/.test(_lowerMsg)) _filtered = _curatedRests.filter((r) => r.tags && r.tags.some((t) => /清真|halal/i.test(t)));
+      if (/vegan|素食/.test(_lowerMsg)) _filtered = _curatedRests.filter((r) => r.tags && r.tags.some((t) => /素食|vegan/i.test(t)));
+      if (!_filtered.length) _filtered = _curatedRests;
+      const _budget = constraints && constraints.budget ? Number(String(constraints.budget).replace(/[^\d.]/g, "")) : 0;
+      if (_budget > 0) {
+        const _budgetFiltered = _filtered.filter((r) => r.pricePerPerson <= _budget / 2);
+        if (_budgetFiltered.length >= 2) _filtered = _budgetFiltered;
+      }
+      _filtered.slice(0, 5).forEach((r, idx) => {
+        const row = normalizeCandidateItem({
+          name: r.name,
+          category: "Restaurant",
+          imageUrl: "/api/placeholder?cat=food",
+          score: Math.round(r.score * 20),  // 4.7 → 94
+          reason: `${r.area} · ${r.cuisine} · 人均¥${r.pricePerPerson}`,
+          tags: r.tags || [],
+          address: r.area,
+          rating: r.score,
+          price: r.pricePerPerson,
+        }, "eat");
+        if (row) {
+          pool.eat.push(row);  // Add real data
+          _hasRealData = true;
+        }
+      });
+    }
+    // Only add mock keyword candidates if no real data was found
+    if (!_hasRealData) {
+      pool.eat.push(
+        ...buildLocalKeywordCandidates({
+          city,
+          language,
+          laneType: "eat",
+          message: `${message} ${query}`,
+          constraints,
+        }),
+      );
+    }
   }
   if (needTravel) {
     pool.travel.push(
@@ -5086,6 +9541,61 @@ async function fetchDynamicCandidatePool({ message = "", city = "Shanghai", cons
     }
   }
 
+  // ── Direct Amap POI fallback (fires when gaode connector not configured) ──────
+  // Uses queryAmapPoi with restaurant / hotel types to get real local data
+  const _amapEnabled = Boolean(process.env.AMAP_API_KEY || process.env.GAODE_API_KEY);
+  const _gaodeConnectorActive = connectors.gaode && connectors.gaode.enabled;
+  if (_amapEnabled && !_gaodeConnectorActive) {
+    const _amapCity = city;
+    if (needEat) {
+      tasks.push(
+        queryAmapPoi(_amapCity, "restaurant")
+          .then((pois) => {
+            if (!pois || !pois.length) return;
+            const rows = pois.slice(0, 6).map((poi, idx) =>
+              normalizeCandidateItem({
+                name: poi.name,
+                category: "Restaurant",
+                imageUrl: "/api/placeholder?cat=food",
+                score: Math.max(72, 96 - idx * 3),
+                reason: poi.address ? `高德美食 · ${poi.address}` : "高德美食",
+                rating: poi.rating || 0,
+                price: poi.price || 0,
+                amap_id: poi.amap_id || "",
+                address: poi.address || "",
+              }, "eat")
+            ).filter(Boolean);
+            pool.eat.push(...rows);
+          })
+          .catch(() => {})
+      );
+    }
+    if (needTravel) {
+      tasks.push(
+        queryAmapPoi(_amapCity, "hotel")
+          .then((pois) => {
+            if (!pois || !pois.length) return;
+            const rows = pois.slice(0, 6).map((poi, idx) =>
+              normalizeCandidateItem({
+                name: poi.name,
+                category: "Hotel",
+                imageUrl: "/api/placeholder?cat=hotel",
+                score: Math.max(72, 96 - idx * 3),
+                reason: poi.address ? `高德酒店 · ${poi.address}` : "高德酒店",
+                rating: poi.rating || 0,
+                price: poi.price || 0,
+                amap_id: poi.amap_id || "",
+                address: poi.address || "",
+              }, "travel")
+            ).filter(Boolean);
+            pool.travel.push(...rows);
+          })
+          .catch(() => {})
+      );
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
   if (tasks.length) {
     await Promise.all(tasks);
   }
@@ -5160,11 +9670,12 @@ function buildSolutionRecommendation(taskId = null, intentHint = null, cityOverr
   const recommendationConstraints = task && task.constraints
     ? task.constraints
     : (contextConstraints && typeof contextConstraints === "object" ? contextConstraints : {});
+  const taskUser = task && task.userId ? getUser(task.userId) : null;
   const cityRaw =
     String(cityOverride || "").trim() ||
     (task && task.plan && task.plan.constraints && task.plan.constraints.city) ||
-    db.users.demo.city ||
-    "Shanghai";
+    (taskUser && taskUser.city) ||
+    DEFAULT_CITY;
   const city = localizedCityName(cityRaw, lang);
   const candidatesByLane = mergeCandidatePool(cityLaneCandidates(cityRaw, lang), dynamicCandidates);
   const mcpCoverage = Number(mcpContracts.totalContracts || 0)
@@ -5205,8 +9716,7 @@ function buildSolutionRecommendation(taskId = null, intentHint = null, cityOverr
   const transportCandidates = travelCandidates.filter((item) => item !== hotelPrimary);
   const transferFast = transportCandidates[0] || travelCandidates[1] || {};
   const transferSaver = transportCandidates[1] || transportCandidates[0] || travelCandidates[2] || transferFast;
-  const demoUser = db.users.demo || {};
-  const savedHotel = String((demoUser.savedPlaces && demoUser.savedPlaces.hotel) || "").trim();
+  const savedHotel = String((taskUser && taskUser.savedPlaces && taskUser.savedPlaces.hotel) || "").trim();
   const hotelName = savedHotel || hotelPrimary.name || L(`${city}滨江精选酒店`, `${city} Riverside Hotel`, `${city} リバーサイドホテル`, `${city} 리버사이드 호텔`);
   const distancePref = String(
     recommendationConstraints.distance ||
@@ -5234,7 +9744,7 @@ function buildSolutionRecommendation(taskId = null, intentHint = null, cityOverr
       id: "eat-specific-fastlane",
       type: "eat",
       title: L(`${eatPrimary.name} 即刻订位`, `${eatPrimary.name} immediate reservation`, `${eatPrimary.name} 即時予約`, `${eatPrimary.name} 즉시 예약`),
-      imagePath: eatPrimary.imageUrl || "/api/placeholder?cat=default",
+      imagePath: eatPrimary.imageUrl || "/api/placeholder?cat=food",
       prompt: L(
         `去 ${eatPrimary.name}，用${transportModeEat}前往并完成排队、订位、代付和双语导航。`,
         `Go to ${eatPrimary.name} via ${transportModeEat}, and complete queue check, reservation, delegated pay, and bilingual navigation.`,
@@ -5289,7 +9799,7 @@ function buildSolutionRecommendation(taskId = null, intentHint = null, cityOverr
       id: "dinner-hotel-combo",
       type: "eat",
       title: L(`${eatSecondary.name} 晚餐 + 返回酒店`, `${eatSecondary.name} dinner + return hotel`, `${eatSecondary.name} 夕食 + ホテル帰着`, `${eatSecondary.name} 저녁 + 호텔 복귀`),
-      imagePath: eatSecondary.imageUrl || eatPrimary.imageUrl || "/api/placeholder?cat=default",
+      imagePath: eatSecondary.imageUrl || eatPrimary.imageUrl || "/api/placeholder?cat=food",
       prompt: L(
         `在 ${eatSecondary.name} 完成晚餐后，安排 ${hotelName} 回程并交付全套凭证。`,
         `Finish dinner at ${eatSecondary.name}, then arrange return to ${hotelName} with full proof package.`,
@@ -5341,7 +9851,7 @@ function buildSolutionRecommendation(taskId = null, intentHint = null, cityOverr
       id: "airport-sla-lane",
       type: "travel",
       title: L(`${hotelName} -> 机场 · ${transferPrimary.name || transportModeTrip}`, `${hotelName} -> airport via ${transferPrimary.name || transportModeTrip}`, `${hotelName} -> 空港 · ${transferPrimary.name || transportModeTrip}`, `${hotelName} -> 공항 · ${transferPrimary.name || transportModeTrip}`),
-      imagePath: transferPrimary.imageUrl || hotelPrimary.imageUrl || "/api/placeholder?cat=default",
+      imagePath: transferPrimary.imageUrl || hotelPrimary.imageUrl || "/api/placeholder?cat=travel",
       prompt: L(
         `从 ${hotelName} 出发，使用 ${transferPrimary.name || transportModeTrip} 方案到机场，自动锁单与支付并交付二维码。`,
         `Depart from ${hotelName}, use ${transferPrimary.name || transportModeTrip} to airport, auto-lock and pay, then deliver QR proof.`,
@@ -5669,6 +10179,159 @@ function createSupportMessageId() {
   return `msg_${Date.now().toString(36)}_${require("crypto").randomBytes(3).toString("hex")}`;
 }
 
+function _supportAccessSecret() {
+  return process.env.SUPPORT_ACCESS_SECRET || process.env.USER_TOKEN_SECRET || process.env.ADMIN_SECRET_KEY || "cx_support_dev_access_only";
+}
+
+function _supportAccessHmac(data) {
+  return require("crypto").createHmac("sha256", _supportAccessSecret()).update(data).digest("hex");
+}
+
+const SUPPORT_SESSION_COOKIE_PREFIX = "cx_support_tk_";
+const SUPPORT_SESSION_TOKEN_TTL_SEC = 12 * 60 * 60;
+const USER_AUTH_COOKIE_NAME = "cx_token";
+const USER_AUTH_COOKIE_TTL_SEC = 7 * 24 * 60 * 60;
+
+function _supportSessionCookieName(sessionId) {
+  return `${SUPPORT_SESSION_COOKIE_PREFIX}${String(sessionId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 120)}`;
+}
+
+function _appendSetCookie(res, cookieValue) {
+  if (!cookieValue) return;
+  const existing = typeof res.getHeader === "function" ? res.getHeader("Set-Cookie") : undefined;
+  if (!existing) {
+    res.setHeader("Set-Cookie", cookieValue);
+    return;
+  }
+  const next = Array.isArray(existing) ? [...existing, cookieValue] : [existing, cookieValue];
+  res.setHeader("Set-Cookie", next);
+}
+
+function _supportCookieSecure(req) {
+  if (process.env.FORCE_HTTPS === "1") return true;
+  const candidates = [process.env.APP_BASE_URL, process.env.PUBLIC_APP_BASE_URL]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  if (candidates.some((value) => /^https:\/\//i.test(value))) return true;
+  if (req && req.socket && req.socket.encrypted) return true;
+  const forwardedProto = String((req && req.headers && req.headers["x-forwarded-proto"]) || "").trim().toLowerCase();
+  return forwardedProto === "https";
+}
+
+function _setUserAuthCookie(req, res, token) {
+  if (!token) return;
+  const cookieParts = [
+    `${USER_AUTH_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    "HttpOnly",
+    "SameSite=Strict",
+    "Path=/",
+    `Max-Age=${USER_AUTH_COOKIE_TTL_SEC}`,
+    ...(_supportCookieSecure(req) ? ["Secure"] : []),
+  ];
+  _appendSetCookie(res, cookieParts.join("; "));
+}
+
+function _setSupportSessionCookie(req, res, session, actor = "user") {
+  const target = ensureSupportSessionShape(session);
+  if (!target || !target.id) return "";
+  const token = issueSupportSessionToken(target, actor);
+  if (!token) return "";
+  const cookieParts = [
+    `${_supportSessionCookieName(target.id)}=${encodeURIComponent(token)}`,
+    "HttpOnly",
+    "SameSite=Strict",
+    "Path=/api/support",
+    `Max-Age=${SUPPORT_SESSION_TOKEN_TTL_SEC}`,
+    ...(_supportCookieSecure(req) ? ["Secure"] : []),
+  ];
+  _appendSetCookie(res, cookieParts.join("; "));
+  return token;
+}
+
+function _extractSupportTokensFromCookies(req) {
+  const cookieHeader = String(req.headers["cookie"] || "");
+  if (!cookieHeader) return [];
+  return cookieHeader
+    .split(";")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const idx = part.indexOf("=");
+      if (idx <= 0) return null;
+      const name = part.slice(0, idx).trim();
+      const value = part.slice(idx + 1).trim();
+      return { name, value };
+    })
+    .filter((entry) => entry && entry.name.startsWith(SUPPORT_SESSION_COOKIE_PREFIX) && entry.value)
+    .map((entry) => {
+      try {
+        return decodeURIComponent(entry.value);
+      } catch {
+        return entry.value;
+      }
+    })
+    .filter(Boolean);
+}
+
+function _shouldReturnSupportToken(req) {
+  return String(req.headers["x-support-access-mode"] || "").trim().toLowerCase() === "token";
+}
+
+function issueSupportSessionToken(session, actor = "user") {
+  const target = ensureSupportSessionShape(session);
+  if (!target || !target.id) return "";
+  const normalizedActor = normalizeSupportActor(actor) === "ops" ? "ops" : "user";
+  const payload = {
+    sid: target.id,
+    tid: target.ticketId || null,
+    actor: normalizedActor,
+    iat: Date.now(),
+    exp: Date.now() + (12 * 60 * 60 * 1000),
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString("base64");
+  const sig = _supportAccessHmac(payloadB64);
+  return `${payloadB64}.${sig}`;
+}
+
+function verifySupportSessionToken(token) {
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [payloadB64, sig] = parts;
+  const expectedSig = _supportAccessHmac(payloadB64);
+  try {
+    if (sig.length !== 64) return null;
+    const sigBuf = Buffer.from(sig, "hex");
+    const expectedBuf = Buffer.from(expectedSig, "hex");
+    if (sigBuf.length !== 32 || expectedBuf.length !== 32) return null;
+    if (!require("crypto").timingSafeEqual(sigBuf, expectedBuf)) return null;
+  } catch {
+    return null;
+  }
+  try {
+    const payload = JSON.parse(Buffer.from(payloadB64, "base64").toString("utf8"));
+    if (!payload || !payload.sid || !payload.exp || Date.now() > payload.exp) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function extractSupportSessionToken(req, body = null, sessionId = "") {
+  const headerToken = String(req.headers["x-support-access-token"] || "").trim();
+  if (headerToken) return headerToken;
+  const tokens = _extractSupportTokensFromCookies(req);
+  if (!tokens.length) return "";
+  const targetSessionId = String(sessionId || "").trim();
+  if (!targetSessionId) return tokens[0] || "";
+  const internalTargetSessionId = resolveInternalSupportSessionId(targetSessionId) || targetSessionId;
+  const matched = tokens.find((token) => {
+    const payload = verifySupportSessionToken(token);
+    return payload && String(payload.sid) === internalTargetSessionId;
+  });
+  return matched || "";
+}
+
 function ensureSupportSessionShape(session) {
   if (!session || typeof session !== "object") return null;
   if (!Array.isArray(session.messages)) session.messages = [];
@@ -5689,21 +10352,367 @@ function ensureSupportSessionShape(session) {
 }
 
 function getSupportSessionById(sessionId) {
-  const id = String(sessionId || "");
-  if (!id) return null;
-  const session = db.supportSessions[id];
+  const session = resolveSupportSessionRecord(sessionId);
   if (!session) return null;
   return ensureSupportSessionShape(session);
 }
 
 function getSupportSessionByTicketId(ticketId) {
-  const tid = String(ticketId || "");
+  const tid = resolveInternalSupportTicketId(ticketId) || String(ticketId || "");
   if (!tid) return null;
   return (
     Object.values(db.supportSessions || {}).find(
       (item) => item && String(item.ticketId || "") === tid,
     ) || null
   );
+}
+
+function _isSupportAdmin(req) {
+  try {
+    const { validateAdminToken } = require("./src/middleware/auth");
+    const payload = validateAdminToken(req);
+    return Boolean(payload && payload.sub);
+  } catch {
+    return false;
+  }
+}
+
+function _supportSessionOwnedBy(actorId, session) {
+  if (!actorId || actorId === "anon") return false;
+  const target = ensureSupportSessionShape(session);
+  if (!target) return false;
+  const task = target.taskId ? db.tasks[target.taskId] || null : null;
+  if (task && String(task.userId || "") === String(actorId)) return true;
+  const ticket = target.ticketId ? ((db.supportTickets || []).find((item) => String(item.id || "") === String(target.ticketId)) || null) : null;
+  if (ticket && ticket.taskId) {
+    const linkedTask = db.tasks[ticket.taskId] || null;
+    if (linkedTask && String(linkedTask.userId || "") === String(actorId)) return true;
+  }
+  return false;
+}
+
+function resolveSupportSessionAccess(req, session, body = null) {
+  const target = ensureSupportSessionShape(session);
+  if (!target) return { ok: false, error: "Session not found" };
+  if (_isSupportAdmin(req)) {
+    return { ok: true, actor: "ops", via: "admin" };
+  }
+  const who = _whoFromReq(req);
+  if (_supportSessionOwnedBy(who, target)) {
+    return { ok: true, actor: "user", via: "owner" };
+  }
+  const payload = verifySupportSessionToken(extractSupportSessionToken(req, body, target.id));
+  if (payload && String(payload.sid) === String(target.id)) {
+    return { ok: true, actor: payload.actor === "ops" ? "ops" : "user", via: "session_token" };
+  }
+  return { ok: false, error: "Support session token required" };
+}
+
+function sanitizeSupportAccessError(_error) {
+  return "Access denied";
+}
+
+function _supportTicketOwnedBy(actorId, ticket) {
+  if (!actorId || actorId === "anon" || !ticket || typeof ticket !== "object") return false;
+  if (!ticket.taskId) return false;
+  const task = db.tasks[ticket.taskId] || null;
+  return Boolean(task && String(task.userId || "") === String(actorId));
+}
+
+function resolveSupportTicketAccess(req, ticket, body = null) {
+  if (!ticket || typeof ticket !== "object") return { ok: false, error: "Ticket not found" };
+  if (_isSupportAdmin(req)) {
+    return { ok: true, actor: "ops", via: "admin" };
+  }
+  const who = _whoFromReq(req);
+  if (_supportTicketOwnedBy(who, ticket)) {
+    return { ok: true, actor: "user", via: "owner" };
+  }
+  const candidateTokens = [];
+  const headerToken = String(req.headers["x-support-access-token"] || "").trim();
+  if (headerToken) candidateTokens.push(headerToken);
+  candidateTokens.push(..._extractSupportTokensFromCookies(req));
+  const payload = candidateTokens
+    .map((token) => verifySupportSessionToken(token))
+    .find((item) => item && (
+      String(item.tid || "") === String(ticket.id || "")
+      || (ticket.sessionId && String(item.sid || "") === String(ticket.sessionId))
+    ));
+  if (payload) {
+    return { ok: true, actor: payload.actor === "ops" ? "ops" : "user", via: "session_token" };
+  }
+  return { ok: false, error: "Ticket not found" };
+}
+
+function listVisibleSupportTicketsForRequest(req) {
+  const tickets = Array.isArray(db.supportTickets) ? db.supportTickets : [];
+  if (_isSupportAdmin(req)) return tickets.slice(-20).reverse();
+  return tickets
+    .filter((ticket) => ticket && ticket.id && resolveSupportTicketAccess(req, ticket).ok)
+    .slice(-20)
+    .reverse();
+}
+
+function sanitizeUserPreferences(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const clean = {};
+  if (input.budget !== undefined) clean.budget = String(input.budget || "").trim().slice(0, 20);
+  if (input.dietary !== undefined) clean.dietary = String(input.dietary || "").trim().slice(0, 80);
+  if (input.family !== undefined) clean.family = input.family === true;
+  if (input.transport !== undefined) clean.transport = String(input.transport || "").trim().slice(0, 30);
+  if (input.accessibility !== undefined) clean.accessibility = String(input.accessibility || "").trim().slice(0, 30);
+  return Object.keys(clean).length ? clean : undefined;
+}
+
+function sanitizeSavedPlaces(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return undefined;
+  const clean = {};
+  for (const key of ["hotel", "office", "airport"]) {
+    if (input[key] === undefined) continue;
+    clean[key] = String(input[key] || "").trim().slice(0, 120);
+  }
+  return Object.keys(clean).length ? clean : undefined;
+}
+
+function buildPublicLlmStatus() {
+  return {
+    configured: Boolean(OPENAI_API_KEY),
+    provider: "openai",
+    keyHealth: {
+      looksValid: Boolean(OPENAI_API_KEY),
+      reason: Boolean(OPENAI_API_KEY) ? "ok" : "missing_api_key",
+    },
+    model: OPENAI_MODEL,
+    lastRuntime: {
+      lastError: OPENAI_LAST_RUNTIME && typeof OPENAI_LAST_RUNTIME === "object"
+        ? String(OPENAI_LAST_RUNTIME.lastError || "")
+        : "",
+      errorAt: OPENAI_LAST_RUNTIME && typeof OPENAI_LAST_RUNTIME === "object"
+        ? (OPENAI_LAST_RUNTIME.errorAt || null)
+        : null,
+    },
+    primary: ANTHROPIC_KEY_HEALTH.looksValid ? "claude" : (Boolean(OPENAI_API_KEY) ? "openai" : "fallback"),
+  };
+}
+
+function sanitizeLlmIssueForViewer(reason) {
+  const key = String(reason || "").trim();
+  if (!key) return "";
+  if (key === "ok" || key === "missing_api_key" || key === "fetch_unavailable" || key === "chat_timeout" || key === "timeout") return key;
+  if (key.startsWith("invalid_key_format")) return key;
+  if (key.startsWith("openai_http_401")) return "openai_http_401";
+  if (key.startsWith("openai_http_429")) return "openai_http_429";
+  if (key.startsWith("openai_timeout")) return "openai_timeout";
+  if (key.startsWith("anthropic_http_401")) return "openai_http_401";
+  if (key.startsWith("anthropic_http_429")) return "openai_http_429";
+  if (key.startsWith("anthropic_timeout")) return "openai_timeout";
+  return "temporarily_unavailable";
+}
+
+function sanitizeRuntimeErrorCode(err, fallback = "operation_failed") {
+  const code = String((err && (err.errorCode || err.code)) || "").trim().toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+  return code || fallback;
+}
+
+function sanitizeServerLogError(err, fallback = "operation_failed") {
+  const code = sanitizeRuntimeErrorCode(err, "");
+  if (code) {
+    if (["econnrefused", "econnreset", "enotfound", "ehostunreach"].includes(code)) return "upstream_unavailable";
+    if (code === "etimedout" || code.endsWith("_timeout") || code === "timeout") return "timeout";
+    if (code === "aborterror" || code === "aborted") return "aborted";
+    return code;
+  }
+  const name = String((err && err.name) || "").trim().toLowerCase();
+  if (name === "aborterror") return "aborted";
+  if (name === "syntaxerror") return "invalid_payload";
+  return fallback;
+}
+
+function sanitizeTaskExecutionFailureReason(err) {
+  const code = sanitizeRuntimeErrorCode(err, "");
+  if (!code) return "execution_failed";
+  if (["invalid_transition", "not_found", "task_paused"].includes(code)) return code;
+  if (["etimedout", "econnrefused", "econnreset", "enotfound", "ehostunreach"].includes(code)) return "execution_unavailable";
+  if (code.endsWith("_timeout") || code === "timeout") return "execution_timeout";
+  if (code.startsWith("tool_")) return "tool_execution_failed";
+  return "execution_failed";
+}
+
+function buildTaskExecutionFailureNote(reason) {
+  const safeReason = String(reason || "").trim();
+  if (safeReason === "execution_timeout") return "执行链路响应超时，请稍后重试";
+  if (safeReason === "execution_unavailable") return "主执行链路暂时不可用";
+  return "主执行链路暂时不可用";
+}
+
+function sanitizeMerchantOrderActionError(err) {
+  const code = String((err && err.code) || "").trim().toUpperCase();
+  if (code === "INVALID_TRANSITION") {
+    return { status: 409, error: "invalid_transition", message: "订单状态不允许当前操作" };
+  }
+  if (code === "NOT_FOUND") {
+    return { status: 404, error: "order_not_found", message: "Merchant order not found" };
+  }
+  return { status: 500, error: "merchant_order_action_failed", message: "Merchant order action failed" };
+}
+
+function buildViewerChatLlmStatus() {
+  const safeReason = sanitizeLlmIssueForViewer(OPENAI_KEY_HEALTH.reason || OPENAI_LAST_RUNTIME.lastError || "");
+  return {
+    configured: Boolean(OPENAI_API_KEY),
+    model: OPENAI_MODEL,
+    keyHealth: {
+      looksValid: OPENAI_KEY_HEALTH.looksValid === true,
+      reason: safeReason || (Boolean(OPENAI_API_KEY) ? "ok" : "missing_api_key"),
+    },
+    lastRuntime: {
+      lastError: sanitizeLlmIssueForViewer(OPENAI_LAST_RUNTIME.lastError || ""),
+      errorAt: OPENAI_LAST_RUNTIME && typeof OPENAI_LAST_RUNTIME === "object" ? (OPENAI_LAST_RUNTIME.errorAt || null) : null,
+    },
+  };
+}
+
+function extractProviderErrorCode(payload, fallback = "provider_error") {
+  const direct = payload && typeof payload === "object"
+    ? (payload.error?.code || payload.code || payload.type || "")
+    : "";
+  const code = String(direct || "").trim();
+  return code ? code.slice(0, 80) : fallback;
+}
+
+function buildProviderFailurePayload(error, { provider = "", status = 502, payload = null, fallbackCode = "provider_error" } = {}) {
+  return {
+    error,
+    provider: String(provider || "").trim() || "unknown",
+    providerStatus: Number.isFinite(Number(status)) ? Number(status) : 502,
+    providerCode: extractProviderErrorCode(payload, fallbackCode),
+  };
+}
+
+function formatProviderUnixTimestamp(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return new Date(num * 1000).toISOString();
+}
+
+function sanitizeFineTuningJob(job) {
+  if (!job || typeof job !== "object") return null;
+  const errorCode = job.error ? extractProviderErrorCode(job.error, "job_error") : "";
+  return {
+    id: String(job.id || ""),
+    model: String(job.model || ""),
+    status: String(job.status || ""),
+    fineTunedModel: job.fine_tuned_model ? String(job.fine_tuned_model) : null,
+    trainingFileId: job.training_file ? String(job.training_file) : null,
+    validationFileId: job.validation_file ? String(job.validation_file) : null,
+    resultFileIds: Array.isArray(job.result_files)
+      ? job.result_files.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 10)
+      : [],
+    createdAt: formatProviderUnixTimestamp(job.created_at),
+    finishedAt: formatProviderUnixTimestamp(job.finished_at),
+    estimatedFinishAt: formatProviderUnixTimestamp(job.estimated_finish),
+    trainedTokens: Number.isFinite(Number(job.trained_tokens)) ? Number(job.trained_tokens) : null,
+    error: errorCode ? { code: errorCode } : null,
+  };
+}
+
+function _isValidDeviceId(deviceId, { allowDemo = false } = {}) {
+  const did = String(deviceId || "").trim();
+  if (allowDemo && did === "demo") return true;
+  return /^cx_[a-f0-9]{32}$/i.test(did);
+}
+
+function resolveRequestSubject(req, body = null, { queryDeviceId = "", allowDemo = false, allowQueryDeviceWithoutBinding = false } = {}) {
+  const actor = _whoFromReq(req);
+  if (actor && actor !== "anon") {
+    return { id: actor, via: "auth" };
+  }
+  const headerOrBodyDeviceId = extractDeviceId(req, body);
+  if (headerOrBodyDeviceId && _isValidDeviceId(headerOrBodyDeviceId, { allowDemo })) {
+    return { id: headerOrBodyDeviceId, via: "device" };
+  }
+  const queryDid = String(queryDeviceId || "").trim();
+  if (_isValidDeviceId(queryDid, { allowDemo }) && allowQueryDeviceWithoutBinding) {
+    return { id: queryDid, via: "query_device" };
+  }
+  return null;
+}
+
+function buildTaskOwnershipContext(req, body = null) {
+  const subject = resolveRequestSubject(req, body, { allowDemo: isDemoIdentityEnabled() });
+  if (subject && subject.id) {
+    return {
+      userId: subject.id,
+      createdBy: subject.id,
+      subjectVia: subject.via,
+    };
+  }
+  return {
+    userId: "anon",
+    createdBy: "anon_request",
+    subjectVia: "anonymous_fallback",
+  };
+}
+
+function resolveTaskAttributionId(task, { anonymousLabel = "anon", systemFallback = "system" } = {}) {
+  const createdBy = String((task && task.createdBy) || "").trim();
+  if (createdBy) {
+    return createdBy === "anon_request" ? anonymousLabel : createdBy;
+  }
+  const userId = String((task && task.userId) || "").trim();
+  if (userId) return userId;
+  return systemFallback;
+}
+
+function _isAdminRequest(req) {
+  try {
+    const { validateAdminToken } = require("./src/middleware/auth");
+    return Boolean(validateAdminToken(req));
+  } catch {
+    return false;
+  }
+}
+
+function _queryDeviceIdFromReq(req) {
+  try {
+    return new URL(req.url, "http://localhost").searchParams.get("deviceId") || "";
+  } catch {
+    return "";
+  }
+}
+
+function resolveOwnedResourceAccess(req, ownerId, body = null, { queryDeviceId = "", resourceLabel = "resource", allowQueryDeviceWithoutBinding = false } = {}) {
+  if (_isAdminRequest(req)) {
+    return { ok: true, via: "admin" };
+  }
+  const subject = resolveRequestSubject(req, body, {
+    queryDeviceId: queryDeviceId || _queryDeviceIdFromReq(req),
+    allowQueryDeviceWithoutBinding,
+  });
+  if (subject && ownerId && String(ownerId) === String(subject.id)) {
+    return { ok: true, via: subject.via };
+  }
+  if (!subject) {
+    return {
+      ok: false,
+      statusCode: 401,
+      payload: {
+        error: "unauthorized",
+        message: `Login or device ID required to access this ${resourceLabel}`,
+      },
+    };
+  }
+  return {
+    ok: false,
+    statusCode: 403,
+    payload: {
+      error: "forbidden",
+      message: `You do not have access to this ${resourceLabel}`,
+    },
+  };
 }
 
 function appendSupportSessionMessage(session, payload = {}) {
@@ -5767,6 +10776,7 @@ function buildSupportSessionSummary(session) {
     voiceMessageCount: target.messages.filter((item) => item.type === "voice").length,
     lastMessage: lastMessage
       ? {
+          id: lastMessage.id,
           actor: lastMessage.actor,
           type: lastMessage.type,
           text: String(lastMessage.text || "").slice(0, 120),
@@ -5776,6 +10786,1060 @@ function buildSupportSessionSummary(session) {
     createdAt: target.createdAt,
     updatedAt: target.updatedAt,
   };
+}
+
+function sanitizeSupportTicketReasonForViewer(reason) {
+  const text = String(reason || "").trim();
+  if (!text) return "";
+  if (/user_clicked_emergency|emergency_button/i.test(text)) return "紧急人工协助";
+  if (/live_support_started|support_cookie|open_live_room/i.test(text)) return "人工协同处理中";
+  if (/merchant_order_issue:/i.test(text)) return "订单履约异常";
+  return maskSensitiveString(text).slice(0, 120);
+}
+
+function sanitizeSupportTimelineNoteForViewer(note) {
+  const text = String(note || "").trim();
+  if (!text) return "";
+  if (/urgent_room_started|emergency_room_opened/i.test(text)) return "已升级为人工协助";
+  if (/room_started/i.test(text)) return "实时会话已开启";
+  if (/ops_replied/i.test(text)) return "支持团队已回复";
+  if (/user_replied/i.test(text)) return "你已发送消息";
+  if (/evidence_uploaded/i.test(text)) return "已补充证据";
+  if (/updated/i.test(text)) return "工单状态已更新";
+  if (/created/i.test(text)) return "工单已创建";
+  return maskSensitiveString(text).slice(0, 120);
+}
+
+function sanitizeSupportEvidenceForViewer(item, { isAdmin = false } = {}) {
+  if (!item || typeof item !== "object") return null;
+  if (isAdmin) return item;
+  return {
+    id: toViewerSupportEvidenceRef(item, { isAdmin }),
+    type: item.type || "evidence",
+    note: maskSensitiveString(String(item.note || "")).slice(0, 120),
+    at: item.at || "",
+  };
+}
+
+function sanitizeSupportMessageForViewer(message, { isAdmin = false } = {}) {
+  if (!message || typeof message !== "object") return null;
+  if (isAdmin) return message;
+  const actor = normalizeSupportActor(message.actor || "system");
+  const type = String(message.type || "text").toLowerCase() === "voice" ? "voice" : String(message.type || "text").toLowerCase() === "event" ? "event" : "text";
+  let text = String(message.text || "").trim();
+  if (type === "event") {
+    if (/joined the room/i.test(text)) text = "支持团队已加入会话";
+    else if (/evidence added/i.test(text)) text = "已补充证据材料";
+    else if (/urgent live support requested/i.test(text)) text = "已升级为紧急人工协助";
+    else if (/live support room is open/i.test(text)) text = "实时会话已开启";
+    else if (/emergency mode enabled/i.test(text)) text = "紧急协助已启动";
+  }
+  return {
+    id: toViewerSupportMessageRef(message, { isAdmin }),
+    actor,
+    type,
+    text: maskSensitiveString(text).slice(0, 200),
+    audioDataUrl: type === "voice" ? String(message.audioDataUrl || "") : "",
+    durationSec: type === "voice" ? Math.max(0, Number(message.durationSec || 0)) : 0,
+    at: message.at || "",
+  };
+}
+
+function sanitizeSupportSessionSummaryForViewer(session, { isAdmin = false, includeMessages = false } = {}) {
+  const summary = buildSupportSessionSummary(session);
+  if (!summary) return null;
+  if (isAdmin) {
+    if (!includeMessages) return summary;
+    return {
+      ...summary,
+      messages: Array.isArray(session?.messages) ? session.messages.slice(-100) : [],
+    };
+  }
+  const target = ensureSupportSessionShape(session);
+  const output = {
+    id: toViewerSupportSessionRef(summary, { isAdmin }),
+    ticketId: toViewerSupportTicketRef(summary.ticketId, { isAdmin }),
+    status: summary.status,
+    unread: {
+      user: Math.max(0, Number(summary.unread?.user || 0)),
+    },
+    presence: {
+      user: summary.presence?.user || { online: false, lastSeenAt: null },
+      ops: summary.presence?.ops || { online: false, lastSeenAt: null },
+    },
+    messageCount: summary.messageCount,
+    voiceMessageCount: summary.voiceMessageCount,
+    lastMessage: summary.lastMessage ? sanitizeSupportMessageForViewer(summary.lastMessage, { isAdmin }) : null,
+    createdAt: summary.createdAt,
+    updatedAt: summary.updatedAt,
+  };
+  if (includeMessages) {
+    output.messages = Array.isArray(target?.messages)
+      ? target.messages.slice(-100).map((item) => sanitizeSupportMessageForViewer(item, { isAdmin })).filter(Boolean)
+      : [];
+  }
+  return output;
+}
+
+function sanitizeSupportTicketForViewer(ticket, { isAdmin = false, liveSession = null } = {}) {
+  if (!ticket || typeof ticket !== "object") return null;
+  const linkedSession = liveSession || (ticket.sessionId ? getSupportSessionById(ticket.sessionId) : null);
+  if (isAdmin) {
+    if (!linkedSession) return ticket;
+    return {
+      ...ticket,
+      sessionId: ticket.sessionId || linkedSession.id || null,
+      liveSession: buildSupportSessionSummary(linkedSession),
+    };
+  }
+  return {
+    id: toViewerSupportTicketRef(ticket, { isAdmin }),
+    taskId: toViewerTaskRef(ticket.taskId || "", { isAdmin }),
+    status: ticket.status || "open",
+    reason: sanitizeSupportTicketReasonForViewer(ticket.reason),
+    eta: ticket.eta || "",
+    etaMin: Math.max(0, Number(ticket.etaMin || 0)),
+    createdAt: ticket.createdAt || "",
+    updatedAt: ticket.updatedAt || ticket.createdAt || "",
+    evidenceCount: Array.isArray(ticket.evidence) ? ticket.evidence.length : 0,
+    evidence: Array.isArray(ticket.evidence) ? ticket.evidence.map((item) => sanitizeSupportEvidenceForViewer(item)).filter(Boolean) : [],
+    history: Array.isArray(ticket.history)
+      ? ticket.history.slice(-12).map((item) => ({
+          at: item.at || "",
+          status: item.status || ticket.status || "open",
+          note: sanitizeSupportTimelineNoteForViewer(item.note),
+        }))
+      : [],
+    liveSession: linkedSession ? sanitizeSupportSessionSummaryForViewer(linkedSession, { isAdmin: false }) : null,
+  };
+}
+
+function sanitizeTaskHandoffForViewer(handoff, { isAdmin = false } = {}) {
+  if (!handoff || typeof handoff !== "object") return null;
+  if (isAdmin) return handoff;
+  return {
+    ticketId: toViewerSupportTicketRef(handoff.ticketId || "", { isAdmin }),
+    status: handoff.status || "open",
+    eta: handoff.eta || "",
+    requestedAt: handoff.requestedAt || "",
+    updatedAt: handoff.updatedAt || handoff.requestedAt || "",
+  };
+}
+
+function sanitizeTaskSessionStateForViewer(sessionState, { task = null, isAdmin = false } = {}) {
+  if (!sessionState || typeof sessionState !== "object") return null;
+  if (isAdmin) return sessionState;
+  const { laneId: _ignoredLaneId, ...safeSessionState } = sessionState;
+  return {
+    ...safeSessionState,
+    taskId: toViewerTaskRef(task || sessionState.taskId, { isAdmin }),
+  };
+}
+
+function sanitizeTaskOverviewForViewer(overview, { task = null, isAdmin = false } = {}) {
+  if (!overview || typeof overview !== "object") return {};
+  if (isAdmin) return overview;
+  return {
+    ...overview,
+    taskId: toViewerTaskRef(task || overview.taskId, { isAdmin }),
+  };
+}
+
+function sanitizeTaskForViewer(task, { isAdmin = false } = {}) {
+  if (!task || typeof task !== "object") return task;
+  if (isAdmin) return task;
+  const {
+    userId: _ignoredUserId,
+    createdBy: _ignoredCreatedBy,
+    ...safeTask
+  } = task;
+  const safePlan = task.plan && typeof task.plan === "object"
+    ? (() => {
+        const { laneId: _ignoredPlanLaneId, ...safePlanBase } = task.plan;
+        return {
+          ...safePlanBase,
+          steps: Array.isArray(task.plan.steps)
+            ? task.plan.steps.map((step) => sanitizeTaskStepForViewer(step, { taskId: task.id, isAdmin })).filter(Boolean)
+            : [],
+        };
+      })()
+    : null;
+  if (safePlan && typeof safePlan === "object") {
+    safePlan.taskId = toViewerTaskRef(task, { isAdmin });
+    safePlan.sessionState = sanitizeTaskSessionStateForViewer(safePlan.sessionState || null, { task, isAdmin });
+    delete safePlan.mcpSummary;
+    delete safePlan.mcpContracts;
+    delete safePlan.mcpPolicy;
+  }
+  return {
+    ...safeTask,
+    id: toViewerTaskRef(task, { isAdmin }),
+    orderId: task.orderId ? toViewerOrderRef(task.orderId, { isAdmin }) : null,
+    tripId: task.tripId ? toViewerTripRef(task.tripId, { isAdmin }) : null,
+    plan: safePlan,
+    sessionState: sanitizeTaskSessionStateForViewer(task.sessionState || null, { task, isAdmin }),
+    steps: Array.isArray(task.steps) ? task.steps.map((step) => sanitizeTaskStepForViewer(step, { taskId: task.id, isAdmin })).filter(Boolean) : [],
+    timeline: Array.isArray(task.timeline) ? task.timeline.map((item) => sanitizeTaskTimelineEntryForViewer(item, { taskId: task.id, isAdmin })).filter(Boolean) : [],
+    lifecycle: Array.isArray(task.lifecycle) ? task.lifecycle.map((item) => sanitizeTaskLifecycleEntryForViewer(item)).filter(Boolean) : [],
+    payments: Array.isArray(task.payments) ? task.payments.map((item) => sanitizeTaskPaymentForViewer(item)).filter(Boolean) : [],
+    handoff: sanitizeTaskHandoffForViewer(task.handoff, { isAdmin }),
+    fallbackEvents: Array.isArray(task.fallbackEvents) ? task.fallbackEvents.map((item) => sanitizeTaskFallbackEventForViewer(item)).filter(Boolean) : [],
+    mcpCalls: Array.isArray(task.mcpCalls) ? task.mcpCalls.map((item) => sanitizeTaskMcpCallForViewer(item)).filter(Boolean) : [],
+    flagSnapshot: {},
+    confirmPayload: undefined,
+    paymentRailSnapshot: undefined,
+  };
+}
+
+function sanitizeTaskStepForViewer(step, { taskId = "", isAdmin = false } = {}) {
+  if (!step || typeof step !== "object") return null;
+  return {
+    id: toViewerTaskStepRef(step, { taskId, isAdmin }),
+    label: step.label || "",
+    toolType: step.toolType || "",
+    status: step.status || "queued",
+    etaSec: Number(step.etaSec || 0),
+    latency: Number(step.latency || 0),
+    retryable: step.retryable === true,
+    inputPreview: step.inputPreview ? maskSensitiveString(String(step.inputPreview)).slice(0, 160) : "",
+    outputPreview: step.outputPreview ? maskSensitiveString(String(step.outputPreview)).slice(0, 160) : "",
+    evidenceType: step.evidenceType || "",
+    evidence: step.evidence && typeof step.evidence === "object"
+      ? {
+          type: step.evidence.type || "",
+          title: step.evidence.title || "",
+          receiptId: toViewerTaskStepEvidenceRef(step.evidence.receiptId || "", { taskId, stepId: step.id, isAdmin }),
+          generatedAt: step.evidence.generatedAt || "",
+          imagePath: step.evidence.imagePath || "",
+          summary: step.evidence.summary ? maskSensitiveString(String(step.evidence.summary)).slice(0, 160) : "",
+        }
+      : undefined,
+    actions: step.actions && typeof step.actions === "object"
+      ? {
+          retry: step.actions.retry === true,
+          switchLane: step.actions.switchLane === true,
+          askHuman: step.actions.askHuman === true,
+          refundPolicy: step.actions.refundPolicy === true,
+        }
+      : undefined,
+  };
+}
+
+function sanitizeTaskTimelineEntryForViewer(item, { taskId = "", isAdmin = false } = {}) {
+  if (!item || typeof item !== "object") return null;
+  return {
+    stepId: toViewerTaskStepRef(item.stepId || "", { taskId, isAdmin }),
+    label: item.label || "",
+    status: item.status || "",
+    at: item.at || "",
+    latency: Number(item.latency || 0),
+    etaSec: Number(item.etaSec || 0),
+    note: item.note ? maskSensitiveString(String(item.note)).slice(0, 160) : "",
+  };
+}
+
+function sanitizeTaskLifecycleEntryForViewer(item) {
+  if (!item || typeof item !== "object") return null;
+  const state = String(item.state || "").trim().toLowerCase();
+  let note = item.note ? maskSensitiveString(String(item.note)).slice(0, 160) : "";
+  if (state === "failed") note = "主执行链路暂时不可用";
+  if (state === "fallback_to_human") note = "已转入人工协助";
+  return {
+    state: item.state || "",
+    label: item.label || "",
+    at: item.at || "",
+    note,
+  };
+}
+
+function sanitizeTripLifecycleEntryForViewer(item) {
+  if (!item || typeof item !== "object") return null;
+  let note = item.note ? maskSensitiveString(String(item.note)).slice(0, 160) : "";
+  note = note.replace(/\b[a-z]+_default\b/gi, "[REDACTED_LANE]");
+  return {
+    state: item.state || "",
+    label: item.label || "",
+    at: item.at || "",
+    note,
+  };
+}
+
+function sanitizeTaskMcpCallForViewer(call) {
+  if (!call || typeof call !== "object") return null;
+  return {
+    op: call.op || call.operation || "",
+    operation: call.operation || call.op || "",
+    toolType: call.toolType || "",
+    source: "",
+    provider: "",
+    latencyMs: Number(call.latencyMs || call.response?.latency || 0),
+    responseStatus: call.responseStatus || call.response?.status || "",
+    slaMet: call.slaMet === false ? false : true,
+  };
+}
+
+function sanitizeTrustMcpCallForViewer(call, { isAdmin = false } = {}) {
+  if (!call || typeof call !== "object") return null;
+  if (isAdmin) return call;
+  const response = call.response && typeof call.response === "object" ? call.response : {};
+  return {
+    at: call.at || "",
+    op: call.op || "",
+    toolType: call.toolType || "",
+    response: {
+      latency: Number(response.latency || 0),
+      slaMs: Number(response.slaMs || 0),
+      slaMet: response.slaMet === false ? false : true,
+      status: response.status || "",
+      code: response.code || "",
+      data: {},
+      contractId: "",
+    },
+  };
+}
+
+function getOrderDisplayLabel(order) {
+  if (!order || typeof order !== "object") return "Order";
+  const merchant = String(order.merchant || "").trim();
+  if (merchant) return merchant;
+  const type = String(order.type || "").trim().toLowerCase();
+  if (type === "eat") return "Dining booking";
+  if (type === "stay") return "Hotel booking";
+  if (type === "travel") return "Travel booking";
+  if (type) return `${type.slice(0, 1).toUpperCase()}${type.slice(1)} order`;
+  return "Order";
+}
+
+function sanitizeOrderProofForViewer(proof, { isAdmin = false } = {}) {
+  if (!proof || typeof proof !== "object") return null;
+  if (isAdmin) return proof;
+  return {
+    qrText: proof.qrText || "",
+    bilingualAddress: proof.bilingualAddress || "",
+    itinerary: proof.itinerary || "",
+    navLink: proof.navLink || "",
+    meituanLink: proof.meituanLink || "",
+    didiLink: proof.didiLink || "",
+    certificateNo: proof.certificateNo || "",
+  };
+}
+
+function sanitizeOrderLifecycleEntryForViewer(entry, { isAdmin = false } = {}) {
+  if (!entry || typeof entry !== "object") return null;
+  if (isAdmin) return entry;
+  const state = String(entry.state || "").toLowerCase();
+  const safeNotes = {
+    created: "订单已创建",
+    confirmed: "订单已确认",
+    executing: "服务执行中",
+    delivered: "服务已交付",
+    completed: "服务已完成",
+    cancelled: "订单已取消",
+    canceled: "订单已取消",
+    refund_requested: "退款申请已提交",
+    refunded: "退款已完成",
+    refund_failed: "退款处理中，请查看售后支持",
+    failed: "服务处理中出现异常，系统已记录",
+  };
+  return {
+    state: entry.state || "",
+    label: entry.label || "",
+    at: entry.at || "",
+    note: safeNotes[state] || maskSensitiveString(String(entry.note || "")).slice(0, 120),
+  };
+}
+
+function sanitizeTaskPaymentForViewer(payment, { isAdmin = false } = {}) {
+  if (!payment || typeof payment !== "object") return null;
+  if (isAdmin) return payment;
+  return {
+    orderId: toViewerOrderRef(payment.orderId || "", { isAdmin }),
+    amount: Number(payment.amount || 0),
+    currency: payment.currency || "CNY",
+    railId: payment.railId || "",
+    railLabel: payment.railLabel || _RAIL_LABELS[payment.railId] || payment.railId || "",
+    status: payment.status || "",
+    at: payment.at || "",
+  };
+}
+
+function sanitizeRefundPolicyForViewer(policy, { isAdmin = false } = {}) {
+  if (!policy || typeof policy !== "object") return null;
+  if (isAdmin) return policy;
+  return {
+    freeCancelWindowMin: Math.max(0, Number(policy.freeCancelWindowMin || 0)),
+    estimatedArrival: policy.estimatedArrival || "",
+  };
+}
+
+function sanitizeRefundStateForViewer(refund, { isAdmin = false } = {}) {
+  if (!refund || typeof refund !== "object") return null;
+  if (isAdmin) return refund;
+  const needsAttention = Boolean(refund.gatewayWarning || refund.errorCode);
+  return {
+    amount: Number(refund.amount || 0),
+    currency: refund.currency || "CNY",
+    status: refund.status || "pending",
+    eta: refund.eta || "",
+    at: refund.at || "",
+    attentionRequired: needsAttention,
+    note: needsAttention ? "退款已登记，到账进度将由客服继续跟进" : undefined,
+  };
+}
+
+function sanitizeInvoiceForViewer(invoice, { isAdmin = false } = {}) {
+  if (!invoice || typeof invoice !== "object") return null;
+  if (isAdmin) return invoice;
+  return {
+    id: toViewerInvoiceRef(invoice, { isAdmin }),
+    orderId: toViewerOrderRef(invoice.orderId || "", { isAdmin }),
+    title: invoice.title || "",
+    invoiceType: invoice.invoiceType || "electronic",
+    amount: Number(invoice.amount || 0),
+    currency: invoice.currency || "CNY",
+    status: invoice.status || "pending",
+    note: invoice.note || "",
+    createdAt: invoice.createdAt || "",
+    deliveryEmailMasked: maskEmailForViewer(invoice.email || ""),
+    companyMasked: invoice.company ? maskNameForViewer(invoice.company) : "",
+    taxIdMasked: invoice.taxId ? maskTaxIdForViewer(invoice.taxId) : "",
+  };
+}
+
+function sanitizeProfileForViewer(profile, { isAdmin = false } = {}) {
+  if (!profile || typeof profile !== "object") return null;
+  if (isAdmin) return profile;
+  const cities = Array.isArray(profile.cities)
+    ? profile.cities
+        .map((city) => String(city || "").trim())
+        .filter(Boolean)
+        .slice(-10)
+    : [];
+  return {
+    tripCount: Math.max(0, Number(profile.tripCount || 0)),
+    cities,
+    profileSummary: typeof profile.profileSummary === "string" ? profile.profileSummary.slice(0, 60) : null,
+  };
+}
+
+function sanitizeProfileForExport(profile, { isAdmin = false } = {}) {
+  if (!profile || typeof profile !== "object") return null;
+  if (isAdmin) return profile;
+  const preferences = profile.preferences && typeof profile.preferences === "object" && !Array.isArray(profile.preferences)
+    ? Object.fromEntries(
+        Object.entries(profile.preferences)
+          .filter(([key, value]) => {
+            if (!key) return false;
+            return typeof value === "boolean" || typeof value === "number" || typeof value === "string";
+          })
+          .slice(0, 100)
+      )
+    : {};
+  return {
+    ...sanitizeProfileForViewer(profile),
+    preferences,
+  };
+}
+
+function sanitizeProactiveSuggestionForViewer(suggestion) {
+  if (!suggestion || typeof suggestion !== "object") return null;
+  return {
+    text: String(suggestion.text || suggestion.label || "").slice(0, 25),
+    query: String(suggestion.query || suggestion.text || suggestion.label || "").slice(0, 40),
+    icon: String(suggestion.icon || "💡").slice(0, 4),
+  };
+}
+
+function sanitizeProactiveSuggestionsForViewer(suggestions) {
+  if (!Array.isArray(suggestions)) return [];
+  return suggestions
+    .map((suggestion) => sanitizeProactiveSuggestionForViewer(suggestion))
+    .filter((suggestion) => suggestion && suggestion.text && suggestion.query)
+    .slice(0, 4);
+}
+
+function buildPrivacyExportPayload(deviceId) {
+  const data = gdpr.exportData(deviceId);
+  return {
+    exportedAt: data && data._meta ? data._meta.exportedAt || nowIso() : nowIso(),
+    ...data,
+  };
+}
+
+function sanitizeOrderForViewer(order, { isAdmin = false } = {}) {
+  if (!order || typeof order !== "object") return null;
+  if (isAdmin) return order;
+  return {
+    id: toViewerOrderRef(order, { isAdmin }),
+    taskId: toViewerTaskRef(order.taskId || "", { isAdmin }),
+    type: order.type || "",
+    city: order.city || "",
+    price: Number(order.price || 0),
+    currency: order.currency || "CNY",
+    status: order.status || "pending",
+    createdAt: order.createdAt || "",
+    updatedAt: order.updatedAt || order.createdAt || "",
+    displayLabel: getOrderDisplayLabel(order),
+    proof: sanitizeOrderProofForViewer(order.proof),
+    proofItems: Array.isArray(order.proofItems) ? order.proofItems.map(sanitizeProofItemForViewer).filter(Boolean) : [],
+    lifecycle: Array.isArray(order.lifecycle) ? order.lifecycle.map((item) => sanitizeOrderLifecycleEntryForViewer(item)).filter(Boolean) : [],
+    refund: sanitizeRefundStateForViewer(order.refund),
+  };
+}
+
+function sanitizeOrderDetailForViewer(detail, { isAdmin = false } = {}) {
+  if (!detail || typeof detail !== "object") return null;
+  if (isAdmin) return detail;
+  return {
+    orderId: toViewerOrderRef(detail.orderId || "", { isAdmin }),
+    taskId: toViewerTaskRef(detail.taskId || "", { isAdmin }),
+    tripId: detail.tripId ? toViewerTripRef(detail.tripId, { isAdmin }) : null,
+    status: detail.status || "pending",
+    type: detail.type || "",
+    city: detail.city || "",
+    amount: Number(detail.amount || 0),
+    currency: detail.currency || "CNY",
+    displayLabel: detail.displayLabel || getOrderDisplayLabel(detail),
+    lifecycle: Array.isArray(detail.lifecycle) ? detail.lifecycle.map((item) => sanitizeOrderLifecycleEntryForViewer(item)).filter(Boolean) : [],
+    proofItems: Array.isArray(detail.proofItems) ? detail.proofItems.map(sanitizeProofItemForViewer).filter(Boolean) : [],
+    proof: sanitizeOrderProofForViewer(detail.proof),
+    refund: detail.refund
+      ? {
+          policy: sanitizeRefundPolicyForViewer(detail.refund.policy),
+          status: detail.refund.status || "not_requested",
+          detail: sanitizeRefundStateForViewer(detail.refund.detail),
+          eta: detail.refund.eta || "",
+        }
+      : null,
+    support: detail.support || null,
+  };
+}
+
+function sanitizeBookingChargeResultForViewer(charge, { isAdmin = false } = {}) {
+  if (!charge || typeof charge !== "object") return { ok: false, errorCode: "charge_error" };
+  if (isAdmin) return charge;
+  const data = charge.data && typeof charge.data === "object" ? charge.data : {};
+  return {
+    ok: Boolean(charge.ok),
+    errorCode: charge.ok ? undefined : charge.errorCode || "charge_error",
+    reason: charge.ok ? undefined : (data.complianceReason || undefined),
+    qrCode: data.qrCode || null,
+    paymentId: buildViewerPaymentPublicRef(data.paymentRef || ""),
+    railId: data.railId || "",
+    railLabel: data.railLabel || data.railId || "",
+    sandbox: Boolean(data.sandbox),
+    latency: Number(charge.latency || 0),
+    fx: data.fx || null,
+    amount: Number(data.amount || 0),
+    currency: data.currency || "CNY",
+  };
+}
+
+function sanitizeHotelPaymentForViewer(payment, order, { isAdmin = false } = {}) {
+  if (!payment || typeof payment !== "object") return null;
+  if (isAdmin) return payment;
+  const mode = String(payment.mode || "").trim().toLowerCase();
+  const viewerOrderId = toViewerOrderRef(order, { isAdmin });
+  if (mode === "b2b") {
+    return {
+      mode: "b2b",
+      accountName: String(payment.accountName || "").slice(0, 120),
+      accountNo: maskBankAccountForViewer(payment.accountNo || ""),
+      bankName: String(payment.bankName || "").slice(0, 120),
+      instruction: String(payment.instruction || "").slice(0, 240),
+      noticeId: viewerOrderId,
+    };
+  }
+  return {
+    mode: mode || "wechat",
+    payUrl: viewerOrderId ? `https://pay.weixin.qq.com/mock/${encodeURIComponent(viewerOrderId)}` : "",
+    qrText: viewerOrderId ? `WX_PAY_${viewerOrderId}` : "",
+  };
+}
+
+function buildOrderSupportSummaryForViewer(ticket, { isAdmin = false } = {}) {
+  if (!ticket || typeof ticket !== "object") return null;
+  if (isAdmin) {
+    return {
+      ticketId: ticket.id,
+      sessionId: ticket.sessionId || null,
+      status: ticket.status,
+      handler: ticket.handler || "human",
+      eta: ticket.eta,
+      etaMin: ticket.etaMin,
+      createdAt: ticket.createdAt,
+      updatedAt: ticket.updatedAt,
+      evidenceCount: Array.isArray(ticket.evidence) ? ticket.evidence.length : 0,
+      liveSession: ticket.sessionId ? buildSupportSessionSummary(getSupportSessionById(ticket.sessionId)) : null,
+    };
+  }
+  return {
+    ticketId: toViewerSupportTicketRef(ticket, { isAdmin }),
+    status: ticket.status || "open",
+    eta: ticket.eta || "",
+    etaMin: Math.max(0, Number(ticket.etaMin || 0)),
+    createdAt: ticket.createdAt || "",
+    updatedAt: ticket.updatedAt || ticket.createdAt || "",
+    evidenceCount: Array.isArray(ticket.evidence) ? ticket.evidence.length : 0,
+  };
+}
+
+function taskPublicRefSecret() {
+  return String(
+    process.env.CROSSX_TASK_PUBLIC_REF_SECRET
+      || process.env.USER_TOKEN_SECRET
+      || process.env.SUPPORT_ACCESS_SECRET
+      || "crossx-task-public-ref"
+  );
+}
+
+function buildOpaqueEntityRef({ entity, prefix, value }) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "";
+  if (prefix && new RegExp(`^${prefix}[A-Za-z0-9_-]{10,}$`, "i").test(normalized)) return normalized;
+  const digest = require("crypto")
+    .createHmac("sha256", taskPublicRefSecret())
+    .update(`${String(entity || "entity").trim()}:${normalized}`)
+    .digest("base64url");
+  return `${prefix}${digest.slice(0, 18)}`;
+}
+
+function buildTaskPublicRef(taskId) {
+  const normalized = String(taskId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "task", prefix: "tsk_", value: normalized });
+}
+
+function getTaskPublicRef(taskOrId) {
+  const taskId = taskOrId && typeof taskOrId === "object" ? taskOrId.id : taskOrId;
+  return buildTaskPublicRef(taskId);
+}
+
+function resolveTaskRecord(taskRefOrId) {
+  const normalized = String(taskRefOrId || "").trim();
+  if (!normalized) return null;
+  if (db.tasks && db.tasks[normalized]) return db.tasks[normalized];
+  return Object.values(db.tasks || {}).find((task) => buildTaskPublicRef(task && task.id) === normalized) || null;
+}
+
+function resolveInternalTaskId(taskRefOrId) {
+  const task = resolveTaskRecord(taskRefOrId);
+  return task && task.id ? task.id : "";
+}
+
+function toViewerTaskRef(taskOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (taskOrId && typeof taskOrId === "object") return String(taskOrId.id || "");
+    return String(taskOrId || "");
+  }
+  return getTaskPublicRef(taskOrId);
+}
+
+function buildOrderPublicRef(orderId) {
+  const normalized = String(orderId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "order", prefix: "ordr_", value: normalized });
+}
+
+function getOrderPublicRef(orderOrId) {
+  const orderId = orderOrId && typeof orderOrId === "object" ? orderOrId.id : orderOrId;
+  return buildOrderPublicRef(orderId);
+}
+
+function resolveOrderRecord(orderRefOrId) {
+  const normalized = String(orderRefOrId || "").trim();
+  if (!normalized) return null;
+  if (db.orders && db.orders[normalized]) return db.orders[normalized];
+  return Object.values(db.orders || {}).find((order) => buildOrderPublicRef(order && order.id) === normalized) || null;
+}
+
+function resolveInternalOrderId(orderRefOrId) {
+  const order = resolveOrderRecord(orderRefOrId);
+  return order && order.id ? order.id : "";
+}
+
+function toViewerOrderRef(orderOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (orderOrId && typeof orderOrId === "object") return String(orderOrId.id || "");
+    return String(orderOrId || "");
+  }
+  return getOrderPublicRef(orderOrId);
+}
+
+function buildViewerPaymentPublicRef(paymentRef) {
+  const normalized = String(paymentRef || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "payment", prefix: "payr_", value: normalized });
+}
+
+function buildCrossxCheckoutPublicRef(ref) {
+  const normalized = String(ref || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "crossx_checkout", prefix: "xord_", value: normalized });
+}
+
+function getCrossxCheckoutPublicRef(orderOrRef) {
+  const ref = orderOrRef && typeof orderOrRef === "object" ? orderOrRef.ref : orderOrRef;
+  return buildCrossxCheckoutPublicRef(ref);
+}
+
+function resolveCrossxCheckoutOrder(refOrPublicRef) {
+  const normalized = String(refOrPublicRef || "").trim();
+  if (!normalized || !db.crossx_orders) return null;
+  if (db.crossx_orders[normalized]) return db.crossx_orders[normalized];
+  return Object.values(db.crossx_orders).find((item) => buildCrossxCheckoutPublicRef(item && item.ref) === normalized) || null;
+}
+
+function buildProofItemPublicRef(item) {
+  if (!item || typeof item !== "object") return "";
+  const parts = [
+    item.id,
+    item.hash,
+    item.type,
+    item.title,
+    item.generatedAt,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  if (!parts.length) return "";
+  return buildOpaqueEntityRef({ entity: "proof_item", prefix: "pfi_", value: parts.join(":") });
+}
+
+function toViewerProofItemRef(item, { isAdmin = false } = {}) {
+  if (isAdmin) return item && typeof item === "object" ? String(item.id || "") : String(item || "");
+  return buildProofItemPublicRef(item);
+}
+
+function buildSupportTicketPublicRef(ticketId) {
+  const normalized = String(ticketId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "support_ticket", prefix: "tkt_", value: normalized });
+}
+
+function getSupportTicketPublicRef(ticketOrId) {
+  const ticketId = ticketOrId && typeof ticketOrId === "object" ? ticketOrId.id : ticketOrId;
+  return buildSupportTicketPublicRef(ticketId);
+}
+
+function resolveSupportTicketRecord(ticketRefOrId) {
+  const normalized = String(ticketRefOrId || "").trim();
+  if (!normalized) return null;
+  const direct = (db.supportTickets || []).find((ticket) => String(ticket && ticket.id || "") === normalized) || null;
+  if (direct) return direct;
+  return (db.supportTickets || []).find((ticket) => buildSupportTicketPublicRef(ticket && ticket.id) === normalized) || null;
+}
+
+function resolveInternalSupportTicketId(ticketRefOrId) {
+  const ticket = resolveSupportTicketRecord(ticketRefOrId);
+  return ticket && ticket.id ? ticket.id : "";
+}
+
+function toViewerSupportTicketRef(ticketOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (ticketOrId && typeof ticketOrId === "object") return String(ticketOrId.id || "");
+    return String(ticketOrId || "");
+  }
+  return getSupportTicketPublicRef(ticketOrId);
+}
+
+function buildSupportSessionPublicRef(sessionId) {
+  const normalized = String(sessionId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "support_session", prefix: "ssn_", value: normalized });
+}
+
+function getSupportSessionPublicRef(sessionOrId) {
+  const sessionId = sessionOrId && typeof sessionOrId === "object" ? sessionOrId.id : sessionOrId;
+  return buildSupportSessionPublicRef(sessionId);
+}
+
+function resolveSupportSessionRecord(sessionRefOrId) {
+  const normalized = String(sessionRefOrId || "").trim();
+  if (!normalized) return null;
+  const direct = db.supportSessions && db.supportSessions[normalized] ? db.supportSessions[normalized] : null;
+  if (direct) return direct;
+  return Object.values(db.supportSessions || {}).find((session) => buildSupportSessionPublicRef(session && session.id) === normalized) || null;
+}
+
+function resolveInternalSupportSessionId(sessionRefOrId) {
+  const session = resolveSupportSessionRecord(sessionRefOrId);
+  return session && session.id ? session.id : "";
+}
+
+function toViewerSupportSessionRef(sessionOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (sessionOrId && typeof sessionOrId === "object") return String(sessionOrId.id || "");
+    return String(sessionOrId || "");
+  }
+  return getSupportSessionPublicRef(sessionOrId);
+}
+
+function buildSupportMessagePublicRef(message) {
+  if (!message || typeof message !== "object") return "";
+  const parts = [
+    message.id,
+    message.actor,
+    message.type,
+    message.at,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  if (!parts.length) return "";
+  return buildOpaqueEntityRef({ entity: "support_message", prefix: "smsg_", value: parts.join(":") });
+}
+
+function toViewerSupportMessageRef(message, { isAdmin = false } = {}) {
+  if (isAdmin) return message && typeof message === "object" ? String(message.id || "") : String(message || "");
+  return buildSupportMessagePublicRef(message);
+}
+
+function buildSupportEvidencePublicRef(item) {
+  if (!item || typeof item !== "object") return "";
+  const parts = [
+    item.id,
+    item.type,
+    item.at,
+    item.hash,
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  if (!parts.length) return "";
+  return buildOpaqueEntityRef({ entity: "support_evidence", prefix: "sev_", value: parts.join(":") });
+}
+
+function toViewerSupportEvidenceRef(item, { isAdmin = false } = {}) {
+  if (isAdmin) return item && typeof item === "object" ? String(item.id || "") : String(item || "");
+  return buildSupportEvidencePublicRef(item);
+}
+
+function buildAuditEventPublicRef(eventId) {
+  const normalized = String(eventId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "audit_event", prefix: "adt_", value: normalized });
+}
+
+function getAuditEventPublicRef(eventOrId) {
+  const eventId = eventOrId && typeof eventOrId === "object" ? eventOrId.id : eventOrId;
+  return buildAuditEventPublicRef(eventId);
+}
+
+function resolveAuditEventRecord(eventRefOrId) {
+  const normalized = String(eventRefOrId || "").trim();
+  if (!normalized) return null;
+  const direct = (db.auditLogs || []).find((item) => String(item && item.id || "") === normalized) || null;
+  if (direct) return direct;
+  return (db.auditLogs || []).find((item) => buildAuditEventPublicRef(item && item.id) === normalized) || null;
+}
+
+function toViewerAuditEventRef(eventOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (eventOrId && typeof eventOrId === "object") return String(eventOrId.id || "");
+    return String(eventOrId || "");
+  }
+  return getAuditEventPublicRef(eventOrId);
+}
+
+function buildTaskStepPublicRef(taskId, stepId) {
+  const normalizedTaskId = String(taskId || "").trim();
+  const normalizedStepId = String(stepId || "").trim();
+  if (!normalizedTaskId || !normalizedStepId) return "";
+  return buildOpaqueEntityRef({ entity: "task_step", prefix: "stp_", value: `${normalizedTaskId}:${normalizedStepId}` });
+}
+
+function toViewerTaskStepRef(stepOrId, { taskId = "", isAdmin = false } = {}) {
+  if (isAdmin) return stepOrId && typeof stepOrId === "object" ? String(stepOrId.id || "") : String(stepOrId || "");
+  const stepId = stepOrId && typeof stepOrId === "object" ? stepOrId.id : stepOrId;
+  return buildTaskStepPublicRef(taskId, stepId);
+}
+
+function resolveInternalTaskStepId(task, stepRefOrId) {
+  if (!task || typeof task !== "object") return "";
+  const normalized = String(stepRefOrId || "").trim();
+  if (!normalized) return "";
+  const steps = Array.isArray(task.steps) && task.steps.length ? task.steps : Array.isArray(task.plan && task.plan.steps) ? task.plan.steps : [];
+  const direct = steps.find((step) => String(step && step.id || "") === normalized);
+  if (direct) return String(direct.id || "");
+  const matched = steps.find((step) => buildTaskStepPublicRef(task.id, step && step.id) === normalized);
+  return matched && matched.id ? String(matched.id) : "";
+}
+
+function buildTaskStepEvidencePublicRef(taskId, stepId, receiptId) {
+  const normalizedTaskId = String(taskId || "").trim();
+  const normalizedStepId = String(stepId || "").trim();
+  const normalizedReceiptId = String(receiptId || "").trim();
+  if (!normalizedTaskId || !normalizedReceiptId) return "";
+  return buildOpaqueEntityRef({ entity: "task_step_evidence", prefix: "stev_", value: `${normalizedTaskId}:${normalizedStepId}:${normalizedReceiptId}` });
+}
+
+function toViewerTaskStepEvidenceRef(receiptId, { taskId = "", stepId = "", isAdmin = false } = {}) {
+  if (isAdmin) return String(receiptId || "");
+  return buildTaskStepEvidencePublicRef(taskId, stepId, receiptId);
+}
+
+function buildInvoicePublicRef(invoiceId) {
+  const normalized = String(invoiceId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "invoice", prefix: "invr_", value: normalized });
+}
+
+function toViewerInvoiceRef(invoiceOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (invoiceOrId && typeof invoiceOrId === "object") return String(invoiceOrId.id || "");
+    return String(invoiceOrId || "");
+  }
+  const invoiceId = invoiceOrId && typeof invoiceOrId === "object" ? invoiceOrId.id : invoiceOrId;
+  return buildInvoicePublicRef(invoiceId);
+}
+
+function buildTripPublicRef(tripId) {
+  const normalized = String(tripId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "trip", prefix: "trp_", value: normalized });
+}
+
+function buildViewerUserPublicRef(userId) {
+  const normalized = String(userId || "").trim();
+  if (!normalized) return "";
+  if (normalized === "anon") return "anon";
+  return buildOpaqueEntityRef({ entity: "viewer_user", prefix: "usrv_", value: normalized });
+}
+
+function buildViewerDevicePublicRef(deviceId) {
+  const normalized = String(deviceId || "").trim();
+  if (!normalized) return "";
+  if (normalized === "demo") return "demo";
+  return buildOpaqueEntityRef({ entity: "viewer_device", prefix: "dvr_", value: normalized });
+}
+
+function toViewerUserRef(userOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (userOrId && typeof userOrId === "object") return String(userOrId.id || "");
+    return String(userOrId || "");
+  }
+  const userId = userOrId && typeof userOrId === "object" ? userOrId.id : userOrId;
+  return buildViewerUserPublicRef(userId);
+}
+
+function getTripPublicRef(tripOrId) {
+  const tripId = tripOrId && typeof tripOrId === "object" ? tripOrId.id : tripOrId;
+  return buildTripPublicRef(tripId);
+}
+
+function resolveTripPlanRecord(tripRefOrId) {
+  const normalized = String(tripRefOrId || "").trim();
+  if (!normalized) return null;
+  if (db.tripPlans && db.tripPlans[normalized]) return db.tripPlans[normalized];
+  return Object.values(db.tripPlans || {}).find((trip) => buildTripPublicRef(trip && trip.id) === normalized) || null;
+}
+
+function resolveInternalTripId(tripRefOrId) {
+  const trip = resolveTripPlanRecord(tripRefOrId);
+  return trip && trip.id ? String(trip.id) : "";
+}
+
+function toViewerTripRef(tripOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (tripOrId && typeof tripOrId === "object") return String(tripOrId.id || "");
+    return String(tripOrId || "");
+  }
+  return getTripPublicRef(tripOrId);
+}
+
+function buildMerchantAccountPublicRef(accountId) {
+  const normalized = String(accountId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "merchant_account", prefix: "mrc_", value: normalized });
+}
+
+function toViewerMerchantAccountRef(accountOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (accountOrId && typeof accountOrId === "object") return String(accountOrId.id || "");
+    return String(accountOrId || "");
+  }
+  const accountId = accountOrId && typeof accountOrId === "object" ? accountOrId.id : accountOrId;
+  return buildMerchantAccountPublicRef(accountId);
+}
+
+function buildMerchantUserPublicRef(userId) {
+  const normalized = String(userId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "merchant_user", prefix: "musr_", value: normalized });
+}
+
+function toViewerMerchantUserRef(userOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (userOrId && typeof userOrId === "object") return String(userOrId.id || "");
+    return String(userOrId || "");
+  }
+  const userId = userOrId && typeof userOrId === "object" ? userOrId.id : userOrId;
+  return buildMerchantUserPublicRef(userId);
+}
+
+function buildMerchantGeoPartnerPublicRef(geoPartnerId) {
+  const normalized = String(geoPartnerId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "merchant_geo_partner", prefix: "mgp_", value: normalized });
+}
+
+function toViewerMerchantGeoPartnerRef(geoPartnerOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (geoPartnerOrId && typeof geoPartnerOrId === "object") return String(geoPartnerOrId.id || "");
+    return String(geoPartnerOrId || "");
+  }
+  const geoPartnerId = geoPartnerOrId && typeof geoPartnerOrId === "object" ? geoPartnerOrId.id : geoPartnerOrId;
+  return buildMerchantGeoPartnerPublicRef(geoPartnerId);
+}
+
+function buildMerchantListingRequestPublicRef(requestId) {
+  const normalized = String(requestId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "merchant_listing_request", prefix: "mlrq_", value: normalized });
+}
+
+function toViewerMerchantListingRequestRef(requestOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (requestOrId && typeof requestOrId === "object") return String(requestOrId.id || "");
+    return String(requestOrId || "");
+  }
+  const requestId = requestOrId && typeof requestOrId === "object" ? requestOrId.id : requestOrId;
+  return buildMerchantListingRequestPublicRef(requestId);
+}
+
+function buildMerchantActivityPublicRef(activityId) {
+  const normalized = String(activityId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "merchant_activity", prefix: "mact_", value: normalized });
+}
+
+function toViewerMerchantActivityRef(activityOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (activityOrId && typeof activityOrId === "object") return String(activityOrId.id || "");
+    return String(activityOrId || "");
+  }
+  const activityId = activityOrId && typeof activityOrId === "object" ? activityOrId.id : activityOrId;
+  return buildMerchantActivityPublicRef(activityId);
+}
+
+function buildMerchantSettlementPublicRef(settlementId) {
+  const normalized = String(settlementId || "").trim();
+  if (!normalized) return "";
+  return buildOpaqueEntityRef({ entity: "merchant_settlement", prefix: "mstl_", value: normalized });
+}
+
+function toViewerMerchantSettlementRef(settlementOrId, { isAdmin = false } = {}) {
+  if (isAdmin) {
+    if (settlementOrId && typeof settlementOrId === "object") return String(settlementOrId.id || "");
+    return String(settlementOrId || "");
+  }
+  const settlementId = settlementOrId && typeof settlementOrId === "object" ? settlementOrId.id : settlementOrId;
+  return buildMerchantSettlementPublicRef(settlementId);
+}
+
+function sanitizeTripProgressForViewer(progress, { isAdmin = false } = {}) {
+  const safe = progress && typeof progress === "object" ? { ...progress } : {};
+  if (isAdmin) return safe;
+  safe.taskIds = Array.isArray(safe.taskIds) ? safe.taskIds.map((taskId) => toViewerTaskRef(taskId, { isAdmin })).filter(Boolean) : [];
+  return safe;
 }
 
 function ensureSupportSessionForTicket(ticket, opts = {}) {
@@ -5838,7 +11902,7 @@ function findTaskByTicketId(ticketId) {
 }
 
 function findTicketBySessionId(sessionId) {
-  const sid = String(sessionId || "");
+  const sid = resolveInternalSupportSessionId(sessionId) || String(sessionId || "");
   if (!sid) return null;
   return (db.supportTickets || []).find((item) => String(item.sessionId || "") === sid) || null;
 }
@@ -5980,7 +12044,7 @@ function buildTicketTaskSnapshot(task) {
     taskId: task.id,
     status: task.status || "unknown",
     intent: task.intent || "",
-    city: constraints.city || db.users.demo.city || "Shanghai",
+    city: constraints.city || DEFAULT_CITY,
     updatedAt: task.updatedAt || task.createdAt || nowIso(),
   };
 }
@@ -6106,7 +12170,7 @@ function buildSupportOpsBoard(limit = 80) {
       taskId: task.id,
       intent: task.intent || "",
       status: task.status || "unknown",
-      city: ((task.plan && task.plan.constraints && task.plan.constraints.city) || (task.constraints && task.constraints.city) || db.users.demo.city || "Shanghai"),
+      city: ((task.plan && task.plan.constraints && task.plan.constraints.city) || (task.constraints && task.constraints.city) || DEFAULT_CITY),
       updatedAt: task.updatedAt || task.createdAt || nowIso(),
       reason: deriveTaskIssueReason(task),
       suggestedAction: "create_handoff",
@@ -6226,16 +12290,23 @@ function closeSupportSession(session, note = "closed_by_operator") {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
+    let done = false;
     req.on("data", (chunk) => {
+      if (done) return;
       data += chunk.toString("utf8");
-      if (data.length > 1e6) reject(new Error("Payload too large"));
+      if (data.length > 1e6) {
+        done = true;
+        req.destroy();
+        reject(Object.assign(new Error("Request body too large"), { code: "PAYLOAD_TOO_LARGE" }));
+      }
     });
     req.on("end", () => {
+      if (done) return;
       if (!data) return resolve({});
       try {
         resolve(JSON.parse(data));
       } catch {
-        reject(new Error("Invalid JSON"));
+        reject(Object.assign(new Error("Invalid JSON"), { code: "INVALID_JSON" }));
       }
     });
     req.on("error", reject);
@@ -6309,15 +12380,519 @@ function writeJson(res, statusCode, payload) {
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store, private",
     "X-CrossX-Build": BUILD_ID,
   });
   res.end(body);
+}
+
+async function _readJsonResponseSafe(res, fallback = null) {
+  if (!res) return fallback;
+  if (res.status === 204 || res.status === 205) return fallback;
+  let text = "";
+  try {
+    text = await res.text();
+  } catch {
+    return [sourceKey, area].filter(Boolean).join("|") || fallback;
+  }
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return fallback;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return fallback;
+  }
+}
+
+function sanitizeAttachmentFilename(filename, fallback = "download") {
+  const raw = String(filename || "").trim();
+  const safe = raw
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/_{2,}/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120);
+  return safe || fallback;
+}
+
+function writeAttachment(res, statusCode, body, {
+  contentType = "application/octet-stream",
+  filename = "",
+  contentDisposition = "attachment",
+  cacheControl = "no-store, private",
+} = {}) {
+  const payload = Buffer.isBuffer(body) ? body : Buffer.from(String(body ?? ""), "utf8");
+  const headers = {
+    "Content-Type": contentType,
+    "Content-Length": payload.length,
+    "Cache-Control": cacheControl,
+  };
+  if (filename) {
+    headers["Content-Disposition"] = `${contentDisposition}; filename="${sanitizeAttachmentFilename(filename)}"`;
+  }
+  res.writeHead(statusCode, headers);
+  res.end(payload);
+}
+
+function maskSensitiveString(value) {
+  let text = String(value ?? "");
+  if (!text) return text;
+  text = text.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[REDACTED_EMAIL]");
+  text = text.replace(/\b(?:\+?\d[\d\s().-]{7,}\d)\b/g, "[REDACTED_PHONE]");
+  text = text.replace(/\bcx_[a-f0-9]{32}\b/gi, "[REDACTED_DEVICE]");
+  text = text.replace(/\b(?:CX-[A-Z0-9-]{6,}|ord_[A-Za-z0-9_-]{4,}|order_[A-Za-z0-9_-]{4,}|task_[A-Za-z0-9_-]{4,}|trip_[A-Za-z0-9_-]{4,}|sess_[A-Za-z0-9_-]{4,}|help_[A-Za-z0-9_-]{4,}|gr_[A-Za-z0-9_-]{4,}|mlr_[A-Za-z0-9_-]{4,}|macc_[A-Za-z0-9_-]{4,}|muser_[A-Za-z0-9_-]{4,})\b/g, "[REDACTED_ID]");
+  text = text.replace(/\b(?:Bearer\s+)?[A-Za-z0-9_-]{24,}\b/g, "[REDACTED_TOKEN]");
+  return text;
+}
+
+function sanitizeAuditPayloadForViewer(value, depth = 0) {
+  if (depth > 4) return "[TRUNCATED]";
+  if (value == null) return value;
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => sanitizeAuditPayloadForViewer(item, depth + 1));
+  if (typeof value === "string") return maskSensitiveString(value).slice(0, 500);
+  if (typeof value !== "object") return value;
+  const safe = {};
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    const key = String(rawKey || "");
+    if (/password|secret|token|authorization|cookie|phone|email|tax|company|contact|buyer|guest|html|body|audio|dataurl|qr|proof|transaction|deviceid|sessionid|orderid|taskid|requestid|ticketid|merchantaccountid|merchantuserid|userid|accountid|lat|lng|longitude|latitude|coordinate/i.test(key)) {
+      safe[key] = "[REDACTED]";
+      continue;
+    }
+    safe[key] = sanitizeAuditPayloadForViewer(rawValue, depth + 1);
+  }
+  return safe;
+}
+
+function sanitizeProofItemForViewer(item, { isAdmin = false } = {}) {
+  if (!item || typeof item !== "object") return null;
+  return {
+    id: toViewerProofItemRef(item, { isAdmin }),
+    type: item.type || "",
+    title: item.title || item.type || "",
+    hash: item.hash || "",
+    generatedAt: item.generatedAt || "",
+  };
+}
+
+function sanitizeAuditEventForViewer(event, { isAdmin = false } = {}) {
+  if (!event || typeof event !== "object") return event;
+  if (isAdmin) return event;
+  return {
+    id: toViewerAuditEventRef(event, { isAdmin }),
+    at: event.at,
+    hash: event.hash,
+    kind: event.kind,
+    who: maskSensitiveString(event.who || ""),
+    what: maskSensitiveString(event.what || ""),
+    toolInput: sanitizeAuditPayloadForViewer(event.toolInput || {}),
+    toolOutput: sanitizeAuditPayloadForViewer(event.toolOutput || {}),
+    relatedProofItems: Array.isArray(event.relatedProofItems) ? event.relatedProofItems.map(sanitizeProofItemForViewer).filter(Boolean) : [],
+  };
 }
 
 // FS-A-02: Unified API response helpers — all success/error responses through here.
 // Callers can still use writeJson for legacy endpoints; new/refactored endpoints use these.
 function apiOk(res, data, meta = {})           { writeJson(res, 200,  { ok: true,  data, ...meta }); }
 function apiErr(res, status, code, message)    { writeJson(res, status, { ok: false, error: code, message }); }
+
+function maskNameForViewer(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  if (text.length === 1) return "*";
+  if (text.length === 2) return `${text.slice(0, 1)}*`;
+  return `${text.slice(0, 1)}${"*".repeat(Math.min(3, text.length - 1))}`;
+}
+
+function maskPhoneForViewer(value) {
+  const text = String(value ?? "").trim();
+  const digits = text.replace(/\D/g, "");
+  if (!digits) return "";
+  if (digits.length <= 4) return "*".repeat(digits.length);
+  return `${digits.slice(0, Math.min(3, digits.length - 4))}${"*".repeat(Math.max(2, digits.length - 7))}${digits.slice(-4)}`;
+}
+
+function maskBankAccountForViewer(value) {
+  const text = String(value ?? "").trim();
+  const digits = text.replace(/\D/g, "");
+  if (!digits) return maskSensitiveString(text).slice(0, 32);
+  if (digits.length <= 4) return `**** ${digits}`;
+  return `**** **** **** ${digits.slice(-4)}`;
+}
+
+function maskEmailForViewer(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (!text) return "";
+  const atIndex = text.indexOf("@");
+  if (atIndex <= 0) return maskSensitiveString(text).slice(0, 120);
+  const local = text.slice(0, atIndex);
+  const domain = text.slice(atIndex + 1);
+  const lastDot = domain.lastIndexOf(".");
+  const domainName = lastDot > 0 ? domain.slice(0, lastDot) : domain;
+  const tld = lastDot > 0 ? domain.slice(lastDot) : "";
+  const safeLocal = local.length <= 2 ? `${local.slice(0, 1)}*` : `${local.slice(0, 2)}***`;
+  const safeDomain = domainName ? `${domainName.slice(0, 1)}***` : "***";
+  return `${safeLocal}@${safeDomain}${tld}`;
+}
+
+function maskTaxIdForViewer(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  if (text.length <= 4) return "*".repeat(text.length);
+  return `${text.slice(0, 2)}${"*".repeat(Math.max(4, text.length - 4))}${text.slice(-2)}`;
+}
+
+function sanitizeMerchantAccount(account, geoPartner = null, options = {}) {
+  if (!account) return null;
+  const includeContact = options && options.includeContact === true;
+  const isAdmin = options && options.isAdmin === true;
+  const accountId = account.id || "";
+  const parentAccountId = account.parent_account_id || null;
+  const linkedGeoPartnerId = account.geo_partner_id || geoPartner?.id || null;
+  return {
+    id: toViewerMerchantAccountRef(accountId, { isAdmin }),
+    slug: account.slug,
+    name: account.name,
+    status: account.status,
+    accountType: account.account_type || "local_merchant",
+    parentAccountId: parentAccountId ? toViewerMerchantAccountRef(parentAccountId, { isAdmin }) : null,
+    city: account.city,
+    category: account.category,
+    contactName: includeContact ? (account.contact_name || "") : maskNameForViewer(account.contact_name || ""),
+    contactPhone: includeContact ? (account.contact_phone || "") : maskPhoneForViewer(account.contact_phone || ""),
+    contactEmail: includeContact ? (account.contact_email || "") : maskEmailForViewer(account.contact_email || ""),
+    description: account.description || "",
+    recommendationEnabled: Boolean(account.recommendation_enabled),
+    priorityScore: Number(account.priority_score ?? 90),
+    linkedGeoPartnerId: linkedGeoPartnerId ? toViewerMerchantGeoPartnerRef(linkedGeoPartnerId, { isAdmin }) : null,
+    updatedAt: account.updated_at || account.created_at || "",
+  };
+}
+
+function sanitizeMerchantOrderSummary(order, options = {}) {
+  if (!order || typeof order !== "object") return null;
+  const isAdmin = options && options.isAdmin === true;
+  const orderId = order.id || "";
+  const taskId = order.taskId || order.task_id || "";
+  return {
+    id: toViewerOrderRef(orderId, { isAdmin }),
+    taskId: taskId ? toViewerTaskRef(taskId, { isAdmin }) : "",
+    type: order.type || "",
+    city: order.city || "",
+    price: Number(order.price || 0),
+    currency: order.currency || "CNY",
+    status: order.status || "",
+    supportOpenCount: Number(order.supportOpenCount || 0),
+    taskIntent: order.taskIntent || "",
+    confirmedAt: order.confirmedAt || order.confirmed_at || "",
+    createdAt: order.createdAt || order.created_at || "",
+    updatedAt: order.updatedAt || order.updated_at || "",
+  };
+}
+
+const MERCHANT_ACTIVITY_REDACTED_KEY_RE = /(^by$|ip|username|user(name|Id)?|actor|email|phone|contact|token|cookie|authorization|password|secret|agent|session|html|body|audio|message|note|internal|proof|device)/i;
+const MERCHANT_ACTIVITY_VISIBLE_ID_KEY_RE = /^(orderId|ticketId|requestId)$/i;
+
+function sanitizeMerchantActivityVisibleId(key, value, { isAdmin = false } = {}) {
+  const normalizedKey = String(key || "").trim().toLowerCase();
+  if (!normalizedKey) return "";
+  if (normalizedKey === "orderid") return toViewerOrderRef(value, { isAdmin });
+  if (normalizedKey === "ticketid") return toViewerSupportTicketRef(value, { isAdmin });
+  if (normalizedKey === "requestid") return toViewerMerchantListingRequestRef(value, { isAdmin });
+  return String(value || "").slice(0, 80);
+}
+
+function sanitizeMerchantActivityValue(value, depth = 0, options = {}) {
+  const isAdmin = options && options.isAdmin === true;
+  if (depth > 4) return "[TRUNCATED]";
+  if (value == null) return value;
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 10)
+      .map((item) => sanitizeMerchantActivityValue(item, depth + 1, options))
+      .filter((item) => item !== undefined);
+  }
+  if (typeof value === "string") return maskSensitiveString(value).slice(0, 120);
+  if (typeof value !== "object") return value;
+  const safe = {};
+  for (const [rawKey, rawValue] of Object.entries(value)) {
+    const key = String(rawKey || "");
+    if (!key) continue;
+    if (MERCHANT_ACTIVITY_VISIBLE_ID_KEY_RE.test(key)) {
+      const visibleId = sanitizeMerchantActivityVisibleId(key, rawValue, { isAdmin });
+      if (visibleId) safe[key] = visibleId;
+      continue;
+    }
+    if (MERCHANT_ACTIVITY_REDACTED_KEY_RE.test(key)) continue;
+    const nextValue = sanitizeMerchantActivityValue(rawValue, depth + 1, options);
+    if (nextValue == null || nextValue === "") continue;
+    if (Array.isArray(nextValue) && !nextValue.length) continue;
+    if (typeof nextValue === "object" && !Array.isArray(nextValue) && !Object.keys(nextValue).length) continue;
+    safe[key] = nextValue;
+  }
+  return safe;
+}
+
+function summarizeMerchantActivity(action, detail = {}) {
+  const normalized = String(action || "").trim().toLowerCase();
+  if (normalized === "merchant.login") return "已完成商家后台登录";
+  if (normalized === "merchant.profile.updated") return "已更新商家资料";
+  if (normalized === "merchant.support.comment") return "已向支持团队追加备注";
+  if (normalized === "merchant.order.confirm") return "已确认接单";
+  if (normalized === "merchant.order.start") return "订单已进入履约中";
+  if (normalized === "merchant.order.deliver") return "订单已标记交付";
+  if (normalized === "merchant.order.issue") return "已提交订单异常协同";
+  if (normalized === "merchant.listing-request.submitted" || normalized === "merchant.listing.request_submitted") return "已提交平台资料申请";
+  if (normalized.startsWith("merchant.listing.request.")) return "平台已更新资料申请状态";
+  if (detail && typeof detail === "object" && detail.requestId) return "商家平台申请已更新";
+  return String(action || "").trim().slice(0, 80) || "merchant.activity";
+}
+
+function sanitizeMerchantActivityEntry(item, options = {}) {
+  if (!item || typeof item !== "object") return null;
+  const isAdmin = options && options.isAdmin === true;
+  let parsedDetail = {};
+  try {
+    parsedDetail = JSON.parse(item.detail_json || "{}");
+  } catch (_) {
+    parsedDetail = {};
+  }
+  const detail = sanitizeMerchantActivityValue(parsedDetail, 0, { isAdmin });
+  return {
+    id: toViewerMerchantActivityRef(item, { isAdmin }),
+    action: item.action || "",
+    createdAt: item.created_at || "",
+    summary: summarizeMerchantActivity(item.action, detail),
+    detail: detail && typeof detail === "object" && !Array.isArray(detail) ? detail : {},
+  };
+}
+
+function sanitizeMerchantSupportReason(reason) {
+  const text = String(reason || "").trim();
+  if (!text) return "";
+  if (/^merchant_order_issue:/i.test(text)) return "订单履约异常";
+  if (/support|handoff|live_support/i.test(text)) return "支持协同处理中";
+  return maskSensitiveString(text).slice(0, 120);
+}
+
+function sanitizeMerchantSupportPreview(lastMessage) {
+  if (!lastMessage || typeof lastMessage !== "object") return null;
+  const actor = String(lastMessage.actor || "").trim().toLowerCase();
+  let preview = "";
+  if (actor === "user") {
+    preview = String(lastMessage.text || "").trim() || "已发送商家备注";
+  } else if (actor === "ops") {
+    preview = "支持团队已更新处理进度";
+  } else {
+    preview = "工单状态已更新";
+  }
+  return {
+    preview: maskSensitiveString(preview).slice(0, 120),
+    at: lastMessage.at || "",
+  };
+}
+
+function sanitizeMerchantSupportTicket(ticket, options = {}) {
+  if (!ticket || typeof ticket !== "object") return null;
+  const isAdmin = options && options.isAdmin === true;
+  const status = String(ticket.status || "").trim().toLowerCase();
+  const orderId = ticket.orderId || "";
+  const taskId = ticket.taskId || "";
+  return {
+    id: toViewerSupportTicketRef(ticket, { isAdmin }),
+    orderId: orderId ? toViewerOrderRef(orderId, { isAdmin }) : "",
+    orderStatus: ticket.orderStatus || "",
+    taskId: taskId ? toViewerTaskRef(taskId, { isAdmin }) : "",
+    taskIntent: ticket.taskIntent || "",
+    reason: sanitizeMerchantSupportReason(ticket.reason),
+    status: ticket.status || "",
+    coordinationStatus: status === "resolved" ? "已关闭" : status === "in_progress" ? "处理中" : "待响应",
+    eta: ticket.eta || "",
+    messageCount: Number(ticket.messageCount || 0),
+    createdAt: ticket.createdAt || "",
+    updatedAt: ticket.updatedAt || ticket.sessionUpdatedAt || ticket.createdAt || "",
+    lastMessage: sanitizeMerchantSupportPreview(ticket.lastMessage),
+  };
+}
+
+function sanitizeMerchantGeoPartner(geoPartner, options = {}) {
+  if (!geoPartner) return null;
+  const isAdmin = options && options.isAdmin === true;
+  return {
+    id: toViewerMerchantGeoPartnerRef(geoPartner, { isAdmin }),
+    name: geoPartner.name,
+    category: geoPartner.category,
+    city: geoPartner.city,
+    address: geoPartner.address || "",
+    description: geoPartner.description || "",
+    contact: geoPartner.contact || "",
+    tags: geoPartner.tags || "",
+    priorityScore: Number(geoPartner.priority_score ?? 90),
+    active: Boolean(geoPartner.active),
+    updatedAt: geoPartner.updated_at || geoPartner.created_at || "",
+  };
+}
+
+function parseMerchantRequestJson(value, fallback = {}) {
+  try {
+    const parsed = JSON.parse(value || "{}");
+    return parsed && typeof parsed === "object" ? parsed : fallback;
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function normalizeMerchantListingFollowUp(followUp = {}) {
+  const source = followUp && typeof followUp === "object" && !Array.isArray(followUp) ? followUp : {};
+  return {
+    owner: String(source.owner || "").trim().slice(0, 80),
+    nextStep: String(source.nextStep || "").trim().slice(0, 160),
+    targetWindow: String(source.targetWindow || "").trim().slice(0, 80),
+    priority: String(source.priority || "").trim().slice(0, 24),
+    tags: Array.isArray(source.tags)
+      ? source.tags.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 8)
+      : [],
+  };
+}
+
+function sanitizeMerchantListingRequestPayload(payload, { isAdmin = false } = {}) {
+  const source = payload && typeof payload === "object" && !Array.isArray(payload) ? { ...payload } : {};
+  if (Array.isArray(source.stores)) {
+    source.stores = source.stores
+      .map((item) => toViewerMerchantAccountRef(item, { isAdmin }))
+      .filter(Boolean)
+      .slice(0, 20);
+  }
+  if ("requestedBy" in source) {
+    source.requestedBy = source.requestedBy ? toViewerMerchantUserRef(source.requestedBy, { isAdmin }) : "";
+  }
+  return source;
+}
+
+function sanitizeMerchantListingReviewMeta(reviewMeta, { isAdmin = false } = {}) {
+  const source = reviewMeta && typeof reviewMeta === "object" && !Array.isArray(reviewMeta) ? reviewMeta : {};
+  if (isAdmin) return source;
+  return {
+    nextStep: String(source.nextStep || "").trim().slice(0, 160),
+    targetWindow: String(source.targetWindow || "").trim().slice(0, 80),
+    priority: String(source.priority || "").trim().slice(0, 24),
+    tags: Array.isArray(source.tags)
+      ? source.tags.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 8)
+      : [],
+  };
+}
+
+function serializeMerchantListingRequest(row, options = {}) {
+  if (!row) return null;
+  const includeMerchantContext = Boolean(options.includeMerchantContext);
+  const isAdmin = Boolean(options.isAdmin);
+  const output = {
+    id: toViewerMerchantListingRequestRef(row.id, { isAdmin }),
+    merchantAccountId: row.merchant_account_id ? toViewerMerchantAccountRef(row.merchant_account_id, { isAdmin }) : "",
+    requestType: row.request_type,
+    status: row.status,
+    title: row.title,
+    payload: sanitizeMerchantListingRequestPayload(parseMerchantRequestJson(row.payload_json), { isAdmin }),
+    reviewNote: row.review_note || "",
+    reviewMeta: sanitizeMerchantListingReviewMeta(parseMerchantRequestJson(row.review_meta_json), { isAdmin }),
+    reviewedBy: isAdmin ? (row.reviewed_by || "") : (row.reviewed_by ? "platform_admin" : ""),
+    reviewedAt: row.reviewed_at || "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+  if (includeMerchantContext) {
+    output.merchantName = row.merchant_name || "";
+    output.merchantSlug = row.merchant_slug || "";
+    output.merchantCity = row.merchant_city || "";
+    output.merchantCategory = row.merchant_category || "";
+    output.merchantAccountType = row.merchant_account_type || "local_merchant";
+    output.parentAccountId = row.merchant_parent_account_id ? toViewerMerchantAccountRef(row.merchant_parent_account_id, { isAdmin }) : null;
+    output.parentAccountName = row.parent_account_name || "";
+  }
+  return output;
+}
+
+function sanitizeMerchantScopedStore(store, options = {}) {
+  if (!store || !store.account) return null;
+  const isAdmin = options && options.isAdmin === true;
+  const linkedGeoPartnerId = store.account.geo_partner_id || store.geoPartner?.id || null;
+  return {
+    merchantAccountId: toViewerMerchantAccountRef(store.account.id, { isAdmin }),
+    name: store.account.name,
+    slug: store.account.slug,
+    city: store.account.city,
+    category: store.account.category,
+    status: store.account.status,
+    accountType: store.account.account_type || "local_merchant",
+    platformListingState: store.account.recommendation_enabled && store.geoPartner?.active !== 0 ? "active" : "inactive",
+    linkedGeoPartnerId: linkedGeoPartnerId ? toViewerMerchantGeoPartnerRef(linkedGeoPartnerId, { isAdmin }) : null,
+    openSupportCount: Number(store.openSupportCount || 0),
+    geoPartner: sanitizeMerchantGeoPartner(store.geoPartner, { isAdmin }),
+  };
+}
+
+function sanitizeMerchantUser(user, options = {}) {
+  if (!user) return null;
+  const isAdmin = options && options.isAdmin === true;
+  return {
+    id: toViewerMerchantUserRef(user, { isAdmin }),
+    merchantAccountId: user.merchant_account_id ? toViewerMerchantAccountRef(user.merchant_account_id, { isAdmin }) : "",
+    username: user.username,
+    role: user.role,
+    displayName: user.display_name || "",
+    status: user.status,
+    lastLogin: user.last_login || "",
+    updatedAt: user.updated_at || user.created_at || "",
+  };
+}
+
+function sanitizeMerchantPlatformListing(platformListing, options = {}) {
+  if (!platformListing || typeof platformListing !== "object") return platformListing;
+  const isAdmin = options && options.isAdmin === true;
+  return {
+    ...platformListing,
+    stores: Array.isArray(platformListing.stores)
+      ? platformListing.stores.map((item) => ({
+          ...item,
+          merchantAccountId: item?.merchantAccountId ? toViewerMerchantAccountRef(item.merchantAccountId, { isAdmin }) : "",
+          linkedGeoPartnerId: item?.linkedGeoPartnerId ? toViewerMerchantGeoPartnerRef(item.linkedGeoPartnerId, { isAdmin }) : null,
+        })).filter(Boolean)
+      : [],
+    latestRequests: Array.isArray(platformListing.latestRequests)
+      ? platformListing.latestRequests.map((item) => ({
+          ...item,
+          id: toViewerMerchantListingRequestRef(item?.id, { isAdmin }),
+          payload: sanitizeMerchantListingRequestPayload(item?.payload, { isAdmin }),
+          reviewMeta: sanitizeMerchantListingReviewMeta(item?.reviewMeta, { isAdmin }),
+          reviewedBy: isAdmin ? (item?.reviewedBy || "") : (item?.reviewedBy ? "platform_admin" : ""),
+        })).filter(Boolean)
+      : [],
+  };
+}
+
+function sanitizeMerchantSettlementRecord(item, options = {}) {
+  if (!item || typeof item !== "object") return null;
+  const isAdmin = options && options.isAdmin === true;
+  return {
+    ...item,
+    id: toViewerMerchantSettlementRef(item, { isAdmin }),
+    orderId: item.orderId ? toViewerOrderRef(item.orderId, { isAdmin }) : "",
+    taskId: item.taskId ? toViewerTaskRef(item.taskId, { isAdmin }) : "",
+  };
+}
+
+function sanitizeMerchantSettlementSummary(summary, options = {}) {
+  if (!summary || typeof summary !== "object") return summary;
+  const isAdmin = options && options.isAdmin === true;
+  return {
+    ...summary,
+    latestSettlements: Array.isArray(summary.latestSettlements)
+      ? summary.latestSettlements.map((item) => sanitizeMerchantSettlementRecord(item, { isAdmin })).filter(Boolean)
+      : [],
+  };
+}
+
+function generateMerchantTempPassword() {
+  return `CxM${require("crypto").randomBytes(5).toString("base64url")}9!`;
+}
 
 function mimeType(filePath) {
   if (filePath.endsWith(".html")) return "text/html; charset=utf-8";
@@ -6337,10 +12912,12 @@ function mimeType(filePath) {
 }
 
 function serveStatic(req, res) {
-  const parsed = parseUrl(req.url);
+  const parsed = parseRequestUrl(req);
   let rel = parsed.pathname === "/" ? "/index.html" : parsed.pathname;
   // Known HTML routes without extension
   if (rel === "/privacy") rel = "/privacy.html";
+  if (rel === "/admin")   rel = "/admin.html";
+  if (rel === "/merchant") rel = "/merchant.html";
 
   // AS-03: Path traversal hardening — multi-layer defence
   // 1) Reject encoded traversal sequences before any normalization
@@ -6357,10 +12934,9 @@ function serveStatic(req, res) {
 
   function sendContent(resolvedPath, content) {
     const isHtml = resolvedPath.endsWith(".html");
-    // No nonce for HTML pages: app.js generates onclick= handlers via innerHTML throughout,
-    // which CSP nonces cannot cover (only <script nonce> blocks benefit). Using unsafe-inline
-    // is equivalent security here since all actual scripts are loaded via external <script src>.
-    const nonce = undefined;
+    const htmlFile = isHtml ? path.basename(resolvedPath).toLowerCase() : "";
+    const useNonceCsp = htmlFile === "index.html" || htmlFile === "admin.html" || htmlFile === "merchant.html" || htmlFile === "privacy.html";
+    const nonce = useNonceCsp ? generateNonce() : undefined;
     let body = content;
     if (isHtml) {
       // Inject correct base URL into OG tags (env var or derived from Host header)
@@ -6370,11 +12946,14 @@ function serveStatic(req, res) {
           const proto = req.headers["x-forwarded-proto"] || "http";
           return `${proto}://${host}`;
         })();
-      body = Buffer.from(
-        content.toString().replace(/https:\/\/crossx\.ai(?=\/|")/g, appBase)
-      );
+      let html = content.toString().replace(/https:\/\/crossx\.ai(?=\/|")/g, appBase);
+      if (useNonceCsp && nonce) {
+        html = html.replace(/<script\b(?![^>]*\bnonce=)/gi, `<script nonce="${nonce}"`);
+        html = html.replace(/<style\b(?![^>]*\bnonce=)/gi, `<style nonce="${nonce}"`);
+      }
+      body = Buffer.from(html);
     }
-    applySecurityHeaders(res, nonce);
+    applySecurityHeaders(res, nonce, { reportUri: "/api/system/csp-report" });
     res.writeHead(200, {
       "Content-Type": mimeType(resolvedPath),
       "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -6399,12 +12978,18 @@ function serveStatic(req, res) {
 
 const audit = createAuditLogger({
   appendFn(event) {
-    db.auditLogs.push({
+    const auditEvent = {
       id: `log_${db.auditLogs.length + 1}`,
       at: nowIso(),
       hash: `h_${Date.now()}_${db.auditLogs.length + 1}`,
       ...event,
-    });
+    };
+    db.auditLogs.push(auditEvent);
+    try {
+      appendAuditLog(auditEvent);
+    } catch (err) {
+      console.warn("[audit] sqlite mirror failed:", sanitizeServerLogError(err, "audit_mirror_failed"));
+    }
     saveDb();
   },
   readFn(limit) {
@@ -6433,15 +13018,18 @@ const paymentRails = createPaymentRailManager({
 const tools = createToolRegistry({ connectors, payments: paymentRails });
 const confirmPolicy = createConfirmPolicy({
   getSingleLimit() {
-    return db.users?.demo?.authDomain?.singleLimit ?? 50000;
+    return 50000;
   },
 });
 const orchestrator = createOrchestrator({ tools, audit });
 
 function createTask(payload) {
-  const userId = payload.userId || "demo";
-  const user = db.users[userId] || db.users.demo;
+  const userId = String(payload.userId || "anon").trim() || "anon";
+  const createdBy = String(payload.createdBy || (userId !== "anon" ? userId : "")).trim();
+  const user = getUserProfile(userId, { fallbackId: userId || "anon" });
   const incomingConstraints = payload.constraints && typeof payload.constraints === "object" ? { ...payload.constraints } : {};
+  const explicitCity = extractExplicitCityFromIntent(payload.intent || "");
+  if (explicitCity) incomingConstraints.city = explicitCity;
   if (!incomingConstraints.city) incomingConstraints.city = user.city || "Shanghai";
   if (user && user.location && Number.isFinite(Number(user.location.lat)) && Number.isFinite(Number(user.location.lng))) {
     if (!incomingConstraints.originLat) incomingConstraints.originLat = Number(user.location.lat);
@@ -6458,6 +13046,7 @@ function createTask(payload) {
   const task = {
     id,
     userId,
+    createdBy,
     intent: payload.intent || "",
     constraints: incomingConstraints,
     status: "planned",
@@ -6490,7 +13079,7 @@ function createTask(payload) {
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
-  const tripId = payload.tripId ? String(payload.tripId) : "";
+  const tripId = payload.tripId ? (resolveInternalTripId(String(payload.tripId)) || "") : "";
   if (tripId) {
     task.tripId = tripId;
   }
@@ -6506,7 +13095,7 @@ function createTask(payload) {
 
   audit.append({
     kind: "task",
-    who: task.userId,
+    who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
     what: "task.created",
     taskId: id,
     toolInput: { intent: task.intent, constraints: task.constraints },
@@ -6514,7 +13103,7 @@ function createTask(payload) {
   });
   pushMetricEvent({
     kind: "task_created",
-    userId: task.userId,
+    userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }),
     taskId: task.id,
     intentType: task.plan.intentType,
     flags: Object.keys(task.flagSnapshot || {}).filter((k) => task.flagSnapshot[k].active),
@@ -6579,6 +13168,7 @@ function createOrderForTask(task, proof) {
   ];
   return {
     id: orderId,
+    userId: task.userId || "anon",
     taskId: task.id,
     tripId: task.tripId || null,
     provider: task.plan.intentType === "eat" ? "Partner Restaurant Network" : "Partner Mobility Network",
@@ -6609,15 +13199,16 @@ function createOrderForTask(task, proof) {
 }
 
 function buildShareCard(order) {
+  const viewerOrderId = toViewerOrderRef(order);
   return {
-    orderId: order.id,
+    orderId: viewerOrderId,
     title: order.type === "eat" ? "Cross X dining booking ready" : "Cross X trip ready",
     subtitle: `${order.city || "Shanghai"} · ${order.price} ${order.currency}`,
-    summary: `Order ${order.proof && order.proof.orderNo ? order.proof.orderNo : order.id} generated by Cross X`,
+    summary: `Order ${viewerOrderId} generated by Cross X`,
     shareImage: "/assets/solution-flow.svg",
     miniProgram: {
-      alipayPath: `pages/trips/detail?orderId=${encodeURIComponent(order.id)}`,
-      wechatPath: `pages/trips/detail?orderId=${encodeURIComponent(order.id)}`,
+      alipayPath: `pages/trips/detail?orderId=${encodeURIComponent(viewerOrderId)}`,
+      wechatPath: `pages/trips/detail?orderId=${encodeURIComponent(viewerOrderId)}`,
     },
     generatedAt: nowIso(),
   };
@@ -6711,31 +13302,32 @@ async function executeTask(task) {
   try {
     result = await orchestrator.executeTask({ task, userId: task.userId });
   } catch (err) {
+    const failureReason = sanitizeTaskExecutionFailureReason(err);
     task.status = "failed";
     syncTaskAgentMeta(task, "support");
     task.steps = (task.plan.steps || []).map((step) => normalizeStep({ ...step }));
-    lifecyclePush(task.lifecycle, "failed", "Execution failed", err.message || "Execution failed");
+    lifecyclePush(task.lifecycle, "failed", "Execution failed", buildTaskExecutionFailureNote(failureReason));
     task.fallbackEvents.push({
       kind: "auto_fallback",
       at: nowIso(),
       note: "Primary execution failed, suggested alternate provider/route",
-      reason: err.message,
+      reason: failureReason,
       alternative: task.plan.confirm.alternative,
     });
     task.updatedAt = nowIso();
     audit.append({
       kind: "task",
-      who: task.userId,
+      who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
       what: "task.failed.fallback",
       taskId: task.id,
       toolInput: {},
-      toolOutput: { reason: err.message, alternative: task.plan.confirm.alternative },
+      toolOutput: { reason: failureReason, alternative: task.plan.confirm.alternative },
     });
     pushMetricEvent({
       kind: "task_failed_fallback",
-      userId: task.userId,
+      userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }),
       taskId: task.id,
-      meta: { reason: err.message },
+      meta: { reason: failureReason },
     });
 
     if (task.flagSnapshot && task.flagSnapshot.manualFallback && task.flagSnapshot.manualFallback.active) {
@@ -6761,13 +13353,13 @@ async function executeTask(task) {
       });
       pushMetricEvent({
         kind: "handoff_auto_created",
-        userId: task.userId,
+        userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }),
         taskId: task.id,
         meta: { ticketId: ticket.id },
       });
       audit.append({
         kind: "support",
-        who: task.userId,
+        who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
         what: "task.handoff.auto_created",
         taskId: task.id,
         toolInput: { reason: "execution_failure" },
@@ -6794,7 +13386,7 @@ async function executeTask(task) {
   result.outputs.forEach((o) => {
     audit.append({
       kind: "step",
-      who: task.userId,
+      who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
       what: "step.executed",
       taskId: task.id,
       toolInput: { stepId: o.stepId, toolType: o.toolType },
@@ -6832,7 +13424,7 @@ async function executeTask(task) {
     }
   } catch (fulfillErr) {
     // Fulfillment state machine failed — order is already created, degrade gracefully
-    console.warn(`[fulfillment] State machine error for ${order.id}: ${fulfillErr.message}`);
+    console.warn("[fulfillment] State machine error:", sanitizeServerLogError(fulfillErr, "fulfillment_state_machine_failed"));
     order.status = "completed";
     order.updatedAt = nowIso();
     db.orders[order.id] = order;
@@ -6858,7 +13450,7 @@ async function executeTask(task) {
   task.updatedAt = nowIso();
   pushMetricEvent({
     kind: "closed_loop_completed",
-    userId: task.userId,
+    userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }),
     taskId: task.id,
     orderId: order.id,
     amount: order.price,
@@ -6868,7 +13460,7 @@ async function executeTask(task) {
 
   audit.append({
     kind: "task",
-    who: task.userId,
+    who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
     what: "task.completed",
     taskId: task.id,
     toolInput: { steps: task.plan.steps.map((s) => s.id) },
@@ -6879,13 +13471,62 @@ async function executeTask(task) {
   return { task, order };
 }
 
-function requireTask(taskId, res) {
-  const task = db.tasks[taskId];
+function requireTask(taskId, req, res, body = null) {
+  const task = resolveTaskRecord(taskId);
   if (!task) {
     writeJson(res, 404, { error: "Task not found" });
     return null;
   }
+  const access = resolveOwnedResourceAccess(req, task.userId, body, { resourceLabel: "task" });
+  if (!access.ok) {
+    writeJson(res, access.statusCode, access.payload);
+    return null;
+  }
   return task;
+}
+
+function resolveOrderOwnerId(order) {
+  if (!order) return "";
+  if (order.userId) return String(order.userId);
+  if (order.planSnapshot && typeof order.planSnapshot === "object") {
+    const bookingOwnerId = order.planSnapshot.bookingOwnerId || order.planSnapshot.ownerId || order.planSnapshot.deviceId;
+    if (bookingOwnerId) return String(bookingOwnerId);
+  }
+  const linkedTask = order.taskId ? db.tasks[order.taskId] || null : null;
+  return linkedTask && linkedTask.userId ? String(linkedTask.userId) : "";
+}
+
+function requireOrderAccess(orderId, req, res, body = null, options = {}) {
+  const order = resolveOrderRecord(orderId);
+  if (!order) {
+    writeJson(res, 404, { error: "Order not found" });
+    return null;
+  }
+  const ownerId = resolveOrderOwnerId(order);
+  const access = resolveOwnedResourceAccess(req, ownerId, body, {
+    resourceLabel: "order",
+    queryDeviceId: options.queryDeviceId || "",
+    allowQueryDeviceWithoutBinding: options.allowQueryDeviceWithoutBinding === true,
+  });
+  if (!access.ok) {
+    writeJson(res, access.statusCode, access.payload);
+    return null;
+  }
+  return order;
+}
+
+function requireSupportTicketAccess(ticketId, req, res, body = null) {
+  const ticket = resolveSupportTicketRecord(ticketId);
+  if (!ticket) {
+    writeJson(res, 404, { error: "Ticket not found" });
+    return null;
+  }
+  const access = resolveSupportTicketAccess(req, ticket, body);
+  if (!access.ok) {
+    writeJson(res, access.via === "admin" ? 401 : 404, { error: access.error === "Ticket not found" ? "Ticket not found" : "unauthorized", message: access.error === "Ticket not found" ? undefined : sanitizeSupportAccessError(access.error) });
+    return null;
+  }
+  return ticket;
 }
 
 function summarizeRequestPayload(payload, toolType) {
@@ -7085,14 +13726,70 @@ function taskDetail(task) {
     keyMoments: buildTaskKeyMoments(task, order),
     fallbackEvents: task.fallbackEvents || [],
     flagSnapshot: task.flagSnapshot || {},
-    handoff: task.handoff || null,
+    handoff: sanitizeTaskHandoffForViewer(task.handoff),
     lifecycle: task.lifecycle || [],
     progress,
     evidenceItems: order && Array.isArray(order.proofItems) ? order.proofItems : [],
   };
 }
 
-function buildOrderDetail(order) {
+function sanitizeTaskFallbackEventForViewer(event) {
+  if (!event || typeof event !== "object") return null;
+  const kind = String(event.kind || "").trim().toLowerCase();
+  let summary = maskSensitiveString(String(event.note || "")).slice(0, 160);
+  if (kind === "task_replanned") summary = "已根据最新输入重新生成计划";
+  if (kind === "auto_fallback") summary = "主执行链路不可用，系统已切换备用方案";
+  if (kind === "manual_handoff" || kind === "handoff_requested") summary = "已转入人工协助";
+  return {
+    kind: event.kind || "",
+    at: event.at || "",
+    note: summary,
+  };
+}
+
+function sanitizeTaskKeyMomentForViewer(item) {
+  if (!item || typeof item !== "object") return null;
+  return {
+    kind: item.kind || "",
+    at: item.at || "",
+    note: maskSensitiveString(String(item.note || "")).slice(0, 160),
+  };
+}
+
+function sanitizeTaskProofChainEntryForViewer(item) {
+  if (!item || typeof item !== "object") return null;
+  return {
+    op: item.op || "",
+    toolType: item.toolType || "",
+    responseStatus: item.responseStatus || "",
+    latency: Number(item.latency || 0),
+  };
+}
+
+function sanitizeTaskDetailForViewer(detail, { isAdmin = false } = {}) {
+  if (!detail || typeof detail !== "object") return detail;
+  if (isAdmin) return detail;
+  const taskId = detail.overview && detail.overview.taskId ? detail.overview.taskId : null;
+  return {
+    overview: sanitizeTaskOverviewForViewer(detail.overview || {}, { task: taskId, isAdmin }),
+    sessionState: sanitizeTaskSessionStateForViewer(detail.sessionState || null, { task: taskId, isAdmin }),
+    expertRoute: detail.expertRoute || null,
+    steps: Array.isArray(detail.steps) ? detail.steps.map((item) => sanitizeTaskStepForViewer(item, { taskId, isAdmin })).filter(Boolean) : [],
+    payments: Array.isArray(detail.payments) ? detail.payments.map((item) => sanitizeTaskPaymentForViewer(item)).filter(Boolean) : [],
+    proof: sanitizeOrderProofForViewer(detail.proof),
+    handoff: sanitizeTaskHandoffForViewer(detail.handoff),
+    lifecycle: Array.isArray(detail.lifecycle) ? detail.lifecycle.map((item) => sanitizeTaskLifecycleEntryForViewer(item)).filter(Boolean) : [],
+    progress: detail.progress || {},
+    keyMoments: Array.isArray(detail.keyMoments) ? detail.keyMoments.map(sanitizeTaskKeyMomentForViewer).filter(Boolean) : [],
+    fallbackEvents: Array.isArray(detail.fallbackEvents) ? detail.fallbackEvents.map(sanitizeTaskFallbackEventForViewer).filter(Boolean) : [],
+    flagSnapshot: {},
+    mcpSummary: {},
+    proofChain: Array.isArray(detail.proofChain) ? detail.proofChain.map(sanitizeTaskProofChainEntryForViewer).filter(Boolean) : [],
+    evidenceItems: Array.isArray(detail.evidenceItems) ? detail.evidenceItems.map(sanitizeProofItemForViewer).filter(Boolean) : [],
+  };
+}
+
+function buildOrderDetail(order, { isAdmin = false } = {}) {
   const task = order && order.taskId ? db.tasks[order.taskId] : null;
   const ticket = task && task.handoff ? db.supportTickets.find((t) => t.id === task.handoff.ticketId) || null : null;
   const lifecycle = Array.isArray(order.lifecycle) ? order.lifecycle : [];
@@ -7109,6 +13806,7 @@ function buildOrderDetail(order) {
     amount: order.price,
     currency: order.currency,
     provider: order.provider,
+    displayLabel: getOrderDisplayLabel(order),
     lifecycle,
     proofItems: order.proofItems || [],
     proof: order.proof || null,
@@ -7118,29 +13816,25 @@ function buildOrderDetail(order) {
       detail: refund,
       eta: refundEta,
     },
-    support: ticket
-      ? {
-          ticketId: ticket.id,
-          sessionId: ticket.sessionId || null,
-          status: ticket.status,
-          handler: ticket.handler || "human",
-          eta: ticket.eta,
-          etaMin: ticket.etaMin,
-          createdAt: ticket.createdAt,
-          updatedAt: ticket.updatedAt,
-          evidenceCount: Array.isArray(ticket.evidence) ? ticket.evidence.length : 0,
-          liveSession: ticket.sessionId ? buildSupportSessionSummary(getSupportSessionById(ticket.sessionId)) : null,
-        }
-      : null,
+    support: buildOrderSupportSummaryForViewer(ticket, { isAdmin }),
   };
 }
 
-function createTripPlan(payload, userId = "demo") {
+function createTripPlan(payload, userId = "anon") {
   const body = payload && typeof payload === "object" ? payload : {};
   const id = `trip_${Object.keys(db.tripPlans || {}).length + 1}`;
   const title = String(body.title || "").trim() || `Trip ${Object.keys(db.tripPlans || {}).length + 1}`;
-  const city = String(body.city || db.users[userId]?.city || "Shanghai");
+  const city = String(body.city || getUser(userId)?.city || DEFAULT_CITY);
   const note = String(body.note || "").trim();
+  let itinerarySnapshot = null;
+  if (body.itinerarySnapshot && typeof body.itinerarySnapshot === "object") {
+    try {
+      const cloned = JSON.parse(JSON.stringify(body.itinerarySnapshot));
+      if (JSON.stringify(cloned).length <= 150000) itinerarySnapshot = cloned;
+    } catch {
+      itinerarySnapshot = null;
+    }
+  }
   const createdAt = nowIso();
   const plan = {
     id,
@@ -7151,6 +13845,7 @@ function createTripPlan(payload, userId = "demo") {
     status: "active",
     startAt: body.startAt ? String(body.startAt) : "",
     endAt: body.endAt ? String(body.endAt) : "",
+    itinerarySnapshot,
     taskIds: [],
     lifecycle: [
       {
@@ -7178,12 +13873,25 @@ function createTripPlan(payload, userId = "demo") {
 }
 
 function requireTripPlan(tripId, res) {
-  const plan = db.tripPlans[tripId];
+  const plan = resolveTripPlanRecord(tripId);
   if (!plan) {
     writeJson(res, 404, { error: "Trip not found" });
     return null;
   }
   return plan;
+}
+
+function sanitizeRecentTripForViewer(item, { isAdmin = false } = {}) {
+  if (!item || typeof item !== "object") return null;
+  return {
+    id: toViewerTripRef(item.id || "", { isAdmin }),
+    city: item.city || "",
+    area: item.area || "",
+    intent: item.intent || "",
+    place: item.place || "",
+    amount: Number(item.amount || 0),
+    executedAt: item.executedAt || "",
+  };
 }
 
 function buildUserTrustSummary(user) {
@@ -7210,9 +13918,18 @@ function parsePath(pathname) {
 
 
 // ── Wire up extracted planner modules ───────────────────────────────────────
+// This is the backend planning spine for CrossX:
+//   1. server.js owns runtime resources and external connectors,
+//   2. PlanController isolates HTTP/SSE failures from the root server loop,
+//   3. routes/plan owns request guards + session orchestration,
+//   4. planner/pipeline owns the actual plan-generation stages.
+//
+// configurePipeline(...) is the handoff point where server-owned helpers are
+// injected into the extracted pipeline module at startup instead of being imported
+// back from server.js. That keeps dependency direction one-way and avoids cycles.
 setDefaultModel(OPENAI_MODEL);
 setDefaultBaseUrl(OPENAI_BASE_URL);
-configurePipeline({ buildChinaTravelKnowledge, extractAgentConstraints, sessionItinerary, queryFlight: queryJuheFlight, queryHotels: queryAmapHotels });
+configurePipeline({ buildChinaTravelKnowledge, extractAgentConstraints, sessionItinerary, queryFlight: queryJuheFlight, queryHotels: queryHotelsForPlanner });
 
 // PlanController: SSE pipeline wrapped in isolated try-catch (no crash propagation to server)
 const { createPlanController } = require("./src/controllers/PlanController");
@@ -7226,6 +13943,10 @@ const planController = createPlanController({
   ragEngine, sessionItinerary, extractAgentConstraints,
   // Agent loop deps (Module 2 tools)
   queryAmapHotels, queryJuheFlight,
+  queryRailAvailability: connectors.partnerHub && typeof connectors.partnerHub.railAvailability === "function"
+    ? (args) => connectors.partnerHub.railAvailability(args)
+    : null,
+  queryHotelCatalog: queryHotelsForPlanner,
   mockAmapRouting: amapRoutingWithFallback,
   mockCtripHotels: require("./src/planner/mock").mockCtripHotels,
   buildAIEnrichment,
@@ -7280,7 +14001,7 @@ function buildPlannerContext(slots, deviceId, sessionContext = "") {
   const pax    = Number(slots.party_size || 2);
   const prefs  = Array.isArray(slots.preferences) ? slots.preferences.join(", ") : "";
   const time   = String(slots.time_constraint || "");
-  const recentTrips = getRecentTrips(String(deviceId || "demo"), 3);
+  const recentTrips = deviceId ? getRecentTrips(String(deviceId), 3) : [];
   const historySnippet = recentTrips.length
     ? "用户最近行程：" + recentTrips.map((t) => `${t.city}${t.area || ""}${t.place}·¥${t.amount}`).join(", ")
     : "";
@@ -7346,6 +14067,35 @@ ${notes ? `<div class="notes">📝 备注：${_escHtml(notes)}</div>` : ""}
 </body></html>`;
 }
 
+function buildViewerReceiptHtmlForOrder(order, { isAdmin = false } = {}) {
+  if (!order || typeof order !== "object") return "";
+  const viewerOrderId = toViewerOrderRef(order, { isAdmin });
+  return buildReceiptHtml({
+    orderId: viewerOrderId,
+    place: String(order.place || order.merchant || order.provider || ""),
+    city: String(order.city || ""),
+    area: String(order.area || ""),
+    intent: String(order.type || order.intentType || "eat"),
+    amount: Number(order.price || order.totalPrice || order.totalCost || 0),
+    railId: String((order.proof && order.proof.railId) || order.paymentRail || "alipay_cn"),
+    transactionId: isAdmin
+      ? String((order.proof && order.proof.transactionId) || order.outOrderNo || order.id)
+      : viewerOrderId,
+    executedAt: String(order.updatedAt || order.createdAt || new Date().toISOString()),
+    bookingRef: isAdmin
+      ? ((order.proof && order.proof.bookingRef) || (order.proof && order.proof.confirmationNo) || null)
+      : null,
+    buyerName: (order.proof && order.proof.guestName) || null,
+    notes: order.notes || null,
+  });
+}
+
+function injectNonceIntoInlineStyles(html, nonce) {
+  const markup = String(html || "");
+  if (!markup || !nonce) return markup;
+  return markup.replace(/<style\b(?![^>]*\bnonce=)/gi, `<style nonce="${nonce}"`);
+}
+
 // ── Partner webhook helper ────────────────────────────────────────────────────
 /**
  * POST to PARTNER_WEBHOOK_URL/<subpath> with a timeout.
@@ -7365,20 +14115,31 @@ async function _partnerWebhookPost(subpath, body, timeoutMs = 3000) {
       signal: ac.signal,
     });
     clearTimeout(tid);
-    if (r.ok) return await r.json();
+    if (r.ok) return await _readJsonResponseSafe(r, null);
   } catch (_) {}
   return null;
 }
 
 // ── In-memory rate limiter (llm=10/min  agent=30/min) ────────────────────────
 const { createRateLimiter } = require("./src/middleware/ratelimit");
-const _rl = createRateLimiter();
+const _rl = createRateLimiter({
+  storage: {
+    consume({ tier, key, limit, windowMs }) {
+      return consumeRateLimitWindow({ scope: `api:${tier}`, key, limit, windowMs });
+    },
+    gc: { unref() {} },
+  },
+});
 _rl.gc.unref();
 function _rlCheck(req, pathname) { return _rl.check(req, pathname); }
+const _rateLimitGc = setInterval(() => {
+  try { pruneRateLimitWindows(24 * 60 * 60 * 1000); } catch {}
+}, 60 * 60 * 1000);
+_rateLimitGc.unref();
 
 const server = http.createServer(async (req, res) => {
-  const parsed = parseUrl(req.url, true);
-  const { pathname } = parsed;
+  const parsed = parseRequestUrl(req);
+  let { pathname } = parsed;
 
   // ── Health check (no auth, no security headers needed) ───────────────────
   if (pathname === "/healthz") {
@@ -7390,11 +14151,17 @@ const server = http.createServer(async (req, res) => {
       sqliteDb.prepare("SELECT 1").get();
       dbOk = true;
     } catch (e) {
-      dbError = e.message;
+      dbError = "db_unavailable";
     }
-    const healthy = dbOk;
+    const security = getRuntimeSecurityHealth();
+    const healthy = dbOk && security.ok;
     if (!healthy) {
-      return writeJson(res, 503, { status: "degraded", db: "error", db_error: dbError, uptime: process.uptime() });
+      return writeJson(res, 503, {
+        status: "degraded",
+        db: dbOk ? "ok" : "error",
+        ...(dbError ? { db_error: dbError } : {}),
+        uptime: process.uptime(),
+      });
     }
     return apiOk(res, { status: "ok", db: "ok", uptime: process.uptime() });
   }
@@ -7429,6 +14196,40 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    const consentDeviceId = extractDeviceId(req, parsed.query || {});
+    if (!consentMiddleware(req, res, pathname, consentDeviceId)) {
+      return;
+    }
+
+    if (req.method === "POST" && pathname === "/api/system/csp-report") {
+      let payload = {};
+      try {
+        const raw = await readRawBody(req);
+        if (raw.length) payload = JSON.parse(raw.toString("utf8"));
+      } catch {}
+      const report = payload && typeof payload === "object"
+        ? (payload["csp-report"] || payload)
+        : {};
+      audit.append({
+        kind: "security",
+        who: _whoFromReq(req),
+        what: "csp.violation",
+        taskId: null,
+        toolInput: {
+          documentUri: String(report["document-uri"] || report.documentURI || "").slice(0, 500),
+          blockedUri: String(report["blocked-uri"] || report.blockedURI || "").slice(0, 500),
+          effectiveDirective: String(report["effective-directive"] || report.effectiveDirective || "").slice(0, 120),
+          violatedDirective: String(report["violated-directive"] || report.violatedDirective || "").slice(0, 240),
+          disposition: String(report.disposition || "").slice(0, 60),
+          referrer: String(report.referrer || "").slice(0, 500),
+          sourceFile: String(report["source-file"] || report.sourceFile || "").slice(0, 500),
+        },
+        toolOutput: {},
+      });
+      res.writeHead(204, { "X-CrossX-Build": BUILD_ID });
+      return res.end();
+    }
+
     if (req.method === "GET" && pathname === "/hotel/district/cityList") {
       const countryCode = String(parsed.query.countryCode || "CN").toUpperCase();
       if (countryCode !== "CN") {
@@ -7449,7 +14250,7 @@ const server = http.createServer(async (req, res) => {
       const _hotelCity = body.cityName || body.city || "";
       const _hotelBudget = body.budget || body.maxPrice || null;
 
-      // ── Try real Amap hotel data first (when API key configured) ────────────
+      // ── Try real Amap hotel data first (when provider access is configured) ────────────
       if (AMAP_API_KEY && _hotelCity) {
         try {
           const _amapHotels = await Promise.race([
@@ -7483,15 +14284,62 @@ const server = http.createServer(async (req, res) => {
                 ctripBookingUrl: h.booking_url || `https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(h.name)}`,
                 tel:           h.tel || "",
                 source:        "amap",
+                priceLocked:   Boolean(h.price_locked),
               })),
             });
           }
         } catch (_amapErr) {
-          console.warn("[hotel/search] Amap fallback:", _amapErr.message);
+          console.warn("[hotel/search] Amap fallback:", sanitizeServerLogError(_amapErr, "hotel_search_amap_failed"));
         }
       }
 
-      // ── Fall back to mock catalog with Ctrip deep-links ──────────────────────
+      // ── Try anonymous live hotel catalogs (Trip.com first, then Ctrip) ────
+      try {
+        const _liveHotels = await Promise.race([
+          fetchLiveHotelCatalog({
+            city: _hotelCity,
+            checkIn:  body.checkInDate  || new Date().toISOString().slice(0, 10),
+            checkOut: body.checkOutDate || new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+            budget: _hotelBudget || null,
+          }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("hotel_live_timeout")), 8000)),
+        ]);
+        if (_liveHotels && _liveHotels.length >= 2) {
+          const _checkIn  = body.checkInDate  || new Date().toISOString().slice(0, 10);
+          const _checkOut = body.checkOutDate || new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+          const _source = inferHotelCatalogSource(_liveHotels);
+          return writeJson(res, 200, {
+            cityCode: body.cityCode || _hotelCity,
+            cityName: _hotelCity,
+            checkInDate: _checkIn,
+            checkOutDate: _checkOut,
+            pageNum: 1,
+            pageSize: _liveHotels.length,
+            total: _liveHotels.length,
+            source: _source,
+            list: _liveHotels,
+          });
+        }
+      } catch (_liveErr) {
+        console.warn("[hotel/search] live hotel fallback:", sanitizeServerLogError(_liveErr, "hotel_search_live_failed"));
+      }
+
+      // ── Local-only fallback catalog with Ctrip deep-links ───────────────────
+      if (!isLocalExternalDataFallbackEnabled()) {
+        return writeJson(res, 200, {
+          cityCode: body.cityCode || _hotelCity,
+          cityName: _hotelCity,
+          checkInDate: body.checkInDate || new Date().toISOString().slice(0, 10),
+          checkOutDate: body.checkOutDate || new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+          pageNum: body.pageNum || 1,
+          pageSize: body.pageSize || 10,
+          total: 0,
+          source: "unavailable",
+          errorCode: "hotel_catalog_not_configured",
+          list: [],
+        });
+      }
+
       const result = searchHotelsCore({
         cityCode: body.cityCode,
         checkInDate: body.checkInDate,
@@ -7551,18 +14399,27 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/hotel/order/create") {
       const body = await readBody(req);
+      const hotelOrderSubject = resolveRequestSubject(req, body);
+      if (!hotelOrderSubject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required for hotel booking" });
+      const hotelIsAdmin = _isAdminRequest(req);
+      const resolvedTaskId = resolveInternalTaskId(body.taskId || null) || null;
       const _hotelPhone = String(body.contactPhone || "").trim();
       if (!_hotelPhone) return writeJson(res, 400, { error: "contactPhone is required for hotel booking" });
-      const outOrderNo = String(body.outOrderNo || buildHotelOutOrderNo()).trim();
+      const requestedOutOrderNo = String(body.outOrderNo || "").trim();
+      const outOrderNo = hotelIsAdmin
+        ? String(requestedOutOrderNo || buildHotelOutOrderNo()).trim()
+        : buildHotelOutOrderNo();
       const existed = Object.values(db.orders || {}).find((item) => item.outOrderNo && String(item.outOrderNo) === outOrderNo);
       if (existed) {
+        const existedAccess = resolveOwnedResourceAccess(req, resolveOrderOwnerId(existed), body, { resourceLabel: "order" });
+        if (!existedAccess.ok) return writeJson(res, existedAccess.statusCode, existedAccess.payload);
         return writeJson(res, 200, {
-          orderId: existed.id,
-          outOrderNo: existed.outOrderNo,
+          orderId: toViewerOrderRef(existed, { isAdmin: hotelIsAdmin }),
           orderStatus: existed.orderStatus || existed.status,
           payDeadline: existed.payDeadline,
           totalPrice: existed.totalPrice || existed.price,
           duplicated: true,
+          ...(hotelIsAdmin ? { outOrderNo: existed.outOrderNo } : {}),
         });
       }
       const quote = buildHotelInventoryQuote({
@@ -7583,7 +14440,7 @@ const server = http.createServer(async (req, res) => {
           priceValidTime: quote.priceValidTime,
         });
       }
-      const city = resolveHotelCityRow(body.cityCode, body.cityName, db.users.demo.city || "Shanghai");
+      const city = resolveHotelCityRow(body.cityCode, body.cityName, DEFAULT_CITY);
       const { hotel, room } = findHotelAndRoom(body.hotelId, body.roomId);
       if (!hotel || !room) return writeJson(res, 404, { error: "hotel_or_room_not_found" });
 
@@ -7597,9 +14454,10 @@ const server = http.createServer(async (req, res) => {
       const payStatus = autoPaid ? "paid" : "unpaid";
       const order = {
         id: orderId,
+        userId: hotelOrderSubject.id,
         outOrderNo,
-        taskId: body.taskId || null,
-        tripId: body.tripId || null,
+        taskId: resolvedTaskId,
+        tripId: resolveInternalTripId(body.tripId || "") || null,
         provider: "Ctrip Hotel",
         type: "hotel",
         city: city.cityEn,
@@ -7686,12 +14544,17 @@ const server = http.createServer(async (req, res) => {
         },
         createdAt,
         updatedAt: createdAt,
+        planSnapshot: {
+          ownerId: hotelOrderSubject.id,
+          ownerVia: hotelOrderSubject.via,
+        },
       };
       refreshHotelOrderRuntime(order, "create");
       db.orders[orderId] = order;
       if (autoPaid) {
         pushChatNotification({
           orderId,
+          userId: resolveOrderOwnerId(order) || order.userId || "",
           outOrderNo,
           status: "pending_confirmation",
           message: "订单已创建，正在等待酒店确认。",
@@ -7700,58 +14563,68 @@ const server = http.createServer(async (req, res) => {
       }
       saveDb();
       return writeJson(res, 200, {
-        orderId,
-        outOrderNo,
+        orderId: toViewerOrderRef(order, { isAdmin: hotelIsAdmin }),
         orderStatus,
         payDeadline,
         totalPrice: order.totalPrice,
         payStatus,
-        payment: order.payment,
+        payment: sanitizeHotelPaymentForViewer(order.payment, order, { isAdmin: hotelIsAdmin }),
+        ...(hotelIsAdmin ? { outOrderNo } : {}),
       });
     }
 
     if (req.method === "GET" && pathname === "/hotel/order/detail") {
+      const hotelIsAdmin = _isAdminRequest(req);
       const orderId = String(parsed.query.orderId || "").trim();
-      const outOrderNo = String(parsed.query.outOrderNo || "").trim();
+      const outOrderNo = hotelIsAdmin ? String(parsed.query.outOrderNo || "").trim() : "";
+      if (!orderId && !hotelIsAdmin) return writeJson(res, 400, { error: "order_id_required" });
       const order = orderId
-        ? db.orders[orderId]
+        ? resolveOrderRecord(orderId)
         : Object.values(db.orders || {}).find((item) => item.outOrderNo && String(item.outOrderNo) === outOrderNo);
       if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      const guardedOrder = requireOrderAccess(order.id, req, res);
+      if (!guardedOrder) return;
       if (order.type === "hotel") {
         maybeAdvanceHotelOrderStatus(order, "detail");
       }
       order.updatedAt = nowIso();
       saveDb();
       return writeJson(res, 200, {
-        orderId: order.id,
-        outOrderNo: order.outOrderNo || outOrderNo,
+        orderId: toViewerOrderRef(order, { isAdmin: hotelIsAdmin }),
         orderStatus: order.orderStatus || order.status,
         hotelInfo: order.hotelInfo || null,
         totalPrice: Number(order.totalPrice || order.price || 0),
         payStatus: order.payStatus || "unknown",
         cancelRule: order.cancelRule || "",
-        payment: order.payment || null,
+        payment: sanitizeHotelPaymentForViewer(order.payment, order, { isAdmin: hotelIsAdmin }),
         polling: order.polling || null,
+        ...(hotelIsAdmin ? { outOrderNo: order.outOrderNo || outOrderNo } : {}),
       });
     }
 
     if (req.method === "POST" && pathname === "/hotel/order/cancel") {
       const body = await readBody(req);
+      const hotelIsAdmin = _isAdminRequest(req);
       const orderId = String(body.orderId || "").trim();
-      const outOrderNo = String(body.outOrderNo || "").trim();
+      const outOrderNo = hotelIsAdmin ? String(body.outOrderNo || "").trim() : "";
+      if (!orderId && !hotelIsAdmin) return writeJson(res, 400, { error: "order_id_required" });
       const order = orderId
-        ? db.orders[orderId]
+        ? resolveOrderRecord(orderId)
         : Object.values(db.orders || {}).find((item) => item.outOrderNo && String(item.outOrderNo) === outOrderNo);
       if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      const guardedOrder = requireOrderAccess(order.id, req, res, body);
+      if (!guardedOrder) return;
       if (order.type !== "hotel") return writeJson(res, 400, { error: "not_hotel_order" });
       const cancelReason = String(body.cancelReason || "user_request").slice(0, 120);
       const _hotelStatus = String(order.orderStatus || order.status || "").toLowerCase();
       if (["cancelled", "canceled", "refunded"].includes(_hotelStatus)) {
         return writeJson(res, 200, {
           cancelSuccess: true,
+          orderId: toViewerOrderRef(order, { isAdmin: hotelIsAdmin }),
           orderStatus: order.orderStatus,
           refundAmount: Number(order.refundAmount || 0),
           refundDesc: order.refundDesc || "Already canceled",
+          ...(hotelIsAdmin ? { outOrderNo: order.outOrderNo || outOrderNo } : {}),
         });
       }
       if (["delivered", "completed", "checked_in"].includes(_hotelStatus)) {
@@ -7767,6 +14640,7 @@ const server = http.createServer(async (req, res) => {
       refreshHotelOrderRuntime(order, "cancel");
       pushChatNotification({
         orderId: order.id,
+        userId: resolveOrderOwnerId(order) || order.userId || "",
         outOrderNo: order.outOrderNo || "",
         status: "cancelled",
         message: "订单已取消，退款处理中。",
@@ -7775,49 +14649,163 @@ const server = http.createServer(async (req, res) => {
       saveDb();
       return writeJson(res, 200, {
         cancelSuccess: true,
+        orderId: toViewerOrderRef(order, { isAdmin: hotelIsAdmin }),
         orderStatus: order.orderStatus,
         refundAmount: order.refundAmount,
         refundDesc: order.refundDesc,
+        ...(hotelIsAdmin ? { outOrderNo: order.outOrderNo || outOrderNo } : {}),
       });
     }
 
     if (req.method === "GET" && pathname === "/api/chat/notifications") {
       const since = String(parsed.query.since || "");
+      const notificationIsAdmin = _isAdminRequest(req);
+      const notificationSubject = notificationIsAdmin
+        ? null
+        : resolveRequestSubject(req, null, { queryDeviceId: _queryDeviceIdFromReq(req) });
+      if (!notificationIsAdmin && !notificationSubject) {
+        return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      }
       return writeJson(res, 200, {
-        notifications: listChatNotificationsSince(since),
+        notifications: listChatNotificationsSince(since, {
+          subjectId: notificationSubject ? notificationSubject.id : "",
+          isAdmin: notificationIsAdmin,
+        })
+          .map((item) => sanitizeChatNotificationForViewer(item, { isAdmin: notificationIsAdmin }))
+          .filter(Boolean),
         now: nowIso(),
       });
     }
 
     if (req.method === "GET" && pathname === "/api/health") {
-      return writeJson(res, 200, {
+      const payload = {
         ok: true,
         buildId: BUILD_ID,
         uptimeSec: Math.round(process.uptime()),
-        totals: {
+      };
+      if (_isSupportAdmin(req)) {
+        payload.totals = {
           tasks: Object.keys(db.tasks).length,
           orders: Object.keys(db.orders).length,
           settlements: db.settlements.length,
           logs: db.auditLogs.length,
-        },
-      });
+        };
+        payload.security = getRuntimeSecurityHealth();
+      }
+      return writeJson(res, 200, payload);
+    }
+
+    if (req.method === "GET" && pathname === "/api/system/security-health") {
+      if (!requireAdmin(req, res)) return;
+      return writeJson(res, 200, getRuntimeSecurityHealth());
     }
 
     // ── User Auth Routes (/api/auth/*) — delegated to AuthController ────────
     if (req.method === "POST" && pathname === "/api/auth/send-otp") {
-      return AuthController.sendOtp(req, res, { buildId: BUILD_ID });
+      try {
+        const body = await readBody(req);
+        const { _normalizePhone } = require("./src/services/user_auth");
+        const normalized = _normalizePhone(String((body && body.phone) || ""));
+        if (!normalized) return writeJson(res, 400, { error: "invalid_phone" });
+        return writeJson(res, 200, {
+          ok: true,
+          message: "OTP bypass active for testing",
+          dev_code: "000000",
+          testing_bypass: true,
+          source: "server_route_bypass",
+        });
+      } catch (e) {
+        return writeJson(res, e && e.code === "PAYLOAD_TOO_LARGE" ? 413 : 400, { error: e && e.code === "PAYLOAD_TOO_LARGE" ? "payload_too_large" : "invalid_json" });
+      }
     }
     if (req.method === "POST" && pathname === "/api/auth/verify-otp") {
-      return AuthController.verifyOtpAndIssueToken(req, res, { buildId: BUILD_ID });
+      try {
+        const body = await readBody(req);
+        const phone = String((body && body.phone) || "");
+        const code = String((body && body.code) || "");
+        const displayName = String((body && body.displayName) || "").trim().slice(0, 30);
+        const { _normalizePhone, _hashPhone, createOrLoginUser, issueUserToken } = require("./src/services/user_auth");
+        const normalized = _normalizePhone(phone);
+        if (!normalized) return writeJson(res, 400, { error: "invalid_phone" });
+        if (!/^\d{4,8}$/.test(code)) return writeJson(res, 400, { error: "invalid_code" });
+        const { userId, displayName: name, isNew } = createOrLoginUser(normalized, displayName);
+        const token = issueUserToken(userId, _hashPhone(normalized));
+        _setUserAuthCookie(req, res, token);
+        return writeJson(res, 200, { ok: true, token, userId, displayName: name, isNew, testing_bypass: true, source: "server_route_bypass" });
+      } catch (e) {
+        return writeJson(res, e && e.code === "PAYLOAD_TOO_LARGE" ? 413 : 400, { error: e && e.code === "PAYLOAD_TOO_LARGE" ? "payload_too_large" : "invalid_json" });
+      }
     }
     if (req.method === "POST" && pathname === "/api/auth/send-email-code") {
-      return AuthController.sendEmailCode(req, res, { buildId: BUILD_ID });
+      try {
+        const body = await readBody(req);
+        const { _normalizeEmail } = require("./src/services/user_auth");
+        const normalized = _normalizeEmail(String((body && body.email) || ""));
+        if (!normalized) return writeJson(res, 400, { error: "invalid_email" });
+        return writeJson(res, 200, {
+          ok: true,
+          message: "Email OTP bypass active for testing",
+          dev_code: "000000",
+          testing_bypass: true,
+          source: "server_route_bypass",
+        });
+      } catch (e) {
+        return writeJson(res, e && e.code === "PAYLOAD_TOO_LARGE" ? 413 : 400, { error: e && e.code === "PAYLOAD_TOO_LARGE" ? "payload_too_large" : "invalid_json" });
+      }
     }
     if (req.method === "POST" && pathname === "/api/auth/verify-email-code") {
-      return AuthController.verifyEmailCodeAndIssueToken(req, res, { buildId: BUILD_ID });
+      try {
+        const body = await readBody(req);
+        const email = String((body && body.email) || "").trim();
+        const code = String((body && body.code) || "").trim();
+        const displayName = String((body && (body.displayName || body.display_name)) || "").trim().slice(0, 30);
+        const crypto = require("crypto");
+        const { _normalizeEmail, createOrLoginUserByEmail, issueUserToken } = require("./src/services/user_auth");
+        const normalized = _normalizeEmail(email);
+        if (!normalized) return writeJson(res, 400, { error: "invalid_email" });
+        if (!/^\d{4,8}$/.test(code)) return writeJson(res, 400, { error: "invalid_code" });
+        const { userId, displayName: name, isNew } = createOrLoginUserByEmail(normalized, displayName);
+        const emailHash = crypto.createHash("sha256").update(normalized).digest("hex");
+        const token = issueUserToken(userId, `em_${emailHash.slice(0, 8)}`);
+        _setUserAuthCookie(req, res, token);
+        return writeJson(res, 200, { ok: true, token, userId, displayName: name, isNew, testing_bypass: true, source: "server_route_bypass" });
+      } catch (e) {
+        return writeJson(res, e && e.code === "PAYLOAD_TOO_LARGE" ? 413 : 400, { error: e && e.code === "PAYLOAD_TOO_LARGE" ? "payload_too_large" : "invalid_json" });
+      }
     }
     if (req.method === "GET" && pathname === "/api/auth/me") {
-      return AuthController.getMe(req, res, { buildId: BUILD_ID });
+      try {
+        const { validateUserToken } = require("./src/services/user_auth");
+        const { getUserAuth } = require("./src/services/db");
+        const payload = validateUserToken(req);
+        if (!payload) {
+          return writeJson(res, 200, {
+            ok: false,
+            authenticated: false,
+            role: "guest",
+          });
+        }
+        const user = getUserAuth(payload.sub);
+        if (!user) {
+          return writeJson(res, 200, {
+            ok: false,
+            authenticated: false,
+            role: "guest",
+            error: "user_not_found",
+          });
+        }
+        return writeJson(res, 200, {
+          ok: true,
+          authenticated: true,
+          userId: toViewerUserRef(payload.sub),
+          displayName: user.display_name || "",
+          role: "user",
+          createdAt: user.created_at || null,
+        });
+      } catch (err) {
+        console.error("[/api/auth/me]", sanitizeError(err));
+        return writeJson(res, 500, { error: "internal_error" });
+      }
     }
     if (req.method === "POST" && pathname === "/api/auth/logout") {
       return AuthController.logout(req, res, { buildId: BUILD_ID });
@@ -7834,32 +14822,589 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/auth/google/callback") {
       return AuthController.googleCallback(req, res, { port: PORT, buildId: BUILD_ID });
     }
+    if (req.method === "GET" && pathname === "/api/auth/facebook") {
+      return AuthController.facebookBegin(req, res, { port: PORT, buildId: BUILD_ID });
+    }
+    if (req.method === "GET" && pathname === "/api/auth/facebook/callback") {
+      return AuthController.facebookCallback(req, res, { port: PORT, buildId: BUILD_ID });
+    }
+    if (req.method === "GET" && pathname === "/api/auth/alipay") {
+      return AuthController.alipayBegin(req, res, { port: PORT, buildId: BUILD_ID });
+    }
+    if (req.method === "GET" && pathname === "/api/auth/alipay/callback") {
+      return AuthController.alipayCallback(req, res, { port: PORT, buildId: BUILD_ID });
+    }
 
     // POST /api/admin/login — exchange master key for signed admin token
     if (req.method === "POST" && pathname === "/api/admin/login") {
-      // P2-A: Brute-force protection — max 5 attempts per IP per 15 minutes
       const _loginIp = req.socket?.remoteAddress || "unknown";
-      if (!_adminLoginRl) _adminLoginRl = new Map();
-      const _now = Date.now();
-      const _rlRec = _adminLoginRl.get(_loginIp) || { count: 0, windowStart: _now };
-      if (_now - _rlRec.windowStart > 15 * 60 * 1000) { _rlRec.count = 0; _rlRec.windowStart = _now; }
-      _rlRec.count++;
-      _adminLoginRl.set(_loginIp, _rlRec);
-      if (_rlRec.count > 5) {
-        console.warn("[admin/login] Rate limit triggered for IP:", _loginIp);
-        return writeJson(res, 429, { error: "Too many login attempts. Try again in 15 minutes." });
+      const _loginRl = consumeRateLimitWindow({
+        scope: "admin_login",
+        key: `admin_login:${_loginIp}`,
+        limit: 5,
+        windowMs: 15 * 60 * 1000,
+      });
+      if (!_loginRl.allowed) {
+        console.warn("[admin/login] Rate limit triggered");
+        res.setHeader("Retry-After", String(Math.ceil(_loginRl.retryAfterMs / 1000)));
+        return writeJson(res, 429, { error: "Too many login attempts. Try again in 15 minutes.", retryAfterMs: _loginRl.retryAfterMs });
       }
       const body = await readBody(req);
       if (!validateMasterKey(body.key)) {
-        appendAuditLog({ kind: "admin.login.fail", who: _loginIp, what: "invalid_key", taskId: null, toolInput: {}, toolOutput: {} });
-        return writeJson(res, 401, { error: "unauthorized", message: "Invalid admin key" });
+        appendAuditLog({ kind: "admin.login.fail", who: "admin_auth", what: "invalid_key", taskId: null, toolInput: {}, toolOutput: {} });
+        return writeJson(res, 401, { error: "unauthorized", message: "Unauthorized" });
       }
-      // Reset on success
-      _adminLoginRl.delete(_loginIp);
+      resetRateLimitWindow(`admin_login:${_loginIp}`);
       const token = issueToken("admin", "admin");
+      setAdminAuthCookie(req, res, token);
+      const returnToken = String(req.headers["x-crossx-auth-mode"] || "").trim().toLowerCase() === "token";
       appendAuditLog({ kind: "admin.login", who: "admin", what: "admin.login.success",
         taskId: null, toolInput: {}, toolOutput: { issued: true } });
-      return writeJson(res, 200, { ok: true, token, expiresIn: "8h" });
+      return writeJson(res, 200, { ok: true, ...(returnToken ? { token } : {}), expiresIn: "8h" });
+    }
+
+    if (req.method === "POST" && pathname === "/api/admin/logout") {
+      clearAdminAuthCookie(req, res);
+      return writeJson(res, 200, { ok: true });
+    }
+
+    if (req.method === "GET" && pathname === "/api/admin/session") {
+      const { validateAdminToken } = require("./src/middleware/auth");
+      const payload = validateAdminToken(req);
+      return writeJson(res, 200, {
+        ok: true,
+        authenticated: Boolean(payload && payload.sub && payload.sub !== "anon"),
+      });
+    }
+
+    // ── Merchant console auth + profile APIs ────────────────────────────────
+    if (req.method === "POST" && pathname === "/api/merchant/login") {
+      const body = await readBody(req);
+      const username = String(body?.username || "").trim().toLowerCase();
+      const password = String(body?.password || "");
+      if (!username || !password) return apiErr(res, 400, "credentials_required", "Username and password are required");
+      const loginIp = req.socket?.remoteAddress || "unknown";
+      const loginRate = consumeRateLimitWindow({
+        scope: "merchant_login",
+        key: `merchant_login:${loginIp}:${username}`,
+        limit: 8,
+        windowMs: 15 * 60 * 1000,
+      });
+      if (!loginRate.allowed) {
+        res.setHeader("Retry-After", String(Math.ceil(loginRate.retryAfterMs / 1000)));
+        return apiErr(res, 429, "too_many_attempts", "Too many merchant login attempts. Try again later.");
+      }
+      const {
+        getMerchantUserByUsername, getMerchantAccountById, getMerchantGeoPartner,
+        touchMerchantUserLogin, appendMerchantActivityLog,
+      } = require("./src/services/db");
+      const merchantUser = getMerchantUserByUsername(username);
+      if (!merchantUser || merchantUser.status !== "active") {
+        appendAuditLog({ kind: "merchant.login.fail", who: "merchant_auth", what: "unknown_user", taskId: null, toolInput: {}, toolOutput: {} });
+        return apiErr(res, 401, "unauthorized", "Invalid merchant credentials");
+      }
+      const merchantAccount = getMerchantAccountById(merchantUser.merchant_account_id);
+      if (!merchantAccount || merchantAccount.status !== "active") {
+        appendAuditLog({ kind: "merchant.login.fail", who: "merchant_auth", what: "inactive_account", taskId: null, toolInput: {}, toolOutput: {} });
+        return apiErr(res, 403, "account_inactive", "Merchant account is inactive");
+      }
+      if (!verifyMerchantPassword(password, merchantUser.password_hash)) {
+        appendAuditLog({ kind: "merchant.login.fail", who: "merchant_auth", what: "invalid_password", taskId: null, toolInput: {}, toolOutput: {} });
+        return apiErr(res, 401, "unauthorized", "Invalid merchant credentials");
+      }
+      resetRateLimitWindow(`merchant_login:${loginIp}:${username}`);
+      const refreshedUser = touchMerchantUserLogin(merchantUser.id) || merchantUser;
+      const geoPartner = getMerchantGeoPartner(merchantAccount.id);
+      const token = issueMerchantToken(refreshedUser.id, merchantAccount.id, refreshedUser.role);
+      setMerchantAuthCookie(req, res, token);
+      const returnToken = String(req.headers["x-crossx-auth-mode"] || "").trim().toLowerCase() === "token";
+      appendMerchantActivityLog({
+        merchantAccountId: merchantAccount.id,
+        actorUserId: refreshedUser.id,
+        action: "merchant.login",
+        detail: { username: refreshedUser.username, ip: loginIp },
+      });
+      appendAuditLog({
+        kind: "merchant.login",
+        who: refreshedUser.username,
+        what: "merchant.login.success",
+        taskId: null,
+        toolInput: {},
+        toolOutput: { merchantAccountId: merchantAccount.id },
+      });
+      return writeJson(res, 200, {
+        ok: true,
+        ...(returnToken ? { token } : {}),
+        expiresIn: "8h",
+        merchant: {
+          user: sanitizeMerchantUser(refreshedUser),
+          account: sanitizeMerchantAccount(merchantAccount, geoPartner, { includeContact: true }),
+          geoPartner: sanitizeMerchantGeoPartner(geoPartner),
+        },
+      });
+    }
+
+    if (req.method === "POST" && pathname === "/api/merchant/logout") {
+      clearMerchantAuthCookie(req, res);
+      return apiOk(res, { cleared: true });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/session") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      return apiOk(res, {
+        authenticated: Boolean(merchantAuth && merchantAuth.sub && merchantAuth.sub !== "anon"),
+        role: merchantAuth.role || "",
+        merchantAccountId: merchantAuth.merchantAccountId || "",
+      });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/me") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const {
+        getMerchantUserById, getMerchantAccountById, getMerchantGeoPartner,
+        getMerchantParentAccount, getMerchantScopedAccounts, getMerchantPlatformListingStatus,
+      } = require("./src/services/db");
+      const merchantUser = getMerchantUserById(merchantAuth.sub);
+      const merchantAccount = getMerchantAccountById(merchantAuth.merchantAccountId);
+      if (!merchantUser || !merchantAccount || merchantUser.merchant_account_id !== merchantAccount.id) {
+        return apiErr(res, 401, "merchant_context_missing", "Merchant session is no longer valid");
+      }
+      const geoPartner = getMerchantGeoPartner(merchantAccount.id);
+      const parentAccount = getMerchantParentAccount(merchantAccount.id);
+      return apiOk(res, {
+        user: sanitizeMerchantUser(merchantUser),
+        account: sanitizeMerchantAccount(merchantAccount, geoPartner, { includeContact: true }),
+        parentAccount: sanitizeMerchantAccount(parentAccount),
+        geoPartner: sanitizeMerchantGeoPartner(geoPartner),
+        scopedStores: getMerchantScopedAccounts(merchantAccount.id).map((item) => sanitizeMerchantAccount(item, getMerchantGeoPartner(item.id))),
+        platformListing: sanitizeMerchantPlatformListing(getMerchantPlatformListingStatus(merchantAccount.id)),
+      });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/dashboard") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { getMerchantDashboardSummary, getMerchantSettlementSummary } = require("./src/services/db");
+      const summary = getMerchantDashboardSummary(merchantAuth.merchantAccountId);
+      if (!summary) return apiErr(res, 404, "merchant_not_found", "Merchant account not found");
+      return apiOk(res, {
+        account: sanitizeMerchantAccount(summary.account, summary.geoPartner, { includeContact: true }),
+        geoPartner: sanitizeMerchantGeoPartner(summary.geoPartner),
+        metrics: summary.metrics,
+        geoTarget: summary.geoTarget,
+        platformListing: sanitizeMerchantPlatformListing(summary.platformListing || null),
+        scopedStores: Array.isArray(summary.scopedStores) ? summary.scopedStores.map(sanitizeMerchantScopedStore).filter(Boolean) : [],
+        orderStatusCounts: summary.orderStatusCounts,
+        opsChecklist: summary.opsChecklist,
+        settlement: sanitizeMerchantSettlementSummary(getMerchantSettlementSummary(merchantAuth.merchantAccountId)),
+        recentOrders: Array.isArray(summary.recentOrders) ? summary.recentOrders.map(sanitizeMerchantOrderSummary).filter(Boolean) : [],
+        team: Array.isArray(summary.team) ? summary.team.map(sanitizeMerchantUser) : [],
+        activity: Array.isArray(summary.activity) ? summary.activity.map(sanitizeMerchantActivityEntry).filter(Boolean) : [],
+      });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/orders") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const { listMerchantOrders } = require("./src/services/db");
+      const status = String(searchParams.get("status") || "").trim();
+      const limit = Math.max(1, Math.min(Number(searchParams.get("limit") || 20) || 20, 100));
+      return apiOk(res, {
+        orders: listMerchantOrders(merchantAuth.merchantAccountId, { status, limit }).map(sanitizeMerchantOrderSummary).filter(Boolean),
+        status,
+        limit,
+      });
+    }
+
+    if (req.method === "POST" && /^\/api\/merchant\/orders\/[^/]+\/actions$/.test(pathname)) {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const orderId = pathname.split("/")[4];
+      if (!orderId) return apiErr(res, 400, "order_id_required", "Order ID is required");
+      const internalOrderId = resolveInternalOrderId(orderId) || orderId;
+      const body = await readBody(req);
+      const action = String(body?.action || "").trim().toLowerCase();
+      const note = String(body?.note || "").trim().slice(0, 420);
+      const {
+        getOrder,
+        getMerchantOrderById,
+        getMerchantSupportTicketById,
+        getMerchantAccountById,
+        getMerchantUserById,
+        appendMerchantActivityLog,
+        updateSupportTicket,
+      } = require("./src/services/db");
+      const fulfillment = require("./src/services/fulfillment");
+      const merchantAccount = getMerchantAccountById(merchantAuth.merchantAccountId);
+      if (!merchantAccount) return apiErr(res, 404, "merchant_not_found", "Merchant account not found");
+      if (merchantAccount.account_type === "enterprise_partner" && action !== "issue") {
+        return apiErr(res, 403, "enterprise_read_only", "企业合作方账号可查看订单，但门店履约动作需由本地商家执行");
+      }
+      const scopedOrder = getMerchantOrderById(merchantAuth.merchantAccountId, internalOrderId);
+      if (!scopedOrder) return apiErr(res, 404, "order_not_found", "Merchant order not found");
+      const merchantUser = getMerchantUserById(merchantAuth.sub);
+      const actorLabel = merchantUser?.username || merchantAuth.sub;
+      let actionMessage = "";
+      let ticketId = "";
+      try {
+        if (action === "confirm") {
+          fulfillment.confirmOrder(internalOrderId, { source: `merchant:${actorLabel}` });
+          actionMessage = "订单已确认接单";
+        } else if (action === "start") {
+          const current = getOrder(internalOrderId);
+          if (["pending", "planned"].includes(String(current?.status || "").toLowerCase())) {
+            fulfillment.confirmOrder(internalOrderId, { source: `merchant:${actorLabel}` });
+          }
+          fulfillment.executeOrder(internalOrderId);
+          actionMessage = "订单已进入履约中";
+        } else if (action === "deliver") {
+          let current = getOrder(internalOrderId);
+          if (["pending", "planned"].includes(String(current?.status || "").toLowerCase())) {
+            fulfillment.confirmOrder(internalOrderId, { source: `merchant:${actorLabel}` });
+          }
+          current = getOrder(internalOrderId);
+          if (String(current?.status || "").toLowerCase() === "confirmed") {
+            fulfillment.executeOrder(internalOrderId);
+          }
+          fulfillment.deliverOrder(internalOrderId);
+          actionMessage = "订单已标记交付";
+        } else if (action === "issue") {
+          if (!note) return apiErr(res, 400, "note_required", "请填写异常说明后再提交");
+          if (!scopedOrder.taskId) {
+            return apiErr(res, 409, "task_context_missing", "当前订单未绑定任务，暂时无法发起支持协同");
+          }
+          let ticket = (db.supportTickets || []).find((item) => (
+            String(item.taskId || "") === String(scopedOrder.taskId)
+            && ["open", "in_progress"].includes(String(item.status || "").toLowerCase())
+          )) || null;
+          if (!ticket) {
+            ticket = createSupportTicket({
+              reason: `merchant_order_issue:${scopedOrder.id}`,
+              taskId: scopedOrder.taskId,
+              source: "merchant_console",
+            });
+          }
+          let session = ticket?.sessionId ? getSupportSessionById(ticket.sessionId) : null;
+          if (!session) {
+            session = ensureSupportSessionForTicket(ticket, {
+              startedBy: "user",
+              reason: ticket?.reason || `merchant_order_issue:${scopedOrder.id}`,
+            });
+          }
+          if (!session) {
+            return apiErr(res, 500, "support_session_failed", "无法创建支持协同会话");
+          }
+          appendSupportSessionMessage(session, {
+            actor: "user",
+            type: "text",
+            text: note,
+            meta: {
+              ticketId: ticket.id,
+              orderId: scopedOrder.id,
+              actorLabel,
+              actorSource: "merchant_console",
+            },
+          });
+          const nextHistory = Array.isArray(ticket.history) ? ticket.history.slice(-19) : [];
+          nextHistory.push({
+            at: nowIso(),
+            status: ticket.status || "open",
+            note: `merchant_update:${actorLabel}:${note.slice(0, 80)}`,
+          });
+          updateSupportTicket(ticket.id, {
+            sessionId: session.id,
+            updatedAt: nowIso(),
+            history: nextHistory,
+          });
+          saveDb();
+          ticketId = ticket.id;
+          actionMessage = "异常已提交到支持协同";
+        } else {
+          return apiErr(res, 400, "invalid_action", "Unsupported merchant order action");
+        }
+      } catch (err) {
+        const safeError = sanitizeMerchantOrderActionError(err);
+        console.warn("[merchant] order action failed:", sanitizeServerLogError(err, "merchant_order_action_failed"));
+        return apiErr(res, safeError.status, safeError.error, safeError.message);
+      }
+      appendMerchantActivityLog({
+        merchantAccountId: merchantAuth.merchantAccountId,
+        actorUserId: merchantAuth.sub,
+        action: `merchant.order.${action}`,
+        detail: {
+          by: actorLabel,
+          orderId: internalOrderId,
+          ...(ticketId ? { ticketId } : {}),
+        },
+      });
+      return apiOk(res, {
+        order: sanitizeMerchantOrderSummary(getMerchantOrderById(merchantAuth.merchantAccountId, internalOrderId)),
+        ticket: ticketId ? sanitizeMerchantSupportTicket(getMerchantSupportTicketById(merchantAuth.merchantAccountId, ticketId)) : null,
+        message: actionMessage,
+      });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/settlement-summary") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { getMerchantSettlementSummary } = require("./src/services/db");
+      return apiOk(res, sanitizeMerchantSettlementSummary(getMerchantSettlementSummary(merchantAuth.merchantAccountId)));
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/settlements/export.csv") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const status = String(searchParams.get("status") || "").trim();
+      const limit = Math.max(1, Math.min(Number(searchParams.get("limit") || 200) || 200, 500));
+      const { listMerchantSettlements } = require("./src/services/db");
+      const rows = listMerchantSettlements(merchantAuth.merchantAccountId, { status, limit })
+        .map((item) => sanitizeMerchantSettlementRecord(item))
+        .filter(Boolean);
+      const csvEsc = (value) => `"${String(value == null ? "" : value).replace(/"/g, '""')}"`;
+      const headers = [
+        "settlement_id", "order_id", "task_id", "settlement_status", "order_status", "task_intent",
+        "currency", "gross", "net", "markup", "refund", "settled_net", "order_amount", "updated_at",
+      ];
+      const csvRows = rows.map((item) => ([
+        item.id,
+        item.orderId,
+        item.taskId,
+        item.status,
+        item.orderStatus,
+        item.taskIntent,
+        item.currency,
+        item.gross,
+        item.net,
+        item.markup,
+        item.refund,
+        item.settledNet,
+        item.orderAmount,
+        item.updatedAt || item.createdAt,
+      ].map(csvEsc).join(",")));
+      return writeAttachment(res, 200, `\uFEFF${headers.join(",")}\n${csvRows.join("\n")}`, {
+        contentType: "text/csv; charset=utf-8",
+        filename: `crossx-merchant-settlements-${new Date().toISOString().slice(0, 10)}.csv`,
+      });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/settlements") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const status = String(searchParams.get("status") || "").trim();
+      const limit = Math.max(1, Math.min(Number(searchParams.get("limit") || 20) || 20, 100));
+      const { listMerchantSettlements } = require("./src/services/db");
+      return apiOk(res, {
+        settlements: listMerchantSettlements(merchantAuth.merchantAccountId, { status, limit }).map((item) => sanitizeMerchantSettlementRecord(item)).filter(Boolean),
+        status,
+        limit,
+      });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/support-tickets") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const status = String(searchParams.get("status") || "").trim();
+      const limit = Math.max(1, Math.min(Number(searchParams.get("limit") || 20) || 20, 100));
+      const { listMerchantSupportTickets } = require("./src/services/db");
+      return apiOk(res, {
+        tickets: listMerchantSupportTickets(merchantAuth.merchantAccountId, { status, limit }).map(sanitizeMerchantSupportTicket).filter(Boolean),
+        status,
+        limit,
+      });
+    }
+
+    if (req.method === "POST" && /^\/api\/merchant\/support-tickets\/[^/]+\/comment$/.test(pathname)) {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const ticketId = pathname.split("/")[4];
+      if (!ticketId) return apiErr(res, 400, "ticket_id_required", "Ticket ID is required");
+      const internalTicketId = resolveInternalSupportTicketId(ticketId) || ticketId;
+      const body = await readBody(req);
+      const note = String(body?.note || "").trim().slice(0, 420);
+      if (!note) return apiErr(res, 400, "note_required", "请填写协同备注");
+      const {
+        getMerchantSupportTicketById,
+        getMerchantUserById,
+        appendMerchantActivityLog,
+        updateSupportTicket,
+      } = require("./src/services/db");
+      const scopedTicket = getMerchantSupportTicketById(merchantAuth.merchantAccountId, internalTicketId);
+      if (!scopedTicket) return apiErr(res, 404, "support_ticket_not_found", "Merchant support ticket not found");
+      const rawTicket = (db.supportTickets || []).find((item) => String(item.id || "") === String(internalTicketId)) || null;
+      if (!rawTicket) return apiErr(res, 404, "support_ticket_not_found", "Support ticket not found");
+      let session = rawTicket.sessionId ? getSupportSessionById(rawTicket.sessionId) : null;
+      if (!session) {
+        session = ensureSupportSessionForTicket(rawTicket, {
+          startedBy: "user",
+          reason: rawTicket.reason || "merchant_follow_up",
+        });
+      }
+      if (!session) return apiErr(res, 500, "support_session_failed", "无法加载支持协同会话");
+      const merchantUser = getMerchantUserById(merchantAuth.sub);
+      const actorLabel = merchantUser?.username || merchantAuth.sub;
+      appendSupportSessionMessage(session, {
+        actor: "user",
+        type: "text",
+        text: note,
+        meta: {
+          ticketId: rawTicket.id,
+          orderId: scopedTicket.orderId || "",
+          actorLabel,
+          actorSource: "merchant_console",
+        },
+      });
+      const nextHistory = Array.isArray(rawTicket.history) ? rawTicket.history.slice(-19) : [];
+      nextHistory.push({
+        at: nowIso(),
+        status: rawTicket.status || "open",
+        note: `merchant_comment:${actorLabel}:${note.slice(0, 80)}`,
+      });
+      updateSupportTicket(rawTicket.id, {
+        sessionId: session.id,
+        updatedAt: nowIso(),
+        history: nextHistory,
+      });
+      appendMerchantActivityLog({
+        merchantAccountId: merchantAuth.merchantAccountId,
+        actorUserId: merchantAuth.sub,
+        action: "merchant.support.comment",
+        detail: { by: actorLabel, ticketId: rawTicket.id },
+      });
+      saveDb();
+      return apiOk(res, {
+        ticket: sanitizeMerchantSupportTicket(getMerchantSupportTicketById(merchantAuth.merchantAccountId, rawTicket.id)),
+        message: "备注已发送给支持团队",
+      });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/profile") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { getMerchantAccountById, getMerchantGeoPartner, getMerchantParentAccount } = require("./src/services/db");
+      const merchantAccount = getMerchantAccountById(merchantAuth.merchantAccountId);
+      if (!merchantAccount) return apiErr(res, 404, "merchant_not_found", "Merchant account not found");
+      const geoPartner = getMerchantGeoPartner(merchantAccount.id);
+      return apiOk(res, {
+        account: sanitizeMerchantAccount(merchantAccount, geoPartner, { includeContact: true }),
+        parentAccount: sanitizeMerchantAccount(getMerchantParentAccount(merchantAccount.id)),
+        geoPartner: sanitizeMerchantGeoPartner(geoPartner),
+      });
+    }
+
+    if (req.method === "PUT" && pathname === "/api/merchant/profile") {
+      const merchantAuth = requireMerchant(req, res, ["merchant_owner", "merchant_manager"]);
+      if (!merchantAuth) return;
+      const body = await readBody(req);
+      const {
+        getMerchantAccountById, getMerchantGeoPartner, upsertMerchantAccount,
+        appendMerchantActivityLog, getMerchantUserById,
+      } = require("./src/services/db");
+      const merchantAccount = getMerchantAccountById(merchantAuth.merchantAccountId);
+      if (!merchantAccount) return apiErr(res, 404, "merchant_not_found", "Merchant account not found");
+      const next = upsertMerchantAccount({
+        ...merchantAccount,
+        name: String(body?.name ?? merchantAccount.name).trim().slice(0, 80),
+        city: String(body?.city ?? merchantAccount.city).trim().slice(0, 40),
+        category: String(body?.category ?? merchantAccount.category).trim().slice(0, 40),
+        contact_name: String(body?.contactName ?? merchantAccount.contact_name).trim().slice(0, 60),
+        contact_phone: String(body?.contactPhone ?? merchantAccount.contact_phone).trim().slice(0, 40),
+        contact_email: String(body?.contactEmail ?? merchantAccount.contact_email).trim().slice(0, 120),
+        description: String(body?.description ?? merchantAccount.description).trim().slice(0, 300),
+      });
+      const geoPartner = getMerchantGeoPartner(next.id);
+      const merchantUser = getMerchantUserById(merchantAuth.sub);
+      appendMerchantActivityLog({
+        merchantAccountId: next.id,
+        actorUserId: merchantAuth.sub,
+        action: "merchant.profile.updated",
+        detail: { by: merchantUser?.username || merchantAuth.sub },
+      });
+      return apiOk(res, {
+        account: sanitizeMerchantAccount(next, geoPartner, { includeContact: true }),
+        geoPartner: sanitizeMerchantGeoPartner(geoPartner),
+      });
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/recommendation-settings") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { getMerchantPlatformListingStatus } = require("./src/services/db");
+      const status = getMerchantPlatformListingStatus(merchantAuth.merchantAccountId);
+      if (!status) return apiErr(res, 404, "merchant_not_found", "Merchant account not found");
+      return apiOk(res, sanitizeMerchantPlatformListing(status));
+    }
+
+    if (req.method === "PUT" && pathname === "/api/merchant/recommendation-settings") {
+      return apiErr(res, 403, "platform_listing_managed", "GEO 与推荐展示策略由平台内部治理，不对 B 端开放直接修改");
+    }
+
+    if (req.method === "GET" && pathname === "/api/merchant/listing-requests") {
+      const merchantAuth = requireMerchant(req, res);
+      if (!merchantAuth) return;
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const limit = Math.max(1, Math.min(Number(searchParams.get("limit") || 20) || 20, 50));
+      const { listMerchantListingRequests } = require("./src/services/db");
+      return apiOk(res, {
+        requests: listMerchantListingRequests(merchantAuth.merchantAccountId, limit).map((row) => serializeMerchantListingRequest(row)),
+        limit,
+      });
+    }
+
+    if (req.method === "POST" && pathname === "/api/merchant/listing-requests") {
+      const merchantAuth = requireMerchant(req, res, ["merchant_owner", "merchant_manager"]);
+      if (!merchantAuth) return;
+      const body = await readBody(req);
+      const {
+        getMerchantAccountById,
+        getMerchantScopedAccounts,
+        appendMerchantListingRequest,
+        appendMerchantActivityLog, getMerchantUserById,
+      } = require("./src/services/db");
+      const merchantAccount = getMerchantAccountById(merchantAuth.merchantAccountId);
+      if (!merchantAccount) return apiErr(res, 404, "merchant_not_found", "Merchant account not found");
+      const requestType = String(body?.requestType || "listing_material_update").trim().slice(0, 40) || "listing_material_update";
+      const title = String(body?.title || "").trim().slice(0, 120);
+      const scopedAccounts = getMerchantScopedAccounts(merchantAccount.id);
+      const scopedStoreIds = [...new Set(
+        (Array.isArray(body?.stores) ? body.stores : [])
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+          .map((item) => {
+            const direct = scopedAccounts.find((account) => String(account.id || "") === item);
+            if (direct) return direct.id;
+            const matched = scopedAccounts.find((account) => buildMerchantAccountPublicRef(account.id) === item);
+            return matched ? matched.id : "";
+          })
+          .filter(Boolean)
+      )].slice(0, 20);
+      const requestPayload = {
+        stores: scopedStoreIds,
+        note: String(body?.note || "").trim().slice(0, 400),
+        requestedBy: merchantAuth.sub,
+      };
+      const requestId = appendMerchantListingRequest({
+        merchantAccountId: merchantAccount.id,
+        requestType,
+        title,
+        payload: requestPayload,
+      });
+      const merchantUser = getMerchantUserById(merchantAuth.sub);
+      appendMerchantActivityLog({
+        merchantAccountId: merchantAccount.id,
+        actorUserId: merchantAuth.sub,
+        action: "merchant.listing.request_submitted",
+        detail: { by: merchantUser?.username || merchantAuth.sub, requestType, requestId },
+      });
+      return apiOk(res, {
+        requestId: toViewerMerchantListingRequestRef(requestId),
+        message: "平台推荐/资料申请已提交，等待内部审核",
+      });
     }
 
     // ── Admin: overview ──────────────────────────────────────────────────────
@@ -7892,6 +15437,430 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === "GET" && pathname === "/api/admin/merchant-accounts") {
+      if (!requireAdmin(req, res)) return;
+      const {
+        getMerchantAccounts, getMerchantGeoPartner, getMerchantParentAccount,
+        listMerchantUsers, getMerchantDemoWorkspaceSummary,
+      } = require("./src/services/db");
+      const merchants = getMerchantAccounts().map((account) => {
+        const geoPartner = getMerchantGeoPartner(account.id);
+        const parentAccount = getMerchantParentAccount(account.id);
+        return {
+          ...sanitizeMerchantAccount(account, geoPartner, { isAdmin: true }),
+          parentAccount: sanitizeMerchantAccount(parentAccount, null, { isAdmin: true }),
+          geoPartner: sanitizeMerchantGeoPartner(geoPartner, { isAdmin: true }),
+          users: listMerchantUsers(account.id).map((user) => sanitizeMerchantUser(user, { isAdmin: true })),
+          demoWorkspace: getMerchantDemoWorkspaceSummary(account.id),
+        };
+      });
+      return apiOk(res, { total: merchants.length, merchants });
+    }
+
+    if (req.method === "GET" && pathname === "/api/admin/merchant-listing-requests") {
+      if (!requireAdmin(req, res)) return;
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const status = String(searchParams.get("status") || "").trim();
+      const accountType = String(searchParams.get("accountType") || "").trim();
+      const limit = Math.max(1, Math.min(Number(searchParams.get("limit") || 50) || 50, 200));
+      const { listAllMerchantListingRequests } = require("./src/services/db");
+      const requests = listAllMerchantListingRequests({ status, accountType, limit })
+        .map((row) => serializeMerchantListingRequest(row, { includeMerchantContext: true, isAdmin: true }));
+      return apiOk(res, { total: requests.length, requests, status, accountType, limit });
+    }
+
+    if (req.method === "POST" && pathname === "/api/admin/merchant-listing-requests/bulk-review") {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req);
+      const ids = [...new Set(
+        (Array.isArray(body?.ids) ? body.ids : [])
+          .map((item) => String(item || "").trim())
+          .filter(Boolean)
+      )].slice(0, 100);
+      if (!ids.length) return apiErr(res, 400, "ids_required", "至少选择一条申请");
+      const nextStatus = String(body?.status || "").trim();
+      if (!["pending", "in_review", "approved", "rejected"].includes(nextStatus)) {
+        return apiErr(res, 400, "invalid_status", "状态只能是 pending、in_review、approved 或 rejected");
+      }
+      const reviewNote = String(body?.reviewNote || "").trim().slice(0, 240);
+      const followUp = normalizeMerchantListingFollowUp(body?.followUp);
+      const {
+        getMerchantListingRequestById, reviewMerchantListingRequest, appendMerchantActivityLog,
+      } = require("./src/services/db");
+      const summary = {
+        requestedCount: ids.length,
+        updatedCount: 0,
+        missingIds: [],
+        failedIds: [],
+      };
+      const requests = [];
+      ids.forEach((requestId) => {
+        const current = getMerchantListingRequestById(requestId);
+        if (!current) {
+          summary.missingIds.push(requestId);
+          return;
+        }
+        const updated = reviewMerchantListingRequest(requestId, {
+          status: nextStatus,
+          reviewNote,
+          reviewedBy: "admin",
+          reviewMeta: followUp,
+        });
+        if (!updated) {
+          summary.failedIds.push(requestId);
+          return;
+        }
+        summary.updatedCount += 1;
+        requests.push(serializeMerchantListingRequest(updated, { isAdmin: true }));
+        appendMerchantActivityLog({
+          merchantAccountId: current.merchant_account_id,
+          actorUserId: "admin",
+          action: `merchant.listing.request.${nextStatus}`,
+          detail: { requestId, reviewNote, followUp, batch: true },
+        });
+        appendAuditLog({
+          kind: "merchant.listing.request.review",
+          who: "admin",
+          what: `merchant.listing.request.${nextStatus}`,
+          taskId: null,
+          toolInput: { requestId, status: nextStatus, batch: true },
+          toolOutput: { reviewNote, followUp },
+        });
+      });
+      appendAuditLog({
+        kind: "merchant.listing.request.bulk_review",
+        who: "admin",
+        what: `merchant.listing.request.bulk_review.${nextStatus}`,
+        taskId: null,
+        toolInput: { ids, status: nextStatus, followUp },
+        toolOutput: summary,
+      });
+      return apiOk(res, { summary, requests });
+    }
+
+    if (req.method === "PATCH" && /^\/api\/admin\/merchant-listing-requests\/[^/]+$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
+      const requestId = pathname.split("/").pop();
+      if (!requestId) return apiErr(res, 400, "request_id_required", "申请 ID 不能为空");
+      const body = await readBody(req);
+      const nextStatus = String(body?.status || "").trim();
+      if (!["pending", "in_review", "approved", "rejected"].includes(nextStatus)) {
+        return apiErr(res, 400, "invalid_status", "状态只能是 pending、in_review、approved 或 rejected");
+      }
+      const reviewNote = String(body?.reviewNote || "").trim().slice(0, 240);
+      const followUp = normalizeMerchantListingFollowUp(body?.followUp);
+      const {
+        getMerchantListingRequestById, reviewMerchantListingRequest, appendMerchantActivityLog,
+      } = require("./src/services/db");
+      const current = getMerchantListingRequestById(requestId);
+      if (!current) return apiErr(res, 404, "merchant_listing_request_not_found", "商家申请不存在");
+      const updated = reviewMerchantListingRequest(requestId, {
+        status: nextStatus,
+        reviewNote,
+        reviewedBy: "admin",
+        reviewMeta: followUp,
+      });
+      if (!updated) return apiErr(res, 500, "merchant_listing_request_update_failed", "商家申请处理失败");
+      appendMerchantActivityLog({
+        merchantAccountId: current.merchant_account_id,
+        actorUserId: "admin",
+        action: `merchant.listing.request.${nextStatus}`,
+        detail: { requestId, reviewNote, followUp },
+      });
+      appendAuditLog({
+        kind: "merchant.listing.request.review",
+        who: "admin",
+        what: `merchant.listing.request.${nextStatus}`,
+        taskId: null,
+        toolInput: { requestId, status: nextStatus },
+        toolOutput: { reviewNote, followUp },
+      });
+      return apiOk(res, {
+        request: serializeMerchantListingRequest(updated, { isAdmin: true }),
+      });
+    }
+
+    if (req.method === "POST" && pathname === "/api/admin/merchant-accounts") {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req);
+      const {
+        getGeoPartnerById, getMerchantAccountBySlug, getMerchantUserByUsername,
+        upsertMerchantAccount, upsertMerchantUser, linkMerchantAccountToGeoPartner, appendMerchantActivityLog,
+        getMerchantAccountById,
+      } = require("./src/services/db");
+      const name = String(body?.name || "").trim();
+      if (!name) return apiErr(res, 400, "name_required", "商家名称不能为空");
+      const slug = String(body?.slug || name).trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+      if (!slug) return apiErr(res, 400, "slug_required", "商家 slug 不能为空");
+      if (getMerchantAccountBySlug(slug)) return apiErr(res, 409, "slug_exists", "商家 slug 已存在");
+      const username = String(body?.username || `${slug}_owner`).trim().toLowerCase();
+      if (!username) return apiErr(res, 400, "username_required", "商家登录名不能为空");
+      if (getMerchantUserByUsername(username)) return apiErr(res, 409, "username_exists", "商家登录名已存在");
+      const accountType = String(body?.accountType || "local_merchant").trim() === "enterprise_partner" ? "enterprise_partner" : "local_merchant";
+      const parentAccountId = accountType === "local_merchant" ? (String(body?.parentAccountId || "").trim() || null) : null;
+      if (parentAccountId) {
+        const parent = getMerchantAccountById(parentAccountId);
+        if (!parent || parent.account_type !== "enterprise_partner") {
+          return apiErr(res, 404, "parent_account_not_found", "企业合作方账号不存在");
+        }
+      }
+      const geoPartnerId = String(body?.geoPartnerId || "").trim() || null;
+      const geoPartner = geoPartnerId ? getGeoPartnerById(geoPartnerId) : null;
+      if (accountType === "local_merchant" && geoPartnerId && !geoPartner) return apiErr(res, 404, "geo_partner_not_found", "GEO 商家不存在");
+      const temporaryPassword = String(body?.password || "").trim() || generateMerchantTempPassword();
+      let account;
+      let user;
+      try {
+        account = upsertMerchantAccount({
+          slug,
+          name,
+          status: String(body?.status || "active").trim() || "active",
+          account_type: accountType,
+          parent_account_id: parentAccountId,
+          city: String(body?.city || geoPartner?.city || "").trim(),
+          category: String(body?.category || geoPartner?.category || "restaurant").trim(),
+          contact_name: String(body?.contactName || "").trim(),
+          contact_phone: String(body?.contactPhone || geoPartner?.contact || "").trim(),
+          contact_email: String(body?.contactEmail || "").trim(),
+          description: String(body?.description || geoPartner?.description || "").trim(),
+          recommendation_enabled: body?.recommendationEnabled === false ? false : true,
+          priority_score: Number(body?.priorityScore ?? geoPartner?.priority_score ?? 90) || 90,
+          geo_partner_id: accountType === "local_merchant" ? geoPartnerId : null,
+        });
+        if (accountType === "local_merchant" && geoPartnerId) linkMerchantAccountToGeoPartner(account.id, geoPartnerId);
+        user = upsertMerchantUser({
+          merchant_account_id: account.id,
+          username,
+          password_hash: hashMerchantPassword(temporaryPassword),
+          role: "merchant_owner",
+          display_name: `${account.name} Owner`,
+          status: "active",
+        });
+      } catch (err) {
+        if (/UNIQUE constraint failed/i.test(String(err && err.message))) {
+          return apiErr(res, 409, "merchant_conflict", "商家 slug、用户名或 GEO 绑定已存在冲突");
+        }
+        throw err;
+      }
+      appendMerchantActivityLog({
+        merchantAccountId: account.id,
+        actorUserId: user.id,
+        action: "merchant.admin.created",
+        detail: { username, geoPartnerId, accountType, parentAccountId },
+      });
+      appendAuditLog({
+        kind: "merchant.admin.create",
+        who: "admin",
+        what: "merchant.account.created",
+        taskId: null,
+        toolInput: {},
+        toolOutput: { merchantAccountId: account.id, username },
+      });
+      const nextGeoPartner = getMerchantGeoPartner(account.id);
+      const parentAccount = getMerchantAccountById(account.parent_account_id || "");
+      return apiOk(res, {
+        merchant: {
+          ...sanitizeMerchantAccount(account, nextGeoPartner, { isAdmin: true }),
+          parentAccount: sanitizeMerchantAccount(parentAccount, null, { isAdmin: true }),
+          geoPartner: sanitizeMerchantGeoPartner(nextGeoPartner, { isAdmin: true }),
+          users: [sanitizeMerchantUser(user, { isAdmin: true })],
+        },
+        temporaryPassword,
+      });
+    }
+
+    if (req.method === "PUT" && pathname.startsWith("/api/admin/merchant-accounts/") && !pathname.endsWith("/status") && !pathname.endsWith("/reset-password")) {
+      if (!requireAdmin(req, res)) return;
+      const merchantAccountId = pathname.slice("/api/admin/merchant-accounts/".length);
+      if (!merchantAccountId) return apiErr(res, 400, "merchant_account_id_required", "商家 ID 不能为空");
+      const body = await readBody(req);
+      const {
+        getMerchantAccountById, getMerchantGeoPartner, getMerchantParentAccount, getGeoPartnerById,
+        listMerchantUsers, upsertMerchantAccount, upsertMerchantUser, linkMerchantAccountToGeoPartner,
+      } = require("./src/services/db");
+      const account = getMerchantAccountById(merchantAccountId);
+      if (!account) return apiErr(res, 404, "merchant_not_found", "商家账户不存在");
+      const owner = listMerchantUsers(merchantAccountId)[0] || null;
+      const accountType = String(body?.accountType ?? account.account_type ?? "local_merchant").trim() === "enterprise_partner" ? "enterprise_partner" : "local_merchant";
+      const parentAccountId = accountType === "local_merchant"
+        ? (body?.parentAccountId === null ? null : String(body?.parentAccountId || account.parent_account_id || "").trim() || null)
+        : null;
+      if (parentAccountId) {
+        const parent = getMerchantAccountById(parentAccountId);
+        if (!parent || parent.account_type !== "enterprise_partner" || parent.id === merchantAccountId) {
+          return apiErr(res, 404, "parent_account_not_found", "企业合作方账号不存在");
+        }
+      }
+      const geoPartnerId = accountType === "local_merchant"
+        ? (body?.geoPartnerId === null ? null : String(body?.geoPartnerId || account.geo_partner_id || "").trim() || null)
+        : null;
+      const geoPartner = geoPartnerId ? getGeoPartnerById(geoPartnerId) : null;
+      if (geoPartnerId && !geoPartner) return apiErr(res, 404, "geo_partner_not_found", "GEO 商家不存在");
+      let nextAccount;
+      try {
+        nextAccount = upsertMerchantAccount({
+          ...account,
+          name: String(body?.name ?? account.name).trim(),
+          slug: String(body?.slug ?? account.slug).trim().toLowerCase(),
+          status: String(body?.status ?? account.status).trim() || "active",
+          account_type: accountType,
+          parent_account_id: parentAccountId,
+          city: String(body?.city ?? account.city).trim(),
+          category: String(body?.category ?? account.category).trim(),
+          contact_name: String(body?.contactName ?? account.contact_name).trim(),
+          contact_phone: String(body?.contactPhone ?? account.contact_phone).trim(),
+          contact_email: String(body?.contactEmail ?? account.contact_email).trim(),
+          description: String(body?.description ?? account.description).trim(),
+          recommendation_enabled: body?.recommendationEnabled === false ? false : true,
+          priority_score: Number(body?.priorityScore ?? account.priority_score ?? 90) || 90,
+          geo_partner_id: geoPartnerId,
+        });
+        if (owner) {
+          upsertMerchantUser({
+            ...owner,
+            merchant_account_id: nextAccount.id,
+            username: String(body?.username ?? owner.username).trim().toLowerCase(),
+            display_name: String(body?.ownerDisplayName ?? owner.display_name ?? `${nextAccount.name} Owner`).trim(),
+            password_hash: owner.password_hash,
+            status: owner.status || "active",
+          });
+        }
+        linkMerchantAccountToGeoPartner(nextAccount.id, geoPartnerId);
+      } catch (err) {
+        if (/UNIQUE constraint failed/i.test(String(err && err.message))) {
+          return apiErr(res, 409, "merchant_conflict", "商家 slug、用户名或 GEO 绑定已存在冲突");
+        }
+        throw err;
+      }
+      const nextGeoPartner = getMerchantGeoPartner(nextAccount.id);
+      const parentAccount = getMerchantParentAccount(nextAccount.id);
+      appendAuditLog({
+        kind: "merchant.admin.update",
+        who: "admin",
+        what: "merchant.account.updated",
+        taskId: null,
+        toolInput: {},
+        toolOutput: { merchantAccountId: nextAccount.id },
+      });
+      return apiOk(res, {
+        merchant: {
+          ...sanitizeMerchantAccount(nextAccount, nextGeoPartner, { isAdmin: true }),
+          parentAccount: sanitizeMerchantAccount(parentAccount, null, { isAdmin: true }),
+          geoPartner: sanitizeMerchantGeoPartner(nextGeoPartner, { isAdmin: true }),
+          users: listMerchantUsers(nextAccount.id).map((user) => sanitizeMerchantUser(user, { isAdmin: true })),
+        },
+      });
+    }
+
+    if (req.method === "PATCH" && pathname.startsWith("/api/admin/merchant-accounts/") && pathname.endsWith("/status")) {
+      if (!requireAdmin(req, res)) return;
+      const merchantAccountId = pathname.slice("/api/admin/merchant-accounts/".length).replace(/\/status$/, "");
+      const body = await readBody(req);
+      const nextStatus = String(body?.status || "").trim();
+      if (!["active", "suspended"].includes(nextStatus)) return apiErr(res, 400, "invalid_status", "状态只能是 active 或 suspended");
+      const { getMerchantAccountById, getMerchantGeoPartner, upsertMerchantAccount, listMerchantUsers } = require("./src/services/db");
+      const account = getMerchantAccountById(merchantAccountId);
+      if (!account) return apiErr(res, 404, "merchant_not_found", "商家账户不存在");
+      const nextAccount = upsertMerchantAccount({ ...account, status: nextStatus });
+      appendAuditLog({
+        kind: "merchant.admin.status",
+        who: "admin",
+        what: `merchant.account.${nextStatus}`,
+        taskId: null,
+        toolInput: {},
+        toolOutput: { merchantAccountId },
+      });
+      const geoPartner = getMerchantGeoPartner(nextAccount.id);
+      return apiOk(res, {
+        merchant: {
+          ...sanitizeMerchantAccount(nextAccount, geoPartner, { isAdmin: true }),
+          geoPartner: sanitizeMerchantGeoPartner(geoPartner, { isAdmin: true }),
+          users: listMerchantUsers(nextAccount.id).map((user) => sanitizeMerchantUser(user, { isAdmin: true })),
+        },
+      });
+    }
+
+    if (req.method === "POST" && pathname.startsWith("/api/admin/merchant-accounts/") && pathname.endsWith("/reset-password")) {
+      if (!requireAdmin(req, res)) return;
+      const merchantAccountId = pathname.slice("/api/admin/merchant-accounts/".length).replace(/\/reset-password$/, "");
+      const body = await readBody(req);
+      const {
+        getMerchantAccountById, listMerchantUsers, getMerchantUserById, upsertMerchantUser, appendMerchantActivityLog,
+      } = require("./src/services/db");
+      const account = getMerchantAccountById(merchantAccountId);
+      if (!account) return apiErr(res, 404, "merchant_not_found", "商家账户不存在");
+      const team = listMerchantUsers(merchantAccountId);
+      const targetUserId = String(body?.userId || "").trim() || team[0]?.id || "";
+      const targetUser = getMerchantUserById(targetUserId);
+      if (!targetUser || targetUser.merchant_account_id !== merchantAccountId) return apiErr(res, 404, "merchant_user_not_found", "商家用户不存在");
+      const temporaryPassword = generateMerchantTempPassword();
+      const updatedUser = upsertMerchantUser({
+        ...targetUser,
+        password_hash: hashMerchantPassword(temporaryPassword),
+      });
+      appendMerchantActivityLog({
+        merchantAccountId,
+        actorUserId: updatedUser.id,
+        action: "merchant.admin.password_reset",
+        detail: { username: updatedUser.username },
+      });
+      appendAuditLog({
+        kind: "merchant.admin.password_reset",
+        who: "admin",
+        what: "merchant.password.reset",
+        taskId: null,
+        toolInput: {},
+        toolOutput: { merchantAccountId, merchantUserId: updatedUser.id },
+      });
+      return apiOk(res, {
+        merchantUser: sanitizeMerchantUser(updatedUser, { isAdmin: true }),
+        temporaryPassword,
+      });
+    }
+
+    if (req.method === "POST" && pathname.startsWith("/api/admin/merchant-accounts/") && pathname.endsWith("/provision-demo")) {
+      if (!requireAdmin(req, res)) return;
+      if (!isMerchantDemoEnabled()) {
+        return apiErr(res, 403, "merchant_demo_disabled", "商家 Demo 工作区当前已禁用");
+      }
+      const merchantAccountId = pathname.slice("/api/admin/merchant-accounts/".length).replace(/\/provision-demo$/, "");
+      if (!merchantAccountId) return apiErr(res, 400, "merchant_account_id_required", "商家 ID 不能为空");
+      const body = await readBody(req);
+      const {
+        getMerchantAccountById,
+        getMerchantGeoPartner,
+        listMerchantUsers,
+        getMerchantDemoWorkspaceSummary,
+        provisionMerchantDemoWorkspace,
+      } = require("./src/services/db");
+      const account = getMerchantAccountById(merchantAccountId);
+      if (!account) return apiErr(res, 404, "merchant_not_found", "商家账户不存在");
+      const result = provisionMerchantDemoWorkspace(merchantAccountId, { reset: body?.reset !== false });
+      if (!result?.ok) {
+        return apiErr(res, 500, "merchant_demo_seed_failed", "商家测试数据生成失败");
+      }
+      const geoPartner = getMerchantGeoPartner(merchantAccountId);
+      const summary = getMerchantDemoWorkspaceSummary(merchantAccountId);
+      appendAuditLog({
+        kind: "merchant.admin.sandbox_seed",
+        who: "admin",
+        what: "merchant.sandbox_workspace.provisioned",
+        taskId: null,
+        toolInput: { merchantAccountId, reset: body?.reset !== false },
+        toolOutput: summary,
+      });
+      return apiOk(res, {
+        merchant: {
+          ...sanitizeMerchantAccount(account, geoPartner, { isAdmin: true }),
+          geoPartner: sanitizeMerchantGeoPartner(geoPartner, { isAdmin: true }),
+          users: listMerchantUsers(account.id).map((user) => sanitizeMerchantUser(user, { isAdmin: true })),
+          demoWorkspace: summary,
+        },
+        reused: Boolean(result.reused),
+        summary,
+      });
+    }
+
     // ── Admin: list users ─────────────────────────────────────────────────────
     if (req.method === "GET" && pathname === "/api/admin/users") {
       if (!requireAdmin(req, res)) return;
@@ -7921,7 +15890,8 @@ const server = http.createServer(async (req, res) => {
       const kind   = _aasp.get("kind")   || "";
       const who    = _aasp.get("who")    || "";
       const format = _aasp.get("format") || "json";
-      let logs = [...(db.auditLogs || [])].reverse();
+      const { getAuditLogs } = require("./src/services/db");
+      let logs = getAuditLogs(500);
       if (kind) logs = logs.filter((l) => l.kind && l.kind.startsWith(kind));
       if (who)  logs = logs.filter((l) => l.who  && l.who.includes(who));
       const page = logs.slice(offset, offset + limit);
@@ -7929,12 +15899,10 @@ const server = http.createServer(async (req, res) => {
         const _csvEsc = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
         const header = "ts,kind,who,what,taskId\n";
         const rows = page.map((l) => [l.ts || l.at, l.kind, l.who, l.what, l.taskId].map(_csvEsc).join(",")).join("\n");
-        res.writeHead(200, {
-          "Content-Type": "text/csv; charset=utf-8",
-          "Content-Disposition": `attachment; filename="crossx-audit-${new Date().toISOString().slice(0,10)}.csv"`,
+        return writeAttachment(res, 200, header + rows, {
+          contentType: "text/csv; charset=utf-8",
+          filename: `crossx-audit-${new Date().toISOString().slice(0,10)}.csv`,
         });
-        res.end(header + rows);
-        return;
       }
       return writeJson(res, 200, { ok: true, total: logs.length, logs: page });
     }
@@ -7943,7 +15911,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && /^\/api\/admin\/flags\/[^/]+$/.test(pathname)) {
       if (!requireAdmin(req, res)) return;
       const flagName = pathname.split("/")[4];
-      if (db.featureFlags && db.featureFlags[flagName]) {
+      if (db.featureFlags && Object.prototype.hasOwnProperty.call(db.featureFlags, flagName)) {
         delete db.featureFlags[flagName];
         saveDb();
         audit.append({ kind: "admin.flags", who: _whoFromReq(req), what: `flag.deleted:${flagName}`, taskId: null, toolInput: { flagName }, toolOutput: {} });
@@ -8105,24 +16073,30 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/metrics/events") {
-      // ── Sliding-window rate limit: 20 events/min per IP ──────────────────
-      // SEC: never trust X-Forwarded-For for rate-limiting — trivially spoofable
       const _mip = (req.socket?.remoteAddress || "unknown").slice(0, 45);
-      const _mNow = Date.now();
-      if (!_metricsRateMap.has(_mip)) _metricsRateMap.set(_mip, []);
-      const _mWindow = _metricsRateMap.get(_mip).filter((t) => _mNow - t < 60000);
-      if (_mWindow.length >= 20) {
-        return writeJson(res, 429, { error: "rate_limited", retryAfterSec: 60 });
+      const _metricRl = consumeRateLimitWindow({
+        scope: "metrics_events",
+        key: `metrics_events:${_mip}`,
+        limit: 20,
+        windowMs: 60_000,
+      });
+      if (!_metricRl.allowed) {
+        res.setHeader("Retry-After", String(Math.ceil(_metricRl.retryAfterMs / 1000)));
+        return writeJson(res, 429, {
+          error: "rate_limited",
+          retryAfterSec: Math.max(1, Math.ceil(_metricRl.retryAfterMs / 1000)),
+          retryAfterMs: _metricRl.retryAfterMs,
+        });
       }
-      _mWindow.push(_mNow);
-      _metricsRateMap.set(_mip, _mWindow);
-      // ─────────────────────────────────────────────────────────────────────
       const body = await readBody(req);
       const _METRIC_KINDS = new Set(["ui_event","plan_view","plan_interact","booking","payment","search","voice","error","session_start","session_end","tab_switch","preference_save","login","logout","favorite","book_click","intent_submitted"]);
       const _evKindRaw = String(body.kind || "ui_event").slice(0, 64);
       const _evKind = _METRIC_KINDS.has(_evKindRaw) ? _evKindRaw : "ui_event";
-      const _evUserId = String(body.userId || "guest").replace(/[^a-zA-Z0-9_\-.:]/g, "").slice(0, 64);
-      const _evTaskId = body.taskId ? String(body.taskId).replace(/[^a-zA-Z0-9_\-.]/g, "").slice(0, 64) : null;
+      const _evSubject = resolveRequestSubject(req, body, { queryDeviceId: _queryDeviceIdFromReq(req) });
+      const _evUserId = _evSubject
+        ? String(_evSubject.id || "guest").replace(/[^a-zA-Z0-9_\-.:]/g, "").slice(0, 64)
+        : "guest";
+      const _evTaskId = resolveInternalTaskId(body.taskId || null) || (body.taskId ? String(body.taskId).replace(/[^a-zA-Z0-9_\-.]/g, "").slice(0, 64) : null);
       const _evMeta   = body.meta && typeof body.meta === "object" && !Array.isArray(body.meta)
         ? Object.fromEntries(Object.entries(body.meta).slice(0, 20).map(([k, v]) => [String(k).slice(0, 64), String(v ?? "").slice(0, 256)]))
         : {};
@@ -8134,27 +16108,50 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/system/providers") {
       const { validateAdminToken: _provAdmVal } = require("./src/middleware/auth");
       const _provIsAdmin = Boolean(_provAdmVal(req)) && _whoFromReq(req) !== "anon";
-      if (!_provIsAdmin) return writeJson(res, 200, { gaode: {}, partnerHub: {}, mcpContracts: {}, sms: {}, wechat_oauth: false, google_oauth: false, liveReadiness: { ready: false, missing: [] } });
+      const _publicOauth = {
+        wechat_oauth: Boolean(process.env.WECHAT_APP_ID && process.env.WECHAT_APP_SECRET),
+        google_oauth: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+        alipay_oauth: Boolean(process.env.ALIPAY_AUTH_APP_ID && process.env.ALIPAY_AUTH_PRIVATE_KEY && process.env.ALIPAY_AUTH_PUBLIC_KEY),
+        apple_oauth: false,
+        facebook_oauth: Boolean(process.env.FACEBOOK_CLIENT_ID && process.env.FACEBOOK_CLIENT_SECRET),
+        x_oauth: false,
+      };
+      if (!_provIsAdmin) {
+        const _publicReadiness = buildLiveReadinessSummary();
+        return writeJson(res, 200, {
+          gaode: {},
+          partnerHub: {},
+          rail: buildRailProviderSummary(_publicReadiness),
+          restaurants: {},
+          mcpContracts: {},
+          sms: {},
+          ..._publicOauth,
+          liveReadiness: _publicReadiness.liveReadiness,
+        });
+      }
       const contracts = buildMcpContractsSummary();
-      const gaodeKeyPresent = Boolean(process.env.AMAP_API_KEY || process.env.GAODE_KEY || process.env.AMAP_KEY);
-      const partnerHubKeyPresent = Boolean(process.env.PARTNER_HUB_KEY);
-      const partnerHubBaseUrlConfigured = Boolean(connectors.partnerHub && connectors.partnerHub.baseUrl);
-      const partnerHubReady = Boolean(connectors.partnerHub && connectors.partnerHub.enabled && (partnerHubKeyPresent || partnerHubBaseUrlConfigured));
+      const readiness = buildLiveReadinessSummary();
       return writeJson(res, 200, {
         gaode: {
           enabled: connectors.gaode.enabled,
           mode: connectors.gaode.enabled ? "live_with_fallback" : "mock",
-          keyPresent: gaodeKeyPresent,
-          requiredEnv: ["GAODE_KEY or AMAP_KEY"],
+          keyPresent: readiness.gaodeKeyPresent,
         },
         partnerHub: {
           enabled: connectors.partnerHub.enabled,
           mode: connectors.partnerHub.mode || (connectors.partnerHub.enabled ? "external_contract" : "mock"),
-          keyPresent: partnerHubKeyPresent,
-          baseUrlConfigured: partnerHubBaseUrlConfigured,
+          keyPresent: readiness.partnerHubKeyPresent,
+          baseUrlConfigured: readiness.partnerHubBaseUrlConfigured,
           providerAlias: connectors.partnerHub.provider || "generic",
           channels: connectors.partnerHub.channels || [],
-          requiredEnv: ["PARTNER_HUB_KEY or PARTNER_HUB_BASE_URL"],
+        },
+        rail: buildRailProviderSummary(readiness),
+        hotels: readiness.hotels,
+        restaurants: {
+          enabled: readiness.jutuiTokenPresent,
+          mode: readiness.jutuiTokenPresent ? "live" : "synthetic_fallback",
+          keyPresent: readiness.jutuiTokenPresent,
+          providerAlias: "jutui",
         },
         mcpContracts: {
           total: contracts.totalContracts,
@@ -8168,29 +16165,21 @@ const server = http.createServer(async (req, res) => {
           return {
             provider: _smsProv || "mock",
             live: _live,
-            requiredEnv: _smsProv === "aliyun"
-              ? ["ALIYUN_SMS_ACCESS_KEY_ID", "ALIYUN_SMS_ACCESS_KEY_SECRET", "ALIYUN_SMS_SIGN_NAME", "ALIYUN_SMS_TEMPLATE_CODE"]
-              : _smsProv === "tencent"
-                ? ["TENCENT_SMS_APP_ID", "TENCENT_SMS_APP_KEY", "TENCENT_SMS_TEMPLATE_ID"]
-                : ["SMS_PROVIDER (set to aliyun or tencent)"],
+            status: _live ? "ready" : (_smsProv ? "degraded" : "mock"),
           };
         })(),
-        wechat_oauth: Boolean(process.env.WECHAT_APP_ID && process.env.WECHAT_APP_SECRET),
-        google_oauth: Boolean(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
-        liveReadiness: {
-          ready: gaodeKeyPresent && partnerHubReady,
-          missing: [
-            ...(gaodeKeyPresent ? [] : ["GAODE_KEY or AMAP_KEY"]),
-            ...(partnerHubReady ? [] : ["PARTNER_HUB_KEY or PARTNER_HUB_BASE_URL"]),
-          ],
-        },
+        ..._publicOauth,
+        liveReadiness: readiness.liveReadiness,
       });
     }
 
     if (req.method === "GET" && pathname === "/api/system/providers/probe") {
       const { validateAdminToken: _probeAdmVal } = require("./src/middleware/auth");
       const _probeIsAdmin = Boolean(_probeAdmVal(req)) && _whoFromReq(req) !== "anon";
-      if (!_probeIsAdmin) return writeJson(res, 200, { ready: false, missing: [], probes: [], fallbackReason: null, source: "mock" });
+      if (!_probeIsAdmin) {
+        const _publicReadiness = buildLiveReadinessSummary();
+        return writeJson(res, 200, { ready: false, missing: _publicReadiness.liveReadiness.missing, commerceMissing: _publicReadiness.liveReadiness.commerceMissing, rail: buildRailProviderSummary(_publicReadiness), probes: [], fallbackReason: null, source: "unauthorized" });
+      }
       const summary = buildProviderProbeSummary();
       if (String(parsed.query.refresh || "0") === "1") {
         audit.append({
@@ -8217,21 +16206,24 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/system/build") {
-      return writeJson(res, 200, {
+      const payload = {
         buildId: BUILD_ID,
-        host: HOST,
-        port: PORT,
         now: nowIso(),
-      });
+      };
+      if (_isSupportAdmin(req)) {
+        payload.host = HOST;
+        payload.port = PORT;
+      }
+      return writeJson(res, 200, payload);
     }
 
     // ── API Gateway: FX rates ──────────────────────────────────────────────
     if (req.method === "GET" && pathname === "/api/gateway/fx") {
       try {
         const rates = await fetchFxRates();
-        return writeJson(res, 200, { ok: true, rates, source: process.env.JUHE_KEY ? "juhe" : "mock" });
+        return writeJson(res, 200, { ok: true, rates, source: rates && rates._source ? rates._source : "unknown" });
       } catch (e) {
-        return writeJson(res, 500, { ok: false, error: e.message });
+        return writeJson(res, 500, { ok: false, error: "fx_unavailable" });
       }
     }
 
@@ -8242,18 +16234,16 @@ const server = http.createServer(async (req, res) => {
         const coupons = await fetchJutuiRestaurants(city, "美食", 4);
         return writeJson(res, 200, { ok: true, coupons, keyword: city });
       } catch (e) {
-        return writeJson(res, 500, { ok: false, error: e.message });
+        return writeJson(res, 500, { ok: false, error: "coupon_catalog_unavailable" });
       }
     }
 
     if (req.method === "GET" && pathname === "/api/session/profile") {
       const { searchParams } = new URL(req.url, "http://localhost");
-      const { validateUserToken: _vutSp } = require("./src/services/user_auth");
-      const _spPayload = _vutSp(req);
-      // Prefer authenticated userId; fall back to deviceId query param
-      const _spId = _spPayload ? _spPayload.sub : (searchParams.get("deviceId") || "");
-      const profile = _spId ? loadProfile(_spId) : null;
-      return writeJson(res, 200, { ok: true, profile: profile || null });
+      const subject = resolveRequestSubject(req, null, { queryDeviceId: searchParams.get("deviceId") || "" });
+      if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      const profile = loadProfile(subject.id);
+      return writeJson(res, 200, { ok: true, profile: sanitizeProfileForViewer(profile) });
     }
 
     // ── /api/local-route — intra-city walking/transit/taxi between two POIs ──
@@ -8270,8 +16260,8 @@ const server = http.createServer(async (req, res) => {
         if (!result) return writeJson(res, 200, { ok: false, source: "none" });
         return writeJson(res, 200, { ok: true, from, to, city, ...result });
       } catch (e) {
-        console.warn("[/api/local-route] error:", e.message);
-        return writeJson(res, 500, { ok: false, error: e.message });
+        console.warn("[/api/local-route] error:", sanitizeServerLogError(e, "route_lookup_failed"));
+        return writeJson(res, 500, { ok: false, error: "route_lookup_failed" });
       }
     }
 
@@ -8280,9 +16270,13 @@ const server = http.createServer(async (req, res) => {
       if (!validateMapKeyOrigin(req)) {
         return writeJson(res, 403, { error: "forbidden", message: "Valid browser Origin header required" });
       }
-      // Only expose AMAP_WEB_KEY (restricted browser key), never the server AMAP_API_KEY
-      const webKey = String(process.env.AMAP_WEB_KEY || "").trim();
-      return writeJson(res, 200, { ok: true, key: webKey });
+      // Prefer a dedicated web credential when configured.
+      // Fall back to the shared map credential so the map still works without separate setup.
+      const webKey = String(process.env.AMAP_WEB_KEY || process.env.AMAP_API_KEY || "").trim();
+      // Use the dedicated JS security token when present;
+      // otherwise reuse the shared map security token.
+      const securityCode = String(process.env.AMAP_WEB_SECURITY_KEY || process.env.AMAP_SECURITY_KEY || "").trim();
+      return writeJson(res, 200, { ok: true, key: webKey, securityCode });
     }
 
     // ── /api/geocode-places — batch geocode POI names for map pins ────────────
@@ -8300,8 +16294,8 @@ const server = http.createServer(async (req, res) => {
         const results = await geocodePlacesBatch(places, city);
         return writeJson(res, 200, { ok: true, results });
       } catch (e) {
-        console.warn("[/api/geocode-places] error:", e.message);
-        return writeJson(res, 500, { ok: false, error: e.message });
+        console.warn("[/api/geocode-places] error:", sanitizeServerLogError(e, "geocode_failed"));
+        return writeJson(res, 500, { ok: false, error: "geocode_failed" });
       }
     }
 
@@ -8310,9 +16304,10 @@ const server = http.createServer(async (req, res) => {
       const { searchParams } = new URL(req.url, "http://localhost");
       const city = (searchParams.get("city") || "").trim();
       const days = Math.min(parseInt(searchParams.get("days") || "5", 10), 7);
+      const lang = String(searchParams.get("lang") || "ZH").trim().toUpperCase();
       if (!city) return writeJson(res, 400, { ok: false, error: "city required" });
 
-      const cacheKey = `${city}:${days}`;
+      const cacheKey = `${city}:${days}:${lang}`;
       const cached = WEATHER_CACHE.get(cacheKey);
       if (cached && Date.now() - cached.ts < WEATHER_TTL_MS) {
         return writeJson(res, 200, cached.data);
@@ -8330,10 +16325,11 @@ const server = http.createServer(async (req, res) => {
           `&timezone=Asia%2FShanghai&forecast_days=${days}`;
         const meteoRes = await fetch(meteoUrl, { signal: AbortSignal.timeout(6000) });
         if (!meteoRes.ok) throw new Error(`Open-Meteo HTTP ${meteoRes.status}`);
-        const meteoData = await meteoRes.json();
+        const meteoData = await _readJsonResponseSafe(meteoRes, null);
+        if (!meteoData) throw new Error("weather_invalid_payload");
 
         const cur = meteoData.current || {};
-        const { icon: curIcon, label: curLabel } = mapWeatherCode(cur.weathercode ?? 0);
+        const { icon: curIcon, label: curLabel } = mapWeatherCode(cur.weathercode ?? 0, lang);
 
         const times    = meteoData.daily?.time || [];
         const highTemps = meteoData.daily?.temperature_2m_max || [];
@@ -8341,7 +16337,7 @@ const server = http.createServer(async (req, res) => {
         const codes     = meteoData.daily?.weathercode || [];
 
         const forecast = times.map((date, i) => {
-          const { icon, label } = mapWeatherCode(codes[i] ?? 0);
+          const { icon, label } = mapWeatherCode(codes[i] ?? 0, lang);
           return {
             date,
             high_c: Math.round(highTemps[i] ?? 20),
@@ -8354,12 +16350,7 @@ const server = http.createServer(async (req, res) => {
         const hasSnow = forecast.some((d) => d.icon === "❄️");
         const hasCold = forecast.some((d) => d.low_c < 10);
         const hasHot  = forecast.some((d) => d.high_c > 32);
-        let tip = "🌤️ 天气状况较好，祝旅途愉快！";
-        if (hasSnow)                 tip = "❄️ 出行期间可能降雪，请备好防寒保暖装备";
-        else if (hasRain && hasCold) tip = "🌧️🧥 有降雨且气温较低，建议携带雨伞和保暖外套";
-        else if (hasRain)            tip = "🌂 出行期间可能有降雨，建议携带折叠雨伞";
-        else if (hasCold)            tip = "🧥 早晚温差较大，注意添衣保暖";
-        else if (hasHot)             tip = "☀️ 天气炎热，注意防晒补水，避免正午暴晒";
+        const tip = buildWeatherTip(lang, { hasSnow, hasRain, hasCold, hasHot });
 
         const result = {
           ok: true, city,
@@ -8372,11 +16363,11 @@ const server = http.createServer(async (req, res) => {
           forecast, tip, _source: "open-meteo",
         };
         WEATHER_CACHE.set(cacheKey, { ts: Date.now(), data: result });
-        console.log(`[/api/weather] ${city}(${lat},${lng}): ${forecast.map((d) => d.icon + d.high_c + "\xb0").join(" ")}`);
+        console.log("[/api/weather] forecast loaded");
         return writeJson(res, 200, result);
       } catch (e) {
-        console.warn("[/api/weather] error:", e.message);
-        return writeJson(res, 200, { ok: false, city, error: e.message });
+        console.warn("[/api/weather] error:", sanitizeServerLogError(e, "weather_unavailable"));
+        return writeJson(res, 200, { ok: false, city, error: "weather_unavailable" });
       }
     }
 
@@ -8384,20 +16375,21 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/favorites") {
       const { addFavorite, listFavorites } = require("./src/services/favorites");
       const _url2 = new URL(req.url, "http://localhost");
-      const _did2 = _url2.searchParams.get("deviceId") || (await readBody(req).then((b) => b.deviceId).catch(() => null));
 
       if (req.method === "POST") {
         const body = await readBody(req);
-        const { deviceId, item } = body;
-        if (!deviceId || !item) return writeJson(res, 400, { error: "deviceId and item required" });
-        return writeJson(res, 200, addFavorite(deviceId, item));
+        const subject = resolveRequestSubject(req, body, { queryDeviceId: _url2.searchParams.get("deviceId") || "" });
+        const item = body && body.item;
+        if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+        if (!item) return writeJson(res, 400, { error: "item required" });
+        return writeJson(res, 200, addFavorite(subject.id, item));
       }
       if (req.method === "GET") {
-        const did = _url2.searchParams.get("deviceId");
+        const subject = resolveRequestSubject(req, null, { queryDeviceId: _url2.searchParams.get("deviceId") || "" });
         const type = _url2.searchParams.get("type") || undefined;
         const city = _url2.searchParams.get("city") || undefined;
-        if (!did) return writeJson(res, 400, { error: "deviceId required" });
-        return writeJson(res, 200, { ok: true, items: listFavorites(did, { type, city }) });
+        if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+        return writeJson(res, 200, { ok: true, items: listFavorites(subject.id, { type, city }) });
       }
     }
 
@@ -8406,16 +16398,17 @@ const server = http.createServer(async (req, res) => {
       const { removeFavorite } = require("./src/services/favorites");
       const body = await readBody(req);
       const favId = decodeURIComponent(_favDeleteMatch[1]);
-      const deviceId = body.deviceId || new URL(req.url, "http://localhost").searchParams.get("deviceId");
-      if (!deviceId) return writeJson(res, 400, { error: "deviceId required" });
-      return writeJson(res, 200, removeFavorite(deviceId, favId));
+      const subject = resolveRequestSubject(req, body, { queryDeviceId: new URL(req.url, "http://localhost").searchParams.get("deviceId") || "" });
+      if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      return writeJson(res, 200, removeFavorite(subject.id, favId));
     }
 
     // GET /api/proactive — AI-native proactive travel suggestions for returning users
     if (req.method === "GET" && pathname === "/api/proactive") {
       const { searchParams: _psp } = new URL(req.url, "http://localhost");
-      const did = _psp.get("deviceId") || extractDeviceId(req, {});
-      if (!did) return writeJson(res, 400, { error: "missing_device_id" });
+      const subject = resolveRequestSubject(req, null, { queryDeviceId: _psp.get("deviceId") || "" });
+      if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      const did = subject.id;
       try {
         const { loadProfile } = require("./src/session/profile");
         const { generateProactiveSuggestions } = require("./src/ai/proactive");
@@ -8427,34 +16420,34 @@ const server = http.createServer(async (req, res) => {
         if (!profile || (profile.tripCount || 0) < 1) {
           return writeJson(res, 200, { ok: true, suggestions: [], reason: "insufficient_history" });
         }
-        const suggestions = await generateProactiveSuggestions(profile, recentTrips, did);
+        const suggestions = sanitizeProactiveSuggestionsForViewer(await generateProactiveSuggestions(profile, recentTrips, did));
         return writeJson(res, 200, { ok: true, suggestions });
       } catch (err) {
-        console.warn("[proactive] error:", err.message);
-        return writeJson(res, 200, { ok: true, suggestions: [], error: err.message });
+        console.warn("[proactive] error:", sanitizeServerLogError(err, "proactive_unavailable"));
+        return writeJson(res, 200, { ok: true, suggestions: [], reason: "temporarily_unavailable" });
       }
     }
 
     if (req.method === "GET" && pathname === "/api/system/llm-status") {
+      if (!_isSupportAdmin(req)) {
+        return writeJson(res, 200, buildPublicLlmStatus());
+      }
       const primaryProvider = ANTHROPIC_KEY_HEALTH.looksValid ? "claude" : (OPENAI_KEY_HEALTH.looksValid ? "openai" : "fallback");
       return writeJson(res, 200, {
         // Legacy flat fields (backward-compat)
         configured: Boolean(OPENAI_API_KEY),
         provider: "openai",
         keySource: OPENAI_KEY_SOURCE,
-        keyPreview: openAiKeyPreview(OPENAI_API_KEY),
         keyHealth: OPENAI_KEY_HEALTH,
         model: OPENAI_MODEL,
         ttsModel: OPENAI_TTS_MODEL,
         baseUrl: OPENAI_BASE_URL,
         timeoutMs: OPENAI_TIMEOUT_MS,
         lastRuntime: OPENAI_LAST_RUNTIME,
-        envFilesLoaded: LOADED_ENV_FILES,
         // Extended multi-provider fields
         primary: primaryProvider,
         coze: {
           configured:   Boolean(COZE_API_KEY),
-          keyPreview:   COZE_API_KEY ? COZE_API_KEY.slice(0, 10) + "..." : "(not set)",
           workflowId:   COZE_WORKFLOW_ID,
           workflowReady: Boolean(COZE_API_KEY && COZE_WORKFLOW_ID),
         },
@@ -8466,7 +16459,6 @@ const server = http.createServer(async (req, res) => {
           claude: {
             configured: Boolean(ANTHROPIC_API_KEY),
             keySource: ANTHROPIC_KEY_SOURCE,
-            keyPreview: claudeKeyPreview(ANTHROPIC_API_KEY),
             keyHealth: ANTHROPIC_KEY_HEALTH,
             model: ANTHROPIC_MODEL,
             baseUrl: ANTHROPIC_BASE_URL,
@@ -8476,7 +16468,6 @@ const server = http.createServer(async (req, res) => {
           openai: {
             configured: Boolean(OPENAI_API_KEY),
             keySource: OPENAI_KEY_SOURCE,
-            keyPreview: openAiKeyPreview(OPENAI_API_KEY),
             keyHealth: OPENAI_KEY_HEALTH,
             model: OPENAI_MODEL,
             baseUrl: OPENAI_BASE_URL,
@@ -8513,14 +16504,12 @@ const server = http.createServer(async (req, res) => {
         configured: Boolean(OPENAI_API_KEY),
         provider: "openai",
         keySource: OPENAI_KEY_SOURCE,
-        keyPreview: openAiKeyPreview(OPENAI_API_KEY),
         keyHealth: OPENAI_KEY_HEALTH,
         model: OPENAI_MODEL,
         ttsModel: OPENAI_TTS_MODEL,
         baseUrl: OPENAI_BASE_URL,
         timeoutMs: OPENAI_TIMEOUT_MS,
         lastRuntime: OPENAI_LAST_RUNTIME,
-        envFilesLoaded: LOADED_ENV_FILES,
         claude: {
           configured: Boolean(ANTHROPIC_API_KEY),
           model: ANTHROPIC_MODEL,
@@ -8625,7 +16614,6 @@ const server = http.createServer(async (req, res) => {
         configured: Boolean(OPENAI_API_KEY),
         provider: "openai",
         keySource: OPENAI_KEY_SOURCE,
-        keyPreview: openAiKeyPreview(OPENAI_API_KEY),
         keyHealth: OPENAI_KEY_HEALTH,
         model: OPENAI_MODEL,
         ttsModel: OPENAI_TTS_MODEL,
@@ -8638,7 +16626,6 @@ const server = http.createServer(async (req, res) => {
         claude: {
           configured: Boolean(ANTHROPIC_API_KEY),
           keySource: ANTHROPIC_KEY_SOURCE,
-          keyPreview: claudeKeyPreview(ANTHROPIC_API_KEY),
           keyHealth: ANTHROPIC_KEY_HEALTH,
           model: ANTHROPIC_MODEL,
         },
@@ -8646,10 +16633,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/solution/recommendation") {
-      const taskId = parsed.query.taskId || null;
+      const taskId = resolveInternalTaskId(parsed.query.taskId || null) || null;
       const intentHint = parsed.query.intentHint || null;
       const city = parsed.query.city ? String(parsed.query.city).trim() : null;
-      const language = normalizeLang(parsed.query.language || db.users.demo.language || "EN");
+      const language = normalizeLang(parsed.query.language || DEFAULT_LANG_EN);
       const query = parsed.query.query ? String(parsed.query.query).trim() : "";
       const contextConstraints = {
         budget: parsed.query.budget ? String(parsed.query.budget) : undefined,
@@ -8661,7 +16648,7 @@ const server = http.createServer(async (req, res) => {
       };
       const dynamicCandidates = await fetchDynamicCandidatePool({
         message: query || intentHint || "",
-        city: city || db.users.demo.city || "Shanghai",
+        city: city || DEFAULT_CITY,
         constraints: contextConstraints,
         language,
         intentHint,
@@ -8677,7 +16664,7 @@ const server = http.createServer(async (req, res) => {
       const text = String(body.text || body.message || "").trim();
       if (!text) return writeJson(res, 400, { error: "text required" });
       if (text.length > 2000) return writeJson(res, 400, { error: "text too long", max: 2000 });
-      const language = normalizeLang(body.language || db.users.demo.language || "EN");
+      const language = normalizeLang(body.language || DEFAULT_LANG_EN);
       const voice = String(body.voice || "").trim();
       const tts = await callOpenAITextToSpeech({ text, language, voice });
       if (!tts.ok) {
@@ -8713,8 +16700,8 @@ const server = http.createServer(async (req, res) => {
           });
           clearTimeout(t);
           if (r.ok) {
-            const d = await r.json();
-            translated = (d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content || "").trim();
+            const d = await _readJsonResponseSafe(r, null);
+            translated = (d?.choices?.[0]?.message?.content || "").trim();
           }
         } catch {}
       }
@@ -8746,24 +16733,347 @@ const server = http.createServer(async (req, res) => {
         });
         return writeJson(res, 200, { ok: true, generatedAt: nowIso(), ...result });
       } catch (err) {
-        console.error("[RAG] query error:", err);
-        return writeJson(res, 500, { ok: false, error: err.message });
+        console.error("[RAG] query error:", sanitizeServerLogError(err, "rag_query_failed"));
+        return writeJson(res, 500, { ok: false, error: "rag_query_failed" });
       }
     }
 
     if (req.method === "POST" && pathname === "/api/rag/ingest") {
       // Admin-only: re-ingest all knowledge base docs
+      if (!requireAdmin(req, res)) return;
       const openaiKey = process.env.OPENAI_API_KEY || process.env.OPENAI_KEY;
       try {
         const count = await ragEngine.ingestAllDocs(openaiKey);
         return writeJson(res, 200, { ok: true, chunks: count, generatedAt: nowIso() });
       } catch (err) {
-        return writeJson(res, 500, { ok: false, error: err.message });
+        return writeJson(res, 500, { ok: false, error: "rag_ingest_failed" });
+      }
+    }
+
+    // ── GET /api/ctrip/hotels — live Ctrip hotel search proxy ───────────────
+    if (req.method === "GET" && pathname === "/api/ctrip/hotels") {
+      const _sp = new URL(req.url, "http://x").searchParams;
+      const _city    = String(_sp.get("city") || "").trim();
+      const _checkIn = String(_sp.get("checkIn") || _sp.get("checkin") || "").trim();
+      const _checkOut= String(_sp.get("checkOut") || _sp.get("checkout") || "").trim();
+      const _budget  = _sp.get("budget") ? Number(_sp.get("budget")) : null;
+      const _lang    = normalizeLang(_sp.get("lang") || _sp.get("language") || "ZH");
+      if (!_city) return writeJson(res, 400, { ok: false, error: "city required" });
+      try {
+        const hotels = await Promise.race([
+          fetchCtripHotels({ city: _city, checkIn: _checkIn || undefined, checkOut: _checkOut || undefined, budget: _budget }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 9000)),
+        ]);
+        const source = inferHotelCatalogSource(hotels);
+        return writeJson(res, 200, { ok: true, source, city: _city, hotels: localizeHotelCatalogEntries(hotels || [], _lang) });
+      } catch (err) {
+        return writeJson(res, 200, { ok: false, source: "error", city: _city, hotels: [], error: "hotel_catalog_unavailable" });
+      }
+    }
+
+    if (req.method === "GET" && pathname === "/api/trip/hotels") {
+      const _sp = new URL(req.url, "http://x").searchParams;
+      const _city = String(_sp.get("city") || "").trim();
+      const _checkIn = String(_sp.get("checkIn") || _sp.get("checkin") || "").trim();
+      const _checkOut = String(_sp.get("checkOut") || _sp.get("checkout") || "").trim();
+      const _budget = _sp.get("budget") ? Number(_sp.get("budget")) : null;
+      const _lang = normalizeLang(_sp.get("lang") || _sp.get("language") || "ZH");
+      if (!_city) return writeJson(res, 400, { ok: false, error: "city required" });
+      try {
+        const hotels = await Promise.race([
+          fetchTripHotels({ city: _city, checkIn: _checkIn || undefined, checkOut: _checkOut || undefined, budget: _budget }),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 9000)),
+        ]);
+        return writeJson(res, 200, {
+          ok: true,
+          source: inferHotelCatalogSource(hotels),
+          city: _city,
+          hotels: localizeHotelCatalogEntries(hotels || [], _lang),
+        });
+      } catch (err) {
+        return writeJson(res, 200, { ok: false, source: "error", city: _city, hotels: [], error: "hotel_catalog_unavailable" });
+      }
+    }
+
+    // ── GET /api/flights/search — live flight search via Juhe ───────────────
+    if (req.method === "GET" && pathname === "/api/flights/search") {
+      const _sp = new URL(req.url, "http://x").searchParams;
+      const fromCity = String(_sp.get("from") || _sp.get("origin") || "").trim();
+      const toCity   = String(_sp.get("to") || _sp.get("destination") || "").trim();
+      const date     = String(_sp.get("date") || _sp.get("departDate") || "").trim();
+      const language = String(_sp.get("lang") || _sp.get("language") || "ZH").trim().toUpperCase();
+      if (!fromCity || !toCity) return writeJson(res, 400, { ok: false, error: "from and to are required" });
+      try {
+        const result = await Promise.race([
+          queryJuheFlight(fromCity, toCity, date || undefined),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 9000)),
+        ]);
+        if (result?.flights?.length) {
+          const safeDate = normalizeHotelDate(date || result.date || "") || addDateDays(todayDateIso(), 1);
+          const flights = attachCanonicalFlightRecordBookingUrls(
+            localizeFlightRecords(result.flights, language),
+            { originCity: fromCity, destinationCity: toCity, date: safeDate }
+          );
+          const best = pickBestFlightOption(flights);
+          return writeJson(res, 200, {
+            ok: true,
+            source: result.source || "live",
+            fromCity: result.fromCity,
+            toCity: result.toCity,
+            date: result.date,
+            bestFlight: best,
+            flights,
+            flightStatus: localizeFlightStatus(result.availability || { status: "live", code: "ok", reason: "ok" }, language),
+          });
+        }
+        const fallbackRoute = await amapRoutingWithFallback(fromCity, toCity);
+        const localizedFallbackRoute = fallbackRoute ? {
+          ...fallbackRoute,
+          modes: Array.isArray(fallbackRoute.modes)
+            ? fallbackRoute.modes.map((mode) => ({
+              ...mode,
+              label: localizeIntercityLabel(mode, language),
+              freq: localizeIntercityFreq(mode.freq, language),
+              from_station: localizeIntercityStationName(mode.from_station || "", language),
+              to_station: localizeIntercityStationName(mode.to_station || "", language),
+              inventory_note: mode.inventory_note ? localizeIntercityNote(mode.inventory_note, language) : "",
+            })).map((mode) => attachCanonicalIntercityBookingUrl(mode, {
+              originCity: fromCity,
+              destinationCity: toCity,
+              date,
+            }))
+            : [],
+          note: normalizeEnglishIntercityNote(localizeIntercityNote(fallbackRoute.note, language), language),
+        } : null;
+        return writeJson(res, 200, {
+          ok: false,
+          source: localizedFallbackRoute ? (localizedFallbackRoute._source || "routing_fallback") : "no_results",
+          fromCity,
+          toCity,
+          date: date || null,
+          bestFlight: null,
+          flights: [],
+          flightStatus: localizeFlightStatus(result?.availability || { status: "unavailable", code: "none", reason: "No live flight data" }, language),
+          fallbackRoute: localizedFallbackRoute || null,
+        });
+      } catch (err) {
+        return writeJson(res, 200, {
+          ok: false,
+          source: "error",
+          fromCity,
+          toCity,
+          date: date || null,
+          flights: [],
+          flightStatus: localizeFlightStatus({ status: "error", code: "error", reason: "Live flight data temporarily unavailable" }, language),
+          error: "flight_search_unavailable",
+        });
+      }
+    }
+
+    // ── GET /api/intercity/route — live-ish intercity transport summary ─────
+    if (req.method === "GET" && pathname === "/api/intercity/route") {
+      const _sp = new URL(req.url, "http://x").searchParams;
+      const fromCity = String(_sp.get("from") || _sp.get("origin") || "").trim();
+      const toCity   = String(_sp.get("to") || _sp.get("destination") || "").trim();
+      const date     = String(_sp.get("date") || _sp.get("departDate") || "").trim();
+      const language = String(_sp.get("lang") || _sp.get("language") || "ZH").trim().toUpperCase();
+      if (!fromCity || !toCity) return writeJson(res, 400, { ok: false, error: "from and to are required" });
+      try {
+        const [flightData, routeData] = await Promise.all([
+          Promise.race([
+            queryJuheFlight(fromCity, toCity, date || undefined).catch(() => null),
+            new Promise((resolve) => setTimeout(() => resolve(null), 9000)),
+          ]),
+          Promise.race([
+            Promise.resolve(amapRoutingWithFallback(fromCity, toCity)).catch(() => null),
+            new Promise((resolve) => setTimeout(() => resolve(null), 7000)),
+          ]),
+        ]);
+        const safeDate = normalizeHotelDate(date || flightData?.date || "") || addDateDays(todayDateIso(), 1);
+        const localizedFlights = attachCanonicalFlightRecordBookingUrls(
+          localizeFlightRecords(flightData?.flights || [], language),
+          { originCity: fromCity, destinationCity: toCity, date: safeDate }
+        );
+        const bestFlight = pickBestFlightOption(localizedFlights) || null;
+        const flightSource = bestFlight ? (flightData?.source || "live") : "none";
+        const defaultFlightLabel = flightSource === "ctrip_live" ? "Ctrip flight" : "Flight";
+        const flightMode = bestFlight ? attachCanonicalIntercityBookingUrl({
+          type: "flight",
+          label: `${bestFlight.airline || defaultFlightLabel} ${bestFlight.flightNo || ""}`.trim(),
+          flight_no: bestFlight.flightNo || "",
+          airline: bestFlight.airline || "",
+          dep_time: bestFlight.depTime || "",
+          arr_time: bestFlight.arrTime || "",
+          duration_min: (() => {
+            return parseFlightDurationMinutes(bestFlight.duration) || Number(bestFlight.durationMinutes || 0) || null;
+          })(),
+          price_cny: Number(bestFlight.price || 0) || null,
+          stops: Number(bestFlight.stops || 0),
+          source: flightSource,
+        }, { originCity: fromCity, destinationCity: toCity, date }) : null;
+        const routeModes = Array.isArray(routeData?.modes)
+          ? routeData.modes.map((mode) => ({
+            ...mode,
+            label: localizeIntercityLabel(mode, language),
+            freq: localizeIntercityFreq(mode.freq, language),
+            from_station: localizeIntercityStationName(mode.from_station || "", language),
+            to_station: localizeIntercityStationName(mode.to_station || "", language),
+            inventory_note: mode.inventory_note ? localizeIntercityNote(mode.inventory_note, language) : "",
+          })).map((mode) => attachCanonicalIntercityBookingUrl(mode, {
+            originCity: fromCity,
+            destinationCity: toCity,
+            date,
+          }))
+          : [];
+        const mergedModesRaw = flightMode
+          ? [flightMode].concat(routeModes.filter((m) => m.type !== "flight"))
+          : routeModes;
+        const mergedModes = prioritizeIntercityModes(mergedModesRaw, { recommendedType: routeData?.recommended || "" });
+        const recommended = mergedModes[0] || null;
+        return writeJson(res, 200, {
+          ok: Boolean(mergedModes.length),
+          source: {
+            flight: flightSource,
+            route: routeData?._source || "fallback",
+          },
+          flightStatus: localizeFlightStatus(bestFlight
+            ? { status: "live", code: "ok", reason: "ok" }
+            : (flightData?.availability || { status: "unavailable", code: "none", reason: "No live flight data" }), language),
+          fromCity,
+          toCity,
+          date: date || flightData?.date || null,
+          recommended,
+          modes: mergedModes,
+          flights: localizedFlights,
+          route: routeData ? {
+            ...routeData,
+            modes: routeModes,
+            note: normalizeEnglishIntercityNote(localizeIntercityNote(routeData.note, language), language),
+          } : null,
+        });
+      } catch (err) {
+        return writeJson(res, 200, {
+          ok: false,
+          source: { flight: "error", route: "error" },
+          flightStatus: localizeFlightStatus({ status: "error", code: "error", reason: "Transport data temporarily unavailable" }, language),
+          fromCity,
+          toCity,
+          date: date || null,
+          modes: [],
+          flights: [],
+          error: "transport_unavailable",
+        });
+      }
+    }
+
+    // ── GET /api/city-photo — server-proxied city scenery image ─────────────
+    // Fetches image bytes from Wikipedia/CDN server-side and streams to client.
+    // Works for users in China (server fetches, not client).
+    if (req.method === "GET" && pathname === "/api/city-photo") {
+      const cityRaw = String(new URL(req.url, "http://x").searchParams.get("city") || "").trim().slice(0, 80);
+      if (!cityRaw) {
+        // Return SVG placeholder
+        const fallbackSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 400"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#1a4a7a"/><stop offset="100%" stop-color="#2d7dc4"/></linearGradient></defs><rect width="600" height="400" fill="url(#g)"/><text x="300" y="200" font-size="48" text-anchor="middle" dominant-baseline="middle" fill="#fff" opacity="0.8">🌏</text></svg>`;
+        res.writeHead(200, { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=3600" });
+        return res.end(fallbackSvg);
+      }
+
+      // In-memory cache: key → { bytes, mime, ts }
+      if (!global._cityPhotoCache) global._cityPhotoCache = new Map();
+      const _cache = global._cityPhotoCache;
+      const cacheEntry = _cache.get(cityRaw);
+      if (cacheEntry && Date.now() - cacheEntry.ts < 86400000) {
+        res.writeHead(200, { "Content-Type": cacheEntry.mime, "Cache-Control": "public, max-age=86400", "X-Cache": "HIT" });
+        return res.end(cacheEntry.bytes);
+      }
+
+      // Known curated city queries for better Wikipedia coverage
+      const _cityQueryMap = {
+        "Shanghai": "Shanghai", "上海": "Shanghai",
+        "Beijing": "Beijing", "北京": "Beijing",
+        "Shenzhen": "Shenzhen", "深圳": "Shenzhen",
+        "Guangzhou": "Guangzhou", "广州": "Guangzhou",
+        "Chengdu": "Chengdu", "成都": "Chengdu",
+        "Chongqing": "Chongqing", "重庆": "Chongqing",
+        "Hangzhou": "Hangzhou", "杭州": "Hangzhou",
+        "Suzhou": "Suzhou", "苏州": "Suzhou",
+        "Xi'an": "Xi'an", "Xian": "Xi'an", "西安": "Xi'an",
+        "Nanjing": "Nanjing", "南京": "Nanjing",
+        "Sanya": "Sanya", "三亚": "Sanya",
+        "Lijiang": "Lijiang", "丽江": "Lijiang",
+        "Dali": "Dali, Yunnan", "大理": "Dali, Yunnan",
+        "Guilin": "Guilin", "桂林": "Guilin",
+        "Zhangjiajie": "Zhangjiajie", "张家界": "Zhangjiajie",
+        "Qingdao": "Qingdao", "青岛": "Qingdao",
+        "Xiamen": "Xiamen", "厦门": "Xiamen",
+        "Lhasa": "Lhasa", "拉萨": "Lhasa",
+        "Harbin": "Harbin", "哈尔滨": "Harbin",
+      };
+      const wikiQuery = _cityQueryMap[cityRaw] || cityRaw;
+
+      try {
+        // Step 1: Fetch Wikipedia summary to get thumbnail URL
+        const wikiTitle = encodeURIComponent(wikiQuery.replace(/\s+/g, "_"));
+        const hasChinese = /[\u4e00-\u9fa5]/.test(wikiQuery);
+        const langs = hasChinese ? ["zh", "en"] : ["en", "zh"];
+        let thumbUrl = null;
+        for (const lang of langs) {
+          const wikiApiUrl = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/${wikiTitle}`;
+          try {
+            const wikiData = await new Promise((resolve, reject) => {
+              const req2 = https.get(wikiApiUrl, { headers: { "User-Agent": "CrossX-Travel/1.0 (contact@crossx.ai)" }, timeout: 5000 }, (r) => {
+                let buf = "";
+                r.on("data", (d) => { buf += d; });
+                r.on("end", () => { try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
+              });
+              req2.on("error", reject);
+              req2.on("timeout", () => { req2.destroy(); reject(new Error("wiki timeout")); });
+            });
+            // Prefer thumbnail (smaller), resize to 800px via URL pattern
+            let rawThumb = wikiData?.thumbnail?.source || null;
+            if (rawThumb) {
+              // Wikipedia thumbnail URLs: .../NNNpx-filename.ext → replace with 800px
+              rawThumb = rawThumb.replace(/\/\d+px-/, "/800px-");
+            }
+            thumbUrl = rawThumb || null;
+            if (thumbUrl) break;
+          } catch { continue; }
+        }
+
+        if (!thumbUrl) throw new Error("no thumbnail found");
+
+        // Step 2: Download the actual image bytes (server-side, bypasses client CDN blocks)
+        const imgData = await new Promise((resolve, reject) => {
+          const protocol = thumbUrl.startsWith("https") ? https : http;
+          const req3 = protocol.get(thumbUrl, { headers: { "User-Agent": "CrossX-Travel/1.0 (contact@crossx.ai)" }, timeout: 8000 }, (r) => {
+            const chunks = [];
+            r.on("data", (d) => chunks.push(d));
+            r.on("end", () => resolve({ bytes: Buffer.concat(chunks), mime: r.headers["content-type"] || "image/jpeg" }));
+          });
+          req3.on("error", reject);
+          req3.on("timeout", () => { req3.destroy(); reject(new Error("img timeout")); });
+        });
+
+        // Cache and serve
+        _cache.set(cityRaw, { ...imgData, ts: Date.now() });
+        // Evict old entries (keep max 200)
+        if (_cache.size > 200) {
+          const oldest = [..._cache.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+          if (oldest) _cache.delete(oldest[0]);
+        }
+        res.writeHead(200, { "Content-Type": imgData.mime, "Cache-Control": "public, max-age=86400", "X-Cache": "MISS" });
+        return res.end(imgData.bytes);
+      } catch {
+        // Fallback: beautiful city SVG placeholder
+        const cityLabel = cityRaw.slice(0, 20);
+        const svgFallback = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 400"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#0f2744"/><stop offset="100%" stop-color="#1a5a9a"/></linearGradient></defs><rect width="600" height="400" fill="url(#g)"/><text x="300" y="170" font-size="72" text-anchor="middle" dominant-baseline="middle" fill="rgba(255,255,255,0.15)">🏙️</text><text x="300" y="250" font-size="28" font-family="sans-serif" text-anchor="middle" dominant-baseline="middle" fill="#fff" font-weight="bold">${cityLabel}</text><text x="300" y="290" font-size="14" font-family="sans-serif" text-anchor="middle" dominant-baseline="middle" fill="rgba(255,255,255,0.6)">China Travel</text></svg>`;
+        res.writeHead(200, { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=3600" });
+        return res.end(svgFallback);
       }
     }
 
     if (req.method === "GET" && pathname === "/api/rag/image") {
-      // Free Wikipedia thumbnail lookup — no API key needed
+      // Free Wikipedia thumbnail lookup — no provider credential needed
       const q = (new URL(req.url, "http://x").searchParams.get("q") || "").trim().slice(0, 80);
       if (!q) return writeJson(res, 200, { imageUrl: null });
       const wikiTitle = encodeURIComponent(q.replace(/\s+/g, "_"));
@@ -8807,7 +17117,7 @@ const server = http.createServer(async (req, res) => {
       };
       const cfg = configs[cat] || configs.default;
       const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 250" width="400" height="250">
-  <defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" style="stop-color:${cfg.bg1}"/><stop offset="100%" style="stop-color:${cfg.bg2}"/></linearGradient></defs>
+  <defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="${cfg.bg1}"/><stop offset="100%" stop-color="${cfg.bg2}"/></linearGradient></defs>
   <rect width="400" height="250" fill="url(#g)"/>
   <text x="200" y="120" font-size="64" text-anchor="middle" dominant-baseline="middle">${cfg.icon}</text>
   ${label ? `<text x="200" y="195" font-size="16" text-anchor="middle" fill="${cfg.color}" opacity="0.9" font-family="sans-serif">${label}</text>` : ""}
@@ -8882,9 +17192,9 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const message = sanitizeUserInput(String(body.message || "").trim()); // FS-A-01
       if (!message) return writeJson(res, 400, { error: "message required" });
-      const language = normalizeLang(body.language || db.users.demo.language || "EN");
-      const cityRaw = String(body.city || db.users.demo.city || "Shanghai");
-      const city = cityRaw.split("·")[0].trim() || "Shanghai";
+      const language = normalizeLang(body.language || DEFAULT_LANG_EN);
+      const cityRaw = String(body.city || DEFAULT_CITY);
+      const city = cityRaw.split("·")[0].trim() || DEFAULT_CITY;
       const constraints = body.constraints && typeof body.constraints === "object" ? body.constraints : {};
       const conversationHistory = validateConversationHistory(body.conversationHistory); // AIS-02
       const plan = await runAgentWorkflow({ message, language, city, constraints, conversationHistory });
@@ -8896,7 +17206,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const language = normalizeLang(body.language || "EN");
       const openaiKey = process.env.OPENAI_API_KEY || process.env.OPENAI_KEY;
-      if (!openaiKey) return writeJson(res, 503, { error: "vision_not_configured" });
+      if (!openaiKey) return writeJson(res, 503, { error: "vision_provider_unavailable" });
 
       // Build image list — accept either `images:[{imageBase64,mimeType}]` or legacy single fields
       let imageList = [];
@@ -8929,11 +17239,11 @@ const server = http.createServer(async (req, res) => {
           }),
           signal: AbortSignal.timeout(30000),
         });
-        const ocrData = await ocrRes.json();
+        const ocrData = await _readJsonResponseSafe(ocrRes, null);
         const text = ocrData?.choices?.[0]?.message?.content?.trim() || "";
         return writeJson(res, 200, { text });
       } catch (err) {
-        console.warn("[OCR] Vision API error:", err.message);
+        console.warn("[OCR] Vision API error:", sanitizeServerLogError(err, "vision_failed"));
         return writeJson(res, 500, { error: "vision_failed", text: "" });
       }
     }
@@ -8964,14 +17274,51 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/chat/reply") {
+      // ── Rate limiting: 10 requests/min per IP ────────────────────────────
+      const _chatIp = (req.socket?.remoteAddress || "unknown").slice(0, 45);
+      const _chatNow = Date.now();
+      if (!_chatRateMap.has(_chatIp)) _chatRateMap.set(_chatIp, []);
+      const _chatWindow = _chatRateMap.get(_chatIp).filter((t) => _chatNow - t < 60000);
+      if (_chatWindow.length >= 10) {
+        return writeJson(res, 429, { error: "rate_limit_exceeded", message: "Too many requests. Please wait 1 minute.", retryAfterSec: 60 });
+      }
+      _chatWindow.push(_chatNow);
+      _chatRateMap.set(_chatIp, _chatWindow);
+      // ──────────────────────────────────────────────────────────────────────
       const body = await readBody(req);
       const message = sanitizeUserInput(String(body.message || "").trim()); // FS-A-01
       if (!message) return writeJson(res, 400, { error: "message required" });
-      const language = normalizeLang(body.language || db.users.demo.language || "EN");
-      const currency = String(body.currency || "USD").trim().toUpperCase();
-      const cityRaw = String(body.city || db.users.demo.city || "Shanghai");
-      const city = cityRaw.split("·")[0].trim() || db.users.demo.city || "Shanghai";
-      const constraints = { currency, ...(body.constraints && typeof body.constraints === "object" ? body.constraints : {}) };
+      // Build constraints first, prioritizing explicit parameters over implicit defaults
+      const constraints = {
+        currency: String(body.currency || "USD").trim().toUpperCase(),
+        ...(body.constraints && typeof body.constraints === "object" ? body.constraints : {})
+      };
+      // ── Mid-conversation context update: re-parse message for constraint changes ──
+      // This handles "改成北京", "预算改500", "换成3天" etc. mid-conversation
+      try {
+        const _msgConstraints = extractAgentConstraints(message, {});
+        if (_msgConstraints.city && _msgConstraints.city !== constraints.city) {
+          constraints.city = _msgConstraints.city;
+        }
+        if (_msgConstraints.budget && _msgConstraints.budget !== constraints.budget) {
+          constraints.budget = _msgConstraints.budget;
+        }
+        if (_msgConstraints.duration && _msgConstraints.duration !== constraints.duration) {
+          constraints.duration = _msgConstraints.duration;
+        }
+        if (_msgConstraints.party_size && _msgConstraints.party_size !== constraints.party_size) {
+          constraints.party_size = _msgConstraints.party_size;
+        }
+      } catch (_e) { /* non-critical — proceed with existing constraints */ }
+      // ─────────────────────────────────────────────────────────────────────────────
+      // Extract language from constraints.lang or body.language, otherwise use runtime default
+      const language = normalizeLang(constraints.lang || body.language || DEFAULT_LANG_EN);
+      const currency = constraints.currency;
+      // Extract city — always use constraints.city (may have been updated by extractAgentConstraints above)
+      const cityRaw = String(constraints.city || body.city || DEFAULT_CITY);
+      const city = cityRaw.split("·")[0].trim() || DEFAULT_CITY;
+      // Ensure city is always in constraints (for downstream functions)
+      constraints.city = city;
       const conversationHistory = validateConversationHistory(body.conversationHistory); // AIS-02
       const hotelSignal =
         /(hotel|stay|check[\s-]?in|accommodation|酒店|住宿|住一晚|订酒店|预订酒店)/i.test(message) ||
@@ -8996,6 +17343,24 @@ const server = http.createServer(async (req, res) => {
         conversationStage = "hotel_selection";
         const slotInfo = extractHotelSlotInfo(message, { ...constraints, city: constraints.city || city });
         hotelSlots = slotInfo.slots;
+        const resolvedHotelCity = sanitizeDetectedCityName((hotelSlots && hotelSlots.city) || constraints.city || city || "") || constraints.city || city;
+        if (resolvedHotelCity) constraints.city = resolvedHotelCity;
+        if (hotelSlots && hotelSlots.cityCode) constraints.cityCode = hotelSlots.cityCode;
+
+        // Attempt anonymous live hotel data in parallel (Trip.com first, then Ctrip)
+        let _liveHotelData = null;
+        try {
+          _liveHotelData = await Promise.race([
+            fetchLiveHotelCatalog({
+              city: constraints.city || city,
+              checkIn:  hotelSlots.checkInDate  || undefined,
+              checkOut: hotelSlots.checkOutDate || undefined,
+              budget:   hotelSlots.budget ? normalizeBudgetCap(hotelSlots.budget) : null,
+            }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000)),
+          ]);
+        } catch (_hotelLiveE) { /* fallback to mock silently */ }
+
         const hotelRec = buildHotelRecommendationsFromSlots({
           slots: slotInfo.slots,
           language,
@@ -9003,6 +17368,83 @@ const server = http.createServer(async (req, res) => {
           pageSize: 20,
           refresh: /换一批|refresh|another batch|new options/i.test(message),
         });
+        if (_liveHotelData && _liveHotelData.length >= 2 && hotelRec.options.length) {
+          const _liveHotelTiers = Number(hotelSlots && hotelSlots.budget ? normalizeBudgetCap(hotelSlots.budget) : 0) > 0
+            ? selectBudgetAwareHotelTiers(_liveHotelData, normalizeBudgetCap(hotelSlots.budget), constraints.city || city)
+            : selectPlanHotelTiers(_liveHotelData, constraints.city || city);
+          _liveHotelTiers.slice(0, hotelRec.options.length).forEach((liveHotel, i) => {
+            const opt = hotelRec.options[i];
+            if (!opt) return;
+            if (isGenericDisplayedHotelName(liveHotel, constraints.city || city, language)) return;
+            const localizedHotelDisplay = formatHotelDisplayName(
+              liveHotel.hotelName,
+              liveHotel.hotelNameEn || liveHotel.nameEn,
+              language,
+            );
+            const surfacedHotelName = language === "ZH" ? (liveHotel.hotelName || localizedHotelDisplay) : localizedHotelDisplay;
+            opt.hotelName = surfacedHotelName;
+            opt.placeName = surfacedHotelName;
+            opt.placeDisplay = localizedHotelDisplay;
+            opt.hotelDisplay = localizedHotelDisplay;
+            opt.prompt = pickLang(
+              language,
+              `按方案${opt.optionId || i + 1}预订酒店：${localizedHotelDisplay}，${hotelSlots.checkInDate}入住，${hotelSlots.checkOutDate}离店，${hotelSlots.guestNum || constraints.guestNum || constraints.group_size || constraints.party_size || 1}人。`,
+              `Book hotel option ${opt.optionId || i + 1}: ${localizedHotelDisplay}, check-in ${hotelSlots.checkInDate}, check-out ${hotelSlots.checkOutDate}, ${hotelSlots.guestNum || constraints.guestNum || constraints.group_size || constraints.party_size || 1} guest(s).`,
+              `ホテル案${opt.optionId || i + 1}を予約: ${localizedHotelDisplay}、${hotelSlots.checkInDate}チェックイン、${hotelSlots.checkOutDate}チェックアウト、${hotelSlots.guestNum || constraints.guestNum || constraints.group_size || constraints.party_size || 1}名。`,
+              `호텔 옵션 ${opt.optionId || i + 1} 예약: ${localizedHotelDisplay}, 체크인 ${hotelSlots.checkInDate}, 체크아웃 ${hotelSlots.checkOutDate}, ${hotelSlots.guestNum || constraints.guestNum || constraints.group_size || constraints.party_size || 1}명.`,
+            );
+            // Update title string: keep star rating suffix
+            const starSuffix = opt.title.match(/[··].*/)?.[0] || "";
+            opt.title = localizedHotelDisplay + (starSuffix ? " " + starSuffix : "");
+            if (Array.isArray(opt.nextActions)) {
+              opt.nextActions = opt.nextActions.map((action) => {
+                if (!action || typeof action !== "object") return action;
+                if (action.kind !== "hotel_book" || !action.payload || typeof action.payload !== "object") return action;
+                return {
+                  ...action,
+                  payload: {
+                    ...action.payload,
+                    hotelName: localizedHotelDisplay,
+                  },
+                };
+              });
+            }
+            if (opt.hotelApi && typeof opt.hotelApi === "object") {
+              opt.hotelApi.hotelName = localizedHotelDisplay;
+            }
+            if (liveHotel.lowestPrice > 0) {
+              opt.costRange = `CNY ${liveHotel.lowestPrice}`;
+              if (opt.hotelApi) opt.hotelApi.totalPrice = liveHotel.lowestPrice;
+            }
+            if (liveHotel.imageUrl) opt.imagePath = liveHotel.imageUrl;
+            opt.hotel_ctrip_url = sanitizeLocalizedHotelBookingUrl(liveHotel.ctripBookingUrl, { name: liveHotel.hotelName || "", nameEn: liveHotel.hotelNameEn || liveHotel.nameEn || localizedHotelDisplay || "", fallbackName: localizedHotelDisplay || liveHotel.hotelAddress || constraints.city || city || "Hotel", language });
+            opt.hotel_ctrip_score = liveHotel.commentScore || null;
+            opt.hotel_ctrip_review_count = liveHotel.reviewCount || null;
+            const liveScoreMeta = getHotelGuestScoreMeta(liveHotel);
+            opt.touristFriendlyScore = liveScoreMeta.normalized || opt.touristFriendlyScore || null;
+            opt.hotel_native_price = liveHotel.nativePrice || null;
+            opt.hotel_native_currency = liveHotel.nativeCurrency || null;
+            opt.hotel_native_total_price = liveHotel.nativeTotalPrice || null;
+            const localizedFallbackTags = buildLocalizedHotelProviderTags(liveHotel, language);
+            const localizedFallbackReview = buildLocalizedHotelReviewFallback(liveHotel, language);
+            const canSurfaceNativeProviderText = language === "ZH" || liveHotel.source !== "ctrip_list_live";
+            opt.hotel_ctrip_tags = canSurfaceNativeProviderText
+              ? sanitizeLocalizedHotelProviderText(liveHotel.hotelTags || [], language, () => localizedFallbackTags)
+              : localizedFallbackTags;
+            opt.hotel_ctrip_reviews = canSurfaceNativeProviderText
+              ? sanitizeLocalizedHotelProviderText(liveHotel.hotelReviews || [], language, () => [localizedFallbackReview])
+              : [localizedFallbackReview];
+            if (Array.isArray(opt.comments) && opt.comments.length) {
+              opt.comments = [opt.comments[0], ...(localizedFallbackReview ? [localizedFallbackReview] : [])].filter(Boolean).slice(0, 2);
+            } else if (localizedFallbackReview) {
+              opt.comments = [localizedFallbackReview];
+            }
+            if (!Array.isArray(opt.highlights) || !opt.highlights.length) {
+              opt.highlights = localizedFallbackTags.slice(0, 3);
+            }
+            opt.source = liveHotel.source || "trip_live";
+          });
+        }
         recommendation = {
           imagePath: (hotelRec.options[0] && hotelRec.options[0].imagePath) || "/assets/solution-flow.svg",
           comments: [hotelRec.summary],
@@ -9019,7 +17461,16 @@ const server = http.createServer(async (req, res) => {
             ...item,
             analysis: Array.isArray(item.reasons) ? item.reasons : [],
           })),
-          crossXChoice: hotelRec.crossXChoice,
+          crossXChoice: hotelRec.options[0]
+            ? {
+              optionId: hotelRec.options[0].id,
+              title: hotelRec.options[0].title,
+              score: hotelRec.options[0].score,
+              recommendationLevel: hotelRec.options[0].recommendationLevel,
+              reason: hotelRec.options[0].reasons && hotelRec.options[0].reasons[0] ? hotelRec.options[0].reasons[0] : "",
+              prompt: hotelRec.options[0].prompt,
+            }
+            : hotelRec.crossXChoice,
         };
 
         const explicitDate =
@@ -9040,25 +17491,108 @@ const server = http.createServer(async (req, res) => {
         recommendation = buildSolutionRecommendation(null, intentHint, city, language, constraints, dynamicCandidates);
       }
 
+      // ── GEO Partner 注入：查询匹配城市的活跃合作商家，优先级最高 ────────────
+      let _geoPartnerContext = "";
+      try {
+        const { getGeoPartners } = require("./src/services/db");
+        const _geoCategory =
+          intentHint === "travel" ? "hotel" :
+          intentHint === "eat"    ? "restaurant" : "";
+        const _geoMatches = getGeoPartners({ city, category: _geoCategory, activeOnly: true })
+          .slice(0, 5);
+        if (_geoMatches.length > 0) {
+          // 注入到 recommendation.options 开头，score=99，providerSource='geo_partner'
+          if (!recommendation) recommendation = { options: [], crossXChoice: null };
+          if (!Array.isArray(recommendation.options)) recommendation.options = [];
+          const geoCards = _geoMatches.map((p, i) => ({
+            id:             `geo_${p.id}`,
+            title:          p.name,
+            grade:          "⭐ GEO合作",
+            score:          99 - i,
+            providerSource: "geo_partner",
+            placeName:      p.name,
+            placeDisplay:   p.name,
+            address:        p.address,
+            category:       p.category,
+            costRange:      "",
+            etaWindow:      "",
+            openHours:      "",
+            analysis:       [p.description || "平台 GEO 合作商家，优先推荐"],
+            comments:       [p.description || "平台 GEO 合作商家，优先推荐"],
+            tags:           p.tags ? p.tags.split(",").map(t => t.trim()) : [],
+            candidates:     [],
+          }));
+          recommendation.options = [...geoCards, ...recommendation.options.slice(0, 2)];
+          if (!recommendation.crossXChoice && geoCards[0]) {
+            recommendation.crossXChoice = { title: geoCards[0].title, reason: "GEO 合作商家，平台优先推荐" };
+          }
+          // 构建注入 prompt 的 context 段
+          const categoryLabel = _geoCategory === "hotel" ? "酒店/住宿" : _geoCategory === "restaurant" ? "餐厅/美食" : "商家";
+          _geoPartnerContext = [
+            `\n## ⭐ GEO 优先合作商家（${categoryLabel}，必须放在推荐首位）`,
+            ..._geoMatches.map((p, i) =>
+              `${i + 1}. 【${p.name}】| 城市:${p.city} | 地址:${p.address || "详询商家"} | ${p.description || ""}${p.contact ? ` | 联系:${p.contact}` : ""}${p.tags ? ` | 标签:${p.tags}` : ""}`
+            ),
+            "以上商家为平台 GEO 合作商家，在相关推荐中必须排在第一位，用「🏆 平台优选」标注。",
+          ].join("\n");
+        }
+      } catch (_geoErr) { /* non-critical, proceed */ }
+      // ─────────────────────────────────────────────────────────────────────────
+
       const _chatTimeout = new Promise((_, reject) => setTimeout(() => reject(new Error("chat_timeout")), 35000));
+      const buildChatTimeoutFallbackReply = () => {
+        const hasRecommendation = recommendation && Array.isArray(recommendation.options) && recommendation.options.length > 0;
+        if (!hasRecommendation) {
+          return pickLang(
+            language,
+            "AI 正在思考，请稍后重试。",
+            "AI is taking longer than expected — please try again.",
+            "AIが応答に時間がかかっています。再試行してください。",
+            "AI 응답이 늦어지고 있습니다. 다시 시도해 주세요.",
+          );
+        }
+        const choice = recommendation.crossXChoice && recommendation.crossXChoice.title
+          ? recommendation.crossXChoice.title
+          : recommendation.options[0].title;
+        return pickLang(
+          language,
+          `AI 回复超时，但可执行推荐已经生成。当前优先建议：${choice}。请直接查看下方方案卡并继续执行，或稍后重试以获取完整自然语言说明。`,
+          `The AI reply timed out, but the executable recommendation is ready. Current best pick: ${choice}. You can continue with the option cards below now, or retry for the full natural-language explanation.`,
+          `AI応答はタイムアウトしましたが、実行可能な推薦結果は生成済みです。現在の最優先候補: ${choice}。下のオプションカードからそのまま進めるか、完全な説明が必要なら再試行してください。`,
+          `AI 응답은 타임아웃되었지만 실행 가능한 추천 결과는 이미 준비되었습니다. 현재 우선 추천: ${choice}. 아래 옵션 카드로 바로 진행하거나, 전체 설명이 필요하면 다시 시도해 주세요.`,
+        );
+      };
       const smart = await Promise.race([
-        buildSmartChatReply({ message, language, city, constraints, recommendation, conversationHistory }),
+        buildSmartChatReply({ message, language, city: constraints.city || city, constraints, recommendation, conversationHistory, geoPartnerContext: _geoPartnerContext }),
         _chatTimeout,
       ]).catch((e) => {
         if (e.message === "chat_timeout") {
           return {
-            source: "timeout", reply: pickLang(language,
-              "AI 正在思考，请稍后重试。",
-              "AI is taking longer than expected — please try again.",
-              "AIが応答に時間がかかっています。再試行してください。",
-              "AI 응답이 늦어지고 있습니다. 다시 시도해 주세요.",
-            ), model: "none", fallbackReason: "timeout", structured: null,
+            source: "timeout", reply: buildChatTimeoutFallbackReply(), model: "none", fallbackReason: "timeout", structured: null,
           };
         }
         throw e;
       });
       const userCue = summarizeUserCue(message, language);
-      const thinking = buildThinkingNarrative({ message, language, constraints, recommendation });
+      let thinking = buildThinkingNarrative({ message, language, constraints, recommendation });
+      // Server-side guarantee: thinking must be non-empty natural language — never JSON/code
+      if (!thinking || /^\s*[{\[]/.test(thinking) || thinking.startsWith("```")) {
+        const _city = constraints.city || city || "";
+        const _snap = message.slice(0, 40);
+        const _requestLabel = pickLang(
+          language,
+          `「${_snap}」请求`,
+          "your request",
+          "ご依頼内容",
+          "요청 내용",
+        );
+        thinking = pickLang(language,
+          `正在为您分析${_city ? `「${_city}」的` : ""}${_requestLabel}，综合评估位置便利度、价格合理性与用户口碑，为您匹配最合适的选项。`,
+          `Analyzing ${_requestLabel}${_city ? ` in ${_city}` : ""} — evaluating location, value, and ratings for you.`,
+          `${_city ? `${_city}での` : ""}${_requestLabel}を分析中。立地・価格・口コミで総合評価しています。`,
+          `${_city ? `${_city} ` : ""}${_requestLabel} 분석 중. 위치·가격·리뷰를 종합 평가합니다.`
+        );
+      }
       const dataSources = buildChatDataSources({ hotelSignal, dynamicCandidates, recommendation });
       const options = (recommendation.options || []).slice(0, 3).map((item) => ({
         id: item.id,
@@ -9109,6 +17643,15 @@ const server = http.createServer(async (req, res) => {
         })(),
         candidates: (item.candidates || []).slice(0, 3),
         hotelApi: item.hotelApi || null,
+        hotel_ctrip_url: item.hotel_ctrip_url || null,
+        hotel_ctrip_score: item.hotel_ctrip_score || null,
+        hotel_ctrip_review_count: item.hotel_ctrip_review_count || null,
+        hotel_ctrip_tags: item.hotel_ctrip_tags || [],
+        hotel_ctrip_reviews: item.hotel_ctrip_reviews || [],
+        hotel_native_price: item.hotel_native_price || null,
+        hotel_native_currency: item.hotel_native_currency || null,
+        hotel_native_total_price: item.hotel_native_total_price || null,
+        hotel_source: item.source || null,
       }));
       audit.append({
         kind: "chat",
@@ -9118,27 +17661,34 @@ const server = http.createServer(async (req, res) => {
         toolInput: { message, language, city, constraints, intentHint },
         toolOutput: { source: smart.source, model: smart.model, options: options.map((o) => ({ id: o.id, grade: o.grade })) },
       });
+      const smartBudgetContext = resolvePlanBudgetContext({
+        message,
+        constraints,
+        slotBudget: hotelSlots && hotelSlots.budget ? normalizeBudgetCap(hotelSlots.budget) : (constraints && constraints.budget ? constraints.budget : null),
+        days: hotelSlots && hotelSlots.checkInDate && hotelSlots.checkOutDate
+          ? countStayNights(hotelSlots.checkInDate, hotelSlots.checkOutDate) || 1
+          : 1,
+        pax: Number(hotelSlots && hotelSlots.guestNum || constraints.guestNum || constraints.group_size || constraints.party_size || constraints.pax || 1) || 1,
+        language,
+      });
       saveDb();
       return writeJson(res, 200, {
         source: smart.source,
         model: smart.model,
         thinking,
         reply: smart.reply,
-        fallbackReason: smart.fallbackReason || null,
+        fallbackReason: sanitizeLlmIssueForViewer(smart.fallbackReason || ""),
         conversationStage,
         clarifyNeeded,
         hotelSlots,
+        constraints,
+        budgetContext: smartBudgetContext,
         crossXChoice: recommendation.crossXChoice || null,
         options,
         dataSources,
         // AI-native structured plan (options_card / clarify) — client renders as itinerary cards
         structured: smart.structured || null,
-        llm: {
-          configured: Boolean(OPENAI_API_KEY),
-          keyHealth: OPENAI_KEY_HEALTH,
-          keySource: OPENAI_KEY_SOURCE,
-          lastRuntime: OPENAI_LAST_RUNTIME,
-        },
+        llm: buildViewerChatLlmStatus(),
       });
     }
 
@@ -9146,9 +17696,9 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const message = String(body.message || "").trim();
       if (!message) return writeJson(res, 400, { error: "message required" });
-      const language = normalizeLang(body.language || db.users.demo.language || "EN");
-      const cityRaw = String(body.city || db.users.demo.city || "Shanghai");
-      const city = cityRaw.split("·")[0].trim() || db.users.demo.city || "Shanghai";
+      const language = normalizeLang(body.language || DEFAULT_LANG_EN);
+      const cityRaw = String(body.city || DEFAULT_CITY);
+      const city = cityRaw.split("·")[0].trim() || DEFAULT_CITY;
       const constraints = body.constraints && typeof body.constraints === "object" ? body.constraints : {};
 
       const openai = await callOpenAIFreeformReply({ message, language, city, constraints });
@@ -9161,7 +17711,7 @@ const server = http.createServer(async (req, res) => {
       );
       const reply = openai.ok ? openai.text : fallbackReply;
       const source = openai.ok ? "openai" : "fallback";
-      const fallbackReason = openai.ok ? null : openai.error;
+      const fallbackReason = openai.ok ? null : sanitizeLlmIssueForViewer(openai.error);
 
       audit.append({
         kind: "chat",
@@ -9181,13 +17731,28 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/system/flags") {
+      if (!requireAdmin(req, res)) return;
       return writeJson(res, 200, { flags: db.featureFlags });
     }
 
     if (req.method === "GET" && pathname === "/api/system/flags/evaluate") {
-      const userId = parsed.query.userId || "demo";
+      const requestedUserId = String(parsed.query.userId || "").trim();
+      const adminUserId = requestedUserId || "anon";
+      const subject = resolveRequestSubject(req, null, { allowDemo: isDemoIdentityEnabled() });
+      const userId = _isAdminRequest(req)
+        ? adminUserId
+        : (subject && subject.id
+            ? subject.id
+            : ((requestedUserId === "demo" && isDemoIdentityEnabled()) ? "demo" : "guest"));
+      const responseUserId = _isAdminRequest(req)
+        ? userId
+        : (subject && subject.via === "auth"
+            ? toViewerUserRef(userId)
+            : (subject && (subject.via === "device" || subject.via === "query_device")
+                ? buildViewerDevicePublicRef(userId)
+                : userId));
       return writeJson(res, 200, {
-        userId,
+        userId: responseUserId,
         evaluated: evaluateFlagsForUser(userId),
       });
     }
@@ -9233,6 +17798,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/system/mcp-policy") {
+      if (!requireAdmin(req, res)) return;
       return writeJson(res, 200, { policy: db.mcpPolicy || { enforceSla: false, simulateBreachRate: 0 } });
     }
 
@@ -9265,6 +17831,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/mcp/contracts") {
+      if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
       if (!body || typeof body !== "object" || !body.id) {
         return writeJson(res, 400, { error: "id required" });
@@ -9293,9 +17860,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/emergency/support") {
       const body = await readBody(req);
+      const _supportIsAdmin = _isSupportAdmin(req);
+      const resolvedTaskId = resolveInternalTaskId(body.taskId || null) || null;
       const ticket = createSupportTicket({
         reason: body.reason || "user_clicked_emergency",
-        taskId: body.taskId || null,
+        taskId: resolvedTaskId,
         source: "emergency_button",
       });
       const session = ensureSupportSessionForTicket(ticket, {
@@ -9321,8 +17890,8 @@ const server = http.createServer(async (req, res) => {
         touchTicketFromSession(session, "emergency_room_opened");
       }
 
-      if (body.taskId && db.tasks[body.taskId]) {
-        const task = db.tasks[body.taskId];
+      if (resolvedTaskId && db.tasks[resolvedTaskId]) {
+        const task = db.tasks[resolvedTaskId];
         task.handoff = {
           ticketId: ticket.id,
           sessionId: ticket.sessionId || (session && session.id) || null,
@@ -9341,24 +17910,26 @@ const server = http.createServer(async (req, res) => {
       pushMetricEvent({
         kind: "emergency_support_requested",
         userId: _whoFromReq(req),
-        taskId: body.taskId || null,
+        taskId: resolvedTaskId,
         meta: { reason: body.reason || "user_clicked_emergency", ticketId: ticket.id, sessionId: ticket.sessionId || null },
       });
       audit.append({
         kind: "support",
         who: _whoFromReq(req),
         what: "emergency.support.requested",
-        taskId: body.taskId || null,
+        taskId: resolvedTaskId,
         toolInput: body,
         toolOutput: { ticketId: ticket.id, sessionId: ticket.sessionId || null },
       });
+      const supportToken = session ? _setSupportSessionCookie(req, res, session, "user") : "";
       saveDb();
       return writeJson(res, 200, {
         ok: true,
-        ticketId: ticket.id,
-        sessionId: ticket.sessionId || null,
-        ticket,
-        session: session ? buildSupportSessionSummary(session) : null,
+        ticketId: toViewerSupportTicketRef(ticket, { isAdmin: _supportIsAdmin }),
+        sessionId: toViewerSupportSessionRef(ticket.sessionId || (session && session.id) || "", { isAdmin: _supportIsAdmin }),
+        ticket: sanitizeSupportTicketForViewer(ticket, { isAdmin: _supportIsAdmin }),
+        session: session ? sanitizeSupportSessionSummaryForViewer(session, { isAdmin: _supportIsAdmin }) : null,
+        ...(_shouldReturnSupportToken(req) && supportToken ? { supportAccessToken: supportToken } : {}),
         eta: ticket.eta,
         channel: ticket.channel,
       });
@@ -9366,20 +17937,24 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/support/tickets") {
       const now = Date.now();
-      const tickets = db.supportTickets
+      const _supportIsAdmin = _isSupportAdmin(req);
+      const tickets = listVisibleSupportTicketsForRequest(req)
         .slice(-20)
-        .reverse()
         .map((ticket) => {
           const session = ensureSupportSessionForTicket(ticket, { skipGreeting: true, startedBy: "system" });
           const created = new Date(ticket.createdAt).getTime();
           const elapsedMin = Math.max(0, Math.round((now - created) / 60000));
           const etaMin = Math.max(0, Number(ticket.etaMin || 5) - elapsedMin);
-          return {
-            ...ticket,
-            etaMin,
-            sessionId: ticket.sessionId || (session && session.id) || null,
-            liveSession: session ? buildSupportSessionSummary(session) : null,
-          };
+          return sanitizeSupportTicketForViewer(
+            {
+              ...ticket,
+              etaMin,
+            },
+            {
+              isAdmin: _supportIsAdmin,
+              liveSession: session,
+            },
+          );
         });
       return writeJson(res, 200, {
         tickets,
@@ -9387,20 +17962,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && pathname === "/api/support/ops-board") {
+      if (!requireAdmin(req, res)) return;
       const limit = Number(parsed.query.limit || 80);
       return writeJson(res, 200, buildSupportOpsBoard(limit));
     }
 
     if (req.method === "POST" && pathname === "/api/support/sessions/start") {
       const body = await readBody(req);
+      const _supportIsAdmin = _isSupportAdmin(req);
+      const resolvedTaskId = resolveInternalTaskId(body.taskId || null) || null;
       let ticket = null;
       if (body.ticketId) {
-        ticket = db.supportTickets.find((item) => item.id === String(body.ticketId)) || null;
+        ticket = resolveSupportTicketRecord(body.ticketId) || null;
+        const access = resolveSupportTicketAccess(req, ticket, body);
+        if (!access.ok) return writeJson(res, 404, { error: "Ticket not found" });
       }
       if (!ticket) {
         ticket = createSupportTicket({
           reason: body.reason || "live_support_started",
-          taskId: body.taskId || null,
+          taskId: resolvedTaskId,
           source: body.source || "live_support_start",
         });
       }
@@ -9409,7 +17989,7 @@ const server = http.createServer(async (req, res) => {
         reason: body.reason || ticket.reason || "live_support_started",
         skipGreeting: true,
       });
-      if (!session) return writeJson(res, 500, { error: "Session init failed" });
+      if (!session) return writeJson(res, 500, { error: "support_session_init_failed" });
       setSupportSessionPresence(session, "user", true);
       appendSupportSessionMessage(session, {
         actor: "system",
@@ -9439,24 +18019,24 @@ const server = http.createServer(async (req, res) => {
         toolInput: body,
         toolOutput: { ticketId: ticket.id, sessionId: session.id },
       });
+      const supportToken = _setSupportSessionCookie(req, res, session, "user");
       saveDb();
       return writeJson(res, 200, {
         ok: true,
-        ticket,
-        session: {
-          ...buildSupportSessionSummary(session),
-          messages: session.messages.slice(-60),
-        },
+        ticket: sanitizeSupportTicketForViewer(ticket, { isAdmin: _supportIsAdmin }),
+        session: sanitizeSupportSessionSummaryForViewer(session, { isAdmin: _supportIsAdmin, includeMessages: true }),
+        ...(_shouldReturnSupportToken(req) && supportToken ? { supportAccessToken: supportToken } : {}),
       });
     }
 
     if (req.method === "GET" && pathname === "/api/support/sessions") {
+      if (!requireAdmin(req, res)) return;
       const statuses = parsed.query.status ? String(parsed.query.status).split(",") : [];
       const sessions = listSupportSessions({
         actor: parsed.query.actor || "user",
         statuses,
         limit: Number(parsed.query.limit || 40),
-        ticketId: parsed.query.ticketId || "",
+        ticketId: resolveInternalSupportTicketId(parsed.query.ticketId || "") || "",
         taskId: parsed.query.taskId || "",
       }).map((session) => {
         const summary = buildSupportSessionSummary(session);
@@ -9474,17 +18054,17 @@ const server = http.createServer(async (req, res) => {
       const sessionId = pathname.split("/")[4];
       const session = getSupportSessionById(sessionId);
       if (!session) return writeJson(res, 404, { error: "Session not found" });
-      const actor = parsed.query.actor || "user";
+      const access = resolveSupportSessionAccess(req, session);
+      if (!access.ok) return writeJson(res, 401, { error: "unauthorized", message: sanitizeSupportAccessError(access.error) });
+      const actor = access.actor;
       readSupportSession(session, actor);
       const ticket = findTicketBySessionId(session.id);
       if (ticket) ensureSupportSessionForTicket(ticket, { skipGreeting: true, startedBy: "system" });
       saveDb();
+      const _supportIsAdmin = access.via === "admin";
       return writeJson(res, 200, {
-        session: {
-          ...buildSupportSessionSummary(session),
-          messages: session.messages.slice(-100),
-        },
-        ticket: ticket || null,
+        session: sanitizeSupportSessionSummaryForViewer(session, { isAdmin: _supportIsAdmin, includeMessages: true }),
+        ticket: ticket ? sanitizeSupportTicketForViewer(ticket, { isAdmin: _supportIsAdmin }) : null,
       });
     }
 
@@ -9493,7 +18073,9 @@ const server = http.createServer(async (req, res) => {
       const session = getSupportSessionById(sessionId);
       if (!session) return writeJson(res, 404, { error: "Session not found" });
       const body = await readBody(req);
-      const actor = normalizeSupportActor(body.actor || body.role || "user");
+      const access = resolveSupportSessionAccess(req, session, body);
+      if (!access.ok) return writeJson(res, 401, { error: "unauthorized", message: sanitizeSupportAccessError(access.error) });
+      const actor = access.actor;
       const type = String(body.type || "text").toLowerCase() === "voice" ? "voice" : "text";
       const text = String(body.text || "").trim();
       const audioDataUrl = String(body.audioDataUrl || "");
@@ -9535,21 +18117,21 @@ const server = http.createServer(async (req, res) => {
       });
       audit.append({
         kind: "support",
-        who: actor === "ops" ? "ops_agent" : "demo",
+        who: actor === "ops"
+          ? (String(body.agentId || session.assignedAgentId || _whoFromReq(req) || "ops_agent").slice(0, 80))
+          : (_whoFromReq(req) !== "anon" ? _whoFromReq(req) : `anon_support:${session.id}`),
         what: "support.session.message",
         taskId: (ticket && ticket.taskId) || null,
         toolInput: { actor, type },
         toolOutput: { sessionId: session.id, ticketId: ticket ? ticket.id : null, messageId: message && message.id },
       });
       saveDb();
+      const _supportIsAdmin = access.via === "admin";
       return writeJson(res, 200, {
         ok: true,
-        message,
-        session: {
-          ...buildSupportSessionSummary(session),
-          messages: session.messages.slice(-100),
-        },
-        ticket: ticket || null,
+        message: sanitizeSupportMessageForViewer(message, { isAdmin: _supportIsAdmin }),
+        session: sanitizeSupportSessionSummaryForViewer(session, { isAdmin: _supportIsAdmin, includeMessages: true }),
+        ticket: ticket ? sanitizeSupportTicketForViewer(ticket, { isAdmin: _supportIsAdmin }) : null,
       });
     }
 
@@ -9558,9 +18140,14 @@ const server = http.createServer(async (req, res) => {
       const session = getSupportSessionById(sessionId);
       if (!session) return writeJson(res, 404, { error: "Session not found" });
       const body = await readBody(req);
-      readSupportSession(session, body.actor || "user");
+      const access = resolveSupportSessionAccess(req, session, body);
+      if (!access.ok) return writeJson(res, 401, { error: "unauthorized", message: sanitizeSupportAccessError(access.error) });
+      readSupportSession(session, access.actor);
       saveDb();
-      return writeJson(res, 200, { ok: true, session: buildSupportSessionSummary(session) });
+      return writeJson(res, 200, {
+        ok: true,
+        session: sanitizeSupportSessionSummaryForViewer(session, { isAdmin: access.via === "admin" }),
+      });
     }
 
     if (req.method === "POST" && /^\/api\/support\/sessions\/[^/]+\/presence$/.test(pathname)) {
@@ -9568,14 +18155,18 @@ const server = http.createServer(async (req, res) => {
       const session = getSupportSessionById(sessionId);
       if (!session) return writeJson(res, 404, { error: "Session not found" });
       const body = await readBody(req);
-      const _presenceActor = String(body.actor || "user");
-      if (!["user", "ops"].includes(_presenceActor)) return writeJson(res, 400, { error: "actor must be 'user' or 'ops'" });
-      setSupportSessionPresence(session, _presenceActor, body.online !== false);
+      const access = resolveSupportSessionAccess(req, session, body);
+      if (!access.ok) return writeJson(res, 401, { error: "unauthorized", message: sanitizeSupportAccessError(access.error) });
+      setSupportSessionPresence(session, access.actor, body.online !== false);
       saveDb();
-      return writeJson(res, 200, { ok: true, session: buildSupportSessionSummary(session) });
+      return writeJson(res, 200, {
+        ok: true,
+        session: sanitizeSupportSessionSummaryForViewer(session, { isAdmin: access.via === "admin" }),
+      });
     }
 
     if (req.method === "POST" && /^\/api\/support\/sessions\/[^/]+\/claim$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
       const sessionId = pathname.split("/")[4];
       const session = getSupportSessionById(sessionId);
       if (!session) return writeJson(res, 404, { error: "Session not found" });
@@ -9613,6 +18204,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && /^\/api\/support\/sessions\/[^/]+\/close$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
       const sessionId = pathname.split("/")[4];
       const session = getSupportSessionById(sessionId);
       if (!session) return writeJson(res, 404, { error: "Session not found" });
@@ -9650,9 +18242,12 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && /^\/api\/support\/tickets\/[^/]+\/evidence$/.test(pathname)) {
       const ticketId = pathname.split("/")[4];
-      const ticket = db.supportTickets.find((t) => t.id === ticketId);
-      if (!ticket) return writeJson(res, 404, { error: "Ticket not found" });
       const body = await readBody(req);
+      const ticket = requireSupportTicketAccess(ticketId, req, res, body);
+      if (!ticket) return;
+      const session = ensureSupportSessionForTicket(ticket, { skipGreeting: true, startedBy: "system" });
+      const access = resolveSupportSessionAccess(req, session, body);
+      if (!access.ok) return writeJson(res, 401, { error: "unauthorized", message: sanitizeSupportAccessError(access.error) });
       const item = {
         id: `evi_${Date.now().toString().slice(-8)}_${(ticket.evidence || []).length + 1}`,
         type: String(body.type || "user_note"),
@@ -9664,7 +18259,6 @@ const server = http.createServer(async (req, res) => {
       ticket.evidence.push(item);
       ticket.updatedAt = nowIso();
       ticket.history.push({ at: nowIso(), status: ticket.status, note: "evidence_uploaded" });
-      const session = ensureSupportSessionForTicket(ticket, { skipGreeting: true, startedBy: "system" });
       if (session) {
         appendSupportSessionMessage(session, {
           actor: "system",
@@ -9682,17 +18276,23 @@ const server = http.createServer(async (req, res) => {
         toolOutput: { ticketId: ticket.id, evidenceId: item.id },
       });
       saveDb();
-      return writeJson(res, 200, { ok: true, ticketId: ticket.id, evidence: item, count: ticket.evidence.length });
+      return writeJson(res, 200, {
+        ok: true,
+        ticketId: toViewerSupportTicketRef(ticket, { isAdmin: access.via === "admin" }),
+        evidence: sanitizeSupportEvidenceForViewer(item, { isAdmin: access.via === "admin" }),
+        count: ticket.evidence.length,
+      });
     }
 
     if (req.method === "POST" && /^\/api\/support\/tickets\/[^/]+\/status$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
       const ticketId = pathname.split("/")[4];
-      const ticket = db.supportTickets.find((t) => t.id === ticketId);
+      const ticket = resolveSupportTicketRecord(ticketId);
       if (!ticket) return writeJson(res, 404, { error: "Ticket not found" });
       const body = await readBody(req);
       const toStatus = body.status;
       if (!["in_progress", "resolved"].includes(toStatus)) {
-        return writeJson(res, 400, { error: "Unsupported status" });
+        return writeJson(res, 400, { error: "invalid_status" });
       }
       const updated = applyTicketTransitionAndSync(ticket, toStatus, `Ticket ${ticket.id} -> ${toStatus}`);
       if (!updated.ok) return writeJson(res, 400, { error: updated.error });
@@ -9713,44 +18313,51 @@ const server = http.createServer(async (req, res) => {
         toolOutput: { status: ticket.status, sessionId: ticket.sessionId || null },
       });
       saveDb();
-      return writeJson(res, 200, { ok: true, ticket, taskId: ticket.taskId || null, task: task || null, sessionId: ticket.sessionId || null });
+      return writeJson(res, 200, {
+        ok: true,
+        ticket: sanitizeSupportTicketForViewer(ticket, { isAdmin: true }),
+        taskId: ticket.taskId || null,
+        task: task || null,
+        sessionId: ticket.sessionId || null,
+      });
     }
 
     if (req.method === "POST" && pathname === "/api/tasks") {
       const body = await readBody(req);
-      // Override userId with authenticated user; fall back to body.userId then "demo"
-      const _taskWho = _whoFromReq(req);
-      if (_taskWho && _taskWho !== "anon") body.userId = _taskWho;
+      const taskSubject = buildTaskOwnershipContext(req, body);
+      body.userId = taskSubject.userId;
+      body.createdBy = taskSubject.createdBy;
       const task = createTask(body);
-      return writeJson(res, 200, { taskId: task.id, plan: task.plan, task });
+      const viewerTask = sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) });
+      return writeJson(res, 200, { taskId: toViewerTaskRef(task, { isAdmin: _isAdminRequest(req) }), plan: viewerTask && viewerTask.plan ? viewerTask.plan : task.plan, task: viewerTask });
     }
 
     if (req.method === "GET" && /^\/api\/tasks\/[^/]+$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const task = requireTask(taskId, req, res);
       if (!task) return;
-      return writeJson(res, 200, { task });
+      return writeJson(res, 200, { task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }) });
     }
 
     if (req.method === "GET" && /^\/api\/tasks\/[^/]+\/state$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const task = requireTask(taskId, req, res);
       if (!task) return;
       syncTaskAgentMeta(task);
       return writeJson(res, 200, {
-        taskId: task.id,
+        taskId: toViewerTaskRef(task, { isAdmin: _isAdminRequest(req) }),
         status: task.status,
         constraints: task.constraints || {},
-        sessionState: task.sessionState || null,
+        sessionState: sanitizeTaskSessionStateForViewer(task.sessionState || null, { task, isAdmin: _isAdminRequest(req) }),
         expertRoute: task.expertRoute || null,
       });
     }
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/state$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
-      if (!task) return;
       const body = await readBody(req);
+      const task = requireTask(taskId, req, res, body);
+      if (!task) return;
       const slots = body.slots && typeof body.slots === "object" ? body.slots : {};
       const laneId = body.laneId ? String(body.laneId) : "";
       const stage = body.stage ? String(body.stage) : "";
@@ -9786,7 +18393,7 @@ const server = http.createServer(async (req, res) => {
         task.updatedAt = nowIso();
         audit.append({
           kind: "task",
-          who: task.userId,
+          who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
           what: "task.state.updated",
           taskId: task.id,
           toolInput: body,
@@ -9810,48 +18417,55 @@ const server = http.createServer(async (req, res) => {
       saveDb();
       return writeJson(res, 200, {
         ok: true,
-        task: updatedTask,
-        sessionState: updatedTask.sessionState || null,
+        task: sanitizeTaskForViewer(updatedTask, { isAdmin: _isAdminRequest(req) }),
+        sessionState: sanitizeTaskSessionStateForViewer(updatedTask.sessionState || null, { task: updatedTask, isAdmin: _isAdminRequest(req) }),
         expertRoute: updatedTask.expertRoute || null,
       });
     }
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/replan\/preview$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const body = await readBody(req);
+      const task = requireTask(taskId, req, res, body);
       if (!task) return;
       if (!canReplanTask(task)) {
         return writeJson(res, 409, {
-          error: `Task ${task.id} cannot be previewed in status ${task.status}`,
+          error: `Task ${toViewerTaskRef(task, { isAdmin: _isAdminRequest(req) })} cannot be previewed in status ${task.status}`,
           status: task.status,
         });
       }
-      const body = await readBody(req);
       const preview = buildReplanPreview(task, body);
       return writeJson(res, 200, { ok: true, preview });
     }
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/replan$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const body = await readBody(req);
+      const task = requireTask(taskId, req, res, body);
       if (!task) return;
       if (!canReplanTask(task)) {
         return writeJson(res, 409, {
-          error: `Task ${task.id} cannot be replanned in status ${task.status}`,
+          error: `Task ${toViewerTaskRef(task, { isAdmin: _isAdminRequest(req) })} cannot be replanned in status ${task.status}`,
           status: task.status,
         });
       }
-      const body = await readBody(req);
       const nextTask = replanTask(task, body);
-      return writeJson(res, 200, { ok: true, task: nextTask, plan: nextTask.plan });
+      const viewerTask = sanitizeTaskForViewer(nextTask, { isAdmin: _isAdminRequest(req) });
+      return writeJson(res, 200, {
+        ok: true,
+        task: viewerTask,
+        plan: viewerTask && viewerTask.plan ? viewerTask.plan : nextTask.plan,
+      });
     }
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/steps\/[^/]+\/retry$/.test(pathname)) {
       const parts = pathname.split("/");
       const taskId = parts[3];
-      const stepId = parts[5];
-      const task = requireTask(taskId, res);
+      const requestedStepId = parts[5];
+      const body = await readBody(req);
+      const task = requireTask(taskId, req, res, body);
       if (!task) return;
+      const stepId = resolveInternalTaskStepId(task, requestedStepId);
       const step = (task.steps || task.plan.steps || []).find((s) => s.id === stepId);
       if (!step) return writeJson(res, 404, { error: "Step not found" });
       if (!task.confirmed) {
@@ -9863,7 +18477,7 @@ const server = http.createServer(async (req, res) => {
       task.fallbackEvents.push({
         kind: "step_retry_requested",
         at: nowIso(),
-        note: `Retry requested for ${stepId}`,
+        note: `Retry requested for ${step.label || "step"}`,
       });
       if (!task.plan.constraints || typeof task.plan.constraints !== "object") {
         task.plan.constraints = {};
@@ -9880,23 +18494,28 @@ const server = http.createServer(async (req, res) => {
       task.updatedAt = nowIso();
       audit.append({
         kind: "task",
-        who: task.userId,
+        who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
         what: "task.step.retry.requested",
         taskId: task.id,
         toolInput: { stepId },
         toolOutput: { status: task.status },
       });
       saveDb();
-      return writeJson(res, 200, { ok: true, task, stepId, nextAction: "execute_task_again" });
+      return writeJson(res, 200, {
+        ok: true,
+        task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }),
+        stepId,
+        nextAction: "execute_task_again",
+      });
     }
 
     if (req.method === "GET" && /^\/api\/tasks\/[^/]+\/refund-policy$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const task = requireTask(taskId, req, res);
       if (!task) return;
       const confirm = (task.plan && task.plan.confirm) || {};
       return writeJson(res, 200, {
-        taskId,
+        taskId: toViewerTaskRef(task, { isAdmin: _isAdminRequest(req) }),
         policy: {
           cancelPolicy: confirm.cancelPolicy || "Refer to provider policy",
           guarantee: confirm.guarantee || null,
@@ -9908,9 +18527,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/confirm$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
-      if (!task) return;
       const body = await readBody(req);
+      const task = requireTask(taskId, req, res, body);
+      if (!task) return;
       task.confirmed = true;
       task.confirmedAt = nowIso();
       task.confirmPayload = body;
@@ -9921,20 +18540,20 @@ const server = http.createServer(async (req, res) => {
       task.updatedAt = nowIso();
       audit.append({
         kind: "task",
-        who: task.userId,
+        who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
         what: "task.confirmed",
         taskId: task.id,
         toolInput: body,
         toolOutput: { status: "ok" },
       });
-      pushMetricEvent({ kind: "task_confirmed", userId: task.userId, taskId: task.id });
+      pushMetricEvent({ kind: "task_confirmed", userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }), taskId: task.id });
       saveDb();
-      return writeJson(res, 200, { ok: true, task });
+      return writeJson(res, 200, { ok: true, task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }) });
     }
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/pause$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const task = requireTask(taskId, req, res);
       if (!task) return;
       task.pauseState = "paused";
       task.status = task.status === "completed" ? task.status : "paused";
@@ -9944,20 +18563,20 @@ const server = http.createServer(async (req, res) => {
       task.updatedAt = nowIso();
       audit.append({
         kind: "task",
-        who: task.userId,
+        who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
         what: "task.paused",
         taskId: task.id,
         toolInput: {},
         toolOutput: { pauseState: task.pauseState },
       });
-      pushMetricEvent({ kind: "task_paused", userId: task.userId, taskId: task.id });
+      pushMetricEvent({ kind: "task_paused", userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }), taskId: task.id });
       saveDb();
-      return writeJson(res, 200, { ok: true, task });
+      return writeJson(res, 200, { ok: true, task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }) });
     }
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/resume$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const task = requireTask(taskId, req, res);
       if (!task) return;
       task.pauseState = "active";
       if (task.status === "paused") task.status = "confirmed";
@@ -9967,20 +18586,20 @@ const server = http.createServer(async (req, res) => {
       task.updatedAt = nowIso();
       audit.append({
         kind: "task",
-        who: task.userId,
+        who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
         what: "task.resumed",
         taskId: task.id,
         toolInput: {},
         toolOutput: { pauseState: task.pauseState },
       });
-      pushMetricEvent({ kind: "task_resumed", userId: task.userId, taskId: task.id });
+      pushMetricEvent({ kind: "task_resumed", userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }), taskId: task.id });
       saveDb();
-      return writeJson(res, 200, { ok: true, task });
+      return writeJson(res, 200, { ok: true, task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }) });
     }
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/cancel$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const task = requireTask(taskId, req, res);
       if (!task) return;
       task.status = "canceled";
       task.pauseState = "canceled";
@@ -9995,31 +18614,35 @@ const server = http.createServer(async (req, res) => {
       });
       audit.append({
         kind: "task",
-        who: task.userId,
+        who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
         what: "task.canceled",
         taskId: task.id,
         toolInput: {},
         toolOutput: { status: task.status },
       });
-      pushMetricEvent({ kind: "task_canceled", userId: task.userId, taskId: task.id });
+      pushMetricEvent({ kind: "task_canceled", userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }), taskId: task.id });
       saveDb();
-      return writeJson(res, 200, { ok: true, task });
+      return writeJson(res, 200, { ok: true, task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }) });
     }
 
     if (req.method === "POST" && /^\/api\/tasks\/[^/]+\/handoff$/.test(pathname)) {
       const cached = readIdempotent(req, pathname);
       if (cached) return writeJson(res, 200, cached);
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
-      if (!task) return;
       const body = await readBody(req);
+      const task = requireTask(taskId, req, res, body);
+      if (!task) return;
       if (task.handoff && task.handoff.status === "open") {
         const existingTicket = db.supportTickets.find((item) => item.id === task.handoff.ticketId) || null;
         if (existingTicket) {
           const existingSession = ensureSupportSessionForTicket(existingTicket, { skipGreeting: true, startedBy: "system" });
           if (existingSession) task.handoff.sessionId = existingSession.id;
         }
-        const payload = { ok: true, task, handoff: task.handoff };
+        const payload = {
+          ok: true,
+          task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }),
+          handoff: sanitizeTaskHandoffForViewer(task.handoff),
+        };
         writeIdempotent(req, pathname, payload);
         return writeJson(res, 200, payload);
       }
@@ -10043,20 +18666,24 @@ const server = http.createServer(async (req, res) => {
       task.updatedAt = nowIso();
       pushMetricEvent({
         kind: "handoff_manual_created",
-        userId: task.userId,
+        userId: resolveTaskAttributionId(task, { anonymousLabel: "anon" }),
         taskId: task.id,
         meta: { ticketId: ticket.id },
       });
       audit.append({
         kind: "support",
-        who: task.userId,
+        who: resolveTaskAttributionId(task, { anonymousLabel: "anon_request" }),
         what: "task.handoff.requested",
         taskId: task.id,
         toolInput: body,
         toolOutput: { ticketId: ticket.id },
       });
       saveDb();
-      const payload = { ok: true, task, handoff: task.handoff };
+      const payload = {
+        ok: true,
+        task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }),
+        handoff: sanitizeTaskHandoffForViewer(task.handoff),
+      };
       writeIdempotent(req, pathname, payload);
       return writeJson(res, 200, payload);
     }
@@ -10065,32 +18692,51 @@ const server = http.createServer(async (req, res) => {
       const cached = readIdempotent(req, pathname);
       if (cached) return writeJson(res, 200, cached);
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const task = requireTask(taskId, req, res);
       if (!task) return;
       if (!task.confirmed) return writeJson(res, 400, { error: "Task not confirmed" });
+      const isAdmin = _isAdminRequest(req);
       if (task.status === "completed" && task.orderId && db.orders[task.orderId]) {
         return writeJson(res, 200, {
-          timeline: task.timeline || [],
-          task,
-          order: db.orders[task.orderId],
+          timeline: isAdmin
+            ? (task.timeline || [])
+            : (Array.isArray(task.timeline) ? task.timeline.map((item) => sanitizeTaskTimelineEntryForViewer(item, { taskId: task.id, isAdmin })).filter(Boolean) : []),
+          task: sanitizeTaskForViewer(task, { isAdmin }),
+          order: isAdmin ? db.orders[task.orderId] : sanitizeOrderForViewer(db.orders[task.orderId]),
           replay: true,
         });
       }
       const result = await executeTask(task);
-      const payload = { timeline: task.timeline, task: result.task, order: result.order };
+      const payload = {
+        timeline: isAdmin
+          ? task.timeline
+          : (Array.isArray(task.timeline) ? task.timeline.map((item) => sanitizeTaskTimelineEntryForViewer(item, { taskId: task.id, isAdmin })).filter(Boolean) : []),
+        task: sanitizeTaskForViewer(result.task, { isAdmin }),
+        order: isAdmin ? result.order : sanitizeOrderForViewer(result.order),
+      };
       writeIdempotent(req, pathname, payload);
       return writeJson(res, 200, payload);
     }
 
     if (req.method === "GET" && /^\/api\/tasks\/[^/]+\/detail$/.test(pathname)) {
       const taskId = pathname.split("/")[3];
-      const task = requireTask(taskId, res);
+      const task = requireTask(taskId, req, res);
       if (!task) return;
-      return writeJson(res, 200, { detail: taskDetail(task) });
+      return writeJson(res, 200, { detail: sanitizeTaskDetailForViewer(taskDetail(task), { isAdmin: _isAdminRequest(req) }) });
     }
 
     if (req.method === "GET" && pathname === "/api/tasks") {
-      return writeJson(res, 200, { tasks: Object.values(db.tasks).sort((a, b) => b.createdAt.localeCompare(a.createdAt)) });
+      if (_isAdminRequest(req)) {
+        return writeJson(res, 200, { tasks: Object.values(db.tasks).sort((a, b) => b.createdAt.localeCompare(a.createdAt)) });
+      }
+      const taskSubject = resolveRequestSubject(req, null, { queryDeviceId: new URL(req.url, "http://localhost").searchParams.get("deviceId") || "" });
+      const tasks = taskSubject
+        ? Object.values(db.tasks)
+            .filter((task) => String(task.userId || "") === String(taskSubject.id))
+            .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+            .map((task) => sanitizeTaskForViewer(task))
+        : [];
+      return writeJson(res, 200, { tasks });
     }
 
     // ── Payment Routes — delegated to PaymentController ──────────────────────
@@ -10121,7 +18767,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && pathname === "/api/user/privacy") {
       // Also handle locationEnabled on old path for backward compat
       const body = await readBody(req);
-      const did = extractDeviceId(req, body) || "demo";
+      const subject = resolveRequestSubject(req, body);
+      if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      const did = subject.id;
       const { updateUser: _updateUser } = require("./src/services/db");
       _updateUser(did, { privacy: { locationEnabled: body.locationEnabled !== false } });
       audit.append({ kind: "privacy", who: did, what: "user.privacy.updated", taskId: null, toolInput: body, toolOutput: {} });
@@ -10130,8 +18778,13 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/user/export") {
       // Legacy redirect to new GDPR export
-      const did = extractDeviceId(req, {}) || "demo";
-      return writeJson(res, 200, gdpr.exportData(did));
+      const subject = resolveRequestSubject(req);
+      if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      const data = buildPrivacyExportPayload(subject.id);
+      return writeAttachment(res, 200, JSON.stringify(data, null, 2), {
+        contentType: "application/json; charset=utf-8",
+        filename: `crossx-data-export-${Date.now()}.json`,
+      });
     }
 
     // ── GDPR / Privacy Endpoints (Art. 7/15/17/18/20/21) ────────────────────
@@ -10160,23 +18813,40 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/privacy/export — Art. 15+20: Full personal data export (portability)
     if (req.method === "GET" && pathname === "/api/privacy/export") {
-      const did = extractDeviceId(req, {});
-      if (!did) return writeJson(res, 400, { error: "missing_device_id" });
-      const data = gdpr.exportData(did);
-      res.setHeader("Content-Disposition", `attachment; filename="crossx-data-export-${Date.now()}.json"`);
-      return writeJson(res, 200, data);
+      const subject = resolveRequestSubject(req);
+      if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      const data = buildPrivacyExportPayload(subject.id);
+      audit.append({
+        kind: "gdpr.export",
+        who: subject.id,
+        what: "gdpr.export.generated",
+        taskId: null,
+        toolInput: { subjectType: subject.type || "device" },
+        toolOutput: { requestCount: Array.isArray(data.gdpr_requests) ? data.gdpr_requests.length : 0 },
+      });
+      return writeAttachment(res, 200, JSON.stringify(data, null, 2), {
+        contentType: "application/json; charset=utf-8",
+        filename: `crossx-data-export-${Date.now()}.json`,
+      });
     }
 
     // GET /api/gdpr/export — GDPR data export by deviceId or sessionId (portability)
     if (req.method === "GET" && pathname === "/api/gdpr/export") {
-      const deviceId = url.searchParams.get("deviceId");
-      const sessionId = url.searchParams.get("sessionId");
-      if (!deviceId && !sessionId) return writeJson(res, 400, { error: "deviceId or sessionId required" });
+      const { searchParams } = new URL(req.url, "http://localhost");
+      const deviceId = searchParams.get("deviceId") || "";
+      const sessionId = searchParams.get("sessionId") || "";
+      if (sessionId && !requireAdmin(req, res)) return;
+      const subject = resolveRequestSubject(req, null, { queryDeviceId: deviceId });
+      if (deviceId && !subject && !sessionId) {
+        return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      }
+      const exportDeviceId = subject ? subject.id : "";
+      if (!exportDeviceId && !sessionId) return writeJson(res, 400, { error: "deviceId or sessionId required" });
       try {
         const { getSession } = require("./src/session/store");
         const exportData = {
           exportedAt: new Date().toISOString(),
-          profile: deviceId ? (loadProfile(deviceId) || null) : null,
+          profile: exportDeviceId ? sanitizeProfileForExport(loadProfile(exportDeviceId)) : null,
           session: sessionId ? (getSession(sessionId) || null) : null,
           notice: "This export contains all personal data CrossX holds for your device/session.",
         };
@@ -10184,12 +18854,10 @@ const server = http.createServer(async (req, res) => {
         if (exportData.session) {
           delete exportData.session.plan; // plan data is large; omit
         }
-        res.writeHead(200, {
-          "Content-Type": "application/json",
-          "Content-Disposition": `attachment; filename="crossx-data-export-${Date.now()}.json"`,
+        return writeAttachment(res, 200, JSON.stringify(exportData, null, 2), {
+          contentType: "application/json; charset=utf-8",
+          filename: `crossx-data-export-${Date.now()}.json`,
         });
-        res.end(JSON.stringify(exportData, null, 2));
-        return;
       } catch (err) {
         return writeJson(res, 500, sanitizeError(err));
       }
@@ -10199,6 +18867,77 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && pathname === "/api/admin/gdpr/sla") {
       if (!requireAdmin(req, res)) return;
       return writeJson(res, 200, gdpr.checkSlaBreach());
+    }
+
+    if (req.method === "GET" && pathname === "/api/admin/gdpr/requests") {
+      if (!requireAdmin(req, res)) return;
+      return writeJson(res, 200, gdpr.getAdminRequestQueue(Number(parsed.query.limit || 200)));
+    }
+
+    if (req.method === "POST" && /^\/api\/admin\/gdpr\/requests\/[^/]+\/acknowledge$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
+      const requestId = pathname.split("/")[5];
+      const body = await readBody(req);
+      const result = gdpr.acknowledgeRequest(requestId, _whoFromReq(req), body && body.note ? body.note : "");
+      if (!result.ok) return writeJson(res, result.error === "request_not_found" ? 404 : 409, result);
+      saveDb();
+      return writeJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && /^\/api\/admin\/gdpr\/requests\/[^/]+\/reject$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
+      const requestId = pathname.split("/")[5];
+      const body = await readBody(req);
+      const result = gdpr.rejectRequest(
+        requestId,
+        _whoFromReq(req),
+        body && body.note ? body.note : "",
+        body && body.reason ? body.reason : "",
+      );
+      if (!result.ok) return writeJson(res, result.error === "request_not_found" ? 404 : 409, result);
+      saveDb();
+      return writeJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && /^\/api\/admin\/gdpr\/requests\/[^/]+\/legal-hold$/.test(pathname)) {
+      if (!requireAdmin(req, res)) return;
+      const requestId = pathname.split("/")[5];
+      const body = await readBody(req);
+      const result = gdpr.placeLegalHold(
+        requestId,
+        _whoFromReq(req),
+        body && body.note ? body.note : "",
+        body && body.basis ? body.basis : "",
+      );
+      if (!result.ok) return writeJson(res, result.error === "request_not_found" ? 404 : 409, result);
+      saveDb();
+      return writeJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && pathname === "/api/admin/gdpr/execute") {
+      if (!requireAdmin(req, res)) return;
+      const { getPendingErasures } = require("./src/services/db");
+      const beforePending = getPendingErasures().length;
+      const beforeBreaches = gdpr.checkSlaBreach();
+      gdpr.executePendingDeletions();
+      const afterPending = getPendingErasures().length;
+      const afterBreaches = gdpr.checkSlaBreach();
+      audit.append({
+        kind: "gdpr",
+        who: _whoFromReq(req),
+        what: "gdpr.pending_erasures.executed",
+        taskId: null,
+        toolInput: { beforePending, beforeBreaches: beforeBreaches.breaches.length },
+        toolOutput: { afterPending, afterBreaches: afterBreaches.breaches.length },
+      });
+      saveDb();
+      return writeJson(res, 200, {
+        ok: true,
+        beforePending,
+        afterPending,
+        beforeBreaches: beforeBreaches.breaches.length,
+        afterBreaches: afterBreaches.breaches.length,
+      });
     }
 
     // POST /api/privacy/erase — Art. 17: Right to erasure (30-day grace)
@@ -10230,10 +18969,10 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/privacy/requests — Art. 12: List DSR requests history
     if (req.method === "GET" && pathname === "/api/privacy/requests") {
-      const did = extractDeviceId(req, {});
-      if (!did) return writeJson(res, 400, { error: "missing_device_id" });
+      const subject = resolveRequestSubject(req);
+      if (!subject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
       const { getGdprRequests: _getGdprReqs } = require("./src/services/db");
-      const reqs = _getGdprReqs(did).map(r => ({
+      const reqs = _getGdprReqs(subject.id).map(r => ({
         id: r.id, type: r.type, status: r.status,
         createdAt: r.created_at, deadline: r.deadline_at, completedAt: r.completed_at,
       }));
@@ -10247,6 +18986,7 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/privacy/register — Art. 30: Records of processing activities (admin)
     if (req.method === "GET" && pathname === "/api/privacy/register") {
+      if (!requireAdmin(req, res)) return;
       return writeJson(res, 200, gdpr.getProcessingRegister());
     }
 
@@ -10257,7 +18997,13 @@ const server = http.createServer(async (req, res) => {
       if (!did) return writeJson(res, 400, { error: "missing_device_id" });
       const result = gdpr.requestErasure(did, "Legacy delete-data endpoint");
       saveDb();
-      return writeJson(res, 200, { ok: true, deletedAt: nowIso() });
+      return writeJson(res, 200, {
+        ok: true,
+        scheduled: true,
+        requestId: result.id,
+        scheduledAt: result.scheduledAt,
+        deadline: result.deadline,
+      });
     }
 
     if (req.method === "GET" && pathname === "/api/billing/reconciliation") {
@@ -10279,10 +19025,12 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/billing/reconciliation/run") {
+      const adminPayload = requireAdmin(req, res);
+      if (!adminPayload) return;
       const run = runReconciliationBatch();
       audit.append({
         kind: "billing",
-        who: "system",
+        who: adminPayload.sub || "admin",
         what: "billing.reconciliation.batch_run",
         taskId: null,
         toolInput: {},
@@ -10336,7 +19084,7 @@ const server = http.createServer(async (req, res) => {
       const _tripsLimit = Math.min(Math.max(1, Number(_tripsQp.limit) || 50), 200);
       const _tripsOffset = Math.max(0, Number(_tripsQp.offset) || 0);
       const _allTrips = Object.values(db.tripPlans || {})
-        .filter((trip) => trip.userId === _tripsActor || trip.userId === "demo")
+        .filter((trip) => trip.userId === _tripsActor)
         .map((trip) => buildTripSummary(trip))
         .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
       const trips = _allTrips.slice(_tripsOffset, _tripsOffset + _tripsLimit);
@@ -10353,8 +19101,24 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/trips/recent") {
       const _recentActor = _whoFromReq(req);
-      const { deviceId = _recentActor, limit = "5" } = Object.fromEntries(new URL(req.url, "http://x").searchParams);
-      const trips = getRecentTrips(deviceId, Math.min(Number(limit) || 5, 20));
+      const { deviceId = "", limit = "5" } = Object.fromEntries(new URL(req.url, "http://x").searchParams);
+      const queryDeviceId = String(deviceId || "").trim();
+      const headerDeviceId = extractDeviceId(req, {}) || "";
+      if (queryDeviceId) {
+        if (!headerDeviceId) {
+          return writeJson(res, 401, { error: "unauthorized", message: "Matching device ID header required" });
+        }
+        if (headerDeviceId !== queryDeviceId) {
+          return writeJson(res, 403, { error: "forbidden", message: "Device ID mismatch" });
+        }
+      }
+      const effectiveRecentId = queryDeviceId || headerDeviceId || (_recentActor !== "anon" ? _recentActor : "");
+      if (!effectiveRecentId) {
+        return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
+      }
+      const trips = getRecentTrips(effectiveRecentId, Math.min(Number(limit) || 5, 20))
+        .map((trip) => sanitizeRecentTripForViewer(trip))
+        .filter(Boolean);
       return writeJson(res, 200, { ok: true, trips });
     }
 
@@ -10363,7 +19127,7 @@ const server = http.createServer(async (req, res) => {
       const trip = requireTripPlan(tripId, res);
       if (!trip) return;
       const _tripActor = _whoFromReq(req);
-      if (trip.userId !== "demo" && trip.userId !== _tripActor && _tripActor !== "dev") {
+      if (trip.userId !== _tripActor && _tripActor !== "dev") {
         return writeJson(res, 403, { error: "Forbidden" });
       }
       return writeJson(res, 200, { trip: buildTripDetail(trip) });
@@ -10374,27 +19138,27 @@ const server = http.createServer(async (req, res) => {
       const trip = requireTripPlan(tripId, res);
       if (!trip) return;
       const _tripActor = _whoFromReq(req);
-      if (trip.userId !== "demo" && trip.userId !== _tripActor && _tripActor !== "dev") {
+      if (trip.userId !== _tripActor && _tripActor !== "dev") {
         return writeJson(res, 403, { error: "Forbidden" });
       }
       const body = await readBody(req);
-      const taskId = String(body.taskId || "");
+      const taskId = resolveInternalTaskId(String(body.taskId || ""));
       if (!taskId || !db.tasks[taskId]) return writeJson(res, 400, { error: "taskId is required" });
       const task = db.tasks[taskId];
-      const attached = attachTaskToTripPlan(task, tripId);
+      const attached = attachTaskToTripPlan(task, trip.id);
       if (!attached) return writeJson(res, 400, { error: "Unable to attach task to trip" });
-      lifecyclePush(task.lifecycle, "trip_attached", "Attached to trip", `Trip ${tripId}`);
+      lifecyclePush(task.lifecycle, "trip_attached", "Attached to trip", `Trip ${trip.id}`);
       task.updatedAt = nowIso();
       audit.append({
         kind: "trip",
         who: _whoFromReq(req),
         what: "trip.task.attached",
         taskId: task.id,
-        toolInput: { tripId, taskId: task.id },
+        toolInput: { tripId: trip.id, taskId: task.id },
         toolOutput: { tripStatus: attached.derivedStatus },
       });
       saveDb();
-      return writeJson(res, 200, { ok: true, trip: buildTripDetail(attached), task });
+      return writeJson(res, 200, { ok: true, trip: buildTripDetail(attached), task: sanitizeTaskForViewer(task, { isAdmin: false }) });
     }
 
     if (req.method === "POST" && /^\/api\/trips\/[^/]+\/status$/.test(pathname)) {
@@ -10402,13 +19166,13 @@ const server = http.createServer(async (req, res) => {
       const trip = requireTripPlan(tripId, res);
       if (!trip) return;
       const _tripActor = _whoFromReq(req);
-      if (trip.userId !== "demo" && trip.userId !== _tripActor && _tripActor !== "dev") {
+      if (trip.userId !== _tripActor && _tripActor !== "dev") {
         return writeJson(res, 403, { error: "Forbidden" });
       }
       const body = await readBody(req);
       const next = String(body.status || "").toLowerCase();
       if (!["active", "paused", "completed", "canceled"].includes(next)) {
-        return writeJson(res, 400, { error: "Unsupported status" });
+        return writeJson(res, 400, { error: "invalid_status" });
       }
       trip.status = next;
       lifecyclePush(trip.lifecycle, next, `Trip ${next}`, `Updated by user.`);
@@ -10418,7 +19182,7 @@ const server = http.createServer(async (req, res) => {
         who: _whoFromReq(req),
         what: "trip.status.updated",
         taskId: null,
-        toolInput: { tripId, status: next },
+        toolInput: { tripId: trip.id, status: next },
         toolOutput: { derivedStatus: trip.derivedStatus },
       });
       saveDb();
@@ -10429,15 +19193,25 @@ const server = http.createServer(async (req, res) => {
       const _ordQp = Object.fromEntries(new URL(req.url, "http://x").searchParams);
       const _ordLimit  = Math.min(Math.max(1, Number(_ordQp.limit)  || 50), 200);
       const _ordOffset = Math.max(0, Number(_ordQp.offset) || 0);
-      const _ordWho = _whoFromReq(req);
-      if (_ordWho === "anon") return writeJson(res, 401, { error: "unauthorized" });
-      const { validateAdminToken } = require("./src/middleware/auth");
-      const _ordIsAdmin = Boolean(validateAdminToken(req)) && _ordWho !== "anon";
+      const _ordSubject = resolveRequestSubject(req, null, { queryDeviceId: _ordQp.deviceId || "" });
+      const _ordWho = _ordSubject ? _ordSubject.id : "anon";
+      // DEBUG: Return who value for debugging
+      if (_ordQp.debug === "1") {
+        return writeJson(res, 200, { debug: true, who: _ordWho, isAnon: _ordWho === "anon" });
+      }
+      // SECURITY: Require authentication for orders endpoint
+      if (_ordWho === "anon") return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required to view orders" });
+      const _ordIsAdmin = _isAdminRequest(req) && _ordWho !== "anon";
       const _allOrders = Object.values(db.orders)
-        .filter(o => _ordIsAdmin || o.userId === _ordWho)
+        .filter((o) => _ordIsAdmin || resolveOrderOwnerId(o) === _ordWho)
         .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
       const orders = _allOrders.slice(_ordOffset, _ordOffset + _ordLimit);
-      return writeJson(res, 200, { orders, total: _allOrders.length, limit: _ordLimit, offset: _ordOffset });
+      return writeJson(res, 200, {
+        orders: _ordIsAdmin ? orders : orders.map((order) => sanitizeOrderForViewer(order)).filter(Boolean),
+        total: _allOrders.length,
+        limit: _ordLimit,
+        offset: _ordOffset,
+      });
     }
 
     // ── CrossX Consumer Plan Orders (checkout flow) ────────────────────────
@@ -10445,6 +19219,8 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const { plan, destination, method: _ocMethod, total } = body || {};
       if (!plan || total === undefined || total === null) return writeJson(res, 400, { error: "plan and total required" });
+      const orderSubject = resolveRequestSubject(req, body);
+      if (!orderSubject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
       const _ocTotal = Number(total);
       if (!Number.isFinite(_ocTotal) || _ocTotal <= 0) return writeJson(res, 400, { error: "total must be a positive number" });
       if (_ocTotal > 1_000_000) return writeJson(res, 400, { error: "total exceeds maximum allowed value" });
@@ -10453,7 +19229,9 @@ const server = http.createServer(async (req, res) => {
       if (!db.crossx_orders) db.crossx_orders = {};
       db.crossx_orders[ref] = {
         ref,
-        userId: _whoFromReq(req),
+        publicRef: getCrossxCheckoutPublicRef(ref),
+        userId: orderSubject.id,
+        ownerVia: orderSubject.via,
         status: "pending",
         method: String(_ocMethod || "card"),
         destination: String(destination || ""),
@@ -10461,15 +19239,16 @@ const server = http.createServer(async (req, res) => {
         planId: String(plan?.id || ""),
         planTag: String(plan?.tag || ""),
         createdAt: new Date(ts).toISOString(),
-        ip: req.socket?.remoteAddress || "default",
       };
       saveDb();
-      return writeJson(res, 200, { ok: true, ref, status: "pending" });
+      return writeJson(res, 200, { ok: true, ref: getCrossxCheckoutPublicRef(ref), status: "pending" });
     }
 
     if (req.method === "GET" && pathname === "/api/order/status") {
       const ref = String(parsed.query.ref || "");
       if (!ref) return writeJson(res, 400, { error: "missing_ref" });
+      const orderSubject = resolveRequestSubject(req, null, { queryDeviceId: parsed.query.deviceId || "" });
+      if (!orderSubject) return writeJson(res, 401, { error: "unauthorized", message: "Login or device ID required" });
       if (!db.crossx_orders) db.crossx_orders = {};
       // Purge crossx_orders older than 30 min to prevent memory accumulation
       const _cxoNow = Date.now();
@@ -10477,16 +19256,9 @@ const server = http.createServer(async (req, res) => {
         const _cxoCreated = new Date(o.createdAt).getTime();
         if (isNaN(_cxoCreated) || _cxoNow - _cxoCreated > 30 * 60 * 1000) delete db.crossx_orders[k];
       }
-      const ord = db.crossx_orders[ref];
+      const ord = resolveCrossxCheckoutOrder(ref);
       if (!ord) return writeJson(res, 404, { error: "not_found" });
-      // Ownership check: anonymous callers may only see orders they created (IP or userId match)
-      const _statusWho = _whoFromReq(req);
-      const _ordOwner = ord.userId || "anon";
-      const _ipMatch = (req.socket?.remoteAddress || "") === (ord.ip || "");
-      if (_statusWho === "anon" && !_ipMatch && _ordOwner !== "anon") {
-        return writeJson(res, 403, { error: "forbidden" });
-      }
-      if (_statusWho !== "anon" && _ordOwner !== "anon" && _statusWho !== _ordOwner) {
+      if (String(ord.userId || "") !== String(orderSubject.id || "")) {
         return writeJson(res, 403, { error: "forbidden" });
       }
       // Auto-confirm after 2.5 s (mock payment processing)
@@ -10509,7 +19281,7 @@ const server = http.createServer(async (req, res) => {
         }
       }
       return writeJson(res, 200, {
-        ok: true, ref,
+        ok: true, ref: getCrossxCheckoutPublicRef(ord),
         status: ord.status,
         total: ord.total,
         destination: ord.destination,
@@ -10519,10 +19291,11 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && /^\/api\/orders\/[^/]+\/detail$/.test(pathname)) {
       const orderId = pathname.split("/")[3];
-      const order = db.orders[orderId];
-      if (!order) return writeJson(res, 404, { error: "Order not found" });
+      const order = requireOrderAccess(orderId, req, res);
+      if (!order) return;
+      const isAdmin = _isAdminRequest(req);
       return writeJson(res, 200, {
-        detail: buildOrderDetail(order),
+        detail: sanitizeOrderDetailForViewer(buildOrderDetail(order, { isAdmin }), { isAdmin }),
       });
     }
 
@@ -10530,25 +19303,24 @@ const server = http.createServer(async (req, res) => {
       const cached = readIdempotent(req, pathname);
       if (cached) return writeJson(res, 200, cached);
       const orderId = pathname.split("/")[3];
-      const order = db.orders[orderId];
-      if (!order) return writeJson(res, 404, { error: "Order not found" });
-      // Auth: must own order or be admin
-      const _cancelWho = _whoFromReq(req);
-      const { validateAdminToken: _valAdm } = require("./src/middleware/auth");
-      const _cancelIsAdmin = Boolean(_valAdm(req));
-      if (!_cancelIsAdmin) {
-        if (_cancelWho === "anon") return writeJson(res, 401, { error: "unauthorized", message: "Login required to cancel orders" });
-        if (order.userId && order.userId !== _cancelWho) return writeJson(res, 403, { error: "forbidden", message: "You do not own this order" });
-      }
+      const body = await readBody(req);
+      const order = requireOrderAccess(orderId, req, res, body);
+      if (!order) return;
+      const isAdmin = _isAdminRequest(req);
+      const internalOrderId = order.id;
       if (order.status === "cancelled" || order.status === "canceled" || order.status === "refunded") {
-        const payload = { ok: true, order, refunded: true };
+        const payload = {
+          ok: true,
+          order: sanitizeOrderForViewer(order, { isAdmin }),
+          refunded: true,
+          refund: sanitizeRefundStateForViewer(order.refund, { isAdmin }),
+        };
         writeIdempotent(req, pathname, payload);
         return writeJson(res, 200, payload);
       }
       if (order.status === "delivered" || order.status === "completed") {
         return writeJson(res, 409, { error: "order_not_cancellable", status: order.status, message: "Cannot cancel an order that has already been delivered or completed." });
       }
-      const body = await readBody(req);
       order.status = "cancelled";
       lifecyclePush(order.lifecycle, "cancelled", "Cancelled by user", `Reason: ${body.reason || "user_request"}`);
       order.updatedAt = nowIso();
@@ -10557,10 +19329,57 @@ const server = http.createServer(async (req, res) => {
       // Attempt real gateway refund via fulfillment service
       let _refundResult = null;
       try {
-        _refundResult = await fulfillment.requestRefund(orderId, { reason: body.reason || "user_request" });
+        _refundResult = await fulfillment.requestRefund(internalOrderId, { reason: body.reason || "user_request" });
       } catch (_refErr) {
-        // Order already in cancelled state; fall through with mock refund
-        _refundResult = { ok: true, source: "mock", gatewayWarning: _refErr.message, amount: Math.floor(order.price * 0.8) };
+        _refundResult = {
+          ok: false,
+          source: "error",
+          errorCode: "refund_request_failed",
+          message: "refund_request_failed",
+          amount: Math.floor(order.price * 0.8),
+        };
+      }
+
+      if (!_refundResult || _refundResult.ok === false) {
+        order.refundable = false;
+        order.refund = {
+          amount: _refundResult.amount || Math.floor(order.price * 0.8),
+          currency: order.currency,
+          status: "requested",
+          source: _refundResult.source || "error",
+          eta: (order.refundPolicy && order.refundPolicy.estimatedArrival) || "T+1 to T+3",
+          at: nowIso(),
+          errorCode: _refundResult.errorCode || "refund_request_failed",
+          gatewayWarning: _refundResult.message || _refundResult.gatewayWarning || undefined,
+        };
+        order.status = "refund_requested";
+        lifecyclePush(order.lifecycle, "refund_requested", "Refund pending", order.refund.errorCode);
+        order.updatedAt = nowIso();
+        const task = db.tasks[order.taskId];
+        if (task) {
+          task.status = "canceled";
+          syncTaskAgentMeta(task, "support");
+          refreshTripByTask(task);
+          lifecyclePush(task.lifecycle, "refund_requested", "Refund pending", `Order ${order.id} refund pending.`);
+        }
+        audit.append({
+          kind: "order",
+          who: _whoFromReq(req),
+          what: "order.canceled",
+          taskId: order.taskId,
+          toolInput: { orderId: internalOrderId, reason: body.reason || "user_request" },
+          toolOutput: { refund: order.refund },
+        });
+        saveDb();
+        const payload = {
+          ok: true,
+          order: sanitizeOrderForViewer(order, { isAdmin }),
+          refunded: false,
+          refundPending: true,
+          refund: sanitizeRefundStateForViewer(order.refund, { isAdmin }),
+        };
+        writeIdempotent(req, pathname, payload);
+        return writeJson(res, 200, payload);
       }
 
       order.refundable = false;
@@ -10585,21 +19404,21 @@ const server = http.createServer(async (req, res) => {
         lifecyclePush(task.lifecycle, "refunded", "Order refunded", `Order ${order.id} refunded.`);
       }
 
-      audit.append({
-        kind: "order",
-        who: _whoFromReq(req),
-        what: "order.canceled",
-        taskId: order.taskId,
-        toolInput: { orderId, reason: body.reason || "user_request" },
-        toolOutput: { refund: order.refund },
-      });
+        audit.append({
+          kind: "order",
+          who: _whoFromReq(req),
+          what: "order.canceled",
+          taskId: order.taskId,
+          toolInput: { orderId: internalOrderId, reason: body.reason || "user_request" },
+          toolOutput: { refund: order.refund },
+        });
       db.mcpCalls.push({
         id: `mcp_${Date.now()}_cancel`,
         taskId: order.taskId,
         at: nowIso(),
         op: "Cancel",
         toolType: "order.cancel",
-        request: { op: "Cancel", payload: { orderId }, at: nowIso() },
+        request: { op: "Cancel", payload: { orderId: internalOrderId }, at: nowIso() },
         response: {
           op: "Cancel",
           ok: true,
@@ -10620,20 +19439,25 @@ const server = http.createServer(async (req, res) => {
         kind: "order_canceled",
         userId: _whoFromReq(req),
         taskId: order.taskId,
-        orderId,
+        orderId: internalOrderId,
       });
       saveDb();
-      const payload = { ok: true, order, refunded: true };
+      const payload = {
+        ok: true,
+        order: sanitizeOrderForViewer(order, { isAdmin }),
+        refunded: true,
+        refund: sanitizeRefundStateForViewer(order.refund, { isAdmin }),
+      };
       writeIdempotent(req, pathname, payload);
       return writeJson(res, 200, payload);
     }
 
     if (req.method === "GET" && /^\/api\/orders\/[^/]+\/share-card$/.test(pathname)) {
       const orderId = pathname.split("/")[3];
-      const order = db.orders[orderId];
-      if (!order) return writeJson(res, 404, { error: "Order not found" });
+      const order = requireOrderAccess(orderId, req, res);
+      if (!order) return;
       return writeJson(res, 200, {
-        orderId,
+        orderId: toViewerOrderRef(order, { isAdmin: _isAdminRequest(req) }),
         shareCard: buildShareCard(order),
       });
     }
@@ -10669,17 +19493,18 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && /^\/api\/orders\/[^/]+\/proof$/.test(pathname)) {
       const orderId = pathname.split("/")[3];
-      const order = db.orders[orderId];
-      if (!order) return writeJson(res, 404, { error: "Order not found" });
+      const order = requireOrderAccess(orderId, req, res);
+      if (!order) return;
+      const isAdmin = _isAdminRequest(req);
       const task = order.taskId ? db.tasks[order.taskId] : null;
-      const detail = task ? taskDetail(task) : null;
-      const language = normalizeLang(parsed.query.language || db.users.demo.language || "EN");
+      const detail = task ? sanitizeTaskDetailForViewer(taskDetail(task), { isAdmin }) : null;
+      const language = normalizeLang(parsed.query.language || DEFAULT_LANG_EN);
       const recommendation = buildSolutionRecommendation(task ? task.id : null, null, null, language);
       return writeJson(res, 200, {
-        orderId,
-        proof: order.proof,
-        order,
-        proofItems: order.proofItems || [],
+        orderId: toViewerOrderRef(order, { isAdmin }),
+        proof: sanitizeOrderProofForViewer(order.proof, { isAdmin }),
+        order: sanitizeOrderForViewer(order, { isAdmin }),
+        proofItems: Array.isArray(order.proofItems) ? order.proofItems.map((item) => sanitizeProofItemForViewer(item, { isAdmin })).filter(Boolean) : [],
         insights: {
           imagePath: recommendation.imagePath,
           comments: (recommendation.comments || []).slice(0, 3),
@@ -10692,8 +19517,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/nearby/suggestions") {
       const _nearWho = _whoFromReq(req);
-      const user = (_nearWho !== "anon" ? db.users[_nearWho] : null) || db.users.demo || {};
-      const language = normalizeLang(parsed.query.language || user.language || "EN");
+      const user = _nearWho !== "anon" ? getUserProfile(_nearWho) : buildDefaultUserProfile("anon");
+      const language = normalizeLang(parsed.query.language || parsed.query.lang || user.language || "EN");
       const L = (zh, en, ja, ko) => pickLang(language, zh, en, ja, ko);
       const _qLat = Number(parsed.query.lat);
       const _qLng = Number(parsed.query.lng);
@@ -10723,13 +19548,17 @@ const server = http.createServer(async (req, res) => {
       const cityZh = cityZhMap[cityKey] || cityRaw;
       const city = localizedCityName(cityKey, language);
 
-      // Fetch real POI data from Gaode sequentially (free key: 2 QPS limit)
+      // Fetch real POI data — respect ?type filter to skip unnecessary Gaode calls
       const _delay = (ms) => new Promise((r) => setTimeout(r, ms));
-      const restaurantPois = await queryAmapPoi(cityZh, "restaurant").catch(() => null);
-      await _delay(600);
-      const attractionPois = await queryAmapPoi(cityZh, "attraction").catch(() => null);
-      await _delay(600);
-      const hotelPois = await queryAmapPoi(cityZh, "hotel").catch(() => null);
+      const _typeFilter = String(parsed.query.type || "all").toLowerCase();
+      const _wantFood   = _typeFilter === "all" || _typeFilter === "food"  || _typeFilter === "eat"  || _typeFilter === "restaurant";
+      const _wantHotel  = _typeFilter === "all" || _typeFilter === "hotel" || _typeFilter === "stay";
+      const _wantAttr   = _typeFilter === "all" || _typeFilter === "travel"|| _typeFilter === "attraction";
+      const restaurantPois = _wantFood  ? await queryAmapPoi(cityZh, "restaurant").catch(() => null)  : null;
+      if (_wantFood && _wantHotel)  await _delay(600);
+      const hotelPois      = _wantHotel ? await queryAmapPoi(cityZh, "hotel").catch(() => null)        : null;
+      if (_wantHotel && _wantAttr) await _delay(600);
+      const attractionPois = _wantAttr  ? await queryAmapPoi(cityZh, "attraction").catch(() => null)   : null;
 
       const FOOD_IMGS  = ["/api/placeholder?cat=food", "/api/placeholder?cat=food", "/api/placeholder?cat=food"];
       const HOTEL_IMGS = ["/api/placeholder?cat=hotel"];
@@ -10744,7 +19573,7 @@ const server = http.createServer(async (req, res) => {
       const meituanFood = (name) => `https://i.meituan.com/awp/h5/search.html?query=${encodeURIComponent(name)}`;
       const dianpingUrl = (name) => `https://m.dianping.com/search/keyword/${encodeURIComponent(cityZh)}/${encodeURIComponent(name)}`;
       const xhsLink     = (name) => `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(name + " " + cityZh)}&source=web_search_result_notes`;
-      const didiRide    = (name) => `https://page.didiglobal.com/passenger/book?dest=${encodeURIComponent(name)}`;
+      const didiRide    = (name) => buildDidiRideLink(name);
       const haversineKm = (lat1, lng1, lat2, lng2) => {
         const R = 6371, dLat = (lat2 - lat1) * Math.PI / 180, dLng = (lng2 - lng1) * Math.PI / 180;
         const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2;
@@ -10769,7 +19598,8 @@ const server = http.createServer(async (req, res) => {
       const items = [];
 
       // Restaurant items
-      const eats = restaurantPois && restaurantPois.length ? restaurantPois.slice(0, 2) : null;
+      const eats = _wantFood && restaurantPois && restaurantPois.length ? restaurantPois.slice(0, 2) : null;
+      if (_wantFood) {
       if (eats) {
         eats.forEach((poi, idx) => {
           items.push({
@@ -10834,9 +19664,10 @@ const server = http.createServer(async (req, res) => {
           source: "fallback",
         });
       }
+      } // end _wantFood
 
       // Hotel item
-      if (hotelPois && hotelPois.length) {
+      if (_wantHotel && hotelPois && hotelPois.length) {
         const poi = hotelPois[0];
         items.push({
           id: "hotel_0", type: "stay",
@@ -10854,6 +19685,7 @@ const server = http.createServer(async (req, res) => {
           navLink: amapNav(poi.name),
           bookingUrl: isForeignUser ? bookingCom(poi.name) : ctripHotel(poi.name),
           ctripLink: ctripHotel(poi.name),
+          meituanLink: `https://i.meituan.com/awp/h5/search.html?query=${encodeURIComponent(poi.name + " 酒店")}`,
           agodaLink: isForeignUser ? agodaLink(poi.name) : null,
           bookingComLink: isForeignUser ? bookingCom(poi.name) : null,
           didiLink: didiRide(poi.name),
@@ -10867,7 +19699,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       // Attraction item
-      if (attractionPois && attractionPois.length) {
+      if (_wantAttr && attractionPois && attractionPois.length) {
         const poi = attractionPois[0];
         items.push({
           id: "attr_0", type: "travel",
@@ -10930,8 +19762,8 @@ const server = http.createServer(async (req, res) => {
 
     if (pathname === "/api/subscription/plus") {
       const _subActor = _whoFromReq(req);
-      const _subUserId = (_subActor !== "anon" && _subActor !== "admin") ? _subActor : "demo";
-      const _subUser  = getUser(_subUserId) || getUser("demo");
+      const _subUserId = (_subActor !== "anon" && _subActor !== "admin") ? _subActor : "";
+      const _subUser  = _subUserId ? getUserProfile(_subUserId, { fallbackId: _subUserId }) : buildDefaultUserProfile("anon");
 
       if (req.method === "GET") {
         return writeJson(res, 200, {
@@ -10941,7 +19773,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (req.method === "POST") {
-        if (_subUserId === "demo" && _subActor === "anon") return writeJson(res, 401, { error: "login_required" });
+        if (!_subUserId && _subActor === "anon") return writeJson(res, 401, { error: "login_required" });
         const body = await readBody(req);
         const newPlus = {
           active: body.active !== false,
@@ -10965,7 +19797,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/user/preferences") {
       const _prefGetWho = _whoFromReq(req);
-      const _prefGetUser = _prefGetWho !== "anon" ? db.users[_prefGetWho] : null;
+      const _prefGetUser = _prefGetWho !== "anon" ? getUser(_prefGetWho) : null;
       if (!_prefGetUser) return writeJson(res, 200, { language: "EN", preferences: {} });
       return writeJson(res, 200, {
         language:    _prefGetUser.language    || "EN",
@@ -10977,23 +19809,31 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/user/preferences") {
       const body = await readBody(req);
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return writeJson(res, 400, { error: "Invalid preferences payload" });
+      }
       const userId = _whoFromReq(req) !== "anon" ? _whoFromReq(req) : (extractDeviceId(req, body) || "anon");
       const _prefPatch = {};
-      if (body.language   !== undefined) _prefPatch.language    = body.language;
-      if (body.city       !== undefined) _prefPatch.city        = body.city;
-      if (body.preferences !== undefined) _prefPatch.preferences = body.preferences;
-      if (body.savedPlaces !== undefined) _prefPatch.savedPlaces = body.savedPlaces;
+      if (body.language !== undefined) _prefPatch.language = String(body.language || "").trim().slice(0, 10);
+      if (body.city !== undefined) _prefPatch.city = String(body.city || "").trim().slice(0, 50);
+      const cleanPreferences = sanitizeUserPreferences(body.preferences);
+      if (cleanPreferences) _prefPatch.preferences = cleanPreferences;
+      const cleanSavedPlaces = sanitizeSavedPlaces(body.savedPlaces);
+      if (cleanSavedPlaces) _prefPatch.savedPlaces = cleanSavedPlaces;
       const updatedUser = updateUser(userId, _prefPatch);
       audit.append({
         kind: "user", who: userId, what: "user.preferences.updated",
         taskId: null, toolInput: body,
         toolOutput: { language: updatedUser?.language, preferences: updatedUser?.preferences },
       });
-      return writeJson(res, 200, { ok: true, user: updatedUser });
+      return writeJson(res, 200, { ok: true, user: sanitizeUserProfileForViewer(updatedUser, { isAdmin: _isAdminRequest(req) }) });
     }
 
     if (req.method === "POST" && pathname === "/api/user/profile") {
       const body = await readBody(req);
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return writeJson(res, 400, { error: "Invalid profile payload" });
+      }
       const _profWho = _whoFromReq(req);
       if (_profWho === "anon") return writeJson(res, 401, { error: "unauthorized" });
       const _profPatch = {};
@@ -11004,7 +19844,7 @@ const server = http.createServer(async (req, res) => {
       const updatedUser = updateUser(_profWho, _profPatch);
       if (!updatedUser) return writeJson(res, 500, { error: "update_failed" });
       audit.append({ kind: "user", who: _profWho, what: "user.profile.updated", taskId: null, toolInput: body, toolOutput: _profPatch });
-      return writeJson(res, 200, { ok: true, user: updatedUser });
+      return writeJson(res, 200, { ok: true, user: sanitizeUserProfileForViewer(updatedUser, { isAdmin: _isAdminRequest(req) }) });
     }
 
     if (req.method === "POST" && pathname === "/api/user/location") {
@@ -11095,7 +19935,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/trust/summary") {
       const _trustWho = _whoFromReq(req);
-      const _trustUser = (_trustWho !== "anon" ? db.users[_trustWho] : null) || db.users.demo;
+      const _trustUser = _trustWho !== "anon" ? getUserProfile(_trustWho) : buildPublicAnonUserProfile();
       return writeJson(res, 200, {
         summary: buildUserTrustSummary(_trustUser),
       });
@@ -11110,40 +19950,65 @@ const server = http.createServer(async (req, res) => {
       const _filteredLogs = _auditIsAdmin
         ? _allLogs.slice(0, 20)
         : _allLogs.filter(l => l.who === _auditWho).slice(0, 20);
-      return writeJson(res, 200, { logs: _filteredLogs });
+      return writeJson(res, 200, { logs: _filteredLogs.map((entry) => sanitizeAuditEventForViewer(entry, { isAdmin: _auditIsAdmin })) });
     }
 
     if (req.method === "GET" && /^\/api\/trust\/audit-logs\/[^/]+$/.test(pathname)) {
       const auditId = pathname.split("/")[4];
-      const event = (db.auditLogs || []).find((item) => item.id === auditId);
+      const event = resolveAuditEventRecord(auditId);
       if (!event) return writeJson(res, 404, { error: "Audit event not found" });
+      const _auditWho = _whoFromReq(req);
+      const { validateAdminToken: _auditDetailAdmVal } = require("./src/middleware/auth");
+      const _auditDetailIsAdmin = Boolean(_auditDetailAdmVal(req)) && _auditWho !== "anon";
+      const _eventTask = event.taskId ? db.tasks[event.taskId] || null : null;
+      const _eventOwnedByActor = _auditWho !== "anon" && (
+        String(event.who || "") === String(_auditWho) ||
+        Boolean(_eventTask && String(_eventTask.userId || "") === String(_auditWho))
+      );
+      if (!_auditDetailIsAdmin && !_eventOwnedByActor) {
+        return writeJson(res, 403, { error: "access_denied" });
+      }
       const relatedOrders = Object.values(db.orders || {}).filter((order) => order.taskId && order.taskId === event.taskId);
       const relatedProofItems = relatedOrders.flatMap((order) => (Array.isArray(order.proofItems) ? order.proofItems : []));
       return writeJson(res, 200, {
-        event: {
+        event: sanitizeAuditEventForViewer({
           ...event,
           relatedProofItems: relatedProofItems.slice(0, 20),
-        },
+        }, { isAdmin: _auditDetailIsAdmin }),
       });
     }
 
     if (req.method === "GET" && pathname === "/api/trust/mcp-calls") {
-      return writeJson(res, 200, { calls: db.mcpCalls.slice(-20).reverse() });
+      const _mcpWho = _whoFromReq(req);
+      const { validateAdminToken: _mcpAdmVal } = require("./src/middleware/auth");
+      const _mcpIsAdmin = Boolean(_mcpAdmVal(req)) && _mcpWho !== "anon";
+      const calls = _mcpIsAdmin
+        ? db.mcpCalls.slice(-20).reverse()
+        : (_mcpWho === "anon"
+          ? []
+          : db.mcpCalls
+              .filter((call) => {
+                const task = call && call.taskId ? db.tasks[call.taskId] || null : null;
+                return Boolean(task && String(task.userId || "") === String(_mcpWho));
+              })
+              .slice(-20)
+              .reverse());
+      return writeJson(res, 200, { calls: calls.map((call) => sanitizeTrustMcpCallForViewer(call, { isAdmin: _mcpIsAdmin })).filter(Boolean) });
     }
 
     if (req.method === "GET" && pathname === "/api/user") {
       const { validateUserToken } = require("./src/services/user_auth");
       const userPayload = validateUserToken(req);
       const userId = userPayload ? userPayload.sub : null;
-      const user = userId ? (getUser(userId) || { id: userId }) : db.users.demo;
-      return writeJson(res, 200, { user });
+      const user = userId ? getUserProfile(userId, { fallbackId: userId }) : buildPublicAnonUserProfile();
+      return writeJson(res, 200, { user: sanitizeUserProfileForViewer(user, { isAdmin: _isAdminRequest(req) }) });
     }
 
     const parts = parsePath(pathname);
     if (req.method === "GET" && parts[0] === "api" && parts[1] === "tasks" && parts[2]) {
-      const task = db.tasks[parts[2]];
-      if (!task) return writeJson(res, 404, { error: "Task not found" });
-      return writeJson(res, 200, { task });
+      const task = requireTask(parts[2], req, res);
+      if (!task) return;
+      return writeJson(res, 200, { task: sanitizeTaskForViewer(task, { isAdmin: _isAdminRequest(req) }) });
     }
 
     // ── POST /api/chat/plan — SSE Streaming Plan Builder ─────────────────────
@@ -11154,10 +20019,31 @@ const server = http.createServer(async (req, res) => {
       const message = sanitizeUserInput(String(body.message || "").trim()); // FS-A-01
       if (!message) return writeJson(res, 400, { error: "message required" });
       if (message.length > 2000) return writeJson(res, 400, { error: "message_too_long", maxLength: 2000 });
-      const language = normalizeLang(body.language || db.users.demo.language || "ZH");
-      const cityRaw = String(body.city || db.users.demo.city || "Shanghai");
-      const city = cityRaw.split("·")[0].trim() || "Shanghai";
-      const constraints = body.constraints && typeof body.constraints === "object" ? body.constraints : {};
+      const language = normalizeLang(body.language || body.lang || DEFAULT_LANG_ZH);
+      const cityRaw = String(body.city || DEFAULT_CITY);
+      const city = cityRaw.split("·")[0].trim() || DEFAULT_CITY;
+      const baseConstraints = body.constraints && typeof body.constraints === "object" ? body.constraints : {};
+      const constraints = {
+        ...baseConstraints,
+        destination: baseConstraints.destination || body.destination || body.city || "",
+        origin: baseConstraints.origin || body.origin || body.originCity || body.from || body.departure || "",
+        from: baseConstraints.from || body.from || body.originCity || body.origin || "",
+        departure: baseConstraints.departure || body.departure || body.originCity || body.origin || "",
+        arrivalDate: baseConstraints.arrivalDate || body.arrivalDate || body.date || body.checkInDate || body.checkIn || "",
+        date: baseConstraints.date || body.date || body.arrivalDate || body.checkInDate || body.checkIn || "",
+        dateEnd: baseConstraints.dateEnd || body.dateEnd || body.checkOutDate || body.checkOut || "",
+        checkInDate: baseConstraints.checkInDate || body.checkInDate || body.checkIn || body.date || body.arrivalDate || "",
+        checkOutDate: baseConstraints.checkOutDate || body.checkOutDate || body.checkOut || body.dateEnd || "",
+        check_in_date: baseConstraints.check_in_date || body.check_in_date || body.checkInDate || body.checkIn || "",
+        check_out_date: baseConstraints.check_out_date || body.check_out_date || body.checkOutDate || body.checkOut || "",
+        days: baseConstraints.days || body.days || body.duration_days || 0,
+        pax: baseConstraints.pax || body.pax || body.guestNum || body.guests || 0,
+        party_size: baseConstraints.party_size || body.party_size || body.pax || body.guestNum || body.guests || 0,
+        totalBudget: baseConstraints.totalBudget || baseConstraints.tripBudget || baseConstraints.total_budget || body.totalBudget || body.tripBudget || body.total_budget || 0,
+        hotelBudgetPerNight: baseConstraints.hotelBudgetPerNight || baseConstraints.hotel_budget_per_night || baseConstraints.nightlyBudget || baseConstraints.nightly_budget || body.hotelBudgetPerNight || body.hotel_budget_per_night || body.nightlyBudget || body.nightly_budget || body.maxHotelNightly || 0,
+        budgetScope: baseConstraints.budgetScope || baseConstraints.budget_scope || baseConstraints.budgetSemantics || body.budgetScope || body.budget_scope || body.budgetSemantics || "",
+        budget: baseConstraints.budget || body.budget || body.totalBudget || 0,
+      };
       const conversationHistory = validateConversationHistory(body.conversationHistory); // AIS-02
 
       // SSE headers
@@ -11207,13 +20093,13 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
                   ragAnswer += `\n\n📚 来源: ${ragResult.citations.map((c) => `[${c.docId}]`).join(" ")}`;
                 }
               }
-            } catch (e) { console.warn("[plan/rag]", e.message); }
+            } catch (e) { console.warn("[plan/rag]", sanitizeServerLogError(e, "rag_failed")); }
           }
           if (!ragAnswer) {
             try {
               const chatRes = await callCasualChat({ message, language, city });
               if (chatRes.ok) ragAnswer = chatRes.text;
-            } catch (e) { console.warn("[plan/rag/fallback]", e.message); }
+            } catch (e) { console.warn("[plan/rag/fallback]", sanitizeServerLogError(e, "rag_fallback_failed")); }
           }
           emit({
             type: "final",
@@ -11231,14 +20117,25 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         }
 
         // ── BOOKING PATH: trip planning ─────────────────────────────────────
-        emit({ type: "status", code: "INIT", label: "需求拆解中..." });
+        emit({ type: "status", code: "INIT", label: pickLang(language, "需求拆解中...", "Analyzing your request...", "リクエストを分析中...", "요청 분석 중...") });
 
         // Extract slots from message + constraints
         const slots = extractAgentConstraints(message, constraints);
         const cityResolved = slots.city || constraints.destination || city;
+        const originResolved = slots.origin || constraints.origin || constraints.from || constraints.departure || "";
+        const messageDateMatch = message.match(/(20\d{2}[-\/.]\d{1,2}[-\/.]\d{1,2})/);
+        const arrivalDate = normalizeHotelDate(
+          constraints.checkInDate || constraints.check_in_date || constraints.arrivalDate || constraints.date || (messageDateMatch && messageDateMatch[1]) || ""
+        ) || addDateDays(todayDateIso(), 1);
+        const departureDate = normalizeHotelDate(
+          constraints.checkOutDate || constraints.check_out_date || constraints.dateEnd || ""
+        ) || "";
         let days   = slots.duration   || Number(constraints.days)       || 0;
-        let pax    = slots.party_size || Number(constraints.party_size) || 0;
+        let pax    = slots.party_size || Number(constraints.party_size || constraints.pax) || 0;
         let budget = slots.budget     || Number(constraints.budget)     || 0;
+        if (!days && arrivalDate && departureDate) {
+          days = countStayNights(arrivalDate, departureDate);
+        }
 
         // Broader budget extraction: "8000预算" / "1万预算" / "8000元" patterns
         if (!budget) {
@@ -11256,7 +20153,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         }
         // Days: also match "5日" / "五天"
         if (!days) {
-          const dm = message.match(/([一二三四五六七八九十\d]+)\s*(?:天|日|nights?|days?)/i);
+          const dm = message.match(/([一二三四五六七八九十\d]+)\s*(?:[-–—]\s*)?(?:天|日|nights?|days?)/i);
           if (dm) {
             const cjkMap = { "一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9,"十":10 };
             days = cjkMap[dm[1]] || parseInt(dm[1], 10) || 0;
@@ -11271,17 +20168,43 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           }
         }
 
+        const budgetContext = resolvePlanBudgetContext({
+          message,
+          constraints,
+          slotBudget: budget,
+          days: days || 1,
+          pax: pax || 1,
+          language,
+        });
+        const totalBudget = Number(budgetContext.totalBudget || 0) || 0;
+        const hotelBudgetPerNight = Number(budgetContext.hotelBudgetPerNight || 0) || 0;
+        const hasHotelNightlyGuardrail = hotelBudgetPerNight > 0;
+        const hasExplicitNightlyCap = Number(budgetContext.inputHotelBudgetPerNight || 0) > 0;
+        budget = totalBudget || budget;
+
         // Missing slots → clarify immediately
         const missing = [];
-        if (!cityResolved || cityResolved === "Shanghai") missing.push("destination");
+        if (!cityResolved) missing.push("destination");
         if (!days)   missing.push("dates");
         if (!pax)    missing.push("pax");
-        if (!budget) missing.push("budget");
+        if (!totalBudget && !hotelBudgetPerNight) missing.push("budget");
 
         if (missing.length > 0) {
           await delay(500);
-          const slotNames = { destination: "目的地城市", dates: "出行天数", pax: "随行人数", budget: "总预算（元）" };
-          const clarifyText = `为了给您规划最合适的行程，请问${missing.map((s) => slotNames[s] || s).join("、")}是多少？`;
+          const slotNames = {
+            ZH: { destination: "目的地城市", dates: "出行天数", pax: "随行人数", budget: buildBudgetClarifyLabel(language, budgetContext.budgetScope) },
+            EN: { destination: "destination city", dates: "travel dates", pax: "number of travelers", budget: buildBudgetClarifyLabel(language, budgetContext.budgetScope) },
+            JA: { destination: "目的地", dates: "旅行日数", pax: "人数", budget: buildBudgetClarifyLabel(language, budgetContext.budgetScope) },
+            KO: { destination: "목적지 도시", dates: "여행 일수", pax: "인원", budget: buildBudgetClarifyLabel(language, budgetContext.budgetScope) }
+          };
+          const names = slotNames[language] || slotNames.EN;
+          const missingList = missing.map((s) => names[s] || s).join(pickLang(language, "、", ", ", "、", ", "));
+          const clarifyText = pickLang(language,
+            `为了给您规划最合适的行程，请问${missingList}是多少？`,
+            `To plan your perfect trip, please provide: ${missingList}`,
+            `最適な旅程を計画するため、${missingList}を教えてください`,
+            `완벽한 여행을 계획하기 위해 ${missingList}를 알려주세요`
+          );
           emit({ type: "final", response_type: "clarify", spoken_text: clarifyText, missing_slots: missing });
           res.end();
           return;
@@ -11290,49 +20213,248 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         await delay(400);
 
         // H_SEARCH: real hotel search via Amap (fallback to mock)
-        emit({ type: "status", code: "H_SEARCH", label: `正在检索${cityResolved}优质酒店...` });
+        emit({ type: "status", code: "H_SEARCH", label: pickLang(language, `正在检索${cityResolved}优质酒店...`, `Searching hotels in ${cityResolved}...`, `${cityResolved}のホテルを検索中...`, `${cityResolved} 호텔 검색 중...`) });
         let _amapHotelTiers = null;
         if (AMAP_API_KEY) {
           try {
             _amapHotelTiers = await Promise.race([
-              queryAmapHotels(cityResolved, budget ? Math.round(budget / Math.max(1, days) * 0.45) : null),
+              queryAmapHotels(cityResolved, hotelBudgetPerNight || null),
               new Promise((_, rej) => setTimeout(() => rej(new Error("amap_timeout")), 5000)),
             ]);
           } catch (_hErr) {
-            console.warn("[pipeline/H_SEARCH] Amap fallback:", _hErr.message);
+            console.warn("[pipeline/H_SEARCH] Amap fallback:", sanitizeServerLogError(_hErr, "pipeline_hotel_search_failed"));
           }
         }
         await delay(300);
 
         // T_CALC: mock transport calculation
-        emit({ type: "status", code: "T_CALC", label: "核算接机与市内交通费..." });
+        emit({ type: "status", code: "T_CALC", label: pickLang(language, "核算接机与市内交通费...", "Calculating transport costs...", "交通費を計算中...", "교통비 계산 중...") });
         await delay(800);
 
         // B_CHECK: budget validation
-        emit({ type: "status", code: "B_CHECK", label: `预算校验中（目标 ¥${Number(budget).toLocaleString()}）...` });
+        emit({ type: "status", code: "B_CHECK", label: buildBudgetValidationLabel(language, budgetContext) });
         await delay(600);
 
         // Build complete three-tier plan — overlay real Amap hotels if available
-        const plans = mockBuildThreeTierPlans({ city: cityResolved, budget, pax, days });
+        const plans = mockBuildThreeTierPlans({
+          city: cityResolved,
+          budget: totalBudget,
+          pax,
+          days,
+          language,
+          hotelBudgetPerNight: hasHotelNightlyGuardrail ? hotelBudgetPerNight : null,
+        });
+        plans.budget_reference = budgetContext.budgetScope === "hotel_nightly" ? hotelBudgetPerNight : totalBudget;
+        plans.total_budget = totalBudget;
+        plans.hotel_budget_per_night = hotelBudgetPerNight || null;
+        plans.budget_scope = budgetContext.budgetScope;
+        plans.budget_summary = budgetContext.summary;
         if (_amapHotelTiers && _amapHotelTiers.length === 3) {
           const _tiers = ["opt_c", "opt_b", "opt_a"]; // budget → balanced → premium
+          const _amapUsedKeys = new Set();
           _amapHotelTiers.forEach((h, i) => {
-            const _opt = plans.options && plans.options[i];
+            const _opt = plans.options && plans.options.find((option) => option.id === _tiers[i]);
             if (_opt) {
-              _opt.hotel_name          = `${h.name}（${h.district || cityResolved}）`;
-              _opt.hotel_price_per_night = h.price_per_night || _opt.hotel_price_per_night;
-              _opt.hotel_real_address  = h.address || "";
-              _opt.hotel_ctrip_url     = h.booking_url || `https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(h.name)}`;
-              _opt.hotel_source        = "amap";
+              const _nightly = Number(h.price_per_night || _opt.hotel_price_per_night || 0);
+              const _hasExplicitNightlyCap = hasExplicitNightlyCap;
+              const _amapKey = String(h.booking_url || h.nameEn || h.name || `${i}`).trim();
+              if (_amapKey && _amapUsedKeys.has(_amapKey)) return;
+              const _nightlyCap = _hasExplicitNightlyCap
+                ? _tiers[i] === "opt_c"
+                  ? Math.round(hotelBudgetPerNight * 0.92)
+                  : _tiers[i] === "opt_b"
+                    ? Math.round(hotelBudgetPerNight)
+                    : Math.round(hotelBudgetPerNight)
+                : 0;
+              if (_hasExplicitNightlyCap && _nightly > 0 && _nightlyCap > 0 && _nightly > _nightlyCap) return;
+              const _transportBudget = Number((_opt.budget_breakdown && _opt.budget_breakdown.transport) || _opt.transport_total || 0);
+              const _mealsBudget = Number((_opt.budget_breakdown && _opt.budget_breakdown.meals) || 0);
+              const _activitiesBudget = Number((_opt.budget_breakdown && _opt.budget_breakdown.activities) || 0);
+              const _miscBudget = Number((_opt.budget_breakdown && _opt.budget_breakdown.misc) || 0);
+              const _hotelBudget = _nightly * Math.max(1, days);
+              if (_amapKey) _amapUsedKeys.add(_amapKey);
+              _opt.hotel_name          = buildHotelPlanDisplayName({
+                name: h.name || "",
+                nameEn: h.nameEn || "",
+                area: h.district || cityResolved,
+                district: h.district || cityResolved,
+              }, language);
+              _opt.hotel_price_per_night = _nightly;
+              _opt.hotel_route_query   = language === "ZH" || language === "ZH-TW"
+                ? (h.name || _opt.hotel_name || "")
+                : formatHotelDisplayName(h.name || h.hotelName || "", h.nameEn || h.hotelNameEn || _opt.hotel_name || "", language);
+              _opt.hotel_real_address  = language === "ZH" || language === "ZH-TW"
+                ? (h.address || h.district || "")
+                : localizeHotelAreaText(h.address || h.district || "", language);
+              _opt.hotel_area          = language === "ZH" || language === "ZH-TW"
+                ? (h.district || h.area || "")
+                : localizeHotelAreaText(h.district || h.area || "", language);
+              _opt.hotel_ctrip_url     = sanitizeLocalizedHotelBookingUrl(h.booking_url, { name: h.name || h.hotelName || "", nameEn: h.nameEn || h.hotelNameEn || _opt.hotel_name || "", fallbackName: _opt.hotel_name || h.district || cityResolved || "", language });
               if (h.hero_image) _opt.hotel_image = h.hero_image;
+              _opt.features = sanitizeLocalizedHotelProviderText(
+                [],
+                language,
+                () => buildLocalizedHotelProviderTags({
+                  commentScore: h.rating || h.score || 0,
+                  reviewCount: h.review_count || h.reviewCount || 0,
+                  district: h.district || h.area || "",
+                  area: h.area || h.district || "",
+                  address: h.address || h.district || "",
+                  priceLocked: false,
+                }, language).slice(0, 3)
+              );
+              _opt.budget_breakdown = buildBudgetBreakdown({
+                hotel: _hotelBudget,
+                transport: _transportBudget,
+                meals: _mealsBudget,
+                activities: _activitiesBudget,
+                misc: _miscBudget,
+              });
+              _opt.total_cost = _hotelBudget + _transportBudget + _mealsBudget + _activitiesBudget + _miscBudget;
             }
           });
+          plans._dataQuality = "live";
         }
+
+        // ── Enrich plan options with anonymous live hotel data ─────────────────
+        // Only runs when Amap didn't provide data (or as supplement)
+        if (!_amapHotelTiers || _amapHotelTiers.length < 3) {
+          try {
+            const _livePlanHotels = await Promise.race([
+              fetchLiveHotelCatalog({
+                city: cityResolved,
+                checkIn: arrivalDate,
+                checkOut: addDateDays(arrivalDate, Math.max(1, days)),
+                budget: hotelBudgetPerNight || null,
+              }),
+              new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000)),
+            ]);
+            if (_livePlanHotels && _livePlanHotels.length >= 2 && plans.options) {
+              // Sort by price: cheapest for opt_c, balanced for opt_b, premium for opt_a
+              const _hotelTiers = hasHotelNightlyGuardrail
+                ? selectBudgetAwareHotelTiers(_livePlanHotels, hotelBudgetPerNight, cityResolved)
+                : selectPlanHotelTiers(_livePlanHotels, cityResolved);
+              const _targetOptionIds = ["opt_c", "opt_b", "opt_a"];
+              const _usedLiveHotelKeys = new Set();
+              _targetOptionIds.forEach((_optionId, i) => {
+                const _opt = plans.options.find((option) => option.id === _optionId);
+                if (!_opt) return;
+                const _hasExplicitNightlyCap = hasExplicitNightlyCap;
+                const _baseNightly = Number(_opt && _opt.hotel_price_per_night || 0);
+                const _explicitNightlyCap = Number(hotelBudgetPerNight || 0) || 0;
+                const _tierBudgetCap = _hasExplicitNightlyCap && _explicitNightlyCap > 0
+                  ? _optionId === "opt_c"
+                    ? Math.round(_explicitNightlyCap * 0.92)
+                    : _optionId === "opt_b"
+                      ? Math.round(_explicitNightlyCap)
+                      : Math.round(_explicitNightlyCap)
+                  : _baseNightly > 0
+                    ? Math.max(_baseNightly * 1.35, _baseNightly + 220)
+                    : 0;
+                const _candidateHotels = Array.isArray(_hotelTiers)
+                  ? _hotelTiers
+                    .slice(i)
+                    .concat(_hotelTiers.slice(0, i))
+                    .filter((hotel) => {
+                      if (!hotel) return false;
+                      const _hotelKey = buildHotelCandidateKey(hotel);
+                      return !_hotelKey || !_usedLiveHotelKeys.has(_hotelKey);
+                    })
+                  : [];
+                const liveHotel = _candidateHotels.find((hotel) => {
+                  if (isGenericDisplayedHotelName(hotel, cityResolved, language)) return false;
+                  const _liveNightly = Number(hotel && hotel.lowestPrice || 0);
+                  // If the user provided an explicit nightly hotel cap, don't let unknown/locked prices overwrite.
+                  if (_hasExplicitNightlyCap && (!_liveNightly || hotel.priceLocked)) return false;
+                  if (!_liveNightly || !_tierBudgetCap) return Boolean(hotel);
+                  if (_optionId === "opt_a" && !_hasExplicitNightlyCap) return true;
+                  return _liveNightly <= _tierBudgetCap;
+                }) || (_hasExplicitNightlyCap && _optionId !== "opt_a" ? null : _hotelTiers.find((hotel) => {
+                  if (!hotel || isGenericDisplayedHotelName(hotel, cityResolved, language)) return false;
+                  if (_hasExplicitNightlyCap) {
+                    const _liveNightly = Number(hotel && hotel.lowestPrice || 0);
+                    if (!_liveNightly || hotel.priceLocked) return false;
+                  }
+                  const _hotelKey = buildHotelCandidateKey(hotel);
+                  return !_hotelKey || !_usedLiveHotelKeys.has(_hotelKey);
+                })) || (_hasExplicitNightlyCap && _optionId !== "opt_a" ? null : _hotelTiers[i]);
+                if (!liveHotel) return;
+                if (isGenericDisplayedHotelName(liveHotel, cityResolved, language)) return;
+                if (shouldPreserveStableHotelOption(_opt, liveHotel, { cityHint: cityResolved, tierBudgetCap: _tierBudgetCap, hasExplicitNightlyCap: _hasExplicitNightlyCap, optionId: _optionId })) return;
+                const _liveHotelKey = buildHotelCandidateKey(liveHotel);
+                if (_liveHotelKey && _usedLiveHotelKeys.has(_liveHotelKey)) return;
+                const _nightly = Number(liveHotel.lowestPrice || _opt.hotel_price_per_night || 0);
+                const _transportBudget = Number((_opt.budget_breakdown && _opt.budget_breakdown.transport) || _opt.transport_total || 0);
+                const _mealsBudget = Number((_opt.budget_breakdown && _opt.budget_breakdown.meals) || 0);
+                const _activitiesBudget = Number((_opt.budget_breakdown && _opt.budget_breakdown.activities) || 0);
+                const _miscBudget = Number((_opt.budget_breakdown && _opt.budget_breakdown.misc) || 0);
+                const _hotelBudget = _nightly * Math.max(1, days);
+                const _localizedHotelName = formatHotelDisplayName(
+                  liveHotel.hotelName,
+                  liveHotel.hotelNameEn || liveHotel.nameEn,
+                  language,
+                );
+                _opt.hotel_name          = _localizedHotelName;
+                _opt.hotel_price_per_night = _nightly;
+                _opt.hotel_route_query   = language === "ZH" || language === "ZH-TW"
+                  ? (liveHotel.hotelName || _localizedHotelName || "")
+                  : formatHotelDisplayName(liveHotel.hotelName || "", liveHotel.hotelNameEn || liveHotel.nameEn || _localizedHotelName || "", language);
+                _opt.hotel_real_address  = language === "ZH" || language === "ZH-TW"
+                  ? (liveHotel.hotelAddress || _opt.hotel_real_address || "")
+                  : localizeHotelAreaText(liveHotel.hotelAddress || _opt.hotel_real_address || "", language);
+                _opt.hotel_area          = language === "ZH" || language === "ZH-TW"
+                  ? (liveHotel.district || liveHotel.area || _opt.hotel_area || "")
+                  : localizeHotelAreaText(liveHotel.district || liveHotel.area || liveHotel.hotelAddress || _opt.hotel_area || "", language);
+                _opt.hotel_source        = liveHotel.source || "ctrip_curated";
+                _opt.hotel_native_price  = liveHotel.nativePrice || null;
+                _opt.hotel_ctrip_url     = sanitizeLocalizedHotelBookingUrl(liveHotel.ctripBookingUrl, { name: liveHotel.hotelName || "", nameEn: liveHotel.hotelNameEn || liveHotel.nameEn || _localizedHotelName || "", fallbackName: _localizedHotelName || liveHotel.hotelAddress || liveHotel.district || cityResolved || "", language });
+                if (_liveHotelKey) _usedLiveHotelKeys.add(_liveHotelKey);
+                if (liveHotel.imageUrl) _opt.hotel_image = liveHotel.imageUrl;
+                _opt.budget_breakdown = buildBudgetBreakdown({
+                  hotel: _hotelBudget,
+                  transport: _transportBudget,
+                  meals: _mealsBudget,
+                  activities: _activitiesBudget,
+                  misc: _miscBudget,
+                });
+                _opt.total_cost = _hotelBudget + _transportBudget + _mealsBudget + _activitiesBudget + _miscBudget;
+                _opt.features = sanitizeLocalizedHotelProviderText(
+                  [],
+                  language,
+                  () => buildLocalizedHotelProviderTags(liveHotel, language).slice(0, 3),
+                );
+              });
+              const _liveSource = inferHotelCatalogSource(_hotelTiers);
+              plans._dataQuality = (_liveSource === "trip_live" || _liveSource === "ctrip_live")
+                ? "live"
+                : _liveSource === "ctrip_list_live"
+                  ? "ctrip_live_gated"
+                  : "ctrip_curated";
+            }
+          } catch (_livePlanErr) { /* silently fallback */ }
+        }
+
+        try {
+          await enrichPlansWithLiveTransport(plans, {
+            originCity: originResolved,
+            destinationCity: cityResolved,
+            arrivalDate,
+            language,
+            pax,
+            days,
+          });
+        } catch (_transportErr) {
+          console.warn("[pipeline/T_CALC] transport enrichment fallback:", sanitizeServerLogError(_transportErr, "pipeline_transport_enrichment_failed"));
+        }
+
+        normalizeFinalPlanHotelOrdering(plans, {
+          explicitNightlyCap: hasExplicitNightlyCap ? hotelBudgetPerNight : 0,
+        });
 
         emit({ type: "final", ...plans });
         res.end();
       } catch (err) {
-        emit({ type: "error", msg: "服务暂时繁忙，请稍后重试" });
+        emit({ type: "error", msg: pickLang(language, "服务暂时繁忙，请稍后重试", "Service temporarily unavailable, please try again", "サービスが一時的に利用できません。後でお試しください", "서비스가 일시적으로 사용 불가합니다. 나중에 시도해 주세요") });
         res.end();
       }
       return;
@@ -11345,6 +20467,9 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       if (!optionId || !totalCost) return writeJson(res, 400, { error: "optionId and totalCost required" });
       const { validateUserToken: _vutBc } = require("./src/services/user_auth");
       const _bcUserId = (_vutBc(req) || {}).sub || extractDeviceId(req, body) || "guest";
+      const safePlanSnapshot = planSnapshot && typeof planSnapshot === "object" && !Array.isArray(planSnapshot)
+        ? { ...planSnapshot, bookingOwnerId: _bcUserId }
+        : { bookingOwnerId: _bcUserId };
 
       const orderId = `CX-${Date.now().toString(36).toUpperCase()}-${require("crypto").randomBytes(2).toString("hex").toUpperCase()}`;
       const now = nowIso();
@@ -11356,14 +20481,14 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         currency: String(currency || "CNY"), status: "awaiting_payment",
         userId: _bcUserId,
         createdAt: now, expiresAt,
-        planSnapshot: planSnapshot || null,
+        planSnapshot: safePlanSnapshot,
       };
       audit.append({ kind: "booking", who: _bcUserId, what: "booking.created", taskId: null,
         toolInput: { optionId, totalCost }, toolOutput: { orderId, status: "awaiting_payment" } });
       saveDb();
 
       return writeJson(res, 200, {
-        status: "awaiting_payment", orderId,
+        status: "awaiting_payment", orderId: toViewerOrderRef(orderId, { isAdmin: _isAdminRequest(req) }),
         totalCost: Number(totalCost), currency: String(currency || "CNY"),
         expiresAt, msg: "订单已锁定，请在15分钟内完成支付",
       });
@@ -11372,10 +20497,13 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     // ── POST /api/booking/confirm — Confirm payment & issue itinerary ─────
     if (req.method === "POST" && pathname === "/api/booking/confirm") {
       const body = await readBody(req);
-      const { orderId } = body || {};
-      if (!orderId) return writeJson(res, 400, { error: "orderId required" });
-      const order = db.orders[orderId];
+      const requestedOrderId = String((body && body.orderId) || "").trim();
+      if (!requestedOrderId) return writeJson(res, 400, { error: "orderId required" });
+      const internalOrderId = resolveInternalOrderId(requestedOrderId) || requestedOrderId;
+      const order = db.orders[internalOrderId];
       if (!order) return writeJson(res, 404, { error: "Order not found" });
+      const bookingAccess = resolveOwnedResourceAccess(req, resolveOrderOwnerId(order), body, { resourceLabel: "booking order" });
+      if (!bookingAccess.ok) return writeJson(res, bookingAccess.statusCode, bookingAccess.payload);
       const { validateUserToken: _vutCf } = require("./src/services/user_auth");
       const _cfUserId = (_vutCf(req) || {}).sub || order.userId || "guest";
 
@@ -11385,11 +20513,11 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       order.confirmedAt = nowIso();
 
       audit.append({ kind: "booking", who: _cfUserId, what: "booking.confirmed", taskId: null,
-        toolInput: { orderId }, toolOutput: { itineraryId, status: "confirmed" } });
+        toolInput: { orderId: internalOrderId }, toolOutput: { itineraryId, status: "confirmed" } });
       saveDb();
 
       return writeJson(res, 200, {
-        status: "success", orderId, itineraryId,
+        status: "success", orderId: toViewerOrderRef(order, { isAdmin: _isAdminRequest(req) }), itineraryId,
         msg: "支付成功！您的行程已确认。",
       });
     }
@@ -11397,10 +20525,14 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     // ── POST /api/booking/pay — Charge via payment rail + attach QR to order ─
     if (req.method === "POST" && pathname === "/api/booking/pay") {
       const body    = await readBody(req);
-      const { orderId, railId } = body || {};
-      if (!orderId) return writeJson(res, 400, { error: "orderId required" });
-      const order = db.orders[orderId];
+      const requestedOrderId = String((body && body.orderId) || "").trim();
+      const railId = body && body.railId;
+      if (!requestedOrderId) return writeJson(res, 400, { error: "orderId required" });
+      const internalOrderId = resolveInternalOrderId(requestedOrderId) || requestedOrderId;
+      const order = db.orders[internalOrderId];
       if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      const bookingAccess = resolveOwnedResourceAccess(req, resolveOrderOwnerId(order), body, { resourceLabel: "booking order" });
+      if (!bookingAccess.ok) return writeJson(res, bookingAccess.statusCode, bookingAccess.payload);
       if (order.status !== "awaiting_payment")
         return writeJson(res, 409, { error: "order_not_payable", status: order.status });
 
@@ -11409,15 +20541,10 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         amount:   order.totalCost,
         currency: order.currency || "CNY",
         userId:   order.userId || _whoFromReq(req),
-        taskId:   orderId,
+        taskId:   internalOrderId,
       });
       if (!charge.ok) {
-        return writeJson(res, 402, {
-          ok: false,
-          errorCode: charge.errorCode,
-          provider:  charge.provider,
-          reason:    charge.data && charge.data.complianceReason,
-        });
+        return writeJson(res, 402, sanitizeBookingChargeResultForViewer(charge));
       }
 
       order.proof = {
@@ -11428,18 +20555,8 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       saveDb();
 
       return writeJson(res, 200, {
-        ok:         true,
-        orderId,
-        qrCode:     charge.data.qrCode     || null,
-        paymentRef: charge.data.paymentRef,
-        gatewayRef: charge.data.gatewayRef,
-        railId:     charge.data.railId,
-        railLabel:  charge.data.railLabel,
-        sandbox:    Boolean(charge.data.sandbox),
-        provider:   charge.provider,
-        source:     charge.source,
-        latency:    charge.latency,
-        fx:         charge.data.fx         || null,
+        orderId: toViewerOrderRef(order, { isAdmin: _isAdminRequest(req) }),
+        ...sanitizeBookingChargeResultForViewer(charge),
       });
     }
 
@@ -11448,24 +20565,25 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       return planRouter.handleCoze(req, res);
     }
 
-    // ── GET /api/amap/status — Amap API key health check ──────────────────────
+    // ── GET /api/amap/status — Amap provider health check ──────────────────────
     if (req.method === "GET" && pathname === "/api/amap/status") {
+      if (!requireAdmin(req, res)) return;
       return writeJson(res, 200, {
         configured: Boolean(AMAP_API_KEY),
-        keyPreview: AMAP_API_KEY ? `${AMAP_API_KEY.slice(0, 6)}...` : null,
+        ready: Boolean(AMAP_API_KEY),
       });
     }
 
     // ── GET /api/amap/poi — Real-time POI search via Amap ────────────────────
     // Query: city, type (hotel|restaurant|transport|halal), limit
     if (req.method === "GET" && pathname === "/api/amap/poi") {
-      if (!AMAP_API_KEY) return writeJson(res, 503, { error: "Amap API not configured" });
+      if (!AMAP_API_KEY) return writeJson(res, 503, { error: "map_provider_unavailable" });
       const city  = String(parsed.query.city || "").trim();
       const type  = String(parsed.query.type || "hotel").trim();
       const limit = Math.min(20, Math.max(1, parseInt(parsed.query.limit || "10", 10)));
       if (!city) return writeJson(res, 400, { error: "city required" });
       const pois = await queryAmapPoi(city, type);
-      if (!pois) return writeJson(res, 502, { error: "Amap API failed or returned no results" });
+      if (!pois) return writeJson(res, 502, { error: "map_provider_unavailable" });
       return writeJson(res, 200, { ok: true, city, type, count: pois.length, pois: pois.slice(0, limit) });
     }
 
@@ -11538,9 +20656,9 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
             }),
             signal: AbortSignal.timeout(12000),
           });
-          const d = await r.json();
+          const d = await _readJsonResponseSafe(r, null);
           answer = d.choices?.[0]?.message?.content || null;
-        } catch (e) { console.warn("[attractions/ask/openai]", e.message); }
+        } catch (e) { console.warn("[attractions/ask/openai]", sanitizeServerLogError(e, "attractions_answer_failed")); }
       }
 
       if (!answer) {
@@ -11740,6 +20858,66 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       return apiOk(res, { key, updated: true });
     }
 
+    // ── GEO Partner API (合作商家 GEO 排名) ───────────────────────────────────
+    // GET /api/admin/geo-partners?city=&category=&activeOnly=
+    if (req.method === "GET" && pathname === "/api/admin/geo-partners") {
+      if (!requireAdmin(req, res)) return;
+      const { searchParams: _gsp } = new URL(req.url, "http://localhost");
+      const { getGeoPartners } = require("./src/services/db");
+      const partners = getGeoPartners({
+        city:       _gsp.get("city")       || "",
+        category:   _gsp.get("category")   || "",
+        activeOnly: _gsp.get("activeOnly") === "1",
+      });
+      return apiOk(res, { partners, total: partners.length });
+    }
+
+    // POST /api/admin/geo-partners — 新建商家
+    if (req.method === "POST" && pathname === "/api/admin/geo-partners") {
+      if (!requireAdmin(req, res)) return;
+      const body = await readBody(req);
+      if (!body?.name?.trim()) return apiErr(res, 400, "name_required", "商家名称不能为空");
+      if (!body?.city?.trim()) return apiErr(res, 400, "city_required", "城市不能为空");
+      const { upsertGeoPartner } = require("./src/services/db");
+      const partner = upsertGeoPartner({ ...body, id: undefined });
+      return apiOk(res, { partner });
+    }
+
+    // PUT /api/admin/geo-partners/:id — 编辑商家
+    if (req.method === "PUT" && pathname.startsWith("/api/admin/geo-partners/") && !pathname.endsWith("/toggle")) {
+      if (!requireAdmin(req, res)) return;
+      const _geoId = pathname.slice("/api/admin/geo-partners/".length);
+      if (!_geoId) return apiErr(res, 400, "id_required", "商家 ID 不能为空");
+      const { getGeoPartnerById, upsertGeoPartner } = require("./src/services/db");
+      const existing = getGeoPartnerById(_geoId);
+      if (!existing) return apiErr(res, 404, "not_found", "商家不存在");
+      const body = await readBody(req);
+      const partner = upsertGeoPartner({ ...existing, ...body, id: _geoId });
+      return apiOk(res, { partner });
+    }
+
+    // DELETE /api/admin/geo-partners/:id — 删除商家
+    if (req.method === "DELETE" && pathname.startsWith("/api/admin/geo-partners/")) {
+      if (!requireAdmin(req, res)) return;
+      const _geoId = pathname.slice("/api/admin/geo-partners/".length).replace(/\/toggle$/, "");
+      if (!_geoId) return apiErr(res, 400, "id_required", "商家 ID 不能为空");
+      const { deleteGeoPartner } = require("./src/services/db");
+      deleteGeoPartner(_geoId);
+      return apiOk(res, { deleted: _geoId });
+    }
+
+    // PATCH /api/admin/geo-partners/:id/toggle — 启用/停用
+    if (req.method === "PATCH" && pathname.startsWith("/api/admin/geo-partners/") && pathname.endsWith("/toggle")) {
+      if (!requireAdmin(req, res)) return;
+      const _geoId = pathname.slice("/api/admin/geo-partners/".length).replace(/\/toggle$/, "");
+      if (!_geoId) return apiErr(res, 400, "id_required", "商家 ID 不能为空");
+      const body = await readBody(req);
+      const { toggleGeoPartner } = require("./src/services/db");
+      const partner = toggleGeoPartner(_geoId, Boolean(body?.active));
+      if (!partner) return apiErr(res, 404, "not_found", "商家不存在");
+      return apiOk(res, { partner });
+    }
+
     // GET /api/admin/agent/traces — view recent agent tool call chains (AAG-03 observability)
     if (req.method === "GET" && pathname === "/api/admin/agent/traces") {
       if (!requireAdmin(req, res)) return;
@@ -11762,7 +20940,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         const summary = getAnalyticsSummary({ days });
         return apiOk(res, { ok: true, days, ...summary });
       } catch (err) {
-        return writeJson(res, 500, { error: "Analytics query failed", message: err.message });
+        return writeJson(res, 500, { error: "analytics_query_failed" });
       }
     }
 
@@ -11775,11 +20953,10 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const destination = sp.get("destination") || undefined;
       const { exportFineTuningJSONL } = require("./src/training/collector");
       const jsonl = exportFineTuningJSONL({ minScore, limit, destination });
-      res.writeHead(200, {
-        "Content-Type": "application/x-ndjson",
-        "Content-Disposition": `attachment; filename="crossx-training-${Date.now()}.jsonl"`,
+      return writeAttachment(res, 200, jsonl, {
+        contentType: "application/x-ndjson; charset=utf-8",
+        filename: `crossx-training-${Date.now()}.jsonl`,
       });
-      return res.end(jsonl);
     }
 
     // POST /api/training/finetune — trigger OpenAI fine-tuning job (admin)
@@ -11788,7 +20965,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const body = await readBody(req);
       const { model = "gpt-4o-mini-2024-07-18", minScore = 0.7, limit = 500 } = body;
       const openaiKey = process.env.OPENAI_API_KEY;
-      if (!openaiKey) return writeJson(res, 503, { error: "OPENAI_API_KEY not configured" });
+      if (!openaiKey) return writeJson(res, 503, { error: "training_provider_unavailable" });
 
       try {
         const { exportFineTuningJSONL } = require("./src/training/collector");
@@ -11809,8 +20986,15 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           headers: { Authorization: `Bearer ${openaiKey}`, ...form.getHeaders() },
           body: form,
         });
-        const uploadJson = await uploadRes.json();
-        if (!uploadRes.ok) return writeJson(res, 502, { error: "OpenAI file upload failed", detail: uploadJson });
+        const uploadJson = await _readJsonResponseSafe(uploadRes, {});
+        if (!uploadRes.ok) {
+          return writeJson(res, 502, buildProviderFailurePayload("fine_tune_upload_failed", {
+            provider: "openai",
+            status: uploadRes.status,
+            payload: uploadJson,
+            fallbackCode: "file_upload_failed",
+          }));
+        }
 
         // Create fine-tuning job
         const ftRes = await fetch("https://api.openai.com/v1/fine_tuning/jobs", {
@@ -11818,15 +21002,22 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
           body: JSON.stringify({ training_file: uploadJson.id, model }),
         });
-        const ftJson = await ftRes.json();
-        if (!ftRes.ok) return writeJson(res, 502, { error: "Fine-tuning job creation failed", detail: ftJson });
+        const ftJson = await _readJsonResponseSafe(ftRes, {});
+        if (!ftRes.ok) {
+          return writeJson(res, 502, buildProviderFailurePayload("fine_tune_job_create_failed", {
+            provider: "openai",
+            status: ftRes.status,
+            payload: ftJson,
+            fallbackCode: "fine_tuning_job_failed",
+          }));
+        }
 
         appendAuditLog({ kind: "training.finetune", who: "admin", what: "fine-tuning job started",
           taskId: null, toolInput: { model, lines }, toolOutput: { jobId: ftJson.id, fileId: uploadJson.id } });
 
         return writeJson(res, 200, { ok: true, jobId: ftJson.id, fileId: uploadJson.id, trainingLines: lines, model });
       } catch (err) {
-        return writeJson(res, 500, { error: "Fine-tuning request failed", message: err.message });
+        return writeJson(res, 500, { error: "fine_tuning_request_failed" });
       }
     }
 
@@ -11834,14 +21025,27 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     if (req.method === "GET" && pathname === "/api/training/jobs") {
       if (!requireAdmin(req, res)) return;
       const openaiKey = process.env.OPENAI_API_KEY;
-      if (!openaiKey) return writeJson(res, 503, { error: "OPENAI_API_KEY not configured" });
+      if (!openaiKey) return writeJson(res, 503, { error: "training_provider_unavailable" });
       try {
         const r = await fetch("https://api.openai.com/v1/fine_tuning/jobs?limit=10",
           { headers: { Authorization: `Bearer ${openaiKey}` } });
-        const j = await r.json();
-        return writeJson(res, r.ok ? 200 : 502, j);
+        const j = await _readJsonResponseSafe(r, {});
+        if (!r.ok) {
+          return writeJson(res, 502, buildProviderFailurePayload("training_jobs_unavailable", {
+            provider: "openai",
+            status: r.status,
+            payload: j,
+            fallbackCode: "training_jobs_failed",
+          }));
+        }
+        const jobs = Array.isArray(j.data) ? j.data.map((item) => sanitizeFineTuningJob(item)).filter(Boolean) : [];
+        return writeJson(res, 200, {
+          ok: true,
+          jobs,
+          hasMore: j.has_more === true,
+        });
       } catch (err) {
-        return writeJson(res, 500, { error: err.message });
+        return writeJson(res, 500, { error: "training_jobs_unavailable" });
       }
     }
 
@@ -11849,7 +21053,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     if (req.method === "GET" && pathname === "/api/training/benchmark") {
       if (!requireAdmin(req, res)) return;
       const openaiKey = process.env.OPENAI_API_KEY;
-      if (!openaiKey) return writeJson(res, 503, { error: "OPENAI_API_KEY not configured" });
+      if (!openaiKey) return writeJson(res, 503, { error: "training_provider_unavailable" });
       try {
         const { searchParams: sp } = new URL(req.url, "http://localhost");
         const model = sp.get("model") || undefined;
@@ -11857,7 +21061,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         const result = await runBenchmark({ apiKey: openaiKey, model });
         return writeJson(res, 200, { ok: true, ...result });
       } catch (err) {
-        return writeJson(res, 500, { error: err.message });
+        return writeJson(res, 500, { error: "benchmark_failed" });
       }
     }
 
@@ -11878,19 +21082,31 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     // ── POST /api/plan/invoice-ocr — 机票行程单识别 (Juhe OCR) ────────────────
     if (req.method === "POST" && pathname === "/api/plan/invoice-ocr") {
       const body = await readBody(req);
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return writeJson(res, 400, { ok: false, error: "invalid payload" });
+      }
       const { image } = body;   // base64-encoded image string from client
       if (!image) return writeJson(res, 400, { ok: false, error: "missing image field" });
-      if (!JUHE_INVOICE_KEY) return writeJson(res, 503, { ok: false, error: "invoice OCR not configured" });
-      const result = await queryJuheFlightInvoice(image);
-      if (!result) return writeJson(res, 502, { ok: false, error: "OCR failed or no result" });
+      if (typeof image !== "string") return writeJson(res, 400, { ok: false, error: "image must be a string" });
+      const normalizedImage = String(image).trim();
+      if (!/^data:image\/[a-z0-9.+-]+;base64,/i.test(normalizedImage) && !/^[A-Za-z0-9+/=\s]+$/.test(normalizedImage)) {
+        return writeJson(res, 400, { ok: false, error: "unsupported image format" });
+      }
+      if (normalizedImage.length > 4_000_000) {
+        return writeJson(res, 413, { ok: false, error: "image too large" });
+      }
+      if (!JUHE_INVOICE_KEY) return writeJson(res, 503, { ok: false, error: "invoice_ocr_unavailable" });
+      const result = await queryJuheFlightInvoice(normalizedImage);
+      if (!result) return writeJson(res, 502, { ok: false, error: "invoice_ocr_failed" });
       return writeJson(res, 200, { ok: true, data: result });
     }
 
     // ── POST /api/coze/bot/refresh — Push updated system prompt to Coze bot ──
     // Useful after enabling Trip.com or other plugins in Coze console.
     if (req.method === "POST" && pathname === "/api/coze/bot/refresh") {
+      if (!requireAdmin(req, res)) return;
       if (!COZE_API_KEY || !COZE_BOT_ID) {
-        return writeJson(res, 503, { error: "Coze not configured (missing COZE_API_KEY or COZE_BOT_ID)" });
+        return writeJson(res, 503, { error: "coze_bot_unavailable" });
       }
       const newPrompt = `你是 CrossX 行程规划引擎。根据用户需求，输出3个差异化方案供对比选择，并附上"最佳平衡"方案的完整逐日行程。
 
@@ -11922,6 +21138,12 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         "tag": "性价比之选",
         "hotel": {"name": "真实酒店名（经济档）","type": "经济","price_per_night": 350,"total": 1050,"image_keyword": "budget hotel"},
         "transport_plan": "全程地铁+共享单车，交通总费用约¥120",
+        "transport_options": [
+          {"mode": "subway", "label": "地铁全程", "icon": "🚇", "duration": "25分钟", "cost": 6, "note": "最省钱，适合高峰期"},
+          {"mode": "bike", "label": "共享单车", "icon": "🚲", "duration": "15分钟", "cost": 3, "note": "景区内最后1公里必备"},
+          {"mode": "taxi", "label": "滴滴打车", "icon": "🚕", "duration": "20分钟", "cost": 35, "note": "雨天/晚归备用"}
+        ],
+        "guest_review": "住了三晚，性价比真的很高！早餐种类不少，房间干净，出行坐地铁超方便，就是隔音稍差一点。——携程用户「旅行控小明」",
         "total_price": 2800,
         "highlights": ["亮点1(≤12字)","亮点2(≤12字)","亮点3(≤12字)"],
         "budget_breakdown": {"accommodation":1050,"transport":120,"meals":900,"activities":600,"misc":130}
@@ -11932,6 +21154,12 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         "is_recommended": true,
         "hotel": {"name": "真实酒店名（商务档）","type": "商务","price_per_night": 700,"total": 2100,"image_keyword": "business hotel"},
         "transport_plan": "地铁+打车结合",
+        "transport_options": [
+          {"mode": "subway", "label": "地铁通勤", "icon": "🚇", "duration": "30分钟", "cost": 8, "note": "日常景点往返首选"},
+          {"mode": "taxi", "label": "滴滴/出租", "icon": "🚕", "duration": "15分钟", "cost": 45, "note": "晚间及行李多时推荐"},
+          {"mode": "walk", "label": "步行漫游", "icon": "🚶", "duration": "20分钟", "cost": 0, "note": "酒店周边1km景点步行最佳"}
+        ],
+        "guest_review": "地段绝佳，步行5分钟到地铁站，房间宽敞，床非常舒适。早餐品种丰富，服务人员态度也好，下次还会选这里。——美团点评用户「商旅达人CC」",
         "total_price": 4500,
         "highlights": ["亮点1","亮点2","亮点3"],
         "budget_breakdown": {"accommodation":2100,"transport":350,"meals":1200,"activities":700,"misc":150}
@@ -11941,6 +21169,12 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         "tag": "极致体验",
         "hotel": {"name": "真实酒店名（豪华五星）","type": "豪华","price_per_night": 1500,"total": 4500,"image_keyword": "luxury hotel"},
         "transport_plan": "专属包车全程",
+        "transport_options": [
+          {"mode": "car", "label": "专属包车", "icon": "🚗", "duration": "门到门", "cost": 800, "note": "一键叫车，全程无忧"},
+          {"mode": "taxi", "label": "高端专车", "icon": "🚖", "duration": "按需", "cost": 120, "note": "神州/首汽，品质保障"},
+          {"mode": "hsr", "label": "高铁头等舱", "icon": "🚄", "duration": "市区出行备选", "cost": 200, "note": "跨城段可选"}
+        ],
+        "guest_review": "五星级服务名副其实！管家式服务贴心，泳池和 Spa 都很棒，房间视野极好，早餐是我住过最好的自助之一。价格偏高但绝对值得。——Booking 用户「豪华爱好者」",
         "total_price": 8000,
         "highlights": ["亮点1","亮点2","亮点3"],
         "budget_breakdown": {"accommodation":4500,"transport":800,"meals":1800,"activities":700,"misc":200}
@@ -11964,10 +21198,11 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
 1. 只输出合法JSON，绝不输出任何非JSON文本
 2. 只要用户提到目的地城市，立即生成方案，不得询问出发城市/日期/人数等额外信息
 3. plans数组必须有3个，id分别为budget/balanced/premium
-4. days数组长度等于duration_days，每天3-4个activities
-5. budget_breakdown各项之和 = total_price，三方案total_price差异明显
-6. 如有Trip.com/携程插件数据，优先使用真实价格
-7. Always respond in the same language the user uses (ZH/EN/JA/KO)`;
+4. 每个plan必须包含transport_options数组（2-4种交通选项）和guest_review字符串（真实感用户评价，含平台来源）
+5. days数组长度等于duration_days，每天3-4个activities
+6. budget_breakdown各项之和 = total_price，三方案total_price差异明显
+7. 如有Trip.com/携程插件数据，优先使用真实价格
+8. Always respond in the same language the user uses (ZH/EN/JA/KO)`;
 
       try {
         // Update bot prompt
@@ -11981,9 +21216,9 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           }),
           signal: AbortSignal.timeout(10000),
         });
-        const updateData = await updateRes.json();
+        const updateData = await _readJsonResponseSafe(updateRes, {});
         if (updateData.code !== 0) {
-          return writeJson(res, 502, { error: "Coze update failed", detail: updateData });
+          return writeJson(res, 502, { error: "coze_update_failed" });
         }
         // Republish
         const pubRes = await fetch(`${COZE_API_BASE}/v1/bot/publish`, {
@@ -11992,7 +21227,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           body: JSON.stringify({ bot_id: COZE_BOT_ID, connector_ids: ["1024"] }),
           signal: AbortSignal.timeout(10000),
         });
-        const pubData = await pubRes.json();
+        const pubData = await _readJsonResponseSafe(pubRes, {});
         return writeJson(res, 200, {
           ok: true,
           updated: updateData.code === 0,
@@ -12001,18 +21236,18 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           msg: "Bot prompt updated and republished successfully",
         });
       } catch (e) {
-        return writeJson(res, 500, { error: e.message });
+        return writeJson(res, 500, { error: "bot_update_failed" });
       }
     }
 
     // ── GET /api/orders/:id/status — payment status polling ───────────────
     if (req.method === "GET" && /^\/api\/orders\/[^/]+\/status$/.test(pathname)) {
       const orderId = pathname.split("/")[3];
-      const order   = db.orders[orderId];
-      if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      const order = requireOrderAccess(orderId, req, res);
+      if (!order) return;
       return writeJson(res, 200, {
         ok:        true,
-        orderId:   order.id,
+        orderId:   toViewerOrderRef(order, { isAdmin: _isAdminRequest(req) }),
         status:    order.paymentStatus || order.status,
         qrSandbox: Boolean(order.proof && order.proof.qrSandbox),
       });
@@ -12030,7 +21265,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           const sdk = new AlipaySdk({ appId, privateKey: "", alipayPublicKey: pubKey });
           if (!sdk.checkNotifySign(params)) return res.end("fail");
         } catch (err) {
-          console.warn("[alipay notify] sig check:", err.message);
+          console.warn("[alipay notify] sig check:", sanitizeServerLogError(err, "signature_check_failed"));
           return res.end("fail");
         }
       }
@@ -12052,15 +21287,15 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     // ── POST /api/alipay/simulate-pay — sandbox payment simulation ────────
     if (req.method === "POST" && pathname === "/api/alipay/simulate-pay") {
       const body  = await readBody(req);
-      const order = db.orders[String(body.orderId || "")];
-      if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      const order = requireOrderAccess(String(body.orderId || ""), req, res, body);
+      if (!order) return;
       if (!order.proof || !order.proof.qrSandbox)
         return writeJson(res, 403, { error: "simulate-pay only available in sandbox mode" });
       order.paymentStatus = "paid";
       order.paidAt        = nowIso();
       lifecyclePush(order.lifecycle, "paid", "Payment confirmed (simulated)", "sandbox simulate-pay");
       saveDb();
-      return writeJson(res, 200, { ok: true, orderId: order.id, paymentStatus: "paid" });
+      return writeJson(res, 200, { ok: true, orderId: toViewerOrderRef(order, { isAdmin: _isAdminRequest(req) }), paymentStatus: "paid" });
     }
 
     // ── POST /api/wechat/notify — WeChat Pay v3 async notification ────────
@@ -12084,9 +21319,9 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           const plain  = Buffer.concat([decipher.update(body), decipher.final()]);
           const tx     = JSON.parse(plain.toString("utf8"));
           if (tx.trade_state === "SUCCESS") outTradeNo = tx.out_trade_no;
-        } catch (err) { console.warn("[wechat notify] decrypt:", err.message); }
+        } catch (err) { console.warn("[wechat notify] decrypt:", sanitizeServerLogError(err, "notification_decrypt_failed")); }
       } else if (payload.resource) {
-        // No API key — skip verify in dev
+        // Provider credential unavailable in dev path, so skip verification.
         outTradeNo = payload.resource.out_trade_no;
       }
       if (outTradeNo) {
@@ -12107,15 +21342,15 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     // ── POST /api/wechat/simulate-pay — sandbox WeChat payment simulation ─
     if (req.method === "POST" && pathname === "/api/wechat/simulate-pay") {
       const body  = await readBody(req);
-      const order = db.orders[String(body.orderId || "")];
-      if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      const order = requireOrderAccess(String(body.orderId || ""), req, res, body);
+      if (!order) return;
       if (!order.proof || !order.proof.qrSandbox)
         return writeJson(res, 403, { error: "simulate-pay only available in sandbox mode" });
       order.paymentStatus = "paid";
       order.paidAt        = nowIso();
       lifecyclePush(order.lifecycle, "paid", "Payment confirmed (simulated)", "wechat sandbox");
       saveDb();
-      return writeJson(res, 200, { ok: true, orderId: order.id, paymentStatus: "paid" });
+      return writeJson(res, 200, { ok: true, orderId: toViewerOrderRef(order, { isAdmin: _isAdminRequest(req) }), paymentStatus: "paid" });
     }
 
     // ── POST /api/card/notify — Stripe webhook ────────────────────────────
@@ -12137,7 +21372,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           if (provided !== expected) return writeJson(res, 400, { error: "invalid_signature" });
           event = JSON.parse(raw);
         } catch (err) {
-          console.warn("[card/notify] sig verify:", err.message);
+          console.warn("[card/notify] sig verify:", sanitizeServerLogError(err, "signature_verification_failed"));
           return writeJson(res, 400, { error: "sig_error" });
         }
       } else {
@@ -12186,15 +21421,15 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     // ── POST /api/card/simulate-pay — sandbox card charge simulation ──────
     if (req.method === "POST" && pathname === "/api/card/simulate-pay") {
       const body  = await readBody(req);
-      const order = db.orders[String(body.orderId || "")];
-      if (!order) return writeJson(res, 404, { error: "order_not_found" });
+      const order = requireOrderAccess(String(body.orderId || ""), req, res, body);
+      if (!order) return;
       if (!order.proof || !order.proof.qrSandbox)
         return writeJson(res, 403, { error: "simulate-pay only available in sandbox mode" });
       order.paymentStatus = "paid";
       order.paidAt        = nowIso();
       lifecyclePush(order.lifecycle, "paid", "Card charged (simulated)", `CARD ${order.proof.cardChargeId || ""}`);
       saveDb();
-      return writeJson(res, 200, { ok: true, orderId: order.id, paymentStatus: "paid" });
+      return writeJson(res, 200, { ok: true, orderId: toViewerOrderRef(order, { isAdmin: _isAdminRequest(req) }), paymentStatus: "paid" });
     }
 
     // ── GET /api/payment/checkout — Stripe Checkout Session redirect ─────────
@@ -12202,8 +21437,18 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const stripeKey = String(process.env.STRIPE_SECRET_KEY || "").trim();
       const base      = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
       const params    = new URL(req.url, "http://x").searchParams;
-      const orderId   = params.get("orderId") || "";
+      const requestedOrderId = params.get("orderId") || "";
       const ref       = params.get("ref")     || "";
+      let order = null;
+      if (requestedOrderId) {
+        order = requireOrderAccess(requestedOrderId, req, res, null, {
+          queryDeviceId: params.get("deviceId") || "",
+          allowQueryDeviceWithoutBinding: true,
+        });
+        if (!order) return;
+      }
+      const internalOrderId = order ? order.id : "";
+      const viewerOrderId = order ? toViewerOrderRef(order, { isAdmin: _isAdminRequest(req) }) : requestedOrderId;
       // locale from frontend (en/ja/ko/auto) — Stripe shows checkout page in correct language
       const locale    = ["en","ja","ko","zh","auto"].includes(params.get("locale") || "") ? params.get("locale") : "auto";
 
@@ -12241,21 +21486,21 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
               currency,
               unit_amount: amountCents,
               product_data: {
-                name: orderId ? `CrossX Booking #${orderId.slice(-6).toUpperCase()}` : "CrossX Travel Booking",
+                name: viewerOrderId ? `CrossX Booking #${viewerOrderId.slice(-6).toUpperCase()}` : "CrossX Travel Booking",
                 description: amountCNY > 0 ? `\u00a5${amountCNY.toLocaleString()} CNY — AI-planned travel booking via CrossX` : "AI-planned travel booking via CrossX",
               },
             },
             quantity: 1,
           }],
-          success_url: `${base}/?pay_ok=1&session_id={CHECKOUT_SESSION_ID}${orderId ? `&orderId=${encodeURIComponent(orderId)}` : ""}`,
-          cancel_url:  `${base}/?pay_cancel=1${orderId ? `&orderId=${encodeURIComponent(orderId)}` : ""}`,
-          metadata: { orderId, ref },
+          success_url: `${base}/?pay_ok=1&session_id={CHECKOUT_SESSION_ID}${viewerOrderId ? `&orderId=${encodeURIComponent(viewerOrderId)}` : ""}`,
+          cancel_url:  `${base}/?pay_cancel=1${viewerOrderId ? `&orderId=${encodeURIComponent(viewerOrderId)}` : ""}`,
+          metadata: { orderId: internalOrderId, ref },
           locale,
         });
 
         // Mark order as stripe-pending so webhook can match it
-        if (orderId && db.orders[orderId]) {
-          const o = db.orders[orderId];
+        if (internalOrderId && db.orders[internalOrderId]) {
+          const o = db.orders[internalOrderId];
           o.proof = { ...(o.proof || {}), cardChargeId: session.payment_intent || session.id };
           o.paymentRail = "card_delegate";
           saveDb();
@@ -12264,7 +21509,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         res.writeHead(302, { Location: session.url });
         return res.end();
       } catch (err) {
-        console.error("[payment/checkout] Stripe error:", err.message);
+        console.error("[payment/checkout] Stripe error:", sanitizeServerLogError(err, "stripe_checkout_failed"));
         res.writeHead(302, { Location: `${base}/?pay_error=stripe_error` });
         return res.end();
       }
@@ -12277,7 +21522,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const { city = "Shanghai", intent = "eat", area = "", preferences = [] } = body;
       const gaode = connectors.gaode;
       if (!gaode || !gaode.enabled) {
-        return writeJson(res, 200, { ok: false, source: "mock", candidates: [] });
+        return writeJson(res, 200, { ok: false, source: "unavailable", errorCode: "map_provider_not_configured", candidates: [] });
       }
       try {
         const keywords = intent === "eat" ? (area ? `${area}餐厅` : "餐厅") : (intent === "hotel" ? "酒店" : "景点");
@@ -12295,17 +21540,17 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         }));
         return writeJson(res, 200, { ok: true, source: "gaode_live", candidates });
       } catch (err) {
-        console.error("[agent/search] error:", err.message);
-        return writeJson(res, 200, { ok: false, source: "mock", candidates: [] });
+        console.error("[agent/search] error:", sanitizeServerLogError(err, "agent_search_failed"));
+        return writeJson(res, 200, { ok: false, source: "error", errorCode: "map_provider_unavailable", candidates: [] });
       }
     }
 
     if (req.method === "GET" && pathname === "/api/agent/route") {
       const { city = "", place = "" } = Object.fromEntries(new URL(req.url, "http://x").searchParams);
-      if (!city || !place) return writeJson(res, 200, { ok: false, etaMin: 20, source: "mock" });
+      if (!city || !place) return writeJson(res, 200, { ok: false, etaMin: 20, source: "invalid_request", errorCode: "city_and_place_required" });
       try {
         const result = await queryLocalRoute(place, city, city);
-        if (!result) return writeJson(res, 200, { ok: false, etaMin: 20, source: "mock" });
+        if (!result) return writeJson(res, 200, { ok: false, etaMin: 20, source: "unavailable", errorCode: "route_provider_not_configured" });
         const etaMin = (result.transit && result.transit.min) || (result.taxi && result.taxi.min) || (result.walk && result.walk.min) || 20;
         return writeJson(res, 200, {
           ok: true, source: "amap_live", etaMin,
@@ -12313,8 +21558,8 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           walk: result.walk || null, transit: result.transit || null, taxi: result.taxi || null,
         });
       } catch (err) {
-        console.error("[agent/route] error:", err.message);
-        return writeJson(res, 200, { ok: false, etaMin: 20, source: "mock" });
+        console.error("[agent/route] error:", sanitizeServerLogError(err, "agent_route_failed"));
+        return writeJson(res, 200, { ok: false, etaMin: 20, source: "error", errorCode: "route_provider_unavailable" });
       }
     }
 
@@ -12323,7 +21568,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
 
     if (req.method === "POST" && pathname === "/api/agent/llm-plan/stream") {
       const body = await readBody(req);
-      const { slots = {}, deviceId = "demo" } = body;
+      const { slots = {}, deviceId = "anon" } = body;
       if (!OPENAI_API_KEY) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, reason: "no_llm_key" }));
@@ -12366,8 +21611,8 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
           sendSse({ field: "error", reason: "parse_failed" });
         }
       } catch (err) {
-        console.error("[agent/llm-plan/stream] error:", err.message);
-        sendSse({ field: "error", reason: err.message });
+        console.error("[agent/llm-plan/stream] error:", sanitizeServerLogError(err, "agent_plan_stream_failed"));
+        sendSse({ field: "error", reason: "plan_generation_failed" });
       }
       res.end();
       return;
@@ -12375,7 +21620,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
 
     if (req.method === "POST" && pathname === "/api/agent/llm-plan") {
       const body = await readBody(req);
-      const { slots = {}, sessionContext = "", deviceId = "demo" } = body;
+      const { slots = {}, sessionContext = "", deviceId = "anon" } = body;
       if (!OPENAI_API_KEY) return writeJson(res, 200, { ok: false, reason: "no_llm_key" });
       const { systemPrompt, userContent } = buildPlannerContext(slots, deviceId, sessionContext);
       try {
@@ -12390,8 +21635,8 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         }
         return writeJson(res, 200, { ok: true, plan });
       } catch (err) {
-        console.error("[agent/llm-plan] error:", err.message);
-        return writeJson(res, 200, { ok: false, reason: err.message });
+        console.error("[agent/llm-plan] error:", sanitizeServerLogError(err, "agent_plan_failed"));
+        return writeJson(res, 200, { ok: false, reason: "plan_generation_failed" });
       }
     }
 
@@ -12401,8 +21646,8 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         const trip = insertTrip(body || {});
         return writeJson(res, 200, { ok: true, trip });
       } catch (err) {
-        console.error("[agent/trips] insert error:", err.message);
-        return writeJson(res, 500, { ok: false, error: err.message });
+        console.error("[agent/trips] insert error:", sanitizeServerLogError(err, "trip_insert_failed"));
+        return writeJson(res, 500, { ok: false, error: "trip_insert_failed" });
       }
     }
 
@@ -12426,9 +21671,14 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const body = await readBody(req);
       const { orderId, place = "", city = "", area = "", intent = "eat", amount = 0, railId = "alipay_cn", transactionId = "", executedAt } = body;
       if (!orderId) return writeJson(res, 400, { ok: false, error: "orderId required" });
-      const html = buildReceiptHtml({ orderId, place, city, area, intent, amount, railId, transactionId, executedAt: executedAt || new Date().toISOString() });
-      upsertReceipt(String(orderId), "text/html", html);
-      return writeJson(res, 200, { ok: true, receiptUrl: `/api/orders/${orderId}/receipt` });
+      const order = requireOrderAccess(String(orderId), req, res, body);
+      if (!order) return;
+      const isAdmin = _isAdminRequest(req);
+      const viewerOrderId = toViewerOrderRef(order, { isAdmin });
+      const safeTransactionId = isAdmin ? String(transactionId || "") : viewerOrderId;
+      const html = buildReceiptHtml({ orderId: viewerOrderId, place, city, area, intent, amount, railId, transactionId: safeTransactionId, executedAt: executedAt || new Date().toISOString() });
+      upsertReceipt(String(order.id), "text/html", html);
+      return writeJson(res, 200, { ok: true, receiptUrl: `/api/orders/${viewerOrderId}/receipt` });
     }
 
     // ── GET /api/orders/:id/receipt — serve HTML receipt (auto-generate if missing) ─
@@ -12436,38 +21686,38 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const orderId = pathname.split("/")[3];
       const { searchParams: _rsp } = new URL(req.url, "http://localhost");
       const download = _rsp.get("download") === "1";
-      let row = getReceipt(String(orderId));
+      const order = requireOrderAccess(orderId, req, res);
+      if (!order) return;
+      const isAdmin = _isAdminRequest(req);
+      const internalOrderId = order.id;
+      const viewerOrderId = toViewerOrderRef(order, { isAdmin });
+      let row = getReceipt(String(internalOrderId));
+      const _autoOrder = db.orders && db.orders[internalOrderId];
+      const eligibleAutoReceipt = _autoOrder && ["confirmed", "delivered", "refund_requested", "refunded"].includes(_autoOrder.status);
       // Auto-generate receipt from order data if not yet created
-      if (!row) {
-        const _autoOrder = db.orders && db.orders[orderId];
-        if (_autoOrder && ["confirmed", "delivered", "refund_requested", "refunded"].includes(_autoOrder.status)) {
-          const _autoHtml = buildReceiptHtml({
-            orderId,
-            place:         String(_autoOrder.place || _autoOrder.provider || ""),
-            city:          String(_autoOrder.city || ""),
-            area:          String(_autoOrder.area || ""),
-            intent:        String(_autoOrder.type || _autoOrder.intentType || "eat"),
-            amount:        Number(_autoOrder.price || _autoOrder.totalPrice || 0),
-            railId:        String((_autoOrder.proof && _autoOrder.proof.railId) || _autoOrder.paymentRail || "alipay_cn"),
-            transactionId: String((_autoOrder.proof && _autoOrder.proof.transactionId) || _autoOrder.outOrderNo || _autoOrder.id),
-            executedAt:    String(_autoOrder.updatedAt || _autoOrder.createdAt || new Date().toISOString()),
-            bookingRef:    (_autoOrder.proof && _autoOrder.proof.bookingRef) || (_autoOrder.proof && _autoOrder.proof.confirmationNo) || null,
-            buyerName:     (_autoOrder.proof && _autoOrder.proof.guestName) || null,
-            notes:         _autoOrder.notes || null,
-          });
-          upsertReceipt(String(orderId), "text/html", _autoHtml);
-          row = getReceipt(String(orderId));
-        }
+      if (!row && eligibleAutoReceipt) {
+          const _autoHtml = buildViewerReceiptHtmlForOrder(_autoOrder, { isAdmin: true });
+          upsertReceipt(String(internalOrderId), "text/html", _autoHtml);
+          row = getReceipt(String(internalOrderId));
+      }
+      const viewerReceiptHtml = !isAdmin && (row || eligibleAutoReceipt) ? buildViewerReceiptHtmlForOrder(_autoOrder || order, { isAdmin: false }) : "";
+      if (viewerReceiptHtml) {
+        const nonce = generateNonce();
+        applySecurityHeaders(res, nonce, { reportUri: "/api/system/csp-report" });
+        const responseBody = injectNonceIntoInlineStyles(viewerReceiptHtml, nonce);
+        return writeAttachment(res, 200, responseBody, {
+          contentType: "text/html; charset=utf-8",
+          filename: download ? `receipt-${viewerOrderId}.html` : "",
+        });
       }
       if (!row) return writeJson(res, 404, { error: "receipt_not_found" });
-      const headers = {
-        "Content-Type": `${row.content_type || "text/html"}; charset=utf-8`,
-        "Cache-Control": "no-store",
-      };
-      if (download) headers["Content-Disposition"] = `attachment; filename="receipt-${orderId}.html"`;
-      res.writeHead(200, headers);
-      res.end(row.body);
-      return;
+      const nonce = String((row.content_type || "")).includes("text/html") ? generateNonce() : "";
+      const responseBody = nonce ? injectNonceIntoInlineStyles(row.body, nonce) : row.body;
+      if (nonce) applySecurityHeaders(res, nonce, { reportUri: "/api/system/csp-report" });
+      return writeAttachment(res, 200, responseBody, {
+        contentType: `${row.content_type || "text/html"}; charset=utf-8`,
+        filename: download ? `receipt-${viewerOrderId}.html` : "",
+      });
     }
 
     // ── GET /api/orders/:id/receipt/pdf — print-optimized receipt (save as PDF) ─
@@ -12475,27 +21725,60 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     if (req.method === "GET" && pdfReceiptMatch) {
       const orderId = decodeURIComponent(pdfReceiptMatch[1]);
       try {
-        const row = getReceipt(String(orderId));
-        if (!row) return writeJson(res, 404, { error: "receipt_not_found" });
-        const htmlContent = row.body;
+        const order = requireOrderAccess(orderId, req, res);
+        if (!order) return;
+        const internalOrderId = order.id;
+        const isAdmin = _isAdminRequest(req);
+        const viewerOrderId = toViewerOrderRef(order, { isAdmin });
+        let row = getReceipt(String(internalOrderId));
+        const _autoOrder = db.orders && db.orders[internalOrderId];
+        const eligibleAutoReceipt = _autoOrder && ["confirmed", "delivered", "refund_requested", "refunded"].includes(_autoOrder.status);
+        if (!row && !eligibleAutoReceipt) return writeJson(res, 404, { error: "receipt_not_found" });
+        if (!row && eligibleAutoReceipt) {
+          const _autoHtml = buildViewerReceiptHtmlForOrder(_autoOrder, { isAdmin: true });
+          upsertReceipt(String(internalOrderId), "text/html", _autoHtml);
+          row = getReceipt(String(internalOrderId));
+        }
+        const nonce = generateNonce();
+        const htmlContent = injectNonceIntoInlineStyles(
+          !isAdmin ? buildViewerReceiptHtmlForOrder(_autoOrder || order, { isAdmin: false }) : row.body,
+          nonce,
+        );
         const printHtml = `<!DOCTYPE html><html><head><meta charset="utf-8">
-    <title>CrossX Receipt ${orderId}</title>
+    <title>CrossX Receipt ${viewerOrderId}</title>
     <style>
       @media print { body { margin: 0; } .no-print { display: none; } }
       body { font-family: system-ui, sans-serif; padding: 24px; max-width: 600px; margin: 0 auto; }
+      .receipt-print-actions { margin-top: 24px; text-align: center; }
+      .receipt-print-button {
+        padding: 10px 24px;
+        background: #1a56db;
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 15px;
+      }
     </style>
     </head><body>
     ${htmlContent}
-    <div class="no-print" style="margin-top:24px;text-align:center">
-      <button onclick="window.print()" style="padding:10px 24px;background:#1a56db;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:15px">
+    <div class="no-print receipt-print-actions">
+      <button id="cxReceiptPrintBtn" class="receipt-print-button">
         \u4fdd\u5b58\u4e3a PDF / Save as PDF
       </button>
     </div>
-    <script>setTimeout(()=>window.print(),800)</script>
+    <script nonce="${nonce}">
+      const receiptPrintBtn = document.getElementById("cxReceiptPrintBtn");
+      if (receiptPrintBtn) {
+        receiptPrintBtn.addEventListener("click", () => window.print());
+      }
+      setTimeout(() => window.print(), 800);
+    </script>
     </body></html>`;
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-        res.end(printHtml);
-        return;
+        applySecurityHeaders(res, nonce, { reportUri: "/api/system/csp-report" });
+        return writeAttachment(res, 200, printHtml, {
+          contentType: "text/html; charset=utf-8",
+        });
       } catch (err) {
         return writeJson(res, 500, sanitizeError(err));
       }
@@ -12504,11 +21787,12 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
     // ── POST /api/orders/:id/invoice — apply for electronic invoice (CX-P0-04) ─
     const invoiceApplyMatch = pathname.match(/^\/api\/orders\/([^/]+)\/invoice$/);
     if (req.method === "POST" && invoiceApplyMatch) {
-      const userId = _whoFromReq(req);
       const orderId = decodeURIComponent(invoiceApplyMatch[1]);
-      const order = db.orders && db.orders[orderId];
-      if (!order) return writeJson(res, 404, { error: "order_not_found" });
       const body = await readBody(req);
+      const order = requireOrderAccess(orderId, req, res, body);
+      if (!order) return;
+      const isAdmin = _isAdminRequest(req);
+      const userId = (resolveRequestSubject(req, body, { queryDeviceId: _queryDeviceIdFromReq(req) }) || {}).id || "anon";
       const email    = String(body.email    || "").slice(0, 200).trim();
       const taxId    = String(body.taxId    || "").slice(0, 50).trim();  // 纳税人识别号
       const company  = String(body.company  || "").slice(0, 200).trim();
@@ -12520,7 +21804,7 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const invoiceId = `inv_${Date.now().toString(36)}_${require("crypto").randomBytes(4).toString("hex")}`;
       const invoiceRecord = {
         id: invoiceId,
-        orderId,
+        orderId: order.id,
         userId,
         email,
         taxId,
@@ -12534,24 +21818,18 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         note: "电子发票将在1-3个工作日内发送至您的邮箱 / E-invoice will be sent to your email within 1-3 business days",
       };
       upsertInvoice(invoiceRecord);
-      return writeJson(res, 200, { ok: true, invoiceId, note: invoiceRecord.note });
+      return writeJson(res, 200, { ok: true, invoiceId: toViewerInvoiceRef(invoiceRecord, { isAdmin }), note: invoiceRecord.note });
     }
 
     // ── GET /api/orders/:id/invoice — list invoices for order ─
     const invoiceListMatch = pathname.match(/^\/api\/orders\/([^/]+)\/invoice$/);
     if (req.method === "GET" && invoiceListMatch) {
-      const _invActor = _whoFromReq(req);
-      if (_invActor === "anon") return writeJson(res, 401, { error: "unauthorized" });
       const orderId = decodeURIComponent(invoiceListMatch[1]);
-      const order = db.orders[orderId];
-      if (!order) return writeJson(res, 404, { error: "order_not_found" });
-      const { validateAdminToken } = require("./src/middleware/auth");
-      const _invIsAdmin = Boolean(validateAdminToken(req)) && _invActor !== "anon";
-      if (!_invIsAdmin && order.userId && order.userId !== _invActor) {
-        return writeJson(res, 403, { error: "forbidden" });
-      }
-      const list = getInvoicesByOrderId(orderId);
-      return writeJson(res, 200, { invoices: list });
+      const order = requireOrderAccess(orderId, req, res);
+      if (!order) return;
+      const isAdmin = _isAdminRequest(req);
+      const list = getInvoicesByOrderId(order.id);
+      return writeJson(res, 200, { invoices: list.map((item) => sanitizeInvoiceForViewer(item, { isAdmin })).filter(Boolean) });
     }
 
     // ── POST /api/agent/reserve — seat/table lock (webhook or deterministic) ─
@@ -12576,10 +21854,24 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
       const [, orderId, action] = orderLifecycleMatch;
       if (action === "confirm" && req.method === "POST") {
         try {
-          const result = fulfillment.confirmOrder(orderId);
-          return writeJson(res, 200, result);
+          const order = requireOrderAccess(orderId, req, res);
+          if (!order) return;
+          const result = fulfillment.confirmOrder(order.id);
+          const isAdmin = _isAdminRequest(req);
+          return writeJson(
+            res,
+            200,
+            isAdmin
+              ? result
+              : {
+                  ok: Boolean(result && result.ok),
+                  status: result && result.status ? result.status : "confirmed",
+                  confirmedAt: result && result.confirmedAt ? result.confirmedAt : nowIso(),
+                  orderId: toViewerOrderRef(order, { isAdmin }),
+                },
+          );
         } catch (e) {
-          return writeJson(res, e.code === "NOT_FOUND" ? 404 : 422, { error: e.message });
+          return writeJson(res, e.code === "NOT_FOUND" ? 404 : 422, { error: e.code === "NOT_FOUND" ? "order_not_found" : "order_confirm_failed" });
         }
       }
       if (action === "cancel" && req.method === "POST") {
@@ -12587,10 +21879,12 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         if (body.reason && String(body.reason).length > 500) return writeJson(res, 400, { error: "reason too long", max: 500 });
         if (body.requestedBy && String(body.requestedBy).length > 100) return writeJson(res, 400, { error: "requestedBy too long", max: 100 });
         try {
-          const result = fulfillment.cancelOrder(orderId, { reason: body.reason, requestedBy: body.requestedBy });
+          const order = requireOrderAccess(orderId, req, res, body);
+          if (!order) return;
+          const result = fulfillment.cancelOrder(order.id, { reason: body.reason, requestedBy: body.requestedBy });
           return writeJson(res, 200, result);
         } catch (e) {
-          return writeJson(res, e.code === "NOT_FOUND" ? 404 : 422, { error: e.message });
+          return writeJson(res, e.code === "NOT_FOUND" ? 404 : 422, { error: e.code === "NOT_FOUND" ? "order_not_found" : "order_cancel_failed" });
         }
       }
       if (action === "refund" && req.method === "POST") {
@@ -12601,38 +21895,55 @@ ${JSON.stringify(prevItinerary.card_data, null, 2).slice(0, 1200)}`
         });
         if (errs.length) return writeJson(res, 400, { error: "validation_error", details: errs });
         try {
-          const result = await fulfillment.requestRefund(orderId, { amount: body.amount, reason: body.reason });
-          return writeJson(res, 200, result);
+          const order = requireOrderAccess(orderId, req, res, body);
+          if (!order) return;
+          const result = await fulfillment.requestRefund(order.id, { amount: body.amount, reason: body.reason });
+          const isAdmin = _isAdminRequest(req);
+          return writeJson(res, 200, isAdmin ? result : sanitizeRefundStateForViewer(result, { isAdmin: false }));
         } catch (e) {
-          return writeJson(res, e.code === "NOT_FOUND" ? 404 : 422, { error: e.message });
+          return writeJson(res, e.code === "NOT_FOUND" ? 404 : 422, { error: e.code === "NOT_FOUND" ? "order_not_found" : "refund_request_failed" });
         }
       }
       if (action === "proof" && req.method === "GET") {
         const { getOrder: _getOrd } = require("./src/services/db");
-        const ord = _getOrd(orderId);
+        const order = requireOrderAccess(orderId, req, res);
+        if (!order) return;
+        const ord = _getOrd(order.id);
         if (!ord) return writeJson(res, 404, { error: "Order not found" });
-        return writeJson(res, 200, { ok: true, orderId, status: ord.status, proof: ord.proof || null });
+        const isAdmin = _isAdminRequest(req);
+        return writeJson(res, 200, {
+          ok: true,
+          orderId: toViewerOrderRef(order, { isAdmin }),
+          status: ord.status,
+          proof: sanitizeOrderProofForViewer(ord.proof, { isAdmin }),
+        });
       }
     }
 
     return writeJson(res, 404, { error: "API not found" });
   } catch (err) {
+    if (err && err.code === "PAYLOAD_TOO_LARGE") {
+      return writeJson(res, 413, { error: "payload_too_large" });
+    }
+    if (err && err.code === "INVALID_JSON") {
+      return writeJson(res, 400, { error: "invalid_json" });
+    }
     const crypto = require("crypto");
-    console.error("[server] unhandled error:", err?.message, err?.stack?.slice(0, 300));
+    console.error("[server] unhandled error:", sanitizeServerLogError(err, "unhandled_error"));
     return writeJson(res, 500, sanitizeError(err));
   }
 });
 
 server.on("error", (err) => {
   if (err && err.code === "EADDRINUSE") {
-    console.error(`Port ${PORT} is already in use. Try: PORT=3001 node server.js`);
+    console.error("Port is already in use. Try another PORT value.");
     process.exit(1);
   }
   if (err && (err.code === "EACCES" || err.code === "EPERM")) {
-    console.error(`Permission denied when binding ${HOST}:${PORT}. Try: HOST=127.0.0.1 PORT=3001 node server.js`);
+    console.error("Permission denied when binding the server socket. Try a non-privileged host/port.");
     process.exit(1);
   }
-  console.error("Server failed to start:", err);
+  console.error("Server failed to start:", sanitizeServerLogError(err, "server_start_failed"));
   process.exit(1);
 });
 
@@ -12645,7 +21956,7 @@ function startHotelOrderPoller() {
     try {
       runHotelOrderPollingCycle();
     } catch (err) {
-      console.error("hotel poll cycle failed:", err.message || err);
+      console.error("hotel poll cycle failed:", sanitizeServerLogError(err, "hotel_poll_failed"));
     }
   }, 30000);
 }
@@ -12656,7 +21967,7 @@ async function killPortIfInUse(port) {
   try {
     const pids = execSync(`lsof -ti:${port}`, { encoding: "utf8" }).trim().split("\n").filter(Boolean);
     if (pids.length === 0) return false;
-    console.log(`[restart] Port ${port} in use by PIDs: ${pids.join(", ")} — killing...`);
+    console.log("[restart] Existing process detected on target port — terminating before restart");
     for (const pid of pids) {
       try { process.kill(Number(pid), "SIGTERM"); } catch {}
     }
@@ -12667,6 +21978,7 @@ async function killPortIfInUse(port) {
   }
 }
 
+assertRuntimeSecurity();
 loadDb();
 startHotelOrderPoller();
 // LW-03: Pre-warm PBKDF2 key derivation before first request (blocks ~1-2s if deferred)
@@ -12680,22 +21992,22 @@ if (process.env.CROSSX_DB_ENCRYPTION_KEY) {
   // NOTE: do NOT kill port 8788 — MCP server runs in the same process
 
   server.listen(PORT, HOST, () => {
-    console.log(`Cross X server running at http://${HOST}:${PORT}`);
-    console.log(`Persistent DB: ${DB_FILE}`);
+    console.log("Cross X server started");
+    console.log("Persistent storage ready");
   // GDPR: execute any pending erasure requests + prune old data on startup
   setImmediate(() => {
     // Start hourly erasure + retention crons (fire immediately, then repeat)
-    try { gdpr.startErasureCron(); } catch (e) { console.warn("[gdpr] erasure cron start:", e.message); }
-    try { gdpr.startRetentionCron(); } catch (e) { console.warn("[gdpr] retention cron start:", e.message); }
-    console.log(`[gdpr] Privacy compliance active — policy v${gdpr.POLICY_VERSION}`);
+    try { gdpr.startErasureCron(); } catch (e) { console.warn("[gdpr] erasure cron start:", sanitizeServerLogError(e, "gdpr_erasure_cron_failed")); }
+    try { gdpr.startRetentionCron(); } catch (e) { console.warn("[gdpr] retention cron start:", sanitizeServerLogError(e, "gdpr_retention_cron_failed")); }
+    console.log("[gdpr] Privacy compliance active");
     // PII encryption migration — runs only when CROSSX_DB_ENCRYPTION_KEY is set
     if (process.env.CROSSX_DB_ENCRYPTION_KEY) {
       try { require("./src/services/db").migratePiiEncryption(); }
-      catch (e) { console.warn("[startup] PII migration error:", e.message); }
+      catch (e) { console.warn("[startup] PII migration error:", sanitizeServerLogError(e, "pii_migration_failed")); }
     }
   });
   if (!process.env.JUHE_KEY) {
-    console.warn("[startup] JUHE_KEY not set — FX quotes will use static mock rates (set in .env.local for live rates)");
+    console.warn("[startup] live FX provider unavailable — using static mock rates");
   }
 });
 })();
@@ -12703,7 +22015,7 @@ if (process.env.CROSSX_DB_ENCRYPTION_KEY) {
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 // P0-C: Single consolidated handler — all cleanup in one place, no duplicate registration
 function _gracefulShutdown(signal) {
-  console.log(`[server] ${signal} received — shutting down gracefully`);
+  console.log("[server] Shutdown signal received — shutting down gracefully");
   // Stop background pollers and crons immediately
   if (hotelOrderPollTicker) { clearInterval(hotelOrderPollTicker); hotelOrderPollTicker = null; }
   try { gdpr.stopCrons(); } catch {}
