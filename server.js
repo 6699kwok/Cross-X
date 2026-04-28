@@ -8977,11 +8977,15 @@ function summarizeProviderCalls(providerKey, calls) {
 function buildLiveReadinessSummary() {
   const gaodeKeyPresent = Boolean(process.env.AMAP_API_KEY || process.env.GAODE_KEY || process.env.AMAP_KEY);
   const partnerHubKeyPresent = Boolean(process.env.PARTNER_HUB_KEY);
+  const railKeyPresent = Boolean(process.env.RAIL_KEY || process.env.PARTNER_HUB_KEY);
   const jutuiTokenPresent = Boolean(process.env.JUTUI_TOKEN);
   const partnerHubBaseUrlConfigured = Boolean(connectors.partnerHub && connectors.partnerHub.baseUrl);
+  const railBaseUrlConfigured = Boolean(connectors.partnerHub && (connectors.partnerHub.railBaseUrl || connectors.partnerHub.baseUrl));
   const partnerHubContractReady = Boolean(connectors.partnerHub && connectors.partnerHub.baseUrl);
+  const railContractReady = Boolean(connectors.partnerHub && (connectors.partnerHub.railBaseUrl || connectors.partnerHub.baseUrl));
   const partnerHubRailMethodAvailable = Boolean(connectors.partnerHub && typeof connectors.partnerHub.railAvailability === "function");
   const partnerHubReady = Boolean(connectors.partnerHub && connectors.partnerHub.enabled && (partnerHubKeyPresent || partnerHubBaseUrlConfigured));
+  const railReady = Boolean(connectors.partnerHub && connectors.partnerHub.railEnabled && (railKeyPresent || railBaseUrlConfigured));
   const hotelCacheEntries = _ctripHotelCache.size;
   const hotelLaneVerified = hotelCacheEntries > 0;
   const consumerMissing = [
@@ -8994,10 +8998,14 @@ function buildLiveReadinessSummary() {
   return {
     gaodeKeyPresent,
     partnerHubKeyPresent,
+    railKeyPresent,
     partnerHubBaseUrlConfigured,
+    railBaseUrlConfigured,
     partnerHubContractReady,
+    railContractReady,
     partnerHubRailMethodAvailable,
     partnerHubReady,
+    railReady,
     jutuiTokenPresent,
     hotels: {
       enabled: true,
@@ -9022,24 +9030,28 @@ function buildLiveReadinessSummary() {
 
 function buildRailProviderSummary(readiness = buildLiveReadinessSummary()) {
   const partnerHub = connectors.partnerHub || {};
-  const enabled = Boolean(partnerHub.enabled && readiness.partnerHubRailMethodAvailable);
-  const runtimeCanServeLiveRail = Boolean(enabled && readiness.partnerHubBaseUrlConfigured);
-  const contractReady = Boolean(readiness.partnerHubContractReady && readiness.partnerHubRailMethodAvailable);
-  const mode = runtimeCanServeLiveRail
-    ? "live_inventory"
-    : enabled
-      ? "12306_self_check_fallback"
-      : "unavailable";
+  const providerAlias = partnerHub.railBaseUrl
+    ? (partnerHub.railProvider || partnerHub.provider || "generic")
+    : "builtin_12306";
+  const runtimeCanServeLiveRail = Boolean(readiness.partnerHubRailMethodAvailable && (readiness.railBaseUrlConfigured || !partnerHub.railBaseUrl));
+  const enabled = Boolean(readiness.partnerHubRailMethodAvailable && (partnerHub.railEnabled || !partnerHub.railBaseUrl));
+  const contractReady = Boolean(readiness.partnerHubRailMethodAvailable && (readiness.railContractReady || !partnerHub.railBaseUrl));
+  const inventorySource = runtimeCanServeLiveRail
+    ? (partnerHub.railBaseUrl
+      ? (partnerHub.liveRailInventorySource || (((providerAlias || "partner_hub").replace(/[^a-z0-9]+/ig, "_").replace(/^_+|_+$/g, "") || "partner_hub") + "_rail_live"))
+      : "builtin_12306_rail_live")
+    : "12306_self_check_fallback";
+  const mode = runtimeCanServeLiveRail ? "live_inventory" : (enabled ? "12306_self_check_fallback" : "unavailable");
   return {
     enabled,
     mode,
-    providerAlias: partnerHub.provider || "generic",
-    channels: partnerHub.channels || [],
-    baseUrlConfigured: readiness.partnerHubBaseUrlConfigured,
+    providerAlias,
+    channels: partnerHub.railBaseUrl ? (partnerHub.railChannels || partnerHub.channels || []) : ["12306"],
+    baseUrlConfigured: readiness.railBaseUrlConfigured || !partnerHub.railBaseUrl,
     contractReady,
     availabilityMethod: readiness.partnerHubRailMethodAvailable,
     runtimeCanServeLiveRail,
-    inventorySource: runtimeCanServeLiveRail ? "partner_hub_rail_live" : "12306_self_check_fallback",
+    inventorySource,
     verificationRequired: !runtimeCanServeLiveRail,
     errorCode: runtimeCanServeLiveRail ? null : (enabled ? "rail_provider_not_configured" : "rail_provider_unavailable"),
   };
@@ -16144,6 +16156,14 @@ const server = http.createServer(async (req, res) => {
           baseUrlConfigured: readiness.partnerHubBaseUrlConfigured,
           providerAlias: connectors.partnerHub.provider || "generic",
           channels: connectors.partnerHub.channels || [],
+        },
+        railProvider: {
+          enabled: Boolean(connectors.partnerHub.railEnabled),
+          mode: connectors.partnerHub.railMode || (connectors.partnerHub.railEnabled ? "external_contract" : "mock"),
+          keyPresent: readiness.railKeyPresent,
+          baseUrlConfigured: readiness.railBaseUrlConfigured,
+          providerAlias: connectors.partnerHub.railProvider || connectors.partnerHub.provider || "generic",
+          channels: connectors.partnerHub.railChannels || connectors.partnerHub.channels || [],
         },
         rail: buildRailProviderSummary(readiness),
         hotels: readiness.hotels,

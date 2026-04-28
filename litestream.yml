@@ -1,0 +1,40 @@
+# MY-03/P1-06: Litestream real-time SQLite backup configuration
+# https://litestream.io/reference/config/
+#
+# Usage:
+#   litestream replicate -config litestream.yml        # Start continuous replication
+#   litestream restore  -config litestream.yml -o /tmp/restore.db s3://crossx-backup/db
+#
+# Install: brew install benbjohnson/litestream/litestream
+#           OR: curl -s https://api.github.com/repos/benbjohnson/litestream/releases/latest | ...
+#
+# Environment variables required:
+#   LITESTREAM_ACCESS_KEY_ID     — S3/OSS access key
+#   LITESTREAM_SECRET_ACCESS_KEY — S3/OSS secret key
+#   LITESTREAM_BUCKET            — bucket name (default: crossx-backup)
+#   LITESTREAM_ENDPOINT          — custom endpoint for Aliyun OSS / MinIO (optional)
+
+addr: "0.0.0.0:9090"  # Prometheus metrics endpoint
+
+dbs:
+  - path: /app/data/crossx.db
+    monitor-interval: 1s       # check WAL every 1 second
+    checkpoint-interval: 60s   # force WAL checkpoint every 60 seconds
+    replicas:
+      # Primary: S3-compatible object storage (Aliyun OSS / AWS S3 / MinIO)
+      - type: s3
+        bucket: ${LITESTREAM_BUCKET:-crossx-backup}
+        path: db/crossx
+        region: cn-shanghai
+        endpoint: ${LITESTREAM_ENDPOINT:-}  # leave empty for AWS S3
+        access-key-id: ${LITESTREAM_ACCESS_KEY_ID}
+        secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
+        sync-interval: 1s       # upload WAL segments every 1 second
+        retention: 72h          # keep 72 hours of point-in-time restore
+        retention-check-interval: 1h
+        snapshot-interval: 6h   # full snapshots every 6 hours
+      # Local file backup (secondary — fast restore without network)
+      - type: file
+        path: /app/data/backups/crossx
+        retention: 24h
+        retention-check-interval: 1h

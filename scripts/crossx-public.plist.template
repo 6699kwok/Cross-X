@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.crossx.public</string>
+
+  <key>WorkingDirectory</key>
+  <string>__LAUNCH_WORKDIR__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__RUN_PUBLIC_SH__</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOST</key>
+    <string>127.0.0.1</string>
+    <key>PORT</key>
+    <string>__PUBLIC_PORT__</string>
+    <key>MCP_PORT</key>
+    <string>__PUBLIC_MCP_PORT__</string>
+    <key>MCP_HOST</key>
+    <string>127.0.0.1</string>
+    <key>PUBLIC_NODE_BIN</key>
+    <string>__PUBLIC_NODE_BIN__</string>
+    <key>PROJECT_ROOT</key>
+    <string>__WORKDIR__</string>
+    <key>NODE_ENV</key>
+    <string>production</string>
+    <key>PUBLIC_MODE</key>
+    <string>1</string>
+__EXTRA_ENV_VARS__
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__WORKDIR__/data/public.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__WORKDIR__/data/public.err.log</string>
+</dict>
+</plist>

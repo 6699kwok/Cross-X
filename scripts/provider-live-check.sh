@@ -8,18 +8,18 @@ echo "Target: ${BASE_URL}"
 echo
 
 missing=0
-if [[ -z "${GAODE_KEY:-}" && -z "${AMAP_KEY:-}" ]]; then
-  echo "- missing: GAODE_KEY or AMAP_KEY"
+has_builtin_rail_live=0
+if [[ -z "${GAODE_KEY:-}" && -z "${AMAP_KEY:-}" && -z "${AMAP_API_KEY:-}" ]]; then
+  echo "- missing: GAODE_KEY or AMAP_KEY or AMAP_API_KEY"
   missing=1
 else
-  echo "- ok: GAODE_KEY/AMAP_KEY present"
+  echo "- ok: GAODE_KEY/AMAP_KEY/AMAP_API_KEY present"
 fi
 
-if [[ -z "${PARTNER_HUB_KEY:-}" ]]; then
-  echo "- missing: PARTNER_HUB_KEY"
-  missing=1
+if [[ -z "${PARTNER_HUB_KEY:-}" && -z "${RAIL_KEY:-}" ]]; then
+  echo "- missing: PARTNER_HUB_KEY or RAIL_KEY (builtin 12306 rail may still satisfy live rail)"
 else
-  echo "- ok: PARTNER_HUB_KEY present"
+  echo "- ok: PARTNER_HUB_KEY/RAIL_KEY present"
 fi
 
 if [[ -z "${JUTUI_TOKEN:-}" ]]; then
@@ -59,10 +59,14 @@ echo "${resp}"
 rail_mode=$(printf '%s' "${resp}" | node -e 'let raw="";process.stdin.on("data",c=>raw+=c);process.stdin.on("end",()=>{try{const json=JSON.parse(raw);process.stdout.write(String(json.rail&&json.rail.mode||"unknown"));}catch{process.stdout.write("unknown");}})')
 rail_runtime=$(printf '%s' "${resp}" | node -e 'let raw="";process.stdin.on("data",c=>raw+=c);process.stdin.on("end",()=>{try{const json=JSON.parse(raw);process.stdout.write(String(Boolean(json.rail&&json.rail.runtimeCanServeLiveRail)));}catch{process.stdout.write("false");}})')
 rail_source=$(printf '%s' "${resp}" | node -e 'let raw="";process.stdin.on("data",c=>raw+=c);process.stdin.on("end",()=>{try{const json=JSON.parse(raw);process.stdout.write(String(json.rail&&json.rail.inventorySource||"unknown"));}catch{process.stdout.write("unknown");}})')
-echo "- rail: mode=${rail_mode} runtimeCanServeLiveRail=${rail_runtime} source=${rail_source}"
+rail_provider=$(printf '%s' "${resp}" | node -e 'let raw="";process.stdin.on("data",c=>raw+=c);process.stdin.on("end",()=>{try{const json=JSON.parse(raw);process.stdout.write(String(json.rail&&json.rail.providerAlias||"unknown"));}catch{process.stdout.write("unknown");}})')
+if [[ "${rail_provider}" == "builtin_12306" && "${rail_runtime}" == "true" ]]; then
+  has_builtin_rail_live=1
+fi
+echo "- rail: mode=${rail_mode} runtimeCanServeLiveRail=${rail_runtime} source=${rail_source} provider=${rail_provider}"
 
 echo
-if [[ ${missing} -eq 0 ]]; then
+if [[ ${missing} -eq 0 || ${has_builtin_rail_live} -eq 1 ]]; then
   echo "Result: ENV looks ready for live provider mode."
 else
   echo "Result: ENV not ready. Fill missing keys first."

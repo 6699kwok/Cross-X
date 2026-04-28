@@ -1,0 +1,60 @@
+# CrossX — Caddy reverse proxy config (HTTPS termination)
+#
+# Usage:
+#   brew install caddy        # macOS
+#   apt install caddy         # Ubuntu/Debian
+#   caddy run --config Caddyfile
+#
+# Replace "yourdomain.com" with your actual domain.
+# Caddy auto-provisions Let's Encrypt TLS certificates.
+#
+# For local dev with self-signed cert:
+#   replace "yourdomain.com" with "localhost" — Caddy issues a local CA cert.
+
+yourdomain.com {
+  # Reverse proxy to the Node.js server (HTTP on localhost)
+  reverse_proxy 127.0.0.1:8787
+
+  # Enable gzip/zstd compression
+  encode gzip zstd
+
+  # Security headers are set by Node.js (applySecurityHeaders)
+  # Caddy adds HSTS automatically when serving HTTPS
+  header Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+
+  # Static asset cache headers — versioned assets (hashed filenames) cached 1 year
+  @static_versioned {
+    path_regexp \.(js|css|woff2?|ttf|eot|otf|svg|png|jpg|jpeg|gif|ico|webp|avif)\?.*
+  }
+  header @static_versioned Cache-Control "public, max-age=31536000, immutable"
+
+  # Static assets without query string (images, fonts) cached 1 hour
+  @static_assets {
+    path *.png *.jpg *.jpeg *.gif *.ico *.webp *.avif *.woff *.woff2 *.ttf *.eot *.otf *.svg
+  }
+  header @static_assets Cache-Control "public, max-age=3600"
+
+  # JS/CSS without version query — shorter cache with revalidation
+  @static_scripts {
+    path *.js *.css
+    not path_regexp \?
+  }
+  header @static_scripts Cache-Control "public, max-age=3600, must-revalidate"
+
+  # Block common attack paths
+  @blocked {
+    path /.env /.git/* /wp-admin/* /phpinfo.php
+  }
+  respond @blocked 404
+
+  # Access log (optional — remove if using structured logging in Node)
+  log {
+    output file /var/log/caddy/crossx-access.log
+    format json
+  }
+}
+
+# Redirect bare HTTP to HTTPS (Caddy does this automatically, but explicit for clarity)
+http://yourdomain.com {
+  redir https://yourdomain.com{uri} permanent
+}
