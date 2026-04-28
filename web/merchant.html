@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title id="merchantPageTitle">Cross X Merchant Console</title>
+    <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/assets/logo-crossx.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png" />
+    <link rel="stylesheet" href="/styles/tokens.css?v=20260224-23" />
+    <link rel="stylesheet" href="/merchant.css?v=20260409-1718" />
+  </head>
+  <body class="merchant-body">
+    <main class="merchant-shell">
+      <section class="merchant-hero">
+        <div class="merchant-brand">
+          <img src="/assets/logo-crossx.svg" alt="Cross X logo" class="merchant-logo" />
+          <div>
+            <p class="merchant-kicker">Cross X</p>
+            <h1 id="merchantHeroTitle">Merchant Console</h1>
+            <p id="merchantHeroCopy" class="merchant-copy">A focused workspace for partner merchants. It keeps only the content merchants can execute, deliver, and explain to customers directly, so profile updates, store operations, fulfillment, and support coordination stay in one flow.</p>
+            <div class="merchant-hero-tags">
+              <span id="merchantHeroTagProfile" class="merchant-badge merchant-badge-muted">Profile upkeep</span>
+              <span id="merchantHeroTagFulfillment" class="merchant-badge merchant-badge-muted">Fulfillment</span>
+              <span id="merchantHeroTagSupport" class="merchant-badge merchant-badge-muted">Support sync</span>
+              <span id="merchantHeroTagSettlement" class="merchant-badge merchant-badge-muted">Settlements</span>
+            </div>
+          </div>
+        </div>
+        <div class="merchant-hero-side">
+          <div class="merchant-hero-panel">
+            <p class="merchant-section-tag">Console Scope</p>
+            <ul class="merchant-bullet-list">
+              <li id="merchantScopeItem1">Merchants should only maintain operational content they can execute, deliver, and explain clearly to customers.</li>
+              <li id="merchantScopeItem2">Platform ranking, GEO strategy, and risk thresholds remain under internal admin governance and are not directly editable here.</li>
+              <li id="merchantScopeItem3">Daily work should move in one order: business overview -> requests/profile -> fulfillment/support -> settlements.</li>
+            </ul>
+          </div>
+          <div class="merchant-hero-actions">
+            <a id="merchantOpenUserAppLink" class="merchant-link" href="/index.html" target="_blank" rel="noopener">Open user app</a>
+            <label class="pill lang-pill" for="merchantLangSwitch">
+              <span id="merchantLangLabel">Language</span>
+              <select id="merchantLangSwitch" name="merchantLangSwitch">
+                <option value="ZH">ZH</option>
+                <option value="EN">EN</option>
+              </select>
+              <span class="lang-caret">▾</span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section id="merchantLoginView" class="merchant-login-card">
+        <div>
+          <p class="merchant-section-tag">Merchant Login</p>
+          <h2 id="merchantLoginTitle">Sign in to Merchant Console</h2>
+          <p id="merchantLoginCopy" class="merchant-muted">Use your merchant account to enter the merchant workspace. This entry is only for merchant operations and stays separate from the internal admin console.</p>
+          <ul class="merchant-bullet-list merchant-bullet-list-compact">
+            <li id="merchantLoginItem1">Check platform listing status and store network first, then handle fulfillment and support tickets.</li>
+            <li id="merchantLoginItem2">If you only need to update materials, add service capabilities, or submit a governance request, finish it here without offline relay.</li>
+          </ul>
+        </div>
+        <form id="merchantLoginForm" class="merchant-form merchant-form-compact">
+          <label>
+            <span id="merchantLoginUserLabel">Username</span>
+            <input id="merchantUsername" name="username" type="text" autocomplete="username" placeholder="merchant_owner" required />
+          </label>
+          <label>
+            <span id="merchantLoginPasswordLabel">Password</span>
+            <input id="merchantPassword" name="password" type="password" autocomplete="current-password" placeholder="Enter merchant account password" required />
+          </label>
+          <button id="merchantLoginBtn" type="submit">Enter merchant workspace</button>
+          <p id="merchantLoginError" class="merchant-error hidden"></p>
+        </form>
+      </section>
+
+      <section id="merchantAppView" class="merchant-app hidden">
+        <div class="merchant-toolbar">
+          <div>
+            <p class="merchant-section-tag">Merchant Workspace</p>
+            <h2 id="merchantAccountName">-</h2>
+            <p id="merchantAccountMeta" class="merchant-muted">-</p>
+          </div>
+          <div class="merchant-toolbar-actions">
+            <button id="merchantRefreshBtn" class="merchant-secondary" type="button">Refresh workspace</button>
+            <button id="merchantLogoutBtn" class="merchant-ghost" type="button">Sign out</button>
+          </div>
+        </div>
+
+        <div id="merchantNotice" class="merchant-notice hidden"></div>
+
+        <nav class="merchant-quicknav" aria-label="Merchant sections">
+          <a id="merchantNavMetrics" href="#merchantMetrics" class="merchant-quicknav-link">Overview</a>
+          <a id="merchantNavPlatform" href="#merchantPlatformListingSummary" class="merchant-quicknav-link">Platform</a>
+          <a id="merchantNavRequest" href="#merchantListingRequestForm" class="merchant-quicknav-link">Requests</a>
+          <a id="merchantNavProfile" href="#merchantProfileForm" class="merchant-quicknav-link">Profile</a>
+          <a id="merchantNavOrders" href="#merchantOrderList" class="merchant-quicknav-link">Fulfillment</a>
+          <a id="merchantNavSupport" href="#merchantSupportList" class="merchant-quicknav-link">Support</a>
+          <a id="merchantNavSettlement" href="#merchantSettlementList" class="merchant-quicknav-link">Settlements</a>
+        </nav>
+
+        <section id="merchantMetrics" class="merchant-metrics"></section>
+
+        <section class="merchant-grid merchant-grid-overview">
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Platform Listing</p>
+                <h3 id="merchantPlatformTitle">Platform listing status</h3>
+              </div>
+              <span id="merchantPlatformListingBadge" class="merchant-badge">-</span>
+            </div>
+            <p id="merchantPlatformCopy" class="merchant-section-copy">Check how the platform currently represents you before deciding whether to update materials, submit a request, or prioritize support and fulfillment.</p>
+            <div id="merchantPlatformListingSummary" class="merchant-kv-grid"></div>
+            <div id="merchantPlatformListingTags" class="merchant-chip-row"></div>
+            <div id="merchantListingRequestsList" class="merchant-list merchant-list-spaced"></div>
+          </article>
+
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Store Network</p>
+                <h3 id="merchantStoreNetworkTitle">Store network</h3>
+              </div>
+              <span id="merchantScopedStoreBadge" class="merchant-badge">-</span>
+            </div>
+            <p id="merchantStoreNetworkCopy" class="merchant-section-copy">Review the store network by city, status, and support backlog so the highest-priority stores are clear first.</p>
+            <div id="merchantScopedStoreSummary" class="merchant-kv-grid"></div>
+            <div class="merchant-inline-controls merchant-inline-controls-wrap">
+              <select id="merchantScopedStoreCityFilter" class="merchant-select">
+                <option value="">All cities</option>
+              </select>
+              <select id="merchantScopedStoreStatusFilter" class="merchant-select">
+                <option value="">All statuses</option>
+                <option value="attention">Needs attention</option>
+                <option value="active">Listed</option>
+                <option value="inactive">Pending onboarding</option>
+                <option value="support">Support backlog</option>
+              </select>
+              <select id="merchantScopedStoreSort" class="merchant-select">
+                <option value="attention_desc">Sort by attention</option>
+                <option value="support_desc">Sort by support</option>
+                <option value="city_asc">Sort by city</option>
+                <option value="name_asc">Sort by name</option>
+              </select>
+            </div>
+            <div id="merchantScopedStoreHighlights" class="merchant-kv-grid"></div>
+            <div id="merchantScopedStoreGroups" class="merchant-chip-row"></div>
+            <div id="merchantScopedStoreList" class="merchant-list merchant-list-spaced"></div>
+          </article>
+        </section>
+
+        <section class="merchant-grid merchant-grid-bottom">
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Ops Suggestions</p>
+                <h3 id="merchantChecklistTitle">Current ops suggestions</h3>
+              </div>
+            </div>
+            <p id="merchantChecklistCopy" class="merchant-section-copy">This section is not a message backlog. It only keeps the most actionable business suggestions for right now.</p>
+            <div id="merchantChecklist" class="merchant-list"></div>
+          </article>
+
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Settlement</p>
+                <h3 id="merchantSettlementOverviewTitle">Settlement overview</h3>
+              </div>
+            </div>
+            <p id="merchantSettlementOverviewCopy" class="merchant-section-copy">Review receivables, settled amounts, and pending gaps first, then decide whether follow-up or support coordination is needed.</p>
+            <div id="merchantSettlementSummary" class="merchant-kv-grid"></div>
+          </article>
+        </section>
+
+        <section class="merchant-grid">
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Platform Request</p>
+                <h3 id="merchantListingRequestTitle">Platform requests</h3>
+              </div>
+              <span id="merchantListingFormStatus" class="merchant-badge">Platform reviewed</span>
+            </div>
+            <p id="merchantListingRequestCopy" class="merchant-section-copy">Submit listing, profile, capability, and governance requests here instead of handling them through offline escalation.</p>
+            <form id="merchantListingRequestForm" class="merchant-form">
+              <div class="merchant-form-grid">
+                <label>
+                  <span id="merchantListingRequestTypeLabel">Request type</span>
+                  <select id="listingRequestType" name="requestType" class="merchant-select">
+                    <option value="listing_launch_request">Apply for platform listing</option>
+                    <option value="listing_material_update">Update listing materials</option>
+                    <option value="service_capability_update">Add service capabilities</option>
+                    <option value="network_activation_request">Request store-network onboarding</option>
+                  </select>
+                </label>
+                <label>
+                  <span id="merchantListingRequestTitleLabel">Request title</span>
+                  <input id="listingRequestTitle" name="title" type="text" maxlength="120" placeholder="Example: Apply Shanghai store for platform listing" />
+                </label>
+              </div>
+              <div>
+                <label>
+                  <span id="merchantListingRequestStoresLabel">Stores in scope</span>
+                </label>
+                <div id="merchantListingRequestStores" class="merchant-store-selector"></div>
+              </div>
+              <div id="merchantListingRequestHelper" class="merchant-list-caption"></div>
+              <label>
+                <span id="merchantListingRequestNoteLabel">Additional details</span>
+                <textarea id="listingRequestNote" name="note" rows="5" maxlength="400" placeholder="Describe service highlights, target guests, launch goals, or profile changes."></textarea>
+              </label>
+              <button id="merchantListingRequestSubmitBtn" type="submit">Submit request</button>
+            </form>
+          </article>
+
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Profile</p>
+                <h3 id="merchantProfileTitle">Merchant profile</h3>
+              </div>
+              <span id="merchantProfileUpdated" class="merchant-badge">-</span>
+            </div>
+            <p id="merchantProfileCopy" class="merchant-section-copy">Only maintain the fields that affect user-facing presentation and platform review. Internal notes should not live in public profile fields.</p>
+            <form id="merchantProfileForm" class="merchant-form">
+              <label>
+                <span id="merchantProfileNameLabel">Merchant name</span>
+                <input id="profileName" name="name" type="text" maxlength="80" required />
+              </label>
+              <div class="merchant-form-grid">
+                <label>
+                  <span id="merchantProfileCityLabel">City</span>
+                  <input id="profileCity" name="city" type="text" maxlength="40" />
+                </label>
+                <label>
+                  <span id="merchantProfileCategoryLabel">Category</span>
+                  <input id="profileCategory" name="category" type="text" maxlength="40" />
+                </label>
+              </div>
+              <label>
+                <span id="merchantProfileContactNameLabel">Contact name</span>
+                <input id="profileContactName" name="contactName" type="text" maxlength="60" />
+              </label>
+              <div class="merchant-form-grid">
+                <label>
+                  <span id="merchantProfileContactPhoneLabel">Contact phone</span>
+                  <input id="profileContactPhone" name="contactPhone" type="text" maxlength="40" />
+                </label>
+                <label>
+                  <span id="merchantProfileContactEmailLabel">Contact email</span>
+                  <input id="profileContactEmail" name="contactEmail" type="email" maxlength="120" />
+                </label>
+              </div>
+              <label>
+                <span id="merchantProfileDescriptionLabel">Profile description</span>
+                <textarea id="profileDescription" name="description" rows="4" maxlength="300"></textarea>
+              </label>
+              <button id="merchantProfileSubmitBtn" type="submit">Save profile</button>
+            </form>
+          </article>
+        </section>
+
+        <section class="merchant-grid merchant-grid-bottom">
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Fulfillment Desk</p>
+                <h3 id="merchantFulfillmentTitle">Fulfillment desk</h3>
+              </div>
+            </div>
+            <p id="merchantFulfillmentCopy" class="merchant-section-copy">This area is only for accepting orders, moving fulfillment forward, and reporting issues. It is not for platform review or profile editing.</p>
+            <div class="merchant-inline-controls">
+              <select id="merchantOrderStatusFilter" class="merchant-select">
+                <option value="">All orders</option>
+                <option value="pending">Pending payment</option>
+                <option value="confirmed">Confirmed</option>
+                <option value="paid">Paid</option>
+                <option value="executing">In fulfillment</option>
+                <option value="delivered">Delivered</option>
+                <option value="completed">Completed</option>
+                <option value="canceled">Canceled</option>
+                <option value="refunded">Refunded</option>
+              </select>
+              <button id="merchantOrderRefreshBtn" class="merchant-secondary" type="button">Refresh orders</button>
+            </div>
+            <div id="merchantOrderList" class="merchant-list merchant-list-spaced"></div>
+          </article>
+
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Support Collaboration</p>
+                <h3 id="merchantSupportTitle">Support collaboration</h3>
+              </div>
+              <button id="merchantSupportRefreshBtn" class="merchant-secondary" type="button">Refresh support</button>
+            </div>
+            <p id="merchantSupportCopy" class="merchant-section-copy">When orders, profile details, or onsite service become blocked, coordinate with the platform support team here.</p>
+            <div class="merchant-inline-controls">
+              <select id="merchantSupportStatusFilter" class="merchant-select">
+                <option value="">All support tickets</option>
+                <option value="open">Open</option>
+                <option value="in_progress">In progress</option>
+                <option value="resolved">Resolved</option>
+              </select>
+            </div>
+            <div id="merchantSupportList" class="merchant-list"></div>
+          </article>
+        </section>
+
+        <section class="merchant-grid merchant-grid-bottom">
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Settlement Details</p>
+                <h3 id="merchantSettlementTitle">Settlement details</h3>
+              </div>
+              <button id="merchantSettlementRefreshBtn" class="merchant-secondary" type="button">Refresh settlements</button>
+            </div>
+            <p id="merchantSettlementCopy" class="merchant-section-copy">Review settlement progress, variances, and notes by batch to confirm the financial loop is complete.</p>
+            <div class="merchant-inline-controls">
+              <select id="merchantSettlementStatusFilter" class="merchant-select">
+                <option value="">All statuses</option>
+                <option value="pending">Pending settlement</option>
+                <option value="settled">Settled</option>
+                <option value="refunded">Refunded</option>
+              </select>
+              <button id="merchantSettlementExportBtn" class="merchant-ghost" type="button">导出 CSV</button>
+            </div>
+            <div id="merchantSettlementList" class="merchant-list"></div>
+          </article>
+
+          <article class="merchant-card">
+            <div class="merchant-card-head">
+              <div>
+                <p class="merchant-section-tag">Activity</p>
+                <h3 id="merchantActivityTitle">Recent activity</h3>
+              </div>
+            </div>
+            <p id="merchantActivityCopy" class="merchant-section-copy">Use the activity trail last to see whether any action is still missing or whether incident follow-up is needed today.</p>
+            <div id="merchantActivityList" class="merchant-list"></div>
+          </article>
+        </section>
+      </section>
+    </main>
+
+    <script src="/merchant.js?v=20260409-1816"></script>
+  </body>
+</html>

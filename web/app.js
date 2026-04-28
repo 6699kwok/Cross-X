@@ -1,11 +1,16 @@
-const ASSET_VERSION = "20260228-010";
+// Consumer app entrypoint. This file is the browser-side integration layer that
+// binds chat, planning, fulfillment, nearby exploration, localization, and voice
+// features into one runtime state machine. Most UI behavior hangs off the shared
+// `state` object below, so read this top section first before diving into render
+// helpers further down.
+const ASSET_VERSION = "20260317-001"; // Fixed all Chinese hardcoded strings in plan pipeline
 
 // P1-A: Global error boundary — catches unhandled promise rejections and JS errors
 // Prevents app from silently entering broken state when API calls fail
 window.addEventListener("unhandledrejection", (event) => {
   const reason = event.reason;
   const msg = reason instanceof Error ? reason.message : String(reason || "Unknown error");
-  console.error("[CrossX] Unhandled rejection:", msg, reason);
+  console.error("[CrossX] Unhandled rejection:", sanitizeClientErrorCode(msg, "unhandled_rejection"));
   // Show toast for user-visible failures (network errors, API failures)
   if (msg && (msg.includes("fetch") || msg.includes("API") || msg.includes("network") || msg.includes("Failed"))) {
     if (typeof toast !== "undefined" && toast && typeof pickText === "function") {
@@ -14,7 +19,7 @@ window.addEventListener("unhandledrejection", (event) => {
   }
 });
 window.addEventListener("error", (event) => {
-  console.error("[CrossX] Global error:", event.message, event.filename, event.lineno);
+  console.error("[CrossX] Global error:", sanitizeClientErrorCode(event && event.message, "window_error"));
 });
 
 const i18n = window.CrossXI18n || {
@@ -42,15 +47,25 @@ const AGENT_INTENTS = ["eat", "travel", "hotel", "combo_eat_travel", "combo_hote
 const AGENT_SLOT_KEYS = ["intent", "city", "area", "party_size", "budget", "time_constraint", "preferences", "execution_permission"];
 const AGENT_STATES = ["idle", "parsing", "asking", "planning", "confirming", "executing", "completed", "failed", "replanning"];
 const AGENT_FAILURE_CODES = ["queue_too_long", "budget_overflow", "resource_unavailable"];
+const UI_FALLBACK_LANGUAGES = new Set(["ES", "HI", "VI"]);
+const UI_FALLBACK_LANGUAGE_LABELS = {
+  ES: "Español",
+  HI: "Hindi",
+  VI: "Vietnamese",
+};
 let _ceSlots = null; // working copy for condition editor drawer
 
 const state = {
-  selectedConstraints: {},
+  selectedConstraints: (() => {
+    try { return JSON.parse(localStorage.getItem("cx_constraints") || "{}"); } catch { return {}; }
+  })(),
   constraintsExpanded: false,
   singleDialogMode: true,
+  surfaceMode: "workspace",
   loopProgress: "intent",
   currentTask: null,
   tripPlans: [],
+  orderSummaries: [],
   activeTripId: "",
   currentTaskDetail: null,
   currentTaskRecommendation: null,
@@ -73,20 +88,12 @@ const state = {
   })(),
   uiLanguage: (() => {
     const saved = localStorage.getItem("cx_ui_lang");
-    if (saved && ["ZH","EN","JA","KO","ID","AR","ZH-TW"].includes(saved)) return saved;
-    const nav = (navigator.language || navigator.userLanguage || "en").toLowerCase();
-    if (nav.startsWith("zh-tw") || nav.startsWith("zh-hk") || nav.startsWith("zh-mo")) return "ZH-TW";
-    if (nav.startsWith("zh")) return "ZH";
-    if (nav.startsWith("ja")) return "JA";
-    if (nav.startsWith("ko")) return "KO";
-    if (nav.startsWith("id")) return "ID";
-    if (nav.startsWith("ar")) return "AR";
-    // Track whether we fell back so we can show a one-time notice
-    if (!nav.startsWith("en")) {
-      try { sessionStorage.setItem("cx_lang_fallback", nav.slice(0, 5)); } catch { /* ignore */ }
-    }
+    if (saved && ["ZH","EN","JA","KO","ID","AR","ZH-TW","ES","HI","VI"].includes(saved)) return saved;
     return "EN";
   })(),
+  _locationLabelZh: "",
+  _locationLabelEn: "",
+  _locationHasGps: false,
   viewMode: "user",
   nearItems: [],
   selectedNearItemId: null,
@@ -196,8 +203,9 @@ function saveConversationState() {
 
 function restoreConversationState() {
   try {
-    // Try tab-specific key first, fall back to shared legacy key
-    const raw = localStorage.getItem(CONV_STORAGE_KEY) || localStorage.getItem(CONV_STORAGE_KEY_SHARED);
+    // Only restore tab-scoped conversation. The legacy shared key polluted fresh tabs
+    // with unrelated old requests, which then corrupted follow-up planning state.
+    const raw = localStorage.getItem(CONV_STORAGE_KEY);
     if (!raw) return;
     const saved = JSON.parse(raw);
     if (!saved || !saved.savedAt) return;
@@ -206,8 +214,13 @@ function restoreConversationState() {
       return;
     }
     if (Array.isArray(saved.messages) && saved.messages.length > 0) {
-      state.agentConversation.messages = saved.messages;
-      // Mark that we restored so init() can show context banner
+      // Keep restored turns out of active prompt history until the user
+      // explicitly continues. Hidden restored turns were contaminating fresh
+      // requests while the UI only showed a compact banner.
+      state._restoredConversation = {
+        messages: saved.messages.slice(-20),
+        savedAt: saved.savedAt,
+      };
       state._sessionRestored = true;
       state._restoredAt = saved.savedAt;
     }
@@ -239,6 +252,9 @@ const store = window.CrossXState
 const el = {
   chatFeed: document.getElementById("chatFeed"),
   taskWorkspace: document.getElementById("taskWorkspace"),
+  conciergeHome: document.getElementById("conciergeHome"),
+  plannerWorkspaceIntro: document.getElementById("plannerWorkspaceIntro"),
+  fulfillmentHubIntro: document.getElementById("fulfillmentHubIntro"),
   taskStatusMount: document.getElementById("taskStatusMount"),
   planCardsSection: document.getElementById("planCardsSection"),
   confirmCardSection: document.getElementById("confirmCardSection"),
@@ -426,6 +442,7 @@ const el = {
   currencyPillLabel: document.getElementById("currencyPillLabel"),
   shareItinBtn: document.getElementById("shareItinBtn"),
   shareItinBtnLabel: document.getElementById("shareItinBtnLabel"),
+  brandWrap: document.getElementById("brandWrap"),
   fsDecBtn: document.getElementById("fsDecBtn"),
   fsIncBtn: document.getElementById("fsIncBtn"),
   fsResetBtn: document.getElementById("fsResetBtn"),
@@ -434,6 +451,9 @@ const el = {
   viewModeTag: document.getElementById("viewModeTag"),
   viewModeForm: document.getElementById("viewModeForm"),
   emergencyBtn: document.getElementById("emergencyBtn"),
+  loginBtn: document.getElementById("loginBtn"),
+  userNameTag: document.getElementById("userNameTag"),
+  logoutBtn: document.getElementById("logoutBtn"),
   drawer: document.getElementById("taskDrawer"),
   drawerTitle: document.getElementById("drawerTitle"),
   drawerBody: document.getElementById("drawerBody"),
@@ -544,6 +564,10 @@ function escapeHtml(input) {
     .replace(/'/g, "&#39;");
 }
 
+function inlineJsArg(value) {
+  return escapeHtml(JSON.stringify(value));
+}
+
 function assetUrl(url) {
   const raw = String(url || "");
   if (!raw) return "";
@@ -566,6 +590,213 @@ function pickText(zh, en, ja, ko, id, ar) {
   if (state.uiLanguage === "ID") return id || en;
   if (state.uiLanguage === "AR") return ar || en;
   return en;
+}
+
+function isUiFallbackLanguage(language = state.uiLanguage) {
+  return UI_FALLBACK_LANGUAGES.has(String(language || "").toUpperCase());
+}
+
+function getUiFallbackNotice(language = state.uiLanguage) {
+  const lang = String(language || "").toUpperCase();
+  if (!isUiFallbackLanguage(lang)) return "";
+  const label = UI_FALLBACK_LANGUAGE_LABELS[lang] || lang;
+  return pickText(
+    `${label} 目前为英文界面降级模式，Booking/Agoda 链接会尽量使用对应语言参数。`,
+    `${label} is currently in English fallback mode. Booking/Agoda links will use localized language parameters when available.`,
+    `${label} は現在英語UIでのフォールバック表示です。Booking/Agoda リンクは可能な範囲で該当言語パラメータを使います。`,
+    `${label} UI는 현재 영어 폴백 모드입니다. Booking/Agoda 링크에는 가능한 경우 해당 언어 파라미터를 적용합니다。`,
+    `${label} saat ini memakai fallback UI bahasa Inggris. Tautan Booking/Agoda akan memakai parameter bahasa bila tersedia.`,
+    `تعمل ${label} حالياً بواجهة إنجليزية احتياطية. وستستخدم روابط Booking/Agoda معلمات اللغة المناسبة عند توفرها.`,
+  );
+}
+
+function getEffectiveUiLanguage(language = state.uiLanguage) {
+  const lang = String(language || state.uiLanguage || "EN").toUpperCase();
+  if (lang === "ZH-CN") return "ZH";
+  if (lang === "ZH-HK" || lang === "ZH-MO") return "ZH-TW";
+  return lang || "EN";
+}
+
+function getLocalizedPrivacyUrl(language = state.uiLanguage) {
+  const lang = getEffectiveUiLanguage(language);
+  const pageLang =
+    lang === "ZH" ? "zh"
+    : lang === "ZH-TW" ? "zh-TW"
+    : lang === "JA" ? "ja"
+    : lang === "KO" ? "ko"
+    : lang === "ID" ? "id"
+    : lang === "AR" ? "ar"
+    : "en";
+  return `/privacy?lang=${encodeURIComponent(pageLang)}`;
+}
+
+function syncPrivacyLinkTargets(scope = document, language = state.uiLanguage) {
+  if (!scope || typeof scope.querySelectorAll !== "function") return;
+  const href = getLocalizedPrivacyUrl(language);
+  scope.querySelectorAll('a[href="/privacy"], a[href^="/privacy?"], a[data-privacy-link="1"]').forEach((node) => {
+    node.setAttribute("href", href);
+  });
+}
+
+function setButtonVisibleText(button, text) {
+  if (!button) return;
+  const labelNode = button.querySelector?.('[data-button-label="1"]');
+  if (labelNode) labelNode.textContent = text;
+  else button.textContent = text;
+  button.setAttribute("aria-label", text);
+}
+
+function formatThinkingCharCount(count) {
+  const safeCount = Number(count) || 0;
+  if (safeCount <= 0) return "";
+  return pickText(
+    `${safeCount} 字`,
+    `${safeCount} chars`,
+    `${safeCount} 文字`,
+    `${safeCount}자`,
+    `${safeCount} karakter`,
+    `${safeCount} حرفًا`,
+  );
+}
+
+function shouldSummarizeThinkingForCurrentLanguage(text) {
+  const lang = getEffectiveUiLanguage();
+  if (lang === "ZH" || lang === "ZH-TW") return false;
+  return String(text || "").trim().length > 0;
+}
+
+function normalizeThinkingStatusText(text, fallback = "") {
+  const raw = String(text || "").trim();
+  if (!raw) return fallback;
+  const localized = _localizeVisibleTravelText(raw, fallback, state.uiLanguage);
+  return localized || fallback || raw;
+}
+
+function buildAgentMessageExportHtml(text) {
+  const now = new Date();
+  const title = pickText("CrossX AI 回复导出", "CrossX AI Response Export", "CrossX AI返信エクスポート", "CrossX AI 응답 내보내기");
+  const body = escapeHtml(String(text || "")).replace(/\n/g, "<br>");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "SF Pro Text", "Segoe UI", "Noto Sans", sans-serif;
+      background: linear-gradient(180deg, #f6f3ee 0%, #ffffff 100%);
+      color: #1f2937;
+    }
+    .wrap {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 40px 24px 64px;
+    }
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+    .btn {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 18px;
+      font: inherit;
+      cursor: pointer;
+      background: #111827;
+      color: #fff;
+    }
+    .btn.secondary {
+      background: #e5e7eb;
+      color: #111827;
+    }
+    .card {
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(17,24,39,0.08);
+      border-radius: 24px;
+      padding: 28px;
+      box-shadow: 0 18px 50px rgba(15,23,42,0.08);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+      line-height: 1.1;
+    }
+    .meta {
+      color: #6b7280;
+      font-size: 14px;
+      margin-bottom: 20px;
+    }
+    .message {
+      font-size: 16px;
+      line-height: 1.8;
+      white-space: normal;
+      word-break: break-word;
+    }
+    @media print {
+      body { background: #fff; }
+      .toolbar { display: none; }
+      .wrap { max-width: none; padding: 0; }
+      .card {
+        box-shadow: none;
+        border: 0;
+        border-radius: 0;
+        padding: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="toolbar">
+      <button class="btn" id="cxExportPrintBtn">${escapeHtml(pickText("保存为 PDF", "Save as PDF", "PDFとして保存", "PDF로 저장"))}</button>
+      <button class="btn secondary" id="cxExportCopyBtn">${escapeHtml(pickText("复制文本", "Copy text", "テキストをコピー", "텍스트 복사"))}</button>
+    </div>
+    <article class="card">
+      <h1>${escapeHtml(title)}</h1>
+      <div class="meta">${escapeHtml(now.toLocaleString())}</div>
+      <div class="message">${body}</div>
+    </article>
+  </div>
+</body>
+</html>`;
+}
+
+function exportAgentMessageAsPdf(text) {
+  const popup = window.open("", "_blank", "noopener,noreferrer,width=960,height=760");
+  if (!popup) {
+    notify(
+      pickText("导出窗口被浏览器拦截，请允许弹窗后重试。", "The export window was blocked by your browser. Allow pop-ups and try again.", "エクスポート画面がブロックされました。ポップアップを許可して再試行してください。", "내보내기 창이 차단되었습니다. 팝업을 허용한 뒤 다시 시도해 주세요."),
+      "warning",
+    );
+    return false;
+  }
+  popup.document.documentElement.innerHTML = buildAgentMessageExportHtml(text);
+  const printBtn = popup.document.getElementById("cxExportPrintBtn");
+  const copyBtn = popup.document.getElementById("cxExportCopyBtn");
+  if (printBtn) {
+    printBtn.addEventListener("click", () => {
+      try { popup.print(); } catch {}
+    });
+  }
+  if (copyBtn) {
+    copyBtn.addEventListener("click", async () => {
+      try {
+        if (!popup.navigator?.clipboard?.writeText) throw new Error("clipboard_unavailable");
+        await popup.navigator.clipboard.writeText(popup.document.body.innerText);
+      } catch {}
+    });
+  }
+  popup.focus();
+  setTimeout(() => {
+    try { popup.print(); } catch {}
+  }, 250);
+  return true;
 }
 
 function getLoopStages() {
@@ -658,17 +889,126 @@ let _activeChatReplyCtrl = null;
 // ── Smart auto-scroll ────────────────────────────────────────────────────────
 // Pause when user manually scrolls up; resume when back near bottom.
 let _chatScrollPaused = false;
-let _chatScrollListenerBound = false;
-function _smartScrollToBottom(feed) {
-  if (!feed) return;
-  if (!_chatScrollListenerBound) {
-    _chatScrollListenerBound = true;
-    feed.addEventListener("scroll", () => {
-      const dist = feed.scrollHeight - feed.scrollTop - feed.clientHeight;
-      _chatScrollPaused = dist > 80;
+let _chatScrollListenerTarget = null;
+function _getChatScrollContainer(feed) {
+  if (_isMobileConversationMode() && document.body?.classList.contains("single-dialog-mode")) {
+    return el.chat?.isConnected
+      ? el.chat
+      : document.getElementById("chatTab")
+        || el.taskWorkspace
+        || document.getElementById("taskWorkspace")
+        || feed
+        || el.chatFeed
+        || document.getElementById("chatFeed");
+  }
+  return el.taskWorkspace || document.getElementById("taskWorkspace") || feed || el.chatFeed || document.getElementById("chatFeed");
+}
+function _measureScrollDistance(container) {
+  if (!container) return 0;
+  return Math.max(0, container.scrollHeight - container.scrollTop - container.clientHeight);
+}
+function _isCompactMobileViewport() {
+  return typeof window !== "undefined" && window.innerWidth <= 768;
+}
+function _isMobileConversationMode() {
+  return _isCompactMobileViewport() && document.body?.classList.contains("consumer-app");
+}
+function _applyCompactTopbarContract() {
+  if (!document.body?.classList.contains("consumer-app")) return;
+  const compact = _isCompactMobileViewport();
+  const loginBtn = document.getElementById("loginBtn");
+  const locateBtn = document.getElementById("locateBtn");
+  const locationTag = document.getElementById("locationTag");
+  const userNameTag = document.getElementById("userNameTag");
+  const logoutBtn = document.getElementById("logoutBtn");
+  if (locateBtn) {
+    locateBtn.hidden = false;
+    locateBtn.classList.remove("hidden");
+    locateBtn.style.display = compact ? "inline-flex" : "";
+  }
+  if (!compact) {
+    [locationTag, userNameTag, logoutBtn, loginBtn].forEach((node) => {
+      if (node) {
+        node.hidden = false;
+        node.style.display = "";
+      }
+    });
+    if (locationTag) {
+      if (String(locationTag.textContent || "").trim()) locationTag.classList.remove("hidden");
+      else locationTag.classList.add("hidden");
+    }
+    const loggedIn = Boolean(loginBtn && loginBtn.classList.contains("hidden"));
+    if (userNameTag) userNameTag.classList.toggle("hidden", !loggedIn);
+    if (logoutBtn) logoutBtn.classList.toggle("hidden", !loggedIn);
+    return;
+  }
+  if (locationTag) {
+    locationTag.hidden = true;
+    locationTag.classList.add("hidden");
+    locationTag.style.display = "none";
+  }
+  if (userNameTag) {
+    userNameTag.hidden = true;
+    userNameTag.classList.add("hidden");
+    userNameTag.style.display = "none";
+  }
+  if (logoutBtn) {
+    logoutBtn.hidden = true;
+    logoutBtn.classList.add("hidden");
+    logoutBtn.style.display = "none";
+  }
+  if (loginBtn && !loginBtn.classList.contains("hidden")) loginBtn.style.display = "";
+}
+function _shouldForceOutputFocus() {
+  return _isMobileConversationMode() && (
+    state._planStreamActive === true ||
+    state.agentConversation?.smartLoading === true ||
+    document.body?.classList.contains("cx-cold-start")
+  );
+}
+function _focusComposerAfterReply() {
+  if (!_isMobileConversationMode() || document.getElementById("cx-login-modal")) return;
+  if (!el.chatInput || typeof el.chatInput.focus !== "function") return;
+  window.requestAnimationFrame(() => {
+    try {
+      el.chatInput.focus({ preventScroll: true });
+    } catch {
+      el.chatInput.focus();
+    }
+  });
+}
+function _smartScrollToBottom(feed, options = {}) {
+  const container = _getChatScrollContainer(feed);
+  if (!container) return;
+  if (_chatScrollListenerTarget !== container) {
+    _chatScrollListenerTarget = container;
+    container.addEventListener("scroll", () => {
+      _chatScrollPaused = _measureScrollDistance(container) > 80;
     }, { passive: true });
   }
-  if (!_chatScrollPaused) feed.scrollTop = feed.scrollHeight;
+  if (_chatScrollPaused && options.force !== true) return;
+  container.scrollTop = container.scrollHeight;
+}
+function _revealConversationNode(node, options = {}) {
+  if (!node) return;
+  const force = options.force === true;
+  if (_chatScrollPaused && !force) return;
+  if (_isMobileConversationMode() && typeof node.scrollIntoView === "function") {
+    node.scrollIntoView({
+      behavior: options.behavior || (force ? "smooth" : "auto"),
+      block: options.block || "nearest",
+      inline: "nearest",
+    });
+    return;
+  }
+  _smartScrollToBottom(el.chatFeed, { force });
+}
+function _isPrimaryResultCard(node) {
+  return Boolean(
+    node &&
+    node.matches &&
+    node.matches(".plan-card, .plan-card--v2, .cx-td-card, .task-panel, .task-status-card, .cx-pb-card, .smart-reply-card")
+  );
 }
 
 // ── Tool-call context skeleton ───────────────────────────────────────────────
@@ -716,6 +1056,7 @@ function _removeToolSkeleton() {
  */
 function isAiBusy() {
   return Boolean(_currentPlanAbortController)
+      || Boolean(_activeChatReplyCtrl)
       || el.thinkingIndicator?.classList.contains("is-active") === true;
 }
 
@@ -777,7 +1118,7 @@ function renderHumanAssistDock() {
   if (el.humanAssistCard) {
     const tickets = Array.isArray(state.supportTickets) ? state.supportTickets : [];
     const hasOpenTicket = tickets.some((t) => ["open","in_progress"].includes(String(t.status||"").toLowerCase()));
-    el.humanAssistCard.style.display = (task || hasOpenTicket) ? "" : "none";
+    el.humanAssistCard.classList.toggle("hidden", !(task || hasOpenTicket));
   }
   const tickets = Array.isArray(state.supportTickets) ? state.supportTickets : [];
   const openTickets = tickets.filter((t) => ["open", "in_progress"].includes(String(t.status || "").toLowerCase()));
@@ -819,10 +1160,10 @@ function renderHumanAssistDock() {
 
   if (currentTicket) {
     const ticketLine = pickText(
-      `工单 ${currentTicket.id} · 状态 ${localizeStatus(currentTicket.status)} · 处理方 ${currentTicket.handler || "human"}`,
-      `Ticket ${currentTicket.id} · ${localizeStatus(currentTicket.status)} · handler ${currentTicket.handler || "human"}`,
-      `チケット ${currentTicket.id} · ${localizeStatus(currentTicket.status)} · 担当 ${currentTicket.handler || "human"}`,
-      `티켓 ${currentTicket.id} · ${localizeStatus(currentTicket.status)} · 담당 ${currentTicket.handler || "human"}`,
+      `工单 ${currentTicket.id} · 状态 ${localizeStatus(currentTicket.status)}`,
+      `Ticket ${currentTicket.id} · ${localizeStatus(currentTicket.status)}`,
+      `チケット ${currentTicket.id} · ${localizeStatus(currentTicket.status)}`,
+      `티켓 ${currentTicket.id} · ${localizeStatus(currentTicket.status)}`,
     );
     el.humanAssistTicket.innerHTML = `
       <span>${escapeHtml(ticketLine)}</span>
@@ -902,7 +1243,7 @@ function applySingleDialogMode() {
   // Show/hide admin-only workspace panels (Context, FlowRail, AgentBrain)
   const _isWorkspace = state.viewMode === "admin" && !state.singleDialogMode;
   document.querySelectorAll(".admin-workspace-only").forEach((el) => {
-    el.style.display = _isWorkspace ? "" : "none";
+    el.classList.toggle("hidden", !_isWorkspace);
   });
   if (state.singleDialogMode) {
     switchTab("chat", { force: true });
@@ -925,6 +1266,588 @@ function applySingleDialogMode() {
     }
   }
   autoResizeChatInput();
+  _syncColdStartLayout();
+}
+
+function shouldPreferConciergeHome() {
+  return false;
+}
+
+function getPrimaryTripSummary() {
+  const trips = Array.isArray(state.tripPlans) ? state.tripPlans : [];
+  if (!trips.length) return null;
+  return (
+    trips.find((trip) => trip.id === state.activeTripId)
+    || trips.find((trip) => ["active", "in_progress"].includes(String(trip.status || "").toLowerCase()))
+    || trips[0]
+  );
+}
+
+function getConciergeGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 11) return pickText("早上好", "Good morning", "おはようございます", "좋은 아침입니다");
+  if (hour < 18) return pickText("下午好", "Good afternoon", "こんにちは", "좋은 오후입니다");
+  return pickText("晚上好", "Good evening", "こんばんは", "좋은 저녁입니다");
+}
+
+function formatHomeAmount(order) {
+  if (!order) return pickText("待确认", "Pending", "未確定", "확인 대기");
+  const amount = Number(order.totalPrice || order.amount || order.price || 0);
+  const currency = String(order.currency || "CNY");
+  if (currency === "CNY") return formatCNY(amount);
+  return `${amount.toLocaleString()} ${currency}`;
+}
+
+function getOrderTitle(order) {
+  if (!order) return pickText("订单", "Order", "注文", "주문");
+  return _localizeVisibleTravelText(order.displayLabel || order.provider || order.merchant || order.type || "", pickText("订单", "Order", "注文", "주문"));
+}
+
+function renderConciergeHome() {
+  if (!el.conciergeHome) return;
+  if (!shouldPreferConciergeHome()) {
+    el.conciergeHome.classList.add("hidden");
+    el.conciergeHome.innerHTML = "";
+    return;
+  }
+
+  const displayName =
+    _getAuthName()
+    || String((el.userNameTag && el.userNameTag.textContent) || "").trim()
+    || pickText("旅行者", "Traveler", "旅人", "여행자");
+  const primaryTrip = getPrimaryTripSummary();
+  const recentOrders = Array.isArray(state.orderSummaries) ? state.orderSummaries.slice(0, 2) : [];
+  const latestOrder = recentOrders[0] || null;
+  const location =
+    (primaryTrip && primaryTrip.city)
+    || String((el.locationTag && el.locationTag.textContent) || "").trim()
+    || (typeof getCurrentCity === "function" ? getCurrentCity() : "")
+    || "Shanghai";
+  const tripProgress = primaryTrip && primaryTrip.progress ? primaryTrip.progress : {};
+  const totalTasks = Number(tripProgress.totalTasks || 0);
+  const totalOrders = Number(tripProgress.orderCount || 0);
+  const totalProofs = Number(tripProgress.proofCount || 0);
+  const nextPrompts = primaryTrip
+    ? [
+        {
+          label: pickText("找今晚晚餐", "Find dinner tonight", "今夜の夕食を探す", "오늘 저녁 식당 찾기"),
+          prompt: pickText(
+            `推荐${location}今晚适合外国游客、氛围好的晚餐，并给我两个可直接执行的预订方案。`,
+            `Recommend a foreigner-friendly dinner in ${location} for tonight with two bookable options.`,
+            `今夜の${location}で、外国人旅行者向けの雰囲気が良い夕食先を2案ください。`,
+            `오늘 밤 ${location}에서 외국인 여행자에게 적합한 저녁 식당 2곳을 추천해 주세요.`,
+          ),
+        },
+        {
+          label: pickText("安排接送", "Arrange transfer", "送迎を手配", "픽업 예약"),
+          prompt: pickText(
+            `帮我安排${location}当前行程的机场接送，并给出最稳妥的执行方案。`,
+            `Arrange the most reliable airport transfer for my current ${location} trip.`,
+            `${location}の現在の旅程向けに、最も確実な空港送迎を手配してください。`,
+            `현재 ${location} 여행에 가장 안정적인 공항 이동 수단을 준비해 주세요.`,
+          ),
+        },
+        {
+          label: pickText("继续规划", "Continue planning", "続きを計画", "계속 계획하기"),
+          prompt: pickText(
+            `继续完善我在${location}的当前行程，把待确认事项整理成下一步。`,
+            `Continue planning my current trip in ${location} and turn pending items into next steps.`,
+            `${location}の現在の旅程を続けて、保留事項を次のアクションに整理してください。`,
+            `${location} 현재 여행을 이어서 미정 항목을 다음 단계로 정리해 주세요.`,
+          ),
+        },
+      ]
+    : [
+        {
+          label: pickText("做一个新行程", "Start a new trip", "新しい旅程を作る", "새 여행 만들기"),
+          prompt: pickText(
+            "帮我从零开始规划一个中国行程，先问我最关键的三个问题。",
+            "Help me plan a new China trip from scratch and ask the three most important questions first.",
+            "中国旅行をゼロから計画したいです。まず重要な3つの質問をしてください。",
+            "중국 여행을 처음부터 계획하고 싶어요. 먼저 가장 중요한 세 가지를 물어봐 주세요.",
+          ),
+        },
+        {
+          label: pickText("订一家酒店", "Book a hotel", "ホテルを探す", "호텔 찾기"),
+          prompt: pickText(
+            "帮我找一家适合外国游客入住、流程省心的中国酒店，并给我两个预算档位。",
+            "Find a China hotel that is easy for international travelers, with two budget tiers.",
+            "外国人旅行者でもスムーズに泊まれる中国のホテルを、2つの予算帯で提案してください。",
+            "외국인 여행자가 편하게 숙박할 수 있는 중국 호텔을 두 가지 예산대로 추천해 주세요.",
+          ),
+        },
+        {
+          label: pickText("规划城市玩法", "Plan a city break", "都市旅を作る", "도시 여행 짜기"),
+          prompt: pickText(
+            "帮我做一个 3 天中国城市旅行方案，包含酒店、餐厅和出行安排。",
+            "Build a 3-day China city itinerary with hotel, food, and transport included.",
+            "中国の都市で3日間の旅程を、ホテル・食事・移動込みで作ってください。",
+            "중국 도시 3일 여행 일정을 호텔, 식사, 이동 포함으로 만들어 주세요.",
+          ),
+        },
+      ];
+  const homeOrderCount = primaryTrip ? totalOrders : recentOrders.length;
+  const heroPrimaryAction = primaryTrip
+    ? {
+        label: pickText("继续这个行程", "Continue this trip", "この旅程を続ける", "이 여행 계속하기"),
+        action: "enter-concierge-workspace",
+      }
+    : {
+        label: pickText("开始新的中国行程", "Start a China trip", "中国旅行を始める", "중국 여행 시작하기"),
+        action: "home-run-prompt",
+        message: nextPrompts[0].prompt,
+      };
+  const heroSecondaryAction = latestOrder
+    ? {
+        label: pickText("查看最新订单", "Open latest order", "最新注文を見る", "최근 주문 보기"),
+        action: "open-home-order-detail",
+        orderId: latestOrder.id || "",
+      }
+    : {
+        label: pickText("查看订单", "Review orders", "注文を見る", "주문 보기"),
+        action: "open-home-orders",
+      };
+  const homeStatusTone = primaryTrip
+    ? pickText("继续当前行程", "Trip in progress", "旅程進行中", "여행 진행 중")
+    : latestOrder
+      ? pickText("订单待跟进", "Order needs attention", "注文を確認", "주문 확인 필요")
+      : pickText("从一个明确目标开始", "Start with one clear goal", "まず1つの目的から", "한 가지 목표부터 시작");
+  const homeStatusSummary = primaryTrip
+    ? pickText("今天最优先的是推进当前行程，不要重新读完整个工作区。", "Start from your current trip first instead of re-reading the full workspace.", "今日は現在の旅程から進めれば十分で、ワークスペース全体を見直す必要はありません。", "오늘은 현재 여행부터 이어가면 충분하고, 전체 작업공간을 다시 볼 필요는 없습니다.")
+    : latestOrder
+      ? pickText("先处理最近订单，再决定是否进入深度规划。", "Handle the latest order first, then decide if you need deeper planning.", "まず最新注文を確認し、その後に詳細計画が必要か判断します。", "최근 주문을 먼저 처리한 다음 심화 계획이 필요한지 판단하세요.")
+      : pickText("首页只保留起步动作，不再同时堆满全部工具。", "Home should only keep the starting actions, not every tool at once.", "ホームには開始アクションだけを残し、全ツールを同時に積みません。", "홈에는 시작 액션만 남기고 모든 도구를 한 번에 쌓지 않습니다.");
+  const hasSnapshotData = Boolean(primaryTrip || latestOrder || homeOrderCount || totalProofs);
+  const heroSpotlightTitle = primaryTrip
+    ? pickText("继续当前行程", "Continue the active trip", "現在の旅程を続ける", "현재 여행 계속하기")
+    : latestOrder
+      ? pickText("先处理最近订单", "Handle the latest order first", "最新注文から確認", "최근 주문부터 확인")
+      : pickText("先做一件事", "Start with one clear request", "まず1つの依頼から", "먼저 한 가지 요청부터");
+  const heroSpotlightBody = primaryTrip
+    ? pickText("首页不再让你重新理解整个产品，只保留继续当前任务所需的入口。", "Home no longer asks you to decode the whole product. It keeps only the entrances needed to continue this trip.", "ホームでは製品全体を再理解させず、この旅程を続けるための入口だけを残します。", "홈에서는 제품 전체를 다시 이해하게 만들지 않고, 현재 여행을 이어가기 위한 입구만 남깁니다.")
+    : latestOrder
+      ? pickText("先确认最近一次履约结果，再决定要不要进入更深的规划。", "Confirm the latest fulfillment result first, then decide whether you need the workspace.", "まず直近の履約結果を確認し、その後に詳細な計画が必要か判断します。", "가장 최근의 이행 결과를 먼저 확인하고, 그다음 작업공간이 필요한지 판단하세요.")
+      : pickText("登录后的第一页只负责帮你开局，不再把工作区、订单、帮助中心全部摊开。", "The first signed-in screen should only help you begin, not spread out the workspace, orders, and support center at once.", "サインイン直後の1ページ目は開始を助けるだけに留め、ワークスペースや注文やヘルプを同時に広げません。", "로그인 직후 첫 페이지는 시작만 도와야 하고, 작업공간·주문·도움말을 한꺼번에 펼치지 않습니다.");
+  const heroSummaryItems = [
+    {
+      label: pickText("当前城市", "Current city", "現在地", "현재 도시"),
+      value: location,
+    },
+    {
+      label: primaryTrip
+        ? pickText("当前行程", "Active trip", "進行中の旅程", "활성 여행")
+        : latestOrder
+          ? pickText("最近订单", "Latest order", "最新注文", "최근 주문")
+          : pickText("下一步", "Next step", "次の一手", "다음 단계"),
+      value: primaryTrip
+        ? (primaryTrip.title || location)
+        : latestOrder
+          ? getOrderTitle(latestOrder)
+          : pickText("开始一个明确需求", "Start with one clear ask", "明確な依頼から始める", "명확한 요청 하나로 시작"),
+    },
+  ];
+  const routePanel = `
+    <article class="cx-home-panel cx-home-panel--compact cx-home-route-panel">
+      <div class="cx-home-panel__eyebrow">${pickText("快捷入口", "Quick Routes", "クイックルート", "빠른 진입")}</div>
+      <div class="cx-home-route-list">
+        <button class="cx-home-route-item" data-action="enter-concierge-workspace">
+          <strong>${pickText("规划工作区", "Planning workspace", "計画ワークスペース", "계획 워크스페이스")}</strong>
+          <small>${pickText("需要继续追问、比较方案或推进执行时再进入。", "Enter only when you need deeper planning or execution.", "深い計画や実行が必要な時だけ入ります。", "더 깊은 계획이나 실행이 필요할 때만 들어갑니다.")}</small>
+        </button>
+        <button class="cx-home-route-item" data-action="open-home-orders">
+          <strong>${pickText("订单与凭证", "Orders and proofs", "注文と証憑", "주문과 증빙")}</strong>
+          <small>${pickText("已经确认过的酒店、接送或餐厅，在这里集中查看。", "Keep confirmed hotels, transfers, and restaurant orders in one place.", "確定済みのホテル・送迎・レストランはここでまとめて確認します。", "확정된 호텔, 이동, 식당 주문을 여기서 한 번에 봅니다.")}</small>
+        </button>
+      </div>
+    </article>
+  `;
+  const focusPanel = primaryTrip
+    ? `
+      <article class="cx-home-panel cx-home-panel--primary cx-home-focus-panel">
+        <div class="cx-home-panel__eyebrow">${pickText("当前焦点", "Current Focus", "現在の焦点", "현재 포커스")}</div>
+        <h3>${escapeHtml(primaryTrip.title || location)}</h3>
+        <p>${escapeHtml(primaryTrip.note || pickText("你现在只需要推进下一步，不需要重新消化整个聊天工作台。", "You only need the next step now, not the whole chat workspace again.", "今必要なのは次の一手だけで、チャット全体を見直す必要はありません。", "지금 필요한 건 다음 단계뿐이고, 전체 채팅 작업공간을 다시 볼 필요는 없습니다."))}</p>
+        <div class="cx-home-metrics">
+          <div><span>${pickText("城市", "City", "都市", "도시")}</span><strong>${escapeHtml(primaryTrip.city || location)}</strong></div>
+          <div><span>${pickText("状态", "Status", "状態", "상태")}</span><strong>${escapeHtml(localizeStatus(primaryTrip.status || "active"))}</strong></div>
+          <div><span>${pickText("任务", "Tasks", "タスク", "작업")}</span><strong>${totalTasks}</strong></div>
+          <div><span>${pickText("订单", "Orders", "注文", "주문")}</span><strong>${totalOrders}</strong></div>
+        </div>
+        <div class="cx-home-inline-list">
+          ${nextPrompts.slice(0, 2)
+            .map(
+              (item) => `
+                <button class="cx-home-inline-action" data-action="home-run-prompt" data-message="${escapeHtml(item.prompt)}">
+                  <span>${escapeHtml(item.label)}</span>
+                  <small>${pickText("直接推进当前行程", "Apply on this trip", "今の旅程に使う", "현재 여행에 바로 적용")}</small>
+                </button>
+              `,
+            )
+            .join("")}
+        </div>
+        <div class="cx-home-panel__actions">
+          <button data-action="enter-concierge-workspace">${pickText("继续处理", "Continue trip", "続けて進める", "계속 진행")}</button>
+          <button class="secondary" data-action="open-trip-detail" data-trip="${escapeHtml(primaryTrip.id || "")}">${pickText("行程详情", "Trip details", "旅程詳細", "여행 상세")}</button>
+        </div>
+      </article>
+    `
+    : `
+      <article class="cx-home-panel cx-home-panel--primary cx-home-focus-panel">
+        <div class="cx-home-panel__eyebrow">${pickText("从这里开始", "Start Here", "ここから始める", "여기서 시작")}</div>
+        <h3>${pickText("先决定现在要解决什么，再进入工作区。", "Decide what you want to solve now before entering the workspace.", "まず今解決したいことを決めてからワークスペースへ進みます。", "지금 해결할 일을 먼저 정한 뒤 작업공간으로 들어가세요.")}</h3>
+        <p>${pickText("没有行程和订单时，首页只保留起步动作，不再把完整的产品导航直接摊给用户。", "When there is no trip or order yet, home keeps only the start actions instead of exposing the whole product map.", "旅程や注文がまだない時は、ホームには開始アクションだけを残し、製品全体の地図を前面に出しません。", "여행과 주문이 아직 없을 때 홈에는 시작 액션만 남기고 제품 전체 지도를 앞에 내세우지 않습니다.")}</p>
+        <div class="cx-home-action-list">
+          ${nextPrompts
+            .map(
+              (item, index) => `
+                <button class="cx-home-action${index === 0 ? " cx-home-action--primary" : ""}" data-action="home-run-prompt" data-message="${escapeHtml(item.prompt)}">
+                  <span>${escapeHtml(item.label)}</span>
+                  <small>${pickText("作为首页起点", "Use as your starting point", "ホームの起点として使う", "홈 시작점으로 사용")}</small>
+                </button>
+              `,
+            )
+            .join("")}
+        </div>
+      </article>
+    `;
+  el.conciergeHome.innerHTML = `
+    <section class="cx-home-shell">
+      <article class="cx-home-hero">
+        <div class="cx-home-hero__eyebrow">Cross X Concierge</div>
+        <div class="cx-home-hero__body">
+          <div class="cx-home-hero__copy">
+            <h2>${escapeHtml(getConciergeGreeting())}，${escapeHtml(displayName)}</h2>
+            <p>${escapeHtml(primaryTrip
+              ? pickText("先继续你已经开始的行程，首页只保留最必要的判断和入口。", "Resume the trip already in motion. Home keeps only the decisions and entrances that matter now.", "進行中の旅程をまず続けられるようにし、ホームには今必要な判断と入口だけを残します。", "진행 중인 여행을 먼저 이어가고, 홈에는 지금 필요한 판단과 입구만 남깁니다.")
+              : pickText("这里先帮你开局，只保留一个主入口和少量高频动作。", "This page should help you begin, with one main entry and only a few high-frequency actions.", "このページは開始点に徹し、主入口1つと高頻度アクションだけを残します。", "이 페이지는 시작점 역할만 하고, 주된 입구 하나와 자주 쓰는 액션 몇 개만 남깁니다."))}</p>
+          </div>
+          <aside class="cx-home-hero__spotlight">
+            <span class="cx-home-hero__spotlight-label">${pickText("现在最合适的入口", "Best entry right now", "今もっとも合う入口", "지금 가장 맞는 입구")}</span>
+            <strong>${escapeHtml(heroSpotlightTitle)}</strong>
+            <p>${escapeHtml(heroSpotlightBody)}</p>
+            <div class="cx-home-summary-pills">
+              ${heroSummaryItems
+                .map(
+                  (item) => `
+                    <div class="cx-home-summary-pill">
+                      <span>${escapeHtml(item.label)}</span>
+                      <strong>${escapeHtml(item.value)}</strong>
+                    </div>
+                  `,
+                )
+                .join("")}
+            </div>
+          </aside>
+        </div>
+        <div class="cx-home-hero__actions">
+          <button data-action="${escapeHtml(heroPrimaryAction.action)}"${heroPrimaryAction.message ? ` data-message="${escapeHtml(heroPrimaryAction.message)}"` : ""}>${escapeHtml(heroPrimaryAction.label)}</button>
+          <button class="secondary" data-action="${escapeHtml(heroSecondaryAction.action)}"${heroSecondaryAction.orderId ? ` data-order="${escapeHtml(heroSecondaryAction.orderId)}"` : ""}>${escapeHtml(heroSecondaryAction.label)}</button>
+        </div>
+      </article>
+
+      <div class="cx-home-main-grid">
+        ${focusPanel}
+
+        <div class="cx-home-side-stack">
+          ${hasSnapshotData ? `
+            <article class="cx-home-panel cx-home-panel--compact cx-home-status-panel">
+              <div class="cx-home-panel__eyebrow">${pickText("今天先看这里", "Today at a glance", "まずここを見る", "오늘 여기부터")}</div>
+              <h3>${escapeHtml(homeStatusTone)}</h3>
+              <p>${escapeHtml(homeStatusSummary)}</p>
+              <div class="cx-home-metrics">
+                <div><span>${pickText("当前城市", "Current city", "現在地", "현재 도시")}</span><strong>${escapeHtml(location)}</strong></div>
+                <div><span>${pickText("活跃行程", "Active trip", "進行中の旅程", "활성 여행")}</span><strong>${escapeHtml(primaryTrip ? localizeStatus(primaryTrip.status || "active") : pickText("无", "None", "なし", "없음"))}</strong></div>
+                <div><span>${pickText("订单", "Orders", "注文", "주문")}</span><strong>${homeOrderCount}</strong></div>
+                <div><span>${pickText("凭证", "Proofs", "証憑", "증빙")}</span><strong>${totalProofs}</strong></div>
+              </div>
+              <div class="cx-home-status-card">
+                <span class="cx-home-status-card__label">${pickText("最新订单", "Latest order", "最新注文", "최근 주문")}</span>
+                <strong>${escapeHtml(latestOrder ? getOrderTitle(latestOrder) : pickText("暂无已确认订单", "No confirmed order yet", "確定済み注文なし", "확정 주문 없음"))}</strong>
+                <small>${escapeHtml(latestOrder ? `${_localizeUiCityName(latestOrder.city || location, state.uiLanguage)} · ${localizeStatus(latestOrder.status || "created")} · ${formatHomeAmount(latestOrder)}` : pickText("酒店、接送或餐厅确认后，这里只保留一条最新结果。", "After a booking is confirmed, only the latest result stays here.", "予約確定後、ここには最新結果だけを残します。", "예약 확정 후 여기에는 최신 결과 하나만 남깁니다."))}</small>
+              </div>
+              <div class="cx-home-panel__actions">
+                <button class="secondary" data-action="open-home-orders">${pickText("查看全部订单", "Open all orders", "すべての注文を見る", "전체 주문 보기")}</button>
+              </div>
+            </article>
+          ` : ""}
+          ${routePanel}
+        </div>
+      </div>
+    </section>
+  `;
+
+  if (state.surfaceMode === "home") {
+    el.conciergeHome.classList.remove("hidden");
+  }
+  motion.bindPressables(el.conciergeHome);
+}
+
+function renderPlannerWorkspaceIntro() {
+  if (!el.plannerWorkspaceIntro) return;
+  const shouldShow = Boolean(shouldPreferConciergeHome() && state.surfaceMode === "workspace");
+  if (!shouldShow) {
+    el.plannerWorkspaceIntro.classList.add("hidden");
+    el.plannerWorkspaceIntro.innerHTML = "";
+    return;
+  }
+
+  const displayName =
+    _getAuthName()
+    || String((el.userNameTag && el.userNameTag.textContent) || "").trim()
+    || pickText("旅行者", "Traveler", "旅人", "여행자");
+  const primaryTrip = getPrimaryTripSummary();
+  const currentTask = state.currentTask || null;
+  const latestOrder = Array.isArray(state.orderSummaries) ? state.orderSummaries[0] || null : null;
+  const location =
+    (primaryTrip && primaryTrip.city)
+    || (currentTask && currentTask.city)
+    || String((el.locationTag && el.locationTag.textContent) || "").trim()
+    || (typeof getCurrentCity === "function" ? getCurrentCity() : "")
+    || "Shanghai";
+  const taskStatus = currentTask
+    ? localizeStatus(currentTask.status || state.loopProgress || "planning")
+    : pickText("待开始", "Ready", "開始待ち", "시작 전");
+  const taskLabel = currentTask
+    ? pickText(
+        `当前任务 ${currentTask.id}`,
+        `Live task ${currentTask.id}`,
+        `現在のタスク ${currentTask.id}`,
+        `현재 작업 ${currentTask.id}`,
+      )
+    : pickText("还没有活动任务", "No live task yet", "まだ進行中タスクはありません", "진행 중인 작업이 없습니다");
+  const tripLabel = primaryTrip
+    ? primaryTrip.title || location
+    : pickText("先从一个目标开始", "Start from one goal", "まず1つの目的から", "하나의 목표부터 시작");
+  const summary = currentTask
+    ? pickText(
+        "这里不是首页，也不该再是一个堆满功能的大面板。它只负责推进当前任务。",
+        "This is not the landing page, and it should not become another control panel. It is here to move the current task forward.",
+        "ここはホームではなく、機能を詰め込む場でもありません。現在のタスクを前へ進めるための作業面です。",
+        "여기는 랜딩 페이지도, 기능이 잔뜩 쌓인 제어판도 아닙니다. 현재 작업을 앞으로 밀어주는 작업면입니다.",
+      )
+    : pickText(
+        "你已经进入规划工作区。先选一件事推进，不要再把所有事情一起塞进聊天框。",
+        "You are in the planning workspace now. Advance one clear objective instead of cramming everything into the chat box.",
+        "いまは計画ワークスペースです。すべてを一度に詰め込まず、まず1つの目的を進めます。",
+        "지금은 계획 작업공간입니다. 모든 일을 한 번에 채팅창에 넣지 말고, 하나의 목표부터 진행합니다.",
+      );
+
+  const quickActions = currentTask
+    ? [
+        {
+          label: pickText("继续当前规划", "Continue current plan", "現在の計画を続ける", "현재 계획 계속하기"),
+          prompt: pickText(
+            `继续当前任务，告诉我最值得现在确认的下一步。`,
+            `Continue the current task and tell me the single best next step to confirm now.`,
+            `現在のタスクを続けて、今もっとも確認すべき次の一手を教えてください。`,
+            `현재 작업을 이어서 지금 가장 먼저 확인해야 할 다음 단계를 알려 주세요.`,
+          ),
+        },
+        {
+          label: pickText("补全缺失信息", "Fill missing info", "不足情報を補う", "누락 정보 보완"),
+          prompt: pickText(
+            `检查我当前任务里还缺什么信息，并按优先级一次问我一个问题。`,
+            `Check what is still missing in my current task and ask me one priority question at a time.`,
+            `現在のタスクで不足している情報を確認し、優先度順に1つずつ質問してください。`,
+            `현재 작업에서 부족한 정보를 확인하고 우선순위대로 한 번에 하나씩 물어봐 주세요.`,
+          ),
+        },
+        {
+          label: pickText("切到订单核对", "Review latest order", "最新注文を確認", "최근 주문 검토"),
+          prompt: pickText(
+            `帮我核对当前订单状态、凭证和下一步注意事项。`,
+            `Review my current order status, proof items, and the next thing I should watch.`,
+            `現在の注文状態、証憑、次に気をつける点を確認してください。`,
+            `현재 주문 상태, 증빙, 다음으로 확인할 사항을 검토해 주세요.`,
+          ),
+        },
+      ]
+    : [
+        {
+          label: pickText("做个新行程", "Start a new itinerary", "新しい旅程を作る", "새 일정 만들기"),
+          prompt: pickText(
+            "帮我开始一个新的中国行程，先问我最关键的三个问题。",
+            "Start a new China itinerary and ask me the three most important questions first.",
+            "新しい中国旅行を始めたいです。まず重要な3つの質問をしてください。",
+            "새 중국 여행 일정을 시작하고 가장 중요한 세 가지를 먼저 물어봐 주세요.",
+          ),
+        },
+        {
+          label: pickText("订今晚酒店", "Book tonight's hotel", "今夜のホテルを探す", "오늘 밤 호텔 찾기"),
+          prompt: pickText(
+            `帮我找${location}今晚适合外国游客入住的酒店，并直接给两个可执行方案。`,
+            `Find a foreigner-friendly hotel in ${location} for tonight and give me two executable options.`,
+            `${location}で今夜泊まれる外国人向けホテルを2案ください。`,
+            `${location}에서 오늘 밤 묵을 수 있는 외국인 친화 호텔 두 곳을 제안해 주세요.`,
+          ),
+        },
+        {
+          label: pickText("安排晚餐", "Arrange dinner", "夕食を手配", "저녁 식사 정하기"),
+          prompt: pickText(
+            `帮我安排${location}今晚晚餐，优先顺路、好订、适合外国游客。`,
+            `Arrange tonight's dinner in ${location}, prioritizing easy booking and foreigner-friendly places.`,
+            `${location}で今夜の夕食を、予約しやすく外国人向けの場所で手配してください。`,
+            `${location}에서 오늘 저녁을 예약하기 쉽고 외국인에게 편한 곳으로 잡아 주세요.`,
+          ),
+        },
+      ];
+
+  el.plannerWorkspaceIntro.innerHTML = `
+    <section class="cx-workspace-shell">
+      <article class="cx-workspace-hero">
+        <div class="cx-workspace-hero__eyebrow">${pickText("规划工作区", "Planning Workspace", "計画ワークスペース", "계획 워크스페이스")}</div>
+        <div class="cx-workspace-hero__head">
+          <div>
+            <h2>${escapeHtml(tripLabel)}</h2>
+            <p>${escapeHtml(summary)}</p>
+          </div>
+          <div class="cx-workspace-hero__user">${escapeHtml(displayName)}</div>
+        </div>
+        <div class="cx-workspace-metrics">
+          <div><span>${pickText("城市", "City", "都市", "도시")}</span><strong>${escapeHtml(location)}</strong></div>
+          <div><span>${pickText("当前状态", "Current status", "現在の状態", "현재 상태")}</span><strong>${escapeHtml(taskStatus)}</strong></div>
+          <div><span>${pickText("当前任务", "Live task", "現在のタスク", "현재 작업")}</span><strong>${escapeHtml(taskLabel)}</strong></div>
+          <div><span>${pickText("最新订单", "Latest order", "最新注文", "최근 주문")}</span><strong>${escapeHtml(latestOrder ? `${getOrderTitle(latestOrder)} · ${localizeStatus(latestOrder.status || "created")}` : pickText("暂无", "None yet", "まだなし", "아직 없음"))}</strong></div>
+        </div>
+        <div class="cx-workspace-hero__actions">
+          <button class="secondary" data-action="go-concierge-home">${pickText("返回首页", "Back to home", "ホームへ戻る", "홈으로 돌아가기")}</button>
+          <button class="secondary" data-action="open-home-orders">${pickText("查看订单", "Open orders", "注文を見る", "주문 보기")}</button>
+          <button class="secondary" data-action="assist-open-live-room">${pickText("联系人工礼宾", "Talk to concierge", "コンシェルジュへ連絡", "컨시어지 연결")}</button>
+        </div>
+      </article>
+      <article class="cx-workspace-actions-panel">
+        <div class="cx-workspace-actions-panel__eyebrow">${pickText("建议动作", "Suggested Moves", "おすすめの動き", "추천 액션")}</div>
+        <div class="cx-workspace-actions">
+          ${quickActions
+            .map(
+              (item) => `
+                <button class="cx-workspace-action" data-action="home-run-prompt" data-message="${escapeHtml(item.prompt)}">
+                  <span>${escapeHtml(item.label)}</span>
+                  <small>${pickText("直接送进当前工作区", "Run inside workspace", "この作業面で実行", "현재 작업공간에서 실행")}</small>
+                </button>
+              `,
+            )
+            .join("")}
+        </div>
+      </article>
+    </section>
+  `;
+  el.plannerWorkspaceIntro.classList.remove("hidden");
+  motion.bindPressables(el.plannerWorkspaceIntro);
+}
+
+function canUseFulfillmentHub() {
+  return Boolean(shouldPreferConciergeHome() && state.surfaceMode === "workspace");
+}
+
+function renderFulfillmentHubIntro() {
+  if (!el.fulfillmentHubIntro) return;
+  const shouldShow = Boolean(shouldPreferConciergeHome());
+  if (!shouldShow) {
+    el.fulfillmentHubIntro.innerHTML = "";
+    return;
+  }
+  const trips = Array.isArray(state.tripPlans) ? state.tripPlans : [];
+  const orders = Array.isArray(state.orderSummaries) ? state.orderSummaries : [];
+  const activeTrip = getPrimaryTripSummary();
+  const liveOrders = orders.filter((item) => ["created", "confirmed", "delivered", "refund_requested"].includes(String(item.status || "").toLowerCase()));
+  const refundOrders = orders.filter((item) => String(item.status || "").toLowerCase().includes("refund"));
+  const proofCount = orders.reduce((sum, item) => sum + (Array.isArray(item.proofItems) ? item.proofItems.length : 0), 0);
+  const latestOrder = orders[0] || null;
+  const headline = activeTrip
+    ? pickText(
+        `你现在的履约中心围绕 ${activeTrip.title} 展开。`,
+        `This fulfillment hub is now centered on ${activeTrip.title}.`,
+        `この履約ハブは ${activeTrip.title} を中心に組み立てています。`,
+        `이履行 허브는 ${activeTrip.title} 중심으로 구성됩니다.`,
+      )
+    : pickText(
+        "这里不再只是订单列表，而是你的履约中心。",
+        "This is no longer just a list of orders. It is your fulfillment hub.",
+        "ここは単なる注文一覧ではなく、履約ハブです。",
+        "여기는 단순한 주문 목록이 아니라履行 허브입니다.",
+      );
+  const copy = latestOrder
+    ? pickText(
+        `最近一笔订单是 ${getOrderTitle(latestOrder)}，当前状态 ${localizeStatus(latestOrder.status || "created")}。`,
+        `The latest order is ${getOrderTitle(latestOrder)}, currently ${localizeStatus(latestOrder.status || "created")}.`,
+        `最新注文は ${getOrderTitle(latestOrder)}、状態は ${localizeStatus(latestOrder.status || "created")} です。`,
+        `최근 주문은 ${getOrderTitle(latestOrder)} 이고 현재 상태는 ${localizeStatus(latestOrder.status || "created")} 입니다.`,
+      )
+    : pickText(
+        "先把行程、订单、凭证收进同一个履约层，再决定下一步。",
+        "Keep trips, orders, and proofs in one fulfillment layer before deciding the next move.",
+        "旅程・注文・証憑を1つの履約レイヤーにまとめてから次を決めます。",
+        "여행, 주문, 증빙을 하나의履行 레이어에 모은 뒤 다음 단계를 결정합니다.",
+      );
+
+  el.fulfillmentHubIntro.innerHTML = `
+    <section class="cx-fulfillment-shell">
+      <article class="cx-fulfillment-hero">
+        <div class="cx-fulfillment-hero__eyebrow">${pickText("履约中心", "Fulfillment Hub", "履約ハブ", "履행 허브")}</div>
+        <h2>${escapeHtml(headline)}</h2>
+        <p>${escapeHtml(copy)}</p>
+        <div class="cx-fulfillment-metrics">
+          <div><span>${pickText("行程", "Trips", "旅程", "트립")}</span><strong>${trips.length}</strong></div>
+          <div><span>${pickText("活跃订单", "Live orders", "進行中注文", "진행 주문")}</span><strong>${liveOrders.length}</strong></div>
+          <div><span>${pickText("凭证", "Proof items", "証憑", "증빙")}</span><strong>${proofCount}</strong></div>
+          <div><span>${pickText("退款中", "Refunds", "返金中", "환불")}</span><strong>${refundOrders.length}</strong></div>
+        </div>
+        <div class="cx-fulfillment-hero__actions">
+          <button class="secondary" data-action="go-workspace-chat">${pickText("返回规划工作区", "Back to workspace", "計画ワークスペースへ戻る", "계획 작업공간으로 돌아가기")}</button>
+          ${
+            latestOrder
+              ? `<button class="secondary" data-action="open-home-order-detail" data-order="${escapeHtml(latestOrder.id || "")}">${pickText("打开最新订单", "Open latest order", "最新注文を開く", "최근 주문 열기")}</button>`
+              : `<button class="secondary" data-action="go-workspace-chat">${pickText("开始一个新任务", "Start a new task", "新しいタスクを始める", "새 작업 시작")}</button>`
+          }
+        </div>
+      </article>
+    </section>
+  `;
+  motion.bindPressables(el.fulfillmentHubIntro);
+}
+
+function setConsumerSurface(mode, options = {}) {
+  const normalized = mode === "home" && shouldPreferConciergeHome() ? "home" : "workspace";
+  state.surfaceMode = normalized;
+  const isHome = normalized === "home";
+  const isAuthenticatedWorkspace = normalized === "workspace" && shouldPreferConciergeHome();
+  document.body.classList.toggle("cx-home-mode", isHome);
+  document.body.classList.toggle("cx-workspace-mode", isAuthenticatedWorkspace);
+  if (isHome) document.body.classList.remove("cx-cold-start");
+  if (el.conciergeHome) {
+    el.conciergeHome.classList.toggle("hidden", !isHome);
+  }
+  if (el.plannerWorkspaceIntro) {
+    el.plannerWorkspaceIntro.classList.toggle("hidden", !isAuthenticatedWorkspace);
+  }
+  if (isHome) {
+    renderConciergeHome();
+    renderPlannerWorkspaceIntro();
+    renderFulfillmentHubIntro();
+    if (state.singleDialogMode) switchTab("chat", { force: true });
+    return;
+  }
+  renderPlannerWorkspaceIntro();
+  renderFulfillmentHubIntro();
+  _syncColdStartLayout();
+  if (options.focusComposer !== false && el.chatInput && typeof el.chatInput.focus === "function") {
+    window.requestAnimationFrame(() => el.chatInput.focus());
+  }
+}
+
+async function hydrateConsumerHome(options = {}) {
+  const preferHome = options.preferHome === true && shouldPreferConciergeHome();
+  const focusComposer = options.focusComposer !== false;
+  if (!IS_USER_PORTAL) return;
+  if (!_canUsePrivateUserApis()) {
+    renderConciergeHome();
+    setConsumerSurface("workspace", { focusComposer });
+    return;
+  }
+  await Promise.allSettled([loadTrips(), loadOrders()]);
+  renderConciergeHome();
+  setConsumerSurface(preferHome ? "home" : "workspace", { focusComposer });
 }
 
 function slotLabel(slotKey) {
@@ -967,6 +1890,7 @@ function renderAgentBrain(task = null) {
   if (!current) {
     el.brainState.innerHTML = `<div class="status">${pickText("等待你的目标输入，我会自动路由专家与补全槽位。", "Waiting for your goal. I will route domain experts and fill slots.", "目標入力を待機中。専門家ルーティングとスロット補完を行います。", "목표 입력을 기다리는 중입니다. 전문가 라우팅과 슬롯 보완을 수행합니다.")}</div>`;
     renderHumanAssistDock();
+    renderPlannerWorkspaceIntro();
     return;
   }
   const sessionState = current.sessionState || (current.plan && current.plan.sessionState) || {};
@@ -1005,7 +1929,7 @@ function renderAgentBrain(task = null) {
       </article>
       <article class="brain-block">
         <h4>${pickText("会话状态", "Session state", "セッション状態", "세션 상태")}</h4>
-        <div class="status">${pickText("阶段", "Stage", "ステージ", "단계")}: <strong>${escapeHtml(sessionState.stage || "planning")}</strong> · Lane: <strong>${escapeHtml(sessionState.laneId || (current.plan && current.plan.laneId) || "-")}</strong></div>
+        <div class="status">${pickText("阶段", "Stage", "ステージ", "단계")}: <strong>${escapeHtml(sessionState.stage || "planning")}</strong> · ${pickText("通道", "Lane", "レーン", "레인")}: <strong>${escapeHtml(sessionState.laneId || (current.plan && current.plan.laneId) || "-")}</strong></div>
         <ul class="slot-list">${slotRows || `<li class="status">${pickText("暂无已识别槽位。", "No filled slots yet.", "入力済みスロットはありません。", "채워진 슬롯이 없습니다.")}</li>`}</ul>
       </article>
       <article class="brain-block">
@@ -1021,6 +1945,7 @@ function renderAgentBrain(task = null) {
   `;
   motion.bindPressables(el.brainState);
   renderHumanAssistDock();
+  renderPlannerWorkspaceIntro();
 }
 
 function speechLocaleForLang(lang) {
@@ -1125,7 +2050,7 @@ function startVoiceRecognitionNow() {
     state.voice.recognition.start();
     return true;
   } catch (err) {
-    const reason = err && err.message ? err.message : "start_failed";
+    const reason = sanitizeClientErrorCode(err && err.message, "start_failed");
     notify(
       pickText(
         `语音启动失败：${reason}`,
@@ -1912,15 +2837,7 @@ async function handleVoiceTranscript(text) {
       addMessage(getVoiceConfirmHint(), "agent");
     }
   } catch (err) {
-    notify(
-      pickText(
-        `语音任务处理失败：${err.message}`,
-        `Voice task failed: ${err.message}`,
-        `音声タスク処理に失敗: ${err.message}`,
-        `음성 작업 처리 실패: ${err.message}`,
-      ),
-      "error",
-    );
+    notify(formatClientActionError(err, "语音任务处理失败", "Voice task failed", "音声タスク処理に失敗", "음성 작업 처리 실패"), "error");
   } finally {
     state.voice.processing = false;
     scheduleVoiceRestart();
@@ -1988,6 +2905,7 @@ async function toggleVoiceListening() {
 function buildWelcomeIntro(locationLabel) {
   // locationLabel: e.g. "广东省深圳市" or null
   const loc = locationLabel ? String(locationLabel).trim() : "";
+  const compactMobile = _isCompactMobileViewport();
   // Time-of-day greeting prefix
   const h = new Date().getHours();
   const greetZh = h < 6 ? "\u591C\u5DF1\u6DF1\u4E86" : h < 11 ? "\u65E9\u5B89" : h < 14 ? "\u4E2D\u5348\u597D" : h < 18 ? "\u4E0B\u5348\u597D" : "\u665A\u4E0A\u597D";
@@ -1997,14 +2915,27 @@ function buildWelcomeIntro(locationLabel) {
 
   if (state.uiLanguage === "ZH") {
     const locPart = loc ? `\u6B22\u8FCE\u6765\u5230${loc}\uFF01` : `${greetZh}\uFF01`;
+    if (compactMobile) {
+      return `${locPart}\u6211\u662F Cross X\u3002\u8BF4\u4E00\u53E5\u9700\u6C42\uFF0C\u6211\u4F1A\u7ED9\u4F60\u53EF\u6267\u884C\u65B9\u6848\u3002`;
+    }
     return `${locPart}\u6211\u662F Cross X\uFF0C\u4F60\u7684 AI \u51FA\u884C\u7BA1\u5BB6\u3002\u544A\u8BC9\u6211\u4E00\u53E5\u8BDD\u76EE\u6807\uFF0C\u6211\u4F1A\u4E3A\u4F60\u5B9A\u5236\u65B9\u6848\u5E76\u63A8\u8FDB\u6267\u884C\u3002\n\n\u8BD5\u8BD5\uFF1A\u201C\u627E\u9644\u8FD1\u5C0F\u9F99\u8679\u201D\u00B7\u201C\u9884\u8BA2\u4E0A\u6D77\u4EBA\u6C11\u5E7F\u573A\u9644\u8FD1\u4F4F\u5BBF\u201D\u00B7\u201C\u53EB\u6ED1\u5934\u53BB\u673A\u573A\u201D`;
   }
   if (state.uiLanguage === "JA") {
+    if (compactMobile) {
+      return loc
+        ? `${loc}\u3078\u3088\u3046\u3053\u305D\uFF01Cross X\u3067\u3059\u3002\u3072\u3068\u8A00\u3067\u76EE\u7684\u3092\u4F1A\u3048\u3066\u304F\u3060\u3055\u3044\u3002`
+        : `${greetJa}\uFF01Cross X\u3067\u3059\u3002\u3072\u3068\u8A00\u3067\u76EE\u7684\u3092\u4F1A\u3048\u3066\u304F\u3060\u3055\u3044\u3002`;
+    }
     return loc
       ? `${loc}\u3078\u3088\u3046\u3053\u305D\uFF01Cross X\u3067\u3059\u3002\u3072\u3068\u8A00\u3067\u76EE\u7684\u3092\u4F1A\u3048\u3066\u304F\u3060\u3055\u3044\u3002\u6700\u9069\u306A\u6848\u3092\u4F5C\u6210\u3057\u5B9F\u884C\u307E\u3067\u9032\u3081\u307E\u3059\u3002`
       : `${greetJa}\uFF01Cross X\u3067\u3059\u3002\u3072\u3068\u8A00\u3067\u76EE\u7684\u3092\u4F1A\u3048\u3066\u304F\u3060\u3055\u3044\u3002\u6700\u9069\u306A\u6848\u3092\u4F5C\u6210\u3057\u5B9F\u884C\u307E\u3067\u9032\u3081\u307E\u3059\u3002`;
   }
   if (state.uiLanguage === "KO") {
+    if (compactMobile) {
+      return loc
+        ? `${loc}\uC5D0 \uC624\uC2E0 \uAC83\uC744 \uD658\uC601\uD569\uB2C8\uB2E4! Cross X\uC785\uB2C8\uB2E4. \uD55C \uBB38\uC7A5\uC73C\uB85C \uC6D0\uD558\uB294 \uAC83\uC744 \uB9D0\uD574 \uC8FC\uC138\uC694.`
+        : `${greetKo}! Cross X\uC785\uB2C8\uB2E4. \uD55C \uBB38\uC7A5\uC73C\uB85C \uC6D0\uD558\uB294 \uAC83\uC744 \uB9D0\uD574 \uC8FC\uC138\uC694.`;
+    }
     return loc
       ? `${loc}\uC5D0 \uC624\uC2E0 \uAC83\uC744 \uD658\uC601\uD569\uB2C8\uB2E4! Cross X\uC785\uB2C8\uB2E4. \uD55C \uBB38\uC7A5\uC73C\uB85C \uBAA9\uD45C\uB97C \uB9D0\uD558\uBA74 \uB9DE\uCDA4 \uC635\uC158\uC744 \uB9CC\uB4E4\uACE0 \uC2E4\uD589\uAE4C\uC9C0 \uC9C4\uD589\uD569\uB2C8\uB2E4.`
       : `${greetKo}! Cross X\uC785\uB2C8\uB2E4. \uD55C \uBB38\uC7A5\uC73C\uB85C \uBAA9\uD45C\uB97C \uB9D0\uD558\uBA74 \uB9DE\uCDA4 \uC635\uC158\uC744 \uB9CC\uB4E4\uACE0 \uC2E4\uD589\uAE4C\uC9C0 \uC9C4\uD589\uD569\uB2C8\uB2E4.`;
@@ -2012,6 +2943,11 @@ function buildWelcomeIntro(locationLabel) {
   // Default EN — only use locEn if it's already English (not Chinese chars)
   const locEn = state._locationLabelEn || (/[\u4e00-\u9fff]/.test(loc) ? "" : loc);
   const enExamples = `\n\nTry: \u201cFind me a halal restaurant nearby\u201d · \u201cBook a hotel in Shanghai under ¥500\u201d · \u201cGet me a taxi to the airport\u201d`;
+  if (compactMobile) {
+    return locEn
+      ? `${greetEn}! Welcome to ${locEn}. I’m Cross X. Tell me your goal and I’ll turn it into an executable plan.`
+      : `${greetEn}! I’m Cross X. Tell me your goal and I’ll turn it into an executable plan.`;
+  }
   return locEn
     ? `${greetEn}! Welcome to ${locEn}. I\u2019m Cross X \u2014 your AI bridge into China. Tell me your goal and I\u2019ll build a plan with real booking links.${enExamples}`
     : `${greetEn}! I\u2019m Cross X \u2014 your AI guide for navigating China. Tell me where you want to go or what you need.${enExamples}`;
@@ -2043,6 +2979,18 @@ function updateWelcomeBubbleWithLocation(data) {
 async function silentAutoDetectLocation() {
   if (!navigator.geolocation) return;
   try {
+    if (navigator.permissions && typeof navigator.permissions.query === "function") {
+      const status = await navigator.permissions.query({ name: "geolocation" });
+      if (!status || status.state !== "granted") return;
+    } else {
+      // Do not trigger a surprise permission prompt on startup when the browser
+      // does not expose permission state. Users can still opt in via the button.
+      return;
+    }
+  } catch {
+    return;
+  }
+  try {
     const position = await new Promise((resolve, reject) => {
       navigator.geolocation.getCurrentPosition(resolve, reject, {
         enableHighAccuracy: false,
@@ -2061,9 +3009,14 @@ async function silentAutoDetectLocation() {
       }),
     });
     if (data && data.city) {
-      if (el.locationTag) el.locationTag.textContent = `${data.cityZh || data.city} · GPS`;
+      _updateLocationTag(data.city, {
+        cityZh: data.cityZh || data.city,
+        cityEn: data.city,
+        hasGps: true,
+      });
       state.selectedConstraints.city = data.city;
       state.selectedConstraints.origin = "current_location";
+      _persistConstraints();
       // Store raw coords so buildNearbyPath() can send them to the server
       state._gpsLat = Number(coords.latitude);
       state._gpsLng = Number(coords.longitude);
@@ -2073,7 +3026,7 @@ async function silentAutoDetectLocation() {
       updateWelcomeBubbleWithLocation(data);
       // Update input placeholder to hint city-aware examples
       if (el.chatInput) {
-        const _cityHint = data.city || "Shanghai";
+        const _cityHint = data.city;
         el.chatInput.placeholder = pickText(
           `试试："推荐${_cityHint}附近的餐厅"`,
           `Try: "Find a restaurant near ${_cityHint}"`,
@@ -2125,8 +3078,12 @@ function localizeStatus(status) {
       fallback_to_human: "转人工",
       paused: "已暂停",
       confirmed: "已确认",
+      delivered: "已交付",
       completed: "已完成",
       canceled: "已取消",
+      cancelled: "已取消",
+      refund_requested: "退款申请已提交",
+      refund_failed: "退款处理中",
       open: "待处理",
       resolved: "已解决",
       processing: "处理中",
@@ -2153,8 +3110,12 @@ function localizeStatus(status) {
       fallback_to_human: "有人対応へ",
       paused: "一時停止",
       confirmed: "確認済み",
+      delivered: "引渡し済み",
       completed: "完了",
       canceled: "キャンセル済み",
+      cancelled: "キャンセル済み",
+      refund_requested: "返金申請済み",
+      refund_failed: "返金処理中",
       open: "オープン",
       resolved: "解決済み",
       processing: "処理中",
@@ -2181,8 +3142,12 @@ function localizeStatus(status) {
       fallback_to_human: "사람 상담",
       paused: "일시중지",
       confirmed: "확인됨",
+      delivered: "전달됨",
       completed: "완료",
       canceled: "취소됨",
+      cancelled: "취소됨",
+      refund_requested: "환불 요청됨",
+      refund_failed: "환불 처리 중",
       open: "열림",
       resolved: "해결됨",
       processing: "처리중",
@@ -2209,8 +3174,12 @@ function localizeStatus(status) {
       fallback_to_human: "fallback_to_human",
       paused: "paused",
       confirmed: "confirmed",
+      delivered: "delivered",
       completed: "completed",
       canceled: "canceled",
+      cancelled: "canceled",
+      refund_requested: "refund_requested",
+      refund_failed: "refund_in_progress",
       open: "open",
       resolved: "resolved",
       processing: "processing",
@@ -2227,16 +3196,16 @@ function localizeLlmIssue(reason) {
   if (!key) return pickText("无", "none", "なし", "없음");
   if (key.startsWith("invalid_key_format")) {
     return pickText(
-      "API Key 格式无效（需 sk- 或 sk-proj- 开头，且不要带引号/空格）",
-      "API key format is invalid (must start with sk- or sk-proj-, without extra quotes/spaces).",
-      "APIキー形式が不正です（sk- / sk-proj- で始まり、余分な引用符や空白なし）。",
-      "API 키 형식이 올바르지 않습니다 (sk- 또는 sk-proj- 시작, 따옴표/공백 제거).",
+      "服务凭据格式无效，请检查配置后重试。",
+      "Service credential format is invalid. Review the configuration and retry.",
+      "サービス認証情報の形式が不正です。設定を確認して再試行してください。",
+      "서비스 자격 증명 형식이 올바르지 않습니다. 구성을 확인한 뒤 다시 시도하세요.",
     );
   }
-  if (key.startsWith("openai_http_401")) return pickText("鉴权失败（401），请检查 Key 是否正确。", "Auth failed (401). Check your key.", "認証失敗 (401)。キーを確認してください。", "인증 실패(401). 키를 확인하세요.");
+  if (key.startsWith("openai_http_401")) return pickText("服务鉴权失败（401），请检查配置。", "Service auth failed (401). Review the configuration.", "サービス認証に失敗しました (401)。設定を確認してください。", "서비스 인증에 실패했습니다(401). 구성을 확인하세요.");
   if (key.startsWith("openai_http_429")) return pickText("触发限流（429），请稍后重试。", "Rate limited (429). Retry later.", "レート制限 (429)。後で再試行してください。", "요청 제한(429). 잠시 후 다시 시도하세요.");
   if (key.startsWith("openai_timeout")) return pickText("请求超时，请稍后重试。", "Request timed out. Try again.", "タイムアウトしました。再試行してください。", "요청 시간이 초과되었습니다. 다시 시도하세요.");
-  if (key === "missing_api_key") return pickText("未配置 API Key。", "API key is not configured.", "APIキーが未設定です。", "API 키가 설정되지 않았습니다.");
+  if (key === "missing_api_key") return pickText("AI 服务暂不可用。", "AI service is temporarily unavailable.", "AIサービスは一時的に利用できません。", "AI 서비스를 일시적으로 사용할 수 없습니다.");
   return key;
 }
 
@@ -2249,18 +3218,17 @@ function renderLlmRuntimeStatus(llmData) {
   const valid = keyHealth.looksValid === true;
   const statusLine = configured
     ? `${pickText("连接状态", "Connection", "接続状態", "연결 상태")}: ${pickText("已配置", "configured", "設定済み", "설정됨")} · ${pickText("格式校验", "format check", "形式チェック", "형식 검사")} ${valid ? pickText("通过", "ok", "OK", "통과") : pickText("失败", "failed", "失敗", "실패")}`
-    : `${pickText("连接状态", "Connection", "接続状態", "연결 상태")}: ${pickText("未配置", "not configured", "未設定", "미설정")}`;
-  const preview = data.keyPreview ? ` · key ${String(data.keyPreview)}` : "";
+    : `${pickText("连接状态", "Connection", "接続状態", "연결 상태")}: ${pickText("暂不可用", "unavailable", "一時利用不可", "일시 사용 불가")}`;
   const model = data.model ? ` · model ${String(data.model)}` : "";
-  el.llmStatusText.textContent = `${statusLine}${model}${preview}`;
+  el.llmStatusText.textContent = `${statusLine}${model}`;
 
   const lastError = runtime.lastError || keyHealth.reason || "";
   if (!lastError || lastError === "ok") {
-    el.llmLastErrorText.textContent = pickText("最近诊断：无错误。", "Last diagnose: no error.", "最近の診断: エラーなし。", "최근 진단: 오류 없음.");
+    el.llmLastErrorText.textContent = pickText("最近诊断：无错误。", "Last diagnosis: no error.", "最近の診断: エラーなし。", "최근 진단: 오류 없음.");
     return;
   }
   const when = runtime.errorAt ? ` · ${new Date(runtime.errorAt).toLocaleString()}` : "";
-  el.llmLastErrorText.textContent = `${pickText("最近诊断", "Last diagnose", "最近の診断", "최근 진단")}: ${localizeLlmIssue(lastError)}${when}`;
+  el.llmLastErrorText.textContent = `${pickText("最近诊断", "Last diagnosis", "最近の診断", "최근 진단")}: ${localizeLlmIssue(lastError)}${when}`;
 }
 
 function statusGlyph(status) {
@@ -2397,6 +3365,10 @@ function summarizeConstraints(constraints) {
   return entries.map(([key, value]) => `${key}:${value}`).join(" · ");
 }
 
+function _persistConstraints() {
+  try { localStorage.setItem("cx_constraints", JSON.stringify(state.selectedConstraints || {})); } catch { /* quota */ }
+}
+
 function getCurrentCity() {
   const fromState = String(state.selectedConstraints && state.selectedConstraints.city ? state.selectedConstraints.city : "").trim();
   if (fromState) return fromState;
@@ -2405,7 +3377,28 @@ function getCurrentCity() {
     const parsed = tagText.split("·")[0].trim();
     if (parsed) return parsed;
   }
-  return "Shanghai";
+  return "";
+}
+
+function _updateLocationTag(cityName = "", options = {}) {
+  const city = String(cityName || "").trim();
+  const cityZh = String(options.cityZh || city).trim();
+  const cityEn = String(options.cityEn || city).trim();
+  state._locationLabelZh = city ? (cityZh || city) : "";
+  state._locationLabelEn = city ? (cityEn || city) : "";
+  state._locationHasGps = city ? options.hasGps === true : false;
+  if (!el.locationTag) return;
+  if (!city) {
+    el.locationTag.textContent = "";
+    el.locationTag.classList.add("hidden");
+    _applyCompactTopbarContract();
+    return;
+  }
+  const useZhLabel = String(state.uiLanguage || "EN").toUpperCase().startsWith("ZH");
+  const activeLabel = useZhLabel ? (state._locationLabelZh || city) : (state._locationLabelEn || city);
+  el.locationTag.textContent = state._locationHasGps ? `${activeLabel} · GPS` : activeLabel;
+  el.locationTag.classList.remove("hidden");
+  _applyCompactTopbarContract();
 }
 
 function buildRecommendationPath(taskId = null) {
@@ -2468,17 +3461,22 @@ function localizeRiskValue(value, fallbackCode = "") {
 
 async function withButtonLoading(button, loadingText, action) {
   if (!button || typeof action !== "function") return action();
-  const previous = button.textContent;
+  const labelNode = button.querySelector?.('[data-button-label="1"]');
+  const previous = labelNode ? labelNode.textContent : button.textContent;
   const wasDisabled = button.disabled;
   button.disabled = true;
   button.classList.add("is-loading");
-  if (loadingText) button.textContent = loadingText;
+  if (loadingText) {
+    if (labelNode) labelNode.textContent = loadingText;
+    else button.textContent = loadingText;
+  }
   try {
     return await action();
   } finally {
     button.disabled = wasDisabled;
     button.classList.remove("is-loading");
-    button.textContent = previous;
+    if (labelNode) labelNode.textContent = previous;
+    else button.textContent = previous;
   }
 }
 
@@ -2533,10 +3531,13 @@ function startSupportEtaTicker() {
 function autoResizeChatInput() {
   if (!el.chatInput) return;
   if (!(el.chatInput instanceof HTMLTextAreaElement)) return;
-  const maxHeight = state.singleDialogMode ? 190 : 150;
-  el.chatInput.style.height = "auto";
+  const heightSteps = state.singleDialogMode
+    ? [54, 78, 102, 126, 150, 170, 190]
+    : [54, 78, 102, 126, 150];
+  const maxHeight = heightSteps[heightSteps.length - 1];
   const next = Math.min(maxHeight, Math.max(54, el.chatInput.scrollHeight));
-  el.chatInput.style.height = `${next}px`;
+  const bucketIndex = heightSteps.findIndex((height) => next <= height);
+  el.chatInput.dataset.cxAutosize = String((bucketIndex >= 0 ? bucketIndex : (heightSteps.length - 1)) + 1);
 }
 
 function updateChatSendState() {
@@ -2881,6 +3882,7 @@ function syncSelectedConstraintsFromAgentSlots() {
   if (prefs.includes("family_friendly")) next.family = "true";
 
   state.selectedConstraints = next;
+  _persistConstraints();
 }
 
 function agentIntentFromText(text, fallback = null) {
@@ -3854,6 +4856,20 @@ function buildPlanOptionFromSmart(item, key, fallbackIntent = "eat", fallbackOpt
   };
 }
 
+function paymentDisplayTitle(option) {
+  const safe = option && typeof option === "object" ? option : {};
+  const raw = (
+    safe.hotelDisplay ||
+    safe.placeDisplay ||
+    safe.hotelName ||
+    safe.placeName ||
+    safe.title ||
+    safe.name ||
+    pickText("服务方案", "Service Plan", "サービスプラン", "서비스 플랜")
+  );
+  return (safe.hotelDisplay || safe.hotelName) ? _sanitizeHotelDisplayName(raw) : raw;
+}
+
 function buildAgentPlanFromSmartReply(smartReply, fallbackPlan = null) {
   const smart = smartReply && typeof smartReply === "object" ? smartReply : null;
   const options = smart && Array.isArray(smart.options) ? smart.options.filter(Boolean) : [];
@@ -3899,7 +4915,12 @@ function buildAgentPlanFromSmartReply(smartReply, fallbackPlan = null) {
 function smartReplySnippet(smartReply) {
   const smart = smartReply && typeof smartReply === "object" ? smartReply : null;
   if (!smart) return "";
-  const raw = String(smart.thinking || smart.reply || "").replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
+  // Prefer thinking (always natural language); fall back to reply only if not JSON
+  const _thinking = String(smart.thinking || "").trim();
+  const _reply = String(smart.reply || "").trim();
+  const _isCode = (s) => s.startsWith("{") || s.startsWith("[") || s.startsWith("```") || /"response_type"\s*:/.test(s.slice(0, 80));
+  const raw = (_thinking && !_isCode(_thinking) ? _thinking : (!_isCode(_reply) ? _reply : ""))
+    .replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
   if (!raw) return "";
   return raw.length > 220 ? `${raw.slice(0, 220).trim()}...` : raw;
 }
@@ -4267,10 +5288,10 @@ async function refineAgentPlanWithSmartReply(inputText = "", options = {}) {
   state.agentConversation.smartRequestId = requestId;
   state.agentConversation.smartLoading = true;
   state.agentConversation.smartHint = pickText(
-    "正在结合 ChatGPT 和实时候选优化方案...",
-    "Refining with ChatGPT and live candidates...",
-    "ChatGPT とリアルタイム候補で提案を最適化中...",
-    "ChatGPT와 실시간 후보로 제안을 고도화하는 중...",
+    "正在结合 AI 和实时候选优化方案...",
+    "Refining with AI and live candidates...",
+    "AI とリアルタイム候補で提案を最適化中...",
+    "AI와 실시간 후보로 제안을 고도화하는 중...",
   );
   if (["planning", "confirming"].includes(state.agentConversation.mode)) {
     rerenderAgentFlowCards();
@@ -4288,6 +5309,7 @@ async function refineAgentPlanWithSmartReply(inputText = "", options = {}) {
         currency: state.currency || "USD",
         city: slots.city || getCurrentCity(),
         constraints,
+        conversationHistory: (state.agentConversation.messages || []).slice(-8).map((m) => ({ role: m.role, content: String(m.content || "") })),
       }),
     });
     if (requestId !== state.agentConversation.smartRequestId) return null;
@@ -4298,20 +5320,27 @@ async function refineAgentPlanWithSmartReply(inputText = "", options = {}) {
       state.agentConversation.currentPlan = buildAgentPlanFromSmartReply(smart, state.agentConversation.currentPlan);
       if (smart.source === "openai") {
         state.agentConversation.smartHint = pickText(
-          "已使用 ChatGPT 生成定制化方案。",
-          "Customized plan generated by ChatGPT.",
-          "ChatGPT によるカスタム提案を生成しました。",
-          "ChatGPT로 맞춤 제안을 생성했습니다.",
+          "已使用 AI 生成定制化方案。",
+          "Customized plan generated by AI.",
+          "AI によるカスタム提案を生成しました。",
+          "AI로 맞춤 제안을 생성했습니다.",
+        );
+      } else if (smart.source === "local-execution") {
+        state.agentConversation.smartHint = pickText(
+          "已使用本地执行摘要生成可直接操作的方案。",
+          "Executable plan generated from the local execution summary.",
+          "ローカル実行サマリーから実行可能な提案を生成しました。",
+          "로컬 실행 요약으로 바로 실행 가능한 플랜을 생성했습니다.",
         );
       } else {
         const reason = String(smart.fallbackReason || "").trim();
         const reasonLabel = localizeLlmIssue(reason || "fallback");
         state.agentConversation.smartHint = reason
           ? pickText(
-            `当前为离线回退方案（${reasonLabel}）。如需 ChatGPT 智能对话，请先连接 OpenAI Key。`,
-            `Offline fallback is active (${reasonLabel}). To enable ChatGPT-grade dialogue, connect an OpenAI key.`,
-            `現在はオフラインフォールバックです（${reasonLabel}）。ChatGPT 対話を使うには OpenAI キーを接続してください。`,
-            `현재 오프라인 폴백 모드입니다 (${reasonLabel}). ChatGPT 대화를 사용하려면 OpenAI 키를 연결하세요.`,
+            `当前为离线回退方案（${reasonLabel}）。AI 能力恢复后将自动切换智能对话。`,
+            `Offline fallback is active (${reasonLabel}). AI dialogue will resume automatically when the service recovers.`,
+            `現在はオフラインフォールバックです（${reasonLabel}）。AI サービス復旧後に自動で対話へ戻ります。`,
+            `현재 오프라인 폴백 모드입니다 (${reasonLabel}). AI 서비스가 복구되면 자동으로 전환됩니다.`,
           )
           : pickText(
             "已使用实时候选生成定制化方案。",
@@ -4348,12 +5377,7 @@ async function refineAgentPlanWithSmartReply(inputText = "", options = {}) {
   } catch (err) {
     if (requestId === state.agentConversation.smartRequestId) {
       state.agentConversation.smartLoading = false;
-      state.agentConversation.smartHint = pickText(
-        `智能引擎暂不可用：${err.message}`,
-        `Smart engine unavailable: ${err.message}`,
-        `スマートエンジン一時利用不可: ${err.message}`,
-        `스마트 엔진 일시 사용 불가: ${err.message}`,
-      );
+      state.agentConversation.smartHint = formatClientActionError(err, "智能引擎暂不可用", "Smart engine unavailable", "スマートエンジン一時利用不可", "스마트 엔진 일시 사용 불가");
       if (["planning", "confirming"].includes(state.agentConversation.mode)) {
         rerenderAgentFlowCards();
       }
@@ -4436,14 +5460,14 @@ function renderAgentPlanningCard(plan) {
     }
     <div class="agent-plan-grid">
       <article class="inline-block agent-option-card agent-option-primary">
-        <img class="agent-option-image media-photo" src="${escapeHtml(_getCityHeroUrl((main && main.place) || state.selectedConstraints.city || ""))}" alt="${escapeHtml((main && main.title) || "main option")}" loading="lazy" onerror="this.src='/assets/solution-flow.svg'" />
+        <img class="agent-option-image media-photo" src="${escapeHtml(_getCityHeroUrl((main && main.place) || state.selectedConstraints.city || ""))}" alt="${escapeHtml((main && main.title) || "main option")}" loading="lazy" data-fallback-src="/assets/solution-flow.svg" />
         <h3>${escapeHtml((main && main.title) || "-")}</h3>
         <div class="status">${pickText("地点/路线", "Place/Route", "場所/ルート", "장소/경로")}: ${escapeHtml((main && main.place) || "-")}</div>
         <div class="status">ETA ${Number((main && main.eta) || 0)} min · ${pickText("预估金额", "Estimated amount", "見積金額", "예상 금액")} ${Number((main && main.amount) || 0)} CNY</div>
         <div class="actions"><button data-action="agent-request-execute" data-option="main">${pickText("执行主方案", "Execute primary", "主案を実行", "주안 실행")}</button></div>
       </article>
       <article class="inline-block agent-option-card">
-        <img class="agent-option-image media-photo" src="${escapeHtml(_getCityHeroUrl(((backup || main) && (backup || main).place) || state.selectedConstraints.city || ""))}" alt="${escapeHtml(((backup || main) && (backup || main).title) || "backup option")}" loading="lazy" onerror="this.src='/assets/solution-flow.svg'" />
+        <img class="agent-option-image media-photo" src="${escapeHtml(_getCityHeroUrl(((backup || main) && (backup || main).place) || state.selectedConstraints.city || ""))}" alt="${escapeHtml(((backup || main) && (backup || main).title) || "backup option")}" loading="lazy" data-fallback-src="/assets/solution-flow.svg" />
         <h3>${escapeHtml(((backup || main) && (backup || main).title) || "-")}</h3>
         <div class="status">${pickText("地点/路线", "Place/Route", "場所/ルート", "장소/경로")}: ${escapeHtml(((backup || main) && (backup || main).place) || "-")}</div>
         <div class="status">ETA ${Number((((backup || main) && (backup || main).eta) || 0))} min · ${pickText("预估金额", "Estimated amount", "見積金額", "예상 금액")} ${Number((((backup || main) && (backup || main).amount) || 0))} CNY</div>
@@ -4639,8 +5663,13 @@ function renderAgentResultCard(result) {
   );
 }
 
-function buildAmapNavUrl(place, city) {
-  return `https://uri.amap.com/search?keyword=${encodeURIComponent(place)}&city=${encodeURIComponent(city || place)}`;
+function buildAmapNavUrl(place, city, lng, lat) {
+  // When coordinates are available, use precise navigation deep-link (opens turn-by-turn nav).
+  // Falls back to keyword search when coords are unknown.
+  if (lng != null && lat != null && !isNaN(Number(lng)) && !isNaN(Number(lat))) {
+    return `https://uri.amap.com/navigation?to=${encodeURIComponent(`${lng},${lat},${place}`)}&mode=car&sourceApplication=crossx`;
+  }
+  return `https://uri.amap.com/search?keyword=${encodeURIComponent(place)}&city=${encodeURIComponent(city || place)}&sourceApplication=crossx`;
 }
 
 function renderAgentDeliverableCard(result) {
@@ -4664,7 +5693,7 @@ function renderAgentDeliverableCard(result) {
   const qrImgId = `cx-dlv-qr-${stableHash32(orderId).toString(36)}`;
 
   const confettiPieces = ["\uD83C\uDF89", "\uD83C\uDF1F", "\u2728", "\uD83C\uDF8A", "\uD83C\uDF88"]
-    .map((e, i) => `<span class="cx-dlv-cp" style="--d:${i * 72}deg;--r:${26 + i * 10}px;--delay:${i * 70}ms">${e}</span>`)
+    .map((e, i) => `<span class="cx-dlv-cp cx-dlv-cp--${i}">${e}</span>`)
     .join("");
 
   root.innerHTML = `
@@ -4691,7 +5720,7 @@ function renderAgentDeliverableCard(result) {
       </div>
       <button class="cx-dlv-nav-btn" data-action="agent-nav" data-nav-url="${escapeHtml(navUrl)}">\uD83D\uDDFA\uFE0F ${pickText("\u5BFC\u822A\u8FC7\u53BB \u00B7 Navigate", "Navigate \u00B7 \u5BFC\u822A", "\u30CA\u30D3\u3078 \u00B7 \u5C0E\u822A", "\uAE38\uC548\uB0B4 \u00B7 \u5C0E\u822A")}</button>
       <div class="cx-dlv-acts">
-        ${result.receiptUrl ? `<a class="cx-dlv-act" href="${escapeHtml(result.receiptUrl)}?download=1" download>\uD83D\uDCC4 ${pickText("\u4E0B\u8F7D\u51ED\u8BC1", "Download Receipt", "\u30EC\u30B7\u30FC\u30C8", "\uc601\uc218\uc99d \ub2e4\uc6b4\ub85c\ub4dc")}</a>` : ""}
+        ${result.receiptUrl ? `<a class="cx-dlv-act" href="${escapeHtml(buildOrderReceiptUrl(orderId, { download: true }))}" download>\uD83D\uDCC4 ${pickText("\u4E0B\u8F7D\u51ED\u8BC1", "Download Receipt", "\u30EC\u30B7\u30FC\u30C8", "\uc601\uc218\uc99d \ub2e4\uc6b4\ub85c\ub4dc")}</a>` : ""}
         <button class="cx-dlv-act" data-action="agent-share-result">\uD83D\uDCE4 ${pickText("\u5206\u4EAB", "Share", "\u30B7\u30A7\u30A2", "\uACF5\uC720")}</button>
         <button class="cx-dlv-act" data-action="agent-request-execute" data-option="backup">\uD83D\uDD04 ${pickText("\u5907\u9009\u65B9\u6848", "Backup plan", "\u4EE3\u66FF\u6848", "\uB300\uC548")}</button>
       </div>
@@ -4702,7 +5731,7 @@ function renderAgentDeliverableCard(result) {
           const op = escapeHtml(c.op || c.operation || "call");
           const src = escapeHtml(c.source || c.provider || "");
           const ms = c.latencyMs != null ? `${c.latencyMs}ms` : "";
-          const slaMet = c.slaMet === false ? `<span style="color:#ef4444">\u26A0</span>` : "";
+          const slaMet = c.slaMet === false ? `<span class="cx-mcp-alert">\u26A0</span>` : "";
           return `<li class="cx-mcp-step">${slaMet}<span class="cx-mcp-op">${op}</span>${src ? ` · <span class="cx-mcp-src">${src}</span>` : ""}${ms ? ` · <span class="cx-mcp-ms">${ms}</span>` : ""}</li>`;
         }).join("");
         return `<details class="cx-mcp-chain"><summary>${pickText("查看操作链", "Operation chain", "操作チェーン", "작업 체인")} (${mcpCalls.length})</summary><ul class="cx-mcp-list">${chainItems}</ul></details>`;
@@ -4719,7 +5748,7 @@ function renderAgentDeliverableCard(result) {
         .catch(() => { qrImg.alt = orderId; });
     } else if (qrImg) {
       qrImg.alt = orderId;
-      qrImg.style.display = "none";
+      qrImg.classList.add("hidden");
     }
     if (navigator.vibrate) navigator.vibrate([18, 55, 18, 55, 18]);
   }
@@ -4924,11 +5953,11 @@ async function runStepTool(step, context) {
         }),
       });
       if (!r.ok) throw new Error(`search ${r.status}`);
-      const data = await r.json();
+      const data = await _readJsonResponseSafe(r, {});
       if (data.ok && Array.isArray(data.candidates) && data.candidates.length) {
         search = { candidates: data.candidates, source: data.source };
       }
-    } catch (searchErr) { console.warn("[agent/search] API failed → mock:", searchErr.message); }
+    } catch (searchErr) { console.warn("[agent/search] API failed → mock:", getClientErrorCode(searchErr, "search_options_failed")); }
     if (!search) search = searchOptionsMock(ctx.slots || {}, ctx.intent || "eat");
     const candidate = findCandidateForPlanOption(ctx.option, search, ctx.seedKey);
     return {
@@ -4959,12 +5988,12 @@ async function runStepTool(step, context) {
           signal: AbortSignal.timeout(3000),
         });
         if (r.ok) {
-          const d = await r.json();
+          const d = await _readJsonResponseSafe(r, {});
           if (d.ok) {
             candidate = { ...candidate, available: d.available, queueMin: d.queueEstimateMin, amount: d.price || candidate.amount };
           }
         }
-      } catch (availErr) { console.warn("[agent/check] availability API failed → mock:", availErr.message); }
+      } catch (availErr) { console.warn("[agent/check] availability API failed → mock:", getClientErrorCode(availErr, "availability_check_failed")); }
     }
     const check = checkConstraintsMock(ctx.slots || {}, candidate, stepKey);
     return {
@@ -4991,13 +6020,13 @@ async function runStepTool(step, context) {
           signal: AbortSignal.timeout(4000),
         });
         if (r.ok) {
-          const d = await r.json();
+          const d = await _readJsonResponseSafe(r, {});
           if (d.ok) {
             reservationId = d.reservationId;
             candidate = { ...candidate, amount: d.confirmedAmount || candidate.amount };
           }
         }
-      } catch (lockErr) { console.warn("[agent/lock] reservation API failed → mock:", lockErr.message); }
+      } catch (lockErr) { console.warn("[agent/lock] reservation API failed → mock:", getClientErrorCode(lockErr, "reservation_failed")); }
     }
     const reserve = reserveMock(ctx.slots || {}, candidate, `${ctx.seedKey}|lock`, (ctx.option && ctx.option.key) || "main");
     return {
@@ -5009,16 +6038,15 @@ async function runStepTool(step, context) {
   if (stepKey === "pay") {
     const railId = state.agentConversation.paymentRail || "alipay_cn";
     const amount = (ctx.option && ctx.option.amount) || (ctx.candidate && ctx.candidate.amount) || 0;
-    const deviceId = getDeviceId ? getDeviceId() : "demo";
     try {
       const r = await fetch("/api/payments/charge", {
         method: "POST",
         headers: { "Content-Type": "application/json", ..._authHeaders() },
-        body: JSON.stringify({ railId, amount, currency: "CNY", userId: deviceId }),
+        body: JSON.stringify({ railId, amount, currency: "CNY" }),
       });
       // ── Plus subscription gate ─────────────────────────────────────────────
       if (r.status === 402) {
-        const ge = await r.json().catch(() => ({}));
+        const ge = await _readJsonResponseSafe(r, {});
         if (ge.error === "plus_required") {
           document.getElementById("plusSubscribeBtn")
             ?.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -5029,7 +6057,7 @@ async function runStepTool(step, context) {
           };
         }
       }
-      const data = await r.json();
+      const data = await _readJsonResponseSafe(r, {});
       if (data.ok) {
         const railLabel = railId === "alipay_cn" ? "\u652f\u4ed8\u5b9d" : railId === "wechat_cn" ? "\u5fae\u4fe1\u652f\u4ed8" : "\u59d4\u6258\u4ee3\u4ed8\u5361";
         const _payTick = _startPaymentCountdown();
@@ -5037,13 +6065,16 @@ async function runStepTool(step, context) {
         setTimeout(() => {
           clearInterval(_payTick);
           const countEl = document.querySelector(".cx-pay-countdown");
-          if (countEl) { countEl.textContent = pickText("\u652f\u4ed8\u6210\u529f \u2713", "Payment confirmed \u2713", "\u304a\u652f\u6255\u3044\u5b8c\u4e86 \u2713", "\uacb0\uc81c \uc644\ub8cc \u2713"); countEl.style.color = "#10b981"; }
+          if (countEl) {
+            countEl.textContent = pickText("\u652f\u4ed8\u6210\u529f \u2713", "Payment confirmed \u2713", "\u304a\u652f\u6255\u3044\u5b8c\u4e86 \u2713", "\uacb0\uc81c \uc644\ub8cc \u2713");
+            _setPaymentCountdownTone(countEl, "success");
+          }
           if (typeof notify === "function") notify(pickText("\u652f\u4ed8\u6210\u529f\uff01", "Payment confirmed!", "\u304a\u652f\u6255\u3044\u5b8c\u4e86!", "\uacb0\uc81c \uc644\ub8cc!"), "success");
         }, 3500);
         if (data.qrCode) {
           addCard(`<article class="card cx-qr-card">
     <div class="cx-qr-title">${pickText("\u626b\u7801\u652f\u4ed8", "Scan to Pay", "QR\u30b3\u30fc\u30c9\u3067\u652f\u6255\u3044", "QR\ucf54\ub4dc\ub85c \uacb0\uc81c")}</div>
-    <img class="cx-qr-img" src="${escapeHtml(data.qrCode)}" alt="QR Code" style="width:200px;height:200px;display:block;margin:12px auto;border-radius:8px;">
+    <img class="cx-qr-img" src="${escapeHtml(data.qrCode)}" alt="QR Code">
     <div class="cx-qr-hint">${pickText("\u8bf7\u4f7f\u7528\u652f\u4ed8\u5b9d\u6216\u5fae\u4fe1\u626b\u7801\u5b8c\u6210\u652f\u4ed8", "Scan with Alipay or WeChat to complete payment", "Alipay\u307e\u305f\u306fWeChat\u3067\u30b9\u30ad\u30e3\u30f3", "Alipay \ub610\ub294 WeChat\uc73c\ub85c \uc2a4\uce94\ud558\uc138\uc694")}</div>
   </article>`);
         }
@@ -5052,12 +6083,12 @@ async function runStepTool(step, context) {
           tool: "payment_rail",
           code: "ok",
           railId,
-          transactionId: data.data && data.data.gatewayRef ? data.data.gatewayRef : `PAY-${Date.now().toString(36)}`,
+          transactionId: data.data && data.data.paymentId ? data.data.paymentId : `payr_${Date.now().toString(36)}`,
           reason: pickText(`${railLabel}\u652f\u4ed8\u6210\u529f \xA5${amount}`, `${railLabel} paid \xA5${amount}`, `${railLabel}\u6c7a\u6e08\u5b8c\u4e86 \xA5${amount}`, `${railLabel} \uacb0\uc81c\uc644\ub8cc \xA5${amount}`),
         };
       }
       // charge failed (rail blocked / compliance) — fall through to mock
-    } catch (payErr) { console.warn("[agent/pay] payment API failed → mock:", payErr.message); }
+    } catch (payErr) { console.warn("[agent/pay] payment API failed → mock:", getClientErrorCode(payErr, "payment_failed")); }
     // Fallback: mock pass so demo path stays reliable
     return {
       ok: true,
@@ -5076,10 +6107,10 @@ async function runStepTool(step, context) {
       if (place && city) {
         const r = await fetch(`/api/agent/route?city=${city}&place=${place}`);
         if (!r.ok) throw new Error(`route_${r.status}`);
-        const data = await r.json();
+        const data = await _readJsonResponseSafe(r, {});
         if (data.ok && data.etaMin) routeInfo = { ...data, eta: data.etaMin, source: "amap_live" };
       }
-    } catch (routeErr) { console.warn("[agent/proof] route API failed:", routeErr.message); }
+    } catch (routeErr) { console.warn("[agent/proof] route API failed:", getClientErrorCode(routeErr, "route_lookup_failed")); }
     if (!routeInfo) routeInfo = routeMock(ctx.slots || {}, ctx.candidate || null, `${ctx.seedKey}|route`);
     const proof = proofGenerateMock(ctx.slots || {}, ctx.option || {}, ctx.runId || "run", routeInfo);
     return { ...proof, route: routeInfo };
@@ -5094,8 +6125,7 @@ async function runStepTool(step, context) {
 
 function _startPaymentCountdown(expiresInMs = 15 * 60 * 1000) {
   const _countEl = document.createElement("div");
-  _countEl.className = "cx-pay-countdown";
-  _countEl.style.cssText = "text-align:center;font-size:13px;color:#6b7280;margin-top:8px;";
+  _countEl.className = "cx-pay-countdown cx-pay-countdown--normal";
   // Find the payment card or append to chatFeed
   const _feed = document.getElementById("chatFeed") || document.body;
   _feed.appendChild(_countEl);
@@ -5106,13 +6136,12 @@ function _startPaymentCountdown(expiresInMs = 15 * 60 * 1000) {
     if (remaining <= 0) {
       clearInterval(_tick);
       _countEl.textContent = pickText("\u8ba2\u5355\u5df2\u8fc7\u671f", "Order expired", "\u6ce8\u6587\u304c\u671f\u9650\u5207\u308c", "\uc8fc\ubb38 \ub9cc\ub8cc");
-      _countEl.style.color = "#ef4444";
+      _setPaymentCountdownTone(_countEl, "expired");
       return;
     }
     const mins = Math.floor(remaining / 60000);
     const secs = Math.floor((remaining % 60000) / 1000);
-    const urgentColor = remaining < 60000 ? "#ef4444" : remaining < 300000 ? "#f59e0b" : "#6b7280";
-    _countEl.style.color = urgentColor;
+    _setPaymentCountdownTone(_countEl, remaining < 60000 ? "urgent" : remaining < 300000 ? "warning" : "normal");
     _countEl.textContent = pickText(
       `\u8ba2\u5355\u6709\u6548\u671f\u5269\u4f59 ${mins}:${String(secs).padStart(2, "0")}`,
       `Order expires in ${mins}:${String(secs).padStart(2, "0")}`,
@@ -5125,6 +6154,11 @@ function _startPaymentCountdown(expiresInMs = 15 * 60 * 1000) {
     }
   }, 1000);
   return _tick; // return timer ref so caller can clearInterval on success
+}
+
+function _setPaymentCountdownTone(el, tone) {
+  if (!el) return;
+  el.className = `cx-pay-countdown cx-pay-countdown--${tone}`;
 }
 
 async function autoReplanAfterFailure(run, detail) {
@@ -5350,12 +6384,12 @@ async function runAgentExecution(optionKey = "main", forceFail = false) {
           executedAt: new Date().toISOString(),
         }),
       });
-      const d = await r.json();
+      const d = await _readJsonResponseSafe(r, {});
       if (d.ok && d.receiptUrl) {
-        result.receiptUrl = d.receiptUrl;
+        result.receiptUrl = buildOrderReceiptUrl(result.orderId);
         rerenderAgentFlowCards();
       }
-    } catch (receiptErr) { console.warn("[agent/receipt] receipt URL fetch failed:", receiptErr.message); }
+    } catch (receiptErr) { console.warn("[agent/receipt] receipt URL fetch failed:", getClientErrorCode(receiptErr, "receipt_fetch_failed")); }
   })();
 }
 
@@ -5525,7 +6559,7 @@ function evaluateAgentConversation(options = {}) {
           const trimmed = line.trim();
           if (!trimmed.startsWith("data:")) continue;
           let evt;
-          try { evt = JSON.parse(trimmed.slice(5).trim()); } catch (_e) { console.warn("[plan/stream] SSE parse error:", _e.message, trimmed.slice(5, 60)); continue; }
+          try { evt = JSON.parse(trimmed.slice(5).trim()); } catch (_e) { console.warn("[plan/stream] SSE parse error:", getClientErrorCode(_e, "invalid_payload")); continue; }
           if (state.agentConversation.mode !== "planning") continue;
           const cp = state.agentConversation.currentPlan;
           if (evt.field === "summary" && cp) {
@@ -5557,7 +6591,7 @@ function evaluateAgentConversation(options = {}) {
           }
         }
       }
-    } catch (llmErr) { console.warn("[agent/smart-plan] LLM unavailable → keeping rule-based plan:", llmErr.message); }
+    } catch (llmErr) { console.warn("[agent/smart-plan] LLM unavailable → keeping rule-based plan:", getClientErrorCode(llmErr, "smart_plan_unavailable")); }
     if (backupTimer) clearTimeout(backupTimer);
     if (state.agentConversation.smartLoading) {
       state.agentConversation.smartLoading = false;
@@ -5760,10 +6794,10 @@ async function handleAgentConversationInput(text) {
       if (!configured) {
         addMessage(
           pickText(
-            `当前未连接 OpenAI（${localizeLlmIssue((llm && llm.keyHealth && llm.keyHealth.reason) || (llm && llm.lastRuntime && llm.lastRuntime.lastError) || "missing_api_key")}），我会先用本地策略生成方案。`,
-            `OpenAI is not connected (${localizeLlmIssue((llm && llm.keyHealth && llm.keyHealth.reason) || (llm && llm.lastRuntime && llm.lastRuntime.lastError) || "missing_api_key")}). I will use local strategy for now.`,
-            `OpenAI 未接続です（${localizeLlmIssue((llm && llm.keyHealth && llm.keyHealth.reason) || (llm && llm.lastRuntime && llm.lastRuntime.lastError) || "missing_api_key")}）。現在はローカル戦略で提案します。`,
-            `OpenAI가 연결되지 않았습니다 (${localizeLlmIssue((llm && llm.keyHealth && llm.keyHealth.reason) || (llm && llm.lastRuntime && llm.lastRuntime.lastError) || "missing_api_key")}). 현재는 로컬 전략으로 제안을 생성합니다.`,
+            `当前未连接 AI（${localizeLlmIssue((llm && llm.keyHealth && llm.keyHealth.reason) || (llm && llm.lastRuntime && llm.lastRuntime.lastError) || "missing_api_key")}），我会先用本地策略生成方案。`,
+            `AI is not connected (${localizeLlmIssue((llm && llm.keyHealth && llm.keyHealth.reason) || (llm && llm.lastRuntime && llm.lastRuntime.lastError) || "missing_api_key")}). I will use local strategy for now.`,
+            `AI 未接続です（${localizeLlmIssue((llm && llm.keyHealth && llm.keyHealth.reason) || (llm && llm.lastRuntime && llm.lastRuntime.lastError) || "missing_api_key")}）。現在はローカル戦略で提案します。`,
+            `AI가 연결되지 않았습니다 (${localizeLlmIssue((llm && llm.keyHealth && llm.keyHealth.reason) || (llm && llm.lastRuntime && llm.lastRuntime.lastError) || "missing_api_key")}). 현재는 로컬 전략으로 제안을 생성합니다.`,
           ),
           "agent",
           { speak: false },
@@ -5781,7 +6815,13 @@ async function handleAgentConversationInput(text) {
     if (freeform && freeform.reply) {
       setAgentMode("idle", { source: "freeform_chat" });
       clearAgentFlowCards();
-      addMessage(String(freeform.reply), "agent");
+      // Prevent JSON leakage — if reply is JSON/code, use fallback text
+      const _reply = String(freeform.reply).trim();
+      const _isCode = _reply.startsWith("{") || _reply.startsWith("[") || _reply.startsWith("```") || /^\s*\{/.test(_reply);
+      const _safeReply = _isCode
+        ? pickText("已收到您的请求，正在为您处理...", "Request received, processing...", "リクエストを受け付けました、処理中...", "요청을 받았습니다, 처리 중...")
+        : _reply;
+      addMessage(_safeReply, "agent");
       return;
     }
   }
@@ -5838,6 +6878,7 @@ async function runOpenAISolutionTurn(input) {
     ...inferred,
   };
   state.selectedConstraints = mergedConstraints;
+  _persistConstraints();
   syncChipSelectionFromConstraints();
   updateContextSummary();
   setThinkingIndicator(true);
@@ -5854,6 +6895,7 @@ async function runOpenAISolutionTurn(input) {
         currency: state.currency || "USD",
         city: getCurrentCity(),
         constraints: mergedConstraints,
+        conversationHistory: (state.agentConversation.messages || []).slice(-8).map((m) => ({ role: m.role, content: String(m.content || "") })),
       }),
     });
     if (smart && smart.reply) {
@@ -5881,15 +6923,7 @@ async function runOpenAISolutionTurn(input) {
     );
   } catch (err) {
     setAgentMode("idle", { source: "solution_turn_error" });
-    addMessage(
-      pickText(
-        `智能方案生成失败：${err.message}`,
-        `Smart plan generation failed: ${err.message}`,
-        `スマート提案の生成に失敗しました: ${err.message}`,
-        `스마트 제안 생성 실패: ${err.message}`,
-      ),
-      "agent",
-    );
+    addMessage(formatClientActionError(err, "智能方案生成失败", "Smart plan generation failed", "スマート提案の生成に失敗しました", "스마트 제안 생성 실패"), "agent");
   } finally {
     setThinkingIndicator(false);
   }
@@ -5999,6 +7033,46 @@ function applyLanguagePack() {
   if (el.myOrdersBtn) {
     el.myOrdersBtn.textContent = pickText("我的订单", "My Orders","マイ注文", "내 주문");
   }
+  const buyOnceBtn = document.getElementById("buyOnceBtn");
+  if (buyOnceBtn) {
+    buyOnceBtn.textContent = pickText("单次 ¥9.9 · 5次额度", "One-time ¥9.9 · 5 credits", "単発 ¥9.9 ・ 5回分", "일회성 ¥9.9 · 5회", "Sekali ¥9.9 · 5 kredit", "مرة واحدة ¥9.9 · 5 أرصدة");
+    buyOnceBtn.title = pickText("单次购买，不自动续费", "One-time purchase, no auto-renewal", "単発購入、自动更新なし", "일회성 구매, 자동 갱신 없음", "Pembelian sekali, tanpa perpanjangan otomatis", "شراء لمرة واحدة بدون تجديد تلقائي");
+  }
+  const plusBadge = document.getElementById("plusBadge");
+  if (plusBadge) plusBadge.textContent = pickText("会员专属", "Members only", "会員限定", "회원 전용", "Khusus anggota", "للأعضاء فقط");
+  const plusPriceAnnual = document.getElementById("plusPriceAnnual");
+  if (plusPriceAnnual) plusPriceAnnual.textContent = pickText("年付仅 ¥79/月 · 省¥240", "Billed yearly at ¥79/mo · save ¥240", "年額なら月 ¥79 ・ ¥240節約", "연간 결제 시 월 ¥79 · ¥240 절약", "Tahunan ¥79/bln · hemat ¥240", "سنويًا ¥79/شهريًا · وفر ¥240");
+  const plusPriceUnit = document.getElementById("plusPriceUnit");
+  if (plusPriceUnit) plusPriceUnit.textContent = pickText("/月", "/mo", "/月", "/월", "/bln", "/شهريًا");
+  const plusColFree = document.getElementById("plusColFree");
+  if (plusColFree) plusColFree.textContent = pickText("免费", "Free", "無料", "무료", "Gratis", "مجاني");
+  const plusSocialProof = document.getElementById("plusSocialProof");
+  if (plusSocialProof) plusSocialProof.innerHTML = pickText("已有 <strong>12,000+</strong> 旅行者开通 Plus", "<strong>12,000+</strong> travelers already on Plus", "<strong>12,000+</strong>人の旅行者が Plus を利用中", "<strong>12,000+</strong>명의 여행자가 Plus 이용 중", "<strong>12,000+</strong> pelancong sudah memakai Plus", "أكثر من <strong>12,000+</strong> مسافر يستخدمون Plus");
+  const plusTextMap = [
+    ["plusFeaturePlanLabel", "行程规划次数", "Trip plans", "旅程プラン回数", "여행 계획 횟수", "Rencana perjalanan", "عدد خطط الرحلة"],
+    ["plusFeaturePlanFree", "3次/天", "3/day", "1日3回", "하루 3회", "3/hari", "3 مرات/اليوم"],
+    ["plusFeaturePlanPlus", "无限次", "Unlimited", "無制限", "무제한", "Tanpa batas", "غير محدود"],
+    ["plusFeatureRevisionLabel", "改稿修改次数", "Revision rounds", "修正回数", "수정 횟수", "Revisi", "عدد المراجعات"],
+    ["plusFeatureRevisionFree", "5次", "5", "5回", "5회", "5", "5"],
+    ["plusFeatureRevisionPlus", "无限改稿", "Unlimited revisions", "修正無制限", "무제한 수정", "Revisi tak terbatas", "مراجعات غير محدودة"],
+    ["plusFeatureHistoryLabel", "行程历史保存", "Saved trip history", "旅程履歴保存", "여행 기록 저장", "Riwayat perjalanan", "حفظ سجل الرحلات"],
+    ["plusFeatureHistoryFree", "最近5条", "Latest 5", "直近5件", "최근 5개", "5 terbaru", "آخر 5"],
+    ["plusFeatureHistoryPlus", "永久保存", "Keep forever", "永久保存", "영구 보관", "Simpan selamanya", "احتفاظ دائم"],
+    ["plusFeatureMultiCityLabel", "多城市复杂行程", "Multi-city complex trips", "複数都市の複雑旅程", "다도시 복합 여행", "Perjalanan multi-kota", "رحلات متعددة المدن"],
+    ["plusFeatureMultiCityPlus", "支持", "Included", "対応", "포함", "Termasuk", "مضمن"],
+    ["plusFeaturePdfLabel", "行程 PDF 导出", "Trip PDF export", "旅程 PDF 出力", "여행 PDF 내보내기", "Ekspor PDF", "تصدير PDF"],
+    ["plusFeaturePdfPlus", "支持", "Included", "対応", "포함", "Termasuk", "مضمن"],
+    ["plusFeatureQueueLabel", "优先 AI 排队", "Priority AI queue", "優先 AI キュー", "우선 AI 대기열", "Antrean AI prioritas", "أولوية طابور الذكاء الاصطناعي"],
+    ["plusFeatureQueuePlus", "秒级响应", "Priority response", "高速応答", "우선 응답", "Respons prioritas", "استجابة أولوية"],
+    ["plusFeatureScarceLabel", "稀缺票务代抢", "Scarce ticket concierge", "希少チケット代行", "희소 티켓 컨시어지", "Concierge tiket langka", "خدمة حجز التذاكر النادرة"],
+    ["plusFeatureScarcePlus", "专属权益", "Member benefit", "会員特典", "회원 혜택", "Manfaat anggota", "ميزة للأعضاء"],
+    ["plusFeatureSupportLabel", "7×24 专属客服", "24/7 dedicated support", "24時間専用サポート", "24/7 전담 지원", "Dukungan 24/7", "دعم مخصص 24/7"],
+    ["plusFeatureSupportPlus", "人工接管", "Human takeover", "有人引継ぎ", "사람 개입", "Pengambilalihan manusia", "تدخل بشري"],
+  ];
+  plusTextMap.forEach(([id, zh, en, ja, ko, idText, ar]) => {
+    const node = document.getElementById(id);
+    if (node) node.textContent = pickText(zh, en, ja, ko, idText, ar);
+  });
   if (el.langPillLabel) {
     el.langPillLabel.textContent = lang === "ZH" ? "语言" : lang === "ID" ? "Bahasa" : lang === "JA" ? "言語" : lang === "KO" ? "언어" : lang === "AR" ? "اللغة" : "Lang";
   }
@@ -6006,6 +7080,10 @@ function applyLanguagePack() {
   const isRTL = lang === "AR";
   document.documentElement.setAttribute("dir", isRTL ? "rtl" : "ltr");
   document.documentElement.setAttribute("lang", lang === "ZH" ? "zh" : lang === "JA" ? "ja" : lang === "KO" ? "ko" : lang === "ID" ? "id" : lang === "AR" ? "ar" : "en");
+  syncDynamicLanguageSurfaces();
+  renderConciergeHome();
+  renderPlannerWorkspaceIntro();
+  renderFulfillmentHubIntro();
   // Update export button label
   const _exportLbl = document.getElementById("exportChatBtnLabel");
   if (_exportLbl) _exportLbl.textContent = pickText("导出", "Export", "エクスポート", "내보내기", "Ekspor", "تصدير");
@@ -6015,19 +7093,24 @@ function applyLanguagePack() {
   const _discEl = document.getElementById("cxAiDisclosure");
   if (_discEl) {
     const _privacyLabel = pickText("隐私政策", "Privacy", "プライバシー", "개인정보", "Privasi", "الخصوصية");
-    _discEl.innerHTML = pickText(
-      `对话内容由 OpenAI 处理生成。<a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
-      `AI responses are generated via OpenAI. <a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
-      `AI応答はOpenAIにより生成されます。<a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
-      `AI 응답은 OpenAI를 통해 생성됩니다. <a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
-      `Respons AI dihasilkan melalui OpenAI. <a href="/privacy" target="_blank" rel="noopener" class="cx-disclosure-link">${_privacyLabel}</a>`,
-    );
+    const privacyUrl = escapeHtml(getLocalizedPrivacyUrl(lang));
+    if (IS_USER_PORTAL) {
+      _discEl.innerHTML = `<a href="${privacyUrl}" target="_blank" rel="noopener" class="cx-disclosure-link" data-privacy-link="1">${_privacyLabel}</a>`;
+    } else {
+      _discEl.innerHTML = pickText(
+        `对话内容由 AI 处理生成。<a href="${privacyUrl}" target="_blank" rel="noopener" class="cx-disclosure-link" data-privacy-link="1">${_privacyLabel}</a>`,
+        `AI handles the conversation flow. <a href="${privacyUrl}" target="_blank" rel="noopener" class="cx-disclosure-link" data-privacy-link="1">${_privacyLabel}</a>`,
+        `AI が会話を処理します。<a href="${privacyUrl}" target="_blank" rel="noopener" class="cx-disclosure-link" data-privacy-link="1">${_privacyLabel}</a>`,
+        `AI가 대화 흐름을 처리합니다. <a href="${privacyUrl}" target="_blank" rel="noopener" class="cx-disclosure-link" data-privacy-link="1">${_privacyLabel}</a>`,
+        `AI menangani alur percakapan. <a href="${privacyUrl}" target="_blank" rel="noopener" class="cx-disclosure-link" data-privacy-link="1">${_privacyLabel}</a>`,
+      );
+    }
   }
   if (el.locateBtn) {
-    el.locateBtn.textContent = pickText("定位", "Use Location","現在地", "현재 위치");
+    setButtonVisibleText(el.locateBtn, pickText("定位", "Use Location","現在地", "현재 위치"));
   }
   if (el.inlineLocateBtn) {
-    el.inlineLocateBtn.textContent = pickText("定位", "Locate","現在地", "위치");
+    setButtonVisibleText(el.inlineLocateBtn, pickText("定位", "Locate","現在地", "위치"));
   }
   if (el.openOpsBtn) {
     el.openOpsBtn.textContent = pickText("人工后台", "Ops Board","運用ボード", "운영 보드");
@@ -6043,10 +7126,10 @@ function applyLanguagePack() {
   }
   if (el.inputAssistHint) {
     el.inputAssistHint.textContent = pickText(
-      "先说一句自然语言目标即可，约束项可按需展开。",
-      "Start with one natural-language goal. Expand constraints only if needed.",
-      "まずは自然文で1つの目標を入力。条件は必要時のみ展開してください。",
-      "자연어 목표 한 문장부터 입력하세요. 조건은 필요할 때만 펼치면 됩니다.",
+      "先告诉我你想完成什么，我会先出首版方案；细条件再按需补充。",
+      "Start with your goal. I will generate a first draft, then you can refine with constraints if needed.",
+      "まず目的を伝えてください。初稿を先に出し、条件は必要に応じて後から絞り込めます。",
+      "먼저 목표를 말해 주세요. 제가 초안을 먼저 만들고 필요하면 조건으로 더 다듬습니다.",
     );
   }
   setText(el.contextTitle, "context_chips");
@@ -6068,17 +7151,17 @@ function applyLanguagePack() {
   setText(el.plusHeading, "plus_heading");
   setText(el.plusDescription, "plus_description");
   setText(el.paymentLimitsHeading, "payment_limits_heading");
-  if (el.llmConnectHeading) el.llmConnectHeading.textContent = pickText("连接 OpenAI", "Connect OpenAI", "OpenAI を接続", "OpenAI 연결");
+  if (el.llmConnectHeading) el.llmConnectHeading.textContent = pickText("连接 AI", "Connect AI", "AI を接続", "AI 연결");
   if (el.llmConnectDesc) {
     el.llmConnectDesc.textContent = pickText(
-      "登录 OpenAI 后粘贴 API Key，即可启用 ChatGPT 动态回复。",
-      "Sign in to OpenAI and paste API key to enable ChatGPT dynamic replies.",
-      "OpenAI にログインして API キーを貼り付けると ChatGPT 応答を有効化できます。",
-      "OpenAI 로그인 후 API 키를 붙여넣으면 ChatGPT 동적 응답을 사용할 수 있습니다.",
+      "可接入 AI 服务以启用动态回复。",
+      "Connect an AI service to enable dynamic replies.",
+      "AI サービスを接続すると動的応答を有効化できます。",
+      "AI 서비스를 연결하면 동적 응답을 사용할 수 있습니다.",
     );
   }
   if (el.saveLlmBtn) el.saveLlmBtn.textContent = pickText("保存并测试", "Save & Test","保存してテスト", "저장 후 테스트");
-  if (el.openOpenAiBtn) el.openOpenAiBtn.textContent = pickText("打开 OpenAI 登录", "Open OpenAI Login", "OpenAI ログインを開く", "OpenAI 로그인 열기");
+  if (el.openOpenAiBtn) el.openOpenAiBtn.textContent = pickText("打开 API Key 页面", "Open API Key Page", "API キーページを開く", "API 키 페이지 열기");
   if (el.clearLlmBtn) el.clearLlmBtn.textContent = pickText("清除 Key", "Clear Key","キーを削除", "키 삭제");
   if (el.llmApiKeyInput) el.llmApiKeyInput.placeholder = "sk-...";
   setText(el.trustSummaryHeading, "trust_summary_heading");
@@ -6095,6 +7178,7 @@ function applyLanguagePack() {
   setText(el.switchModeBtn, "switch_mode");
   setText(el.plusSubscribeBtn, "activate_plus");
   setText(el.plusCancelBtn, "pause_plus");
+  if (buyOnceBtn) buyOnceBtn.textContent = pickText("单次 ¥9.9 · 5次额度", "One-time ¥9.9 · 5 credits", "単発 ¥9.9 ・ 5回分", "일회성 ¥9.9 · 5회", "Sekali ¥9.9 · 5 kredit", "مرة واحدة ¥9.9 · 5 أرصدة");
   setText(el.saveRailBtn, "save_payment_method");
   setText(el.openTrustAdvancedBtn, "open_trust_advanced");
   setText(el.updateAuthBtn, "update_authorization");
@@ -6139,7 +7223,7 @@ function applyLanguagePack() {
   }
   if (el.tripCityInput) {
     el.tripCityInput.placeholder = pickText("城市", "City","都市", "도시");
-    if (!el.tripCityInput.value) el.tripCityInput.value = getCurrentCity();
+    if (!el.tripCityInput.value) el.tripCityInput.value = _localizeUiCityName(getCurrentCity(), lang);
   }
   if (el.tripNoteInput) {
     el.tripNoteInput.placeholder = pickText("例如：接机 + 晚餐 + 酒店", "e.g. airport pickup + dinner + hotel","例: 空港迎え + 夕食 + ホテル", "예: 공항 픽업 + 저녁 + 호텔");
@@ -6179,12 +7263,131 @@ function applyLanguagePack() {
   applySingleDialogMode();
   toggleConstraintPanel(state.constraintsExpanded);
   if (state.supportRoom.activeSessionId) {
-    loadSupportRoomSession(state.supportRoom.activeSessionId).catch(() => {});
+    // Only reload support room messages when the support room drawer is actually open,
+    // not on every language switch (prevents unnecessary re-renders).
+    const supportDrawer = document.getElementById("supportRoomDrawer") || document.querySelector(".cx-support-room");
+    if (supportDrawer && !supportDrawer.hidden && supportDrawer.offsetParent !== null) {
+      loadSupportRoomSession(state.supportRoom.activeSessionId).catch(() => {});
+    }
   }
   if (store) store.dispatch({ type: "SET_LANGUAGE", language: lang });
 
   // Smooth fade-in on static UI labels after text swap
   _triggerLangFade();
+}
+
+function syncDynamicLanguageSurfaces() {
+  _updateLocationTag(state._locationLabelEn || state._locationLabelZh || "", {
+    cityZh: state._locationLabelZh,
+    cityEn: state._locationLabelEn || state._locationLabelZh,
+    hasGps: state._locationHasGps === true,
+  });
+  const badgeVisible = !!document.getElementById("cx-session-badge") && !document.getElementById("cx-session-badge").classList.contains("hidden");
+  renderSessionBadge(badgeVisible);
+  syncPrivacyLinkTargets();
+  syncGdprBannerLanguage();
+  syncLoginConsentLanguage();
+  syncThinkingPanelsLanguage();
+}
+
+function syncGdprBannerLanguage() {
+  const banner = document.getElementById("cx-gdpr-banner");
+  if (!banner) return;
+  const text = banner.querySelector(".cx-gdpr-text");
+  const btnMin = document.getElementById("cx-gdpr-min");
+  const btnAll = document.getElementById("cx-gdpr-all");
+  if (text) {
+    text.innerHTML = `
+      <strong>${pickText("隐私提示", "Privacy Notice", "プライバシー通知", "개인정보 안내")}</strong>
+      ${pickText(
+        "CrossX 使用设备偏好数据为您提供个性化旅行规划服务。",
+        "CrossX uses device preferences to personalize your travel planning experience.",
+        "CrossX は端末設定を使って旅行計画をパーソナライズします。",
+        "CrossX는 기기 선호 정보를 사용해 여행 계획을 개인화합니다."
+      )}
+      <a href="${escapeHtml(getLocalizedPrivacyUrl())}" target="_blank" rel="noopener" data-privacy-link="1">${pickText("查看隐私政策", "Read Privacy Policy", "プライバシーポリシーを見る", "개인정보 처리방침 보기")}</a>
+    `;
+  }
+  if (btnMin) btnMin.textContent = pickText("仅必要", "Essential only", "必須のみ", "필수만");
+  if (btnAll) btnAll.textContent = pickText("接受全部", "Accept all", "すべて許可", "모두 허용");
+  _syncGdprOffset();
+}
+
+function _getLoginConsentCopy() {
+  const privacyUrl = escapeHtml(getLocalizedPrivacyUrl());
+  return {
+    consentBadge: pickText("必选步骤 1/2", "Required step 1/2", "必須ステップ 1/2", "필수 단계 1/2", "Langkah wajib 1/2", "خطوة إلزامية 1/2"),
+    privacyTitle: pickText("登录前请先同意隐私政策", "Accept the privacy policy before signing in", "サインイン前にプライバシーポリシーへ同意してください", "로그인 전에 개인정보 처리방침에 동의해 주세요", "Setujui kebijakan privasi sebelum masuk", "وافق على سياسة الخصوصية قبل تسجيل الدخول"),
+    privacyCopy: pickText(
+      "CrossX 会在登录后处理你的账户资料、设备标识和行程偏好，用于完成预订与客服协同。",
+      "CrossX will process your account profile, device identifiers, and trip preferences after sign-in to complete bookings and support.",
+      "CrossX はサインイン後、予約実行とサポート対応のためにアカウント情報・端末識別子・旅行設定を処理します。",
+      "CrossX는 로그인 후 예약 처리와 지원 대응을 위해 계정 정보, 기기 식별자, 여행 선호를 처리합니다.",
+      "Setelah masuk, CrossX memproses profil akun, pengenal perangkat, dan preferensi perjalanan untuk pemesanan dan dukungan.",
+      "بعد تسجيل الدخول، يعالج CrossX بيانات الحساب ومعرّفات الجهاز وتفضيلات الرحلة لإتمام الحجز والدعم."
+    ),
+    privacyHelper: pickText(
+      "未勾选前，下方所有登录方式都会保持禁用。",
+      "All sign-in methods stay locked until you check this box.",
+      "このチェックを入れるまで、下のサインイン方法は無効のままです。",
+      "이 항목을 체크하기 전까지 아래 로그인 방법은 비활성화됩니다.",
+      "Semua metode masuk tetap terkunci sampai Anda mencentang kotak ini.",
+      "ستظل جميع طرق تسجيل الدخول مقفلة حتى تحدد هذا المربع."
+    ),
+    privacyAgreementHtml: pickText(
+      `我已阅读并同意<a href="${privacyUrl}" target="_blank" rel="noopener" id="cxLoginPrivacyLink" data-privacy-link="1">《隐私政策》</a>`,
+      `I have read and agree to the <a href="${privacyUrl}" target="_blank" rel="noopener" id="cxLoginPrivacyLink" data-privacy-link="1">Privacy Policy</a>`,
+      `<a href="${privacyUrl}" target="_blank" rel="noopener" id="cxLoginPrivacyLink" data-privacy-link="1">プライバシーポリシー</a>を読み、同意します`,
+      `<a href="${privacyUrl}" target="_blank" rel="noopener" id="cxLoginPrivacyLink" data-privacy-link="1">개인정보 처리방침</a>을 읽고 동의합니다`,
+      `Saya telah membaca dan menyetujui <a href="${privacyUrl}" target="_blank" rel="noopener" id="cxLoginPrivacyLink" data-privacy-link="1">Kebijakan Privasi</a>`,
+      `لقد قرأت ووافقت على <a href="${privacyUrl}" target="_blank" rel="noopener" id="cxLoginPrivacyLink" data-privacy-link="1">سياسة الخصوصية</a>`
+    ),
+    cookieTitle: pickText("接着选择 Cookie 方案", "Choose a cookie setting to continue", "続いて Cookie 設定を選択してください", "계속하려면 쿠키 설정을 선택해 주세요", "Pilih pengaturan cookie untuk melanjutkan", "اختر إعدادات ملفات تعريف الارتباط للمتابعة"),
+    cookieCopy: pickText(
+      "完成隐私同意后，还需要确认 Cookie 级别，系统才会继续登录流程。",
+      "After privacy acceptance, choose the cookie level so the sign-in flow can continue.",
+      "プライバシー同意の後、サインインを続けるには Cookie レベルの選択が必要です。",
+      "개인정보 동의 후, 로그인 절차를 계속하려면 쿠키 수준을 선택해야 합니다.",
+      "Setelah menyetujui privasi, pilih tingkat cookie agar proses masuk dapat dilanjutkan.",
+      "بعد الموافقة على الخصوصية، اختر مستوى ملفات تعريف الارتباط لمتابعة تسجيل الدخول."
+    ),
+    cookieEssential: pickText("仅必要", "Essential only", "必須のみ", "필수만", "Hanya esensial", "الضرورية فقط"),
+    cookieAll: pickText("接受全部", "Accept all", "すべて許可", "모두 허용", "Terima semua", "قبول الكل"),
+    cookieSavedEssential: pickText("当前设备已选择：仅必要 Cookie", "This device is set to: Essential cookies only", "この端末では「必須 Cookie のみ」が選択されています", "이 기기에는 필수 쿠키만 선택되어 있습니다", "Perangkat ini disetel ke: hanya cookie esensial", "تم ضبط هذا الجهاز على: ملفات تعريف الارتباط الضرورية فقط"),
+    cookieSavedAll: pickText("当前设备已选择：接受全部 Cookie", "This device is set to: Accept all cookies", "この端末では「すべての Cookie を許可」が選択されています", "이 기기에는 모든 쿠키 허용이 선택되어 있습니다", "Perangkat ini disetel ke: terima semua cookie", "تم ضبط هذا الجهاز على: قبول كل ملفات تعريف الارتباط"),
+    privacyRequiredError: pickText("请先阅读并同意隐私政策。", "Please accept the privacy policy first.", "先にプライバシーポリシーへ同意してください。", "먼저 개인정보 처리방침에 동의해 주세요.", "Harap setujui kebijakan privasi terlebih dahulu.", "يرجى الموافقة على سياسة الخصوصية أولاً."),
+    cookieRequiredError: pickText("请先完成 Cookie 选择。", "Please choose a cookie setting first.", "先に Cookie 設定を選択してください。", "먼저 쿠키 설정을 선택해 주세요.", "Harap pilih pengaturan cookie terlebih dahulu.", "يرجى اختيار إعدادات ملفات تعريف الارتباط أولاً."),
+  };
+}
+
+function syncLoginConsentLanguage() {
+  const modal = document.getElementById("cx-login-modal");
+  if (!modal) return;
+  const copy = _getLoginConsentCopy();
+  const consentBadge = document.getElementById("cxLoginConsentBadge");
+  const privacyTitle = document.getElementById("cxLoginPrivacyTitle");
+  const privacyCopy = document.getElementById("cxLoginPrivacyCopy");
+  const privacyHelper = document.getElementById("cxLoginPrivacyHelper");
+  const privacyLabel = document.getElementById("cxLoginPrivacyLabel");
+  const cookieTitle = document.getElementById("cxLoginCookieTitle");
+  const cookieCopy = document.getElementById("cxLoginCookieCopy");
+  const cookieEssential = document.getElementById("cxLoginCookieEssential");
+  const cookieAll = document.getElementById("cxLoginCookieAll");
+  const cookieStatus = document.getElementById("cxLoginCookieStatus");
+  if (consentBadge) consentBadge.textContent = copy.consentBadge;
+  if (privacyTitle) privacyTitle.textContent = copy.privacyTitle;
+  if (privacyCopy) privacyCopy.textContent = copy.privacyCopy;
+  if (privacyHelper) privacyHelper.textContent = copy.privacyHelper;
+  if (privacyLabel) privacyLabel.innerHTML = copy.privacyAgreementHtml;
+  syncPrivacyLinkTargets(modal);
+  if (cookieTitle) cookieTitle.textContent = copy.cookieTitle;
+  if (cookieCopy) cookieCopy.textContent = copy.cookieCopy;
+  if (cookieEssential) cookieEssential.textContent = copy.cookieEssential;
+  if (cookieAll) cookieAll.textContent = copy.cookieAll;
+  if (cookieStatus && !cookieStatus.classList.contains("hidden")) {
+    const choice = modal.dataset.cookieChoice || "";
+    cookieStatus.textContent = choice === "all" ? copy.cookieSavedAll : copy.cookieSavedEssential;
+  }
 }
 
 /** Brief opacity fade on key UI panels to make text swaps feel fluid. */
@@ -6226,7 +7429,7 @@ function addMessage(text, who = "agent", options = null) {
   const bubble = document.createElement("span");
   bubble.className = "bubble";
   // AI-native: typewriter effect for agent chat messages (skip for very long text)
-  const doTypewriter = opts.typewriter && who === "agent" && text.length <= 400;
+  const doTypewriter = opts.typewriter && who === "agent" && text.length <= 400 && !_isCompactMobileViewport();
   bubble.textContent = doTypewriter ? "" : text;
   if (!doTypewriter) bubble.innerHTML = escapeHtml(text);
   row.appendChild(bubble);
@@ -6268,6 +7471,14 @@ function addMessage(text, who = "agent", options = null) {
       };
       row.appendChild(shareBtn);
     }
+
+    const exportBtn = document.createElement("button");
+    exportBtn.className = "cx-msg-copy-btn";
+    exportBtn.title = pickText("导出 PDF", "Export PDF", "PDF 書き出し", "PDF 내보내기");
+    exportBtn.setAttribute("aria-label", pickText("导出为 PDF", "Export message as PDF", "メッセージをPDFで書き出す", "메시지를 PDF로 내보내기", "Ekspor pesan sebagai PDF", "تصدير الرسالة كملف PDF"));
+    exportBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13" aria-hidden="true"><path d="M6 2h9l5 5v15a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z"/><path d="M14 2v6h6"/><path d="M8 13h8"/><path d="M8 17h8"/></svg>';
+    exportBtn.onclick = () => { exportAgentMessageAsPdf(text); };
+    row.appendChild(exportBtn);
   }
 
   // TTS (read aloud) button for agent messages (v8.0 P1)
@@ -6297,7 +7508,7 @@ function addMessage(text, who = "agent", options = null) {
 
   el.chatFeed.appendChild(row);
   motion.enter(row, { duration: 160, fromY: 8 });
-  _smartScrollToBottom(el.chatFeed);
+  _revealConversationNode(row, { force: opts.forceReveal === true, block: who === "user" ? "end" : "nearest" });
   pulseConversationAura();
   if (doTypewriter) {
     // Speed: ~12ms/char for short messages, 8ms for longer ones
@@ -6358,7 +7569,12 @@ function addCard(html) {
   el.chatFeed.appendChild(card);
   motion.popIn(card, { duration: 220 });
   motion.bindPressables(card);
-  _smartScrollToBottom(el.chatFeed);
+  const shouldFocusCard = _isPrimaryResultCard(card);
+  _revealConversationNode(card, {
+    force: shouldFocusCard ? true : _shouldForceOutputFocus(),
+    block: shouldFocusCard ? "start" : "nearest",
+    behavior: shouldFocusCard ? "smooth" : "auto",
+  });
   pulseConversationAura();
 }
 
@@ -6383,7 +7599,7 @@ function renderTaskSkeletonCards() {
   `;
   el.chatFeed.appendChild(wrap);
   motion.enter(wrap, { duration: 140, fromY: 6 });
-  el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  _smartScrollToBottom(el.chatFeed, { force: true });
   return id;
 }
 
@@ -6404,7 +7620,9 @@ async function loadTicketById(ticketId) {
   if (!ticketId) return null;
   const ticket = getTicketById(ticketId);
   if (ticket) return ticket;
-  const data = await api("/api/support/tickets");
+  const data = await api("/api/support/tickets", {
+    headers: _supportAccessHeaders(state.supportRoom.activeSessionId),
+  });
   state.supportTickets = Array.isArray(data.tickets) ? data.tickets : [];
   return getTicketById(ticketId);
 }
@@ -6428,7 +7646,7 @@ async function renderSupportTicketDrawer(ticketId, trigger = null) {
       <li>
         <strong>${escapeHtml(localizeStatus(item.status || "open"))}</strong>
         <span class="status">${new Date(item.at || ticket.updatedAt || ticket.createdAt).toLocaleString()}</span>
-        <div class="status">${escapeHtml(item.note || "-")}</div>
+        <div class="status">${escapeHtml(_localizeVisibleTravelText(item.note || "", "-"))}</div>
       </li>
     `,
         )
@@ -6439,9 +7657,9 @@ async function renderSupportTicketDrawer(ticketId, trigger = null) {
         .map(
           (item) => `
       <li>
-        <strong>${escapeHtml(item.type || "evidence")}</strong>
+        <strong>${escapeHtml(_localizeVisibleTravelText(item.type || "", pickText("证据", "Evidence","証拠", "증빙")))}</strong>
         <span class="status">${new Date(item.at || ticket.updatedAt || ticket.createdAt).toLocaleString()} · ${escapeHtml(item.hash || "-")}</span>
-        <div class="status">${escapeHtml(item.note || "-")}</div>
+        <div class="status">${escapeHtml(_localizeVisibleTravelText(item.note || "", "-"))}</div>
       </li>
     `,
         )
@@ -6457,12 +7675,9 @@ async function renderSupportTicketDrawer(ticketId, trigger = null) {
       <h3>${pickText("工单概览", "Ticket Overview","チケット概要", "티켓 개요")}</h3>
       <div>${pickText("工单号", "Ticket ID","チケットID", "티켓 ID")}: <span class="code">${escapeHtml(ticket.id)}</span></div>
       <div>${pickText("状态", "Status","状態", "상태")}: <span class="status-badge ${escapeHtml(ticket.status || "open")}">${escapeHtml(localizeStatus(ticket.status || "open"))}</span></div>
-      <div class="status">${pickText("处理方", "Handler","担当", "담당")}: ${escapeHtml(ticket.handler || "human")} · ${pickText("来源", "Source","ソース", "소스")}: ${escapeHtml(ticket.source || "-")}</div>
       <div class="status eta-live" data-created-at="${escapeHtml(ticket.createdAt || ticket.updatedAt || new Date().toISOString())}" data-eta-min="${Number(ticket.etaMin || 0)}"></div>
-      <div class="status">${pickText("原因", "Reason","理由", "사유")}: ${escapeHtml(ticket.reason || "-")}</div>
+      <div class="status">${pickText("原因", "Reason","理由", "사유")}: ${escapeHtml(_localizeVisibleTravelText(ticket.reason || "", "-"))}</div>
       <div class="actions">
-        ${ticket.status === "open" ? `<button class="secondary" data-action="ticket-progress" data-ticket="${escapeHtml(ticket.id)}">${pickText("转处理中", "Mark In Progress","対応中にする", "처리중으로 변경")}</button>` : ""}
-        ${ticket.status === "in_progress" ? `<button class="secondary" data-action="ticket-resolve" data-ticket="${escapeHtml(ticket.id)}">${pickText("标记已解决", "Mark Resolved","解決済みにする", "해결 완료로 변경")}</button>` : ""}
         <button class="secondary" data-action="open-live-support" data-ticket="${escapeHtml(ticket.id)}">${pickText("进入实时会话", "Open Live Room","ライブ会話を開く", "실시간 상담 열기")}</button>
         <button class="secondary" data-action="ticket-evidence" data-ticket="${escapeHtml(ticket.id)}">${pickText("补充证据", "Add Evidence","証拠を追加", "증빙 추가")}</button>
         <button class="secondary" data-action="refresh-ticket-detail" data-ticket="${escapeHtml(ticket.id)}">${pickText("刷新工单", "Refresh Ticket","チケット更新", "티켓 새로고침")}</button>
@@ -6567,6 +7782,7 @@ async function setSupportRoomPresence(online) {
   try {
     await api(`/api/support/sessions/${encodeURIComponent(sessionId)}/presence`, {
       method: "POST",
+      headers: _supportAccessHeaders(sessionId),
       body: JSON.stringify({ actor: "user", online: online === true }),
     });
   } catch {
@@ -6597,7 +7813,7 @@ function renderSupportRoomSession(session, ticket = null) {
   const opsOnline = summary.presence && summary.presence.ops && summary.presence.ops.online;
   const userUnread = summary.unread ? Number(summary.unread.user || 0) : 0;
   const opsName =
-    (summary.assignedAgentName && String(summary.assignedAgentName).trim()) ||
+    (_localizeVisibleTravelText(summary.assignedAgentName || "", "") && String(_localizeVisibleTravelText(summary.assignedAgentName || "", "")).trim()) ||
     (opsOnline ? pickText("人工坐席在线", "Ops online","オペレーター在線", "상담원 온라인") : pickText("等待人工接入", "Waiting for ops","オペレーター待機", "상담원 대기"));
   el.supportRoomMeta.textContent = pickText(
     `工单 ${roomTitleTicket} · ${opsName} · ${userUnread > 0 ? `未读 ${userUnread}` :"无未读"}`,
@@ -6621,7 +7837,7 @@ function renderSupportRoomSession(session, ticket = null) {
           : actor === "ops"
             ? pickText("人工坐席", "Support Agent","有人オペレーター", "상담원")
             : pickText("系统", "System","システム", "시스템");
-      const text = item.text ? `<div class="support-room-text">${escapeHtml(item.text)}</div>` : "";
+      const text = item.text ? `<div class="support-room-text">${escapeHtml(_localizeVisibleTravelText(item.text || "", item.text || ""))}</div>` : "";
       const voice = item.type === "voice" && item.audioDataUrl
         ? `<audio controls preload="none" src="${escapeHtml(item.audioDataUrl)}"></audio>
            <div class="status">${pickText("语音时长", "Voice duration","音声長さ", "음성 길이")}: ${Number(item.durationSec || 0)}s</div>`
@@ -6643,7 +7859,9 @@ function renderSupportRoomSession(session, ticket = null) {
 
 async function loadSupportRoomSession(sessionId) {
   if (!sessionId) return null;
-  const data = await api(`/api/support/sessions/${encodeURIComponent(sessionId)}?actor=user`);
+  const data = await api(`/api/support/sessions/${encodeURIComponent(sessionId)}?actor=user`, {
+    headers: _supportAccessHeaders(sessionId),
+  });
   const summary = data && data.session ? data.session : null;
   const ticket = data && data.ticket ? data.ticket : null;
   if (ticket) updateSupportRoomTicketState(ticket);
@@ -6688,21 +7906,17 @@ async function openSupportRoomBySession(sessionId, trigger = null) {
 
 async function openSupportRoomByTicket(ticketId, trigger = null, opts = {}) {
   if (!ticketId) return;
-  const ticket = await loadTicketById(ticketId);
-  let sessionId = ticket && ticket.sessionId ? ticket.sessionId : "";
-  if (!sessionId) {
-    const start = await api("/api/support/sessions/start", {
-      method: "POST",
-      body: JSON.stringify({
-        ticketId,
-        actor: "user",
-        urgent: opts.urgent === true,
-        reason: opts.reason || "open_live_room",
-      }),
-    });
-    if (start && start.ticket) updateSupportRoomTicketState(start.ticket);
-    sessionId = start && start.session ? start.session.id : "";
-  }
+  const start = await api("/api/support/sessions/start", {
+    method: "POST",
+    body: JSON.stringify({
+      ticketId,
+      actor: "user",
+      urgent: opts.urgent === true,
+      reason: opts.reason || "open_live_room",
+    }),
+  });
+  if (start && start.ticket) updateSupportRoomTicketState(start.ticket);
+  const sessionId = start && start.session ? start.session.id : "";
   if (!sessionId) {
     notify(pickText("无法创建人工会话。", "Failed to open live support room.","有人ルームを作成できませんでした。", "실시간 상담 룸을 열 수 없습니다."), "error");
     return;
@@ -6744,6 +7958,7 @@ async function sendSupportRoomTextMessage(text) {
   if (!message) return;
   await api(`/api/support/sessions/${encodeURIComponent(sessionId)}/messages`, {
     method: "POST",
+    headers: _supportAccessHeaders(sessionId),
     body: JSON.stringify({
       actor: "user",
       type: "text",
@@ -6793,6 +8008,7 @@ async function toggleSupportRoomVoiceRecording() {
       const dataUrl = await blobToDataUrl(blob);
       await api(`/api/support/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: "POST",
+        headers: _supportAccessHeaders(sessionId),
         body: JSON.stringify({
           actor: "user",
           type: "voice",
@@ -6803,10 +8019,7 @@ async function toggleSupportRoomVoiceRecording() {
       await loadSupportRoomSession(sessionId);
       notify(pickText("语音已发送到人工会话。", "Voice message sent to live support.","音声を有人会話へ送信しました。", "음성 메시지를 상담 룸으로 전송했습니다."), "success");
     } catch (err) {
-      notify(
-        pickText(`语音发送失败：${err.message}`, `Voice send failed: ${err.message}`, `音声送信失敗: ${err.message}`, `음성 전송 실패: ${err.message}`),
-        "error",
-      );
+      notify(formatClientActionError(err, "语音发送失败", "Voice send failed", "音声送信失敗", "음성 전송 실패"), "error");
     } finally {
       if (state.supportRoom.stream) {
         state.supportRoom.stream.getTracks().forEach((track) => track.stop());
@@ -6917,32 +8130,95 @@ function applyReplanTemplate(templateId) {
   if (el.replanHint) el.replanHint.textContent = `Template applied: ${templateId}`;
 }
 
+function sanitizeClientErrorCode(value, fallback = "request_failed") {
+  const safe = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_:-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+  return safe || fallback;
+}
+
+function getClientErrorCode(err, fallback = "request_failed") {
+  return sanitizeClientErrorCode(err && err.message, fallback);
+}
+
+function localizeClientError(code) {
+  const safeCode = sanitizeClientErrorCode(code, "request_failed");
+  if (safeCode === "request_timed_out") {
+    return pickText("请求超时，请稍后重试。", "Request timed out. Please try again.", "リクエストがタイムアウトしました。再試行してください。", "요청 시간이 초과되었습니다. 다시 시도해 주세요.");
+  }
+  if (safeCode === "unauthorized") {
+    return pickText("登录状态已失效，请重新登录。", "Your session expired. Please sign in again.", "ログイン状態の有効期限が切れました。再度ログインしてください。", "로그인 세션이 만료되었습니다. 다시 로그인해 주세요.");
+  }
+  if (safeCode === "plan_detail_provider_unavailable" || safeCode === "plan_provider_unavailable") {
+    return pickText("AI 行程服务暂时不可用，请稍后重试。", "AI planning is temporarily unavailable. Please try again later.", "AI旅程サービスは一時的に利用できません。後でもう一度お試しください。", "AI 일정 서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.");
+  }
+  if (safeCode === "map_provider_unavailable") {
+    return pickText("地图服务暂时不可用，请稍后重试。", "Map service is temporarily unavailable. Please try again later.", "地図サービスは一時的に利用できません。後でもう一度お試しください。", "지도 서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.");
+  }
+  if (safeCode === "invoice_ocr_unavailable" || safeCode === "invoice_ocr_failed") {
+    return pickText("票据识别暂时不可用，请稍后再试。", "Invoice OCR is temporarily unavailable. Please try again later.", "請求書OCRは一時的に利用できません。後でもう一度お試しください。", "영수증 인식이 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.");
+  }
+  if (safeCode === "coze_bot_unavailable" || safeCode === "training_provider_unavailable" || safeCode === "vision_provider_unavailable") {
+    return pickText("AI 服务暂时不可用，请稍后重试。", "AI service is temporarily unavailable. Please try again later.", "AIサービスは一時的に利用できません。後でもう一度お試しください。", "AI 서비스가 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도해 주세요.");
+  }
+  if (safeCode === "request_failed" || /^http_\d+$/.test(safeCode)) {
+    return pickText("请求失败，请稍后重试。", "Request failed. Please try again.", "リクエストに失敗しました。再試行してください。", "요청에 실패했습니다. 다시 시도해 주세요.");
+  }
+  return safeCode.replace(/_/g, " ");
+}
+
+function describeClientError(err, fallback = "request_failed") {
+  return localizeClientError(getClientErrorCode(err, fallback));
+}
+
+function formatClientActionError(err, zh, en, ja, ko, fallback = "request_failed") {
+  const detail = describeClientError(err, fallback);
+  return pickText(`${zh}：${detail}`, `${en}: ${detail}`, `${ja}: ${detail}`, `${ko}: ${detail}`);
+}
+
+async function _readJsonResponseSafe(res, fallback = {}) {
+  if (!res) return fallback;
+  if (res.status === 204 || res.status === 205) return fallback;
+  let text = "";
+  try {
+    text = await res.text();
+  } catch {
+    return fallback;
+  }
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return fallback;
+  try {
+    return JSON.parse(trimmed);
+  } catch (err) {
+    console.warn("[client/json] response parse skipped:", getClientErrorCode(err, "invalid_payload"));
+    return fallback;
+  }
+}
+
 async function api(path, options = {}) {
-  const { _timeout = 20000, signal: callerSignal, ...fetchOptions } = options;
+  const { _timeout = 20000, signal: callerSignal, headers: customHeaders = {}, ...fetchOptions } = options;
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), _timeout);
   // Allow callers to pass their own signal; abort if either triggers
   if (callerSignal) {
     callerSignal.addEventListener("abort", () => ctrl.abort(), { once: true });
   }
-  // Auto-inject auth token when present
-  const _authToken = _getAuthToken ? _getAuthToken() : null;
-  const _authHeader = _authToken ? { Authorization: `Bearer ${_authToken}` } : {};
   try {
     const res = await fetch(path, {
-      headers: { "Content-Type": "application/json", ..._authHeader },
+      headers: { "Content-Type": "application/json", ..._authHeaders(), ...(customHeaders || {}) },
       signal: ctrl.signal,
       ...fetchOptions,
     });
-    // P2-D: Guard against 204 No Content or non-JSON responses (avoids SyntaxError crash)
-    const ct = res.headers.get("content-type") || "";
-    const data = (res.status !== 204 && ct.includes("json"))
-      ? await res.json().catch(() => ({}))
-      : {};
-    if (!res.ok) throw new Error(data.error || `API error ${res.status}`);
+    const data = await _readJsonResponseSafe(res, {});
+    if (!res.ok) {
+      throw new Error(sanitizeClientErrorCode(data.error || data.code || data.reason, `http_${res.status}`));
+    }
     return data;
   } catch (err) {
-    if (err.name === "AbortError") throw new Error("Request timed out");
+    if (err.name === "AbortError") throw new Error("request_timed_out");
     throw err;
   } finally {
     clearTimeout(timer);
@@ -6952,14 +8228,79 @@ async function api(path, options = {}) {
 // Returns auth header for direct fetch() calls (mirrors api() helper auto-inject)
 function _authHeaders() {
   const t = _getAuthToken ? _getAuthToken() : null;
-  return t ? { Authorization: `Bearer ${t}` } : {};
+  const deviceId = typeof getDeviceId === "function" ? getDeviceId() : "";
+  return {
+    ...(t ? { Authorization: `Bearer ${t}` } : {}),
+    ...(deviceId ? { "X-Device-Id": deviceId } : {}),
+  };
+}
+
+function buildOrderReceiptUrl(orderId, { download = false } = {}) {
+  const params = new URLSearchParams();
+  if (download) params.set("download", "1");
+  const deviceId = typeof getDeviceId === "function" ? getDeviceId() : "";
+  if (deviceId) params.set("deviceId", deviceId);
+  const query = params.toString();
+  return `/api/orders/${encodeURIComponent(orderId)}/receipt${query ? `?${query}` : ""}`;
+}
+
+function _supportAccessHeaders(sessionId = "") {
+  void sessionId;
+  return {};
+}
+
+let _authBootstrapResolved = false;
+let _authBootstrapAuthenticated = false;
+let _bootLoginPromptShown = false;
+let _deferredTripsLoadTimer = 0;
+
+function _hasStoredAuthIdentity() {
+  try {
+    return Boolean(_authStorage()?.getItem(AUTH_SESSION_HINT_KEY));
+  } catch {
+    return false;
+  }
+}
+
+function _hasLegacyStoredAuthState() {
+  try {
+    const legacy = _legacyAuthStorage();
+    return Boolean(
+      (legacy && legacy.getItem(AUTH_TOKEN_KEY))
+      || (legacy && legacy.getItem(AUTH_USERID_KEY))
+      || (legacy && legacy.getItem(AUTH_NAME_KEY))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function _setAuthBootstrapState(resolved, authenticated) {
+  _authBootstrapResolved = Boolean(resolved);
+  _authBootstrapAuthenticated = Boolean(authenticated);
+}
+
+function _canUsePrivateUserApis() {
+  return _authBootstrapResolved && _authBootstrapAuthenticated;
+}
+
+function _hasConsentPurpose(purpose) {
+  if (!purpose) return false;
+  try {
+    const raw = localStorage.getItem("cx_gdpr_v1");
+    const parsed = raw ? JSON.parse(raw) : null;
+    return Array.isArray(parsed?.purposes) && parsed.purposes.includes(purpose);
+  } catch {
+    return false;
+  }
 }
 
 async function trackEvent(kind, meta = {}, taskId = null) {
+  if (!_hasConsentPurpose("analytics")) return;
   try {
     await api("/api/metrics/events", {
       method: "POST",
-      body: JSON.stringify({ kind, userId: _getAuthUserId ? (_getAuthUserId() || "guest") : "guest", taskId, meta }),
+      body: JSON.stringify({ kind, taskId, meta }),
     });
   } catch {
     // no-op
@@ -6989,6 +8330,37 @@ function _buildIntercityHtml(ic) {
   const mIcon = _ICONS[ic.mode] || "🚌";
   const cost  = ic.cost_cny > 0 ? `<span class="act-intercity-cost">¥${Number(ic.cost_cny).toLocaleString()}</span>` : "";
   const fmtDur = (m) => m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? (m % 60) + "m" : ""}` : `${m}m`;
+  const fallbackFlightHint = pickText(
+    "航班实时票价当前不可用，以下展示最佳可用交通组合。",
+    "Live flight pricing is unavailable right now. Showing the best available transport mix.",
+    "航空券のリアルタイム価格は現在利用できません。利用可能な最適ルートを表示しています。",
+    "실시간 항공권 가격을 현재 불러올 수 없습니다. 사용 가능한 최적 경로를 표시합니다."
+  );
+  const flightStatusText = ic?.flight_status_hint || (ic?.source?.flight === "none" ? fallbackFlightHint : "");
+  const flightStatus = flightStatusText
+    ? `<div class="act-intercity-tip">ℹ️ ${escapeHtml(flightStatusText)}</div>`
+    : "";
+  const verificationStatusText = ic?.verification_required
+    ? (ic?.verification_label || pickText(
+        "需去12306自行核验余票",
+        "Check seats on 12306 yourself",
+        "12306で空席を要確認",
+        "12306에서 좌석 직접 확인"
+      ))
+    : "";
+  const verificationStatus = verificationStatusText
+    ? `<div class="act-intercity-tip">🚄 ${escapeHtml(verificationStatusText)}</div>`
+    : "";
+  const inventoryStatusText = ic?.inventory_status === "live_or_verified"
+    ? pickText("实时/已核验", "Live verified", "リアルタイム/確認済み", "실시간/확인됨")
+    : ic?.inventory_status === "estimated"
+      ? pickText("本地估算", "Estimated", "推定", "추정")
+      : ic?.inventory_status === "user_check_required"
+        ? pickText("需自行核验", "User check required", "要確認", "직접 확인 필요")
+        : "";
+  const inventoryStatus = inventoryStatusText
+    ? `<div class="act-intercity-tip">📌 ${escapeHtml(inventoryStatusText)}</div>`
+    : "";
 
   let optsHtml = "";
   if (Array.isArray(ic.route_options) && ic.route_options.length > 1) {
@@ -6996,7 +8368,22 @@ function _buildIntercityHtml(ic) {
       const oIcon  = _ICONS[opt.type] || "🚌";
       const dur    = opt.duration_min > 0 ? fmtDur(opt.duration_min) : "";
       const price  = opt.price_cny > 0 ? `¥${Number(opt.price_cny).toLocaleString()}` : "";
-      const meta   = [dur, opt.freq].filter(Boolean).join(" · ");
+      const optState = opt?.inventory_status === "live_or_verified"
+        ? pickText("实时", "Live", "リアルタイム", "실시간")
+        : opt?.inventory_status === "estimated"
+          ? pickText("估算", "Estimated", "推定", "추정")
+          : opt?.inventory_status === "user_check_required"
+            ? pickText("自核", "Self-check", "要確認", "직접확인")
+            : "";
+      const verify = opt?.verification_required
+        ? (opt?.verification_label || pickText(
+            "需自行核验",
+            "Verify yourself",
+            "要確認",
+            "직접 확인"
+          ))
+        : "";
+      const meta   = [dur, opt.freq, optState, verify].filter(Boolean).join(" · ");
       const active = opt.type === ic.mode;
       return `<div class="cx-route-opt${active ? " cx-route-opt--active" : ""}">
         <span class="cx-ro-icon">${oIcon}</span>
@@ -7018,6 +8405,9 @@ function _buildIntercityHtml(ic) {
     </div>
     ${optsHtml}
     ${ic.detail ? `<div class="act-intercity-detail">${escapeHtml(ic.detail)}</div>` : ""}
+    ${inventoryStatus}
+    ${flightStatus}
+    ${verificationStatus}
     ${ic.tip ? `<div class="act-intercity-tip">💡 ${escapeHtml(ic.tip)}</div>` : ""}
   </div>`;
 }
@@ -7031,15 +8421,15 @@ async function fetchLocalNav(el) {
   const place = el.dataset.place || "";
   if (!city || !place) return;
   const modesEl = el.querySelector(".act-local-nav-modes");
-  if (modesEl) modesEl.textContent = "加载中\u2026";
+  if (modesEl) modesEl.textContent = pickText("加载中…", "Loading…", "読み込み中…", "로딩 중…");
   try {
     const resp = await fetch(
       `/api/local-route?from=${encodeURIComponent(hotel || city)}&to=${encodeURIComponent(place)}&city=${encodeURIComponent(city)}`
     );
-    const data = await resp.json();
+    const data = await _readJsonResponseSafe(resp, {});
     el.classList.remove("act-local-nav--loading");
     if (!data.ok || (!data.walk && !data.transit && !data.taxi)) {
-      if (modesEl) modesEl.textContent = "暂无导航数据";
+      if (modesEl) modesEl.textContent = pickText("暂无导航数据", "No route data", "ルートデータなし", "경로 데이터 없음");
       return;
     }
     const fmtMin = (m) => m >= 60 ? `${Math.floor(m / 60)}h${m % 60 ? (m % 60) + "m" : ""}` : `${m}m`;
@@ -7049,11 +8439,11 @@ async function fetchLocalNav(el) {
     if (data.taxi)    chips.push(`<span class="act-nav-chip"><span class="act-nav-chip-icon">🚕</span>${fmtMin(data.taxi.min)} \u00a5${data.taxi.cost_cny}</span>`);
     if (modesEl) modesEl.innerHTML = chips.length
       ? chips.join('<span class="act-nav-sep">\u00b7</span>')
-      : "导航数据不可用";
+      : pickText("导航数据不可用", "Route unavailable", "ルート利用不可", "경로 사용 불가");
   } catch {
     el.classList.remove("act-local-nav--loading");
     el.classList.add("act-local-nav--error");
-    if (modesEl) modesEl.textContent = "加载失败";
+    if (modesEl) modesEl.textContent = pickText("加载失败", "Load failed", "読み込み失敗", "로드 실패");
   }
 }
 
@@ -7092,13 +8482,13 @@ function renderPlanCard(task) {
   addCard(`
     <article class="card" id="plan-${task.id}">
       <h3>${escapeHtml(tTerm("plan"))} Card</h3>
-      <div>${pickText("我将为你完成", "I will complete","実行する内容", "실행 내용")}: <strong>${escapeHtml(task.plan.title)}</strong></div>
+      <div>${pickText("我将为你完成", "I will complete","実行する内容", "실행 내용")}: <strong>${escapeHtml(_localizeVisibleTravelText(task.plan.title || "-", task.plan.title || "-"))}</strong></div>
       <div class="status">${pickText("预计耗时", "ETA","推定時間", "예상 시간")}: ${etaMin} ${pickText("分钟", "min","分", "분")} · ${pickText("预估成功率", "Success","成功率見込み", "예상 성공률")}: 88-95%</div>
-      <div class="status">${pickText("风险", "Risk","リスク", "리스크")}: ${escapeHtml(task.plan.confirm && task.plan.confirm.alternative ? task.plan.confirm.alternative : pickText("高峰期可能排队波动", "Queue fluctuation at peak","ピーク時は待ち時間が変動", "피크 시간 대기열 변동 가능"))}</div>
-      <div class="status">${pickText("为什么这样做", "Why","選択理由", "선정 이유")}: ${escapeHtml(task.plan.reasoning || pickText("基于成本、时间和成功率做出选择。", "Based on cost, time and confidence.","コスト・時間・成功率を基に判断。", "비용·시간·성공률을 기반으로 선택했습니다."))}</div>
+      <div class="status">${pickText("风险", "Risk","リスク", "리스크")}: ${escapeHtml(_localizeVisibleTravelText(task.plan.confirm && task.plan.confirm.alternative ? task.plan.confirm.alternative : pickText("高峰期可能排队波动", "Queue fluctuation at peak","ピーク時は待ち時間が変動", "피크 시간 대기열 변동可能"), task.plan.confirm && task.plan.confirm.alternative ? task.plan.confirm.alternative : pickText("高峰期可能排队波动", "Queue fluctuation at peak","ピーク時は待ち時間が変動", "피크 시간 대기열 변동可能")))}</div>
+      <div class="status">${pickText("为什么这样做", "Why","選択理由", "선정 이유")}: ${escapeHtml(_localizeVisibleTravelText(task.plan.reasoning || pickText("基于成本、时间和成功率做出选择。", "Based on cost, time and confidence.","コスト・時間・成功率を基に判断。", "비용·시간·성공률을 기반으로 선택했습니다."), task.plan.reasoning || pickText("基于成本、时间和成功率做出选择。", "Based on cost, time and confidence.","コスト・時間・成功率を基に判断。", "비용·시간·성공률을 기반으로 선택했습니다.")))}</div>
       <div class="status">${pickText("进度", "Progress","進捗", "진행")}: ${done}/${total} · ${percent}%</div>
       <div class="status">${tUi("step_current")}: ${escapeHtml((currentStep && currentStep.label) || pickText("等待开始", "Waiting to start","開始待ち", "시작 대기"))}</div>
-      <div class="progress-track"><div class="progress-fill" style="width:${percent}%;"></div></div>
+      <progress class="plan-progress" max="100" value="${percent}">${percent}%</progress>
       <details open class="plan-details">
         <summary>${pickText("执行步骤", "Execution steps","実行ステップ", "실행 단계")} (${task.plan.steps.length})</summary>
         <ol class="steps">${steps}</ol>
@@ -7119,15 +8509,14 @@ function _showExecPermissionTip() {
   try { localStorage.setItem("cx_exec_tip_shown", "1"); } catch { /* quota */ }
   trackEvent("exec_tip_shown", { lang: state.uiLanguage || "EN" }).catch(() => {});
   const overlay = document.createElement("div");
-  overlay.className = "cx-onboarding-overlay";
-  overlay.style.cssText = "display:flex;z-index:9999;";
+  overlay.className = "cx-onboarding-overlay cx-onboarding-overlay-tip";
   overlay.setAttribute("role", "dialog");
   overlay.setAttribute("aria-modal", "true");
   overlay.innerHTML = `
-    <div class="cx-onboarding-card" style="max-width:380px">
-      <div style="font-size:2rem;text-align:center;margin-bottom:12px">🤖</div>
-      <h2 style="margin:0 0 10px;font-size:1.1rem">${pickText("AI 会代你执行吗？", "Will AI book for you?", "AIが代わりに予約しますか？", "AI가 대신 예약하나요?", "Apakah AI akan memesan untuk Anda?", "هل سيحجز الذكاء الاصطناعي بدلاً منك؟")}</h2>
-      <p style="color:#555;font-size:0.9rem;line-height:1.5">${pickText(
+    <div class="cx-onboarding-card cx-onboarding-card-tip">
+      <div class="cx-onboarding-tip-icon">🤖</div>
+      <h2 class="cx-onboarding-tip-title">${pickText("AI 会代你执行吗？", "Will AI book for you?", "AIが代わりに予約しますか？", "AI가 대신 예약하나요?", "Apakah AI akan memesan untuk Anda?", "هل سيحجز الذكاء الاصطناعي بدلاً منك？")}</h2>
+      <p class="cx-onboarding-tip-copy">${pickText(
         "AI 会先展示方案，你确认后才会执行预订。费用由你授权，AI 不会在未经确认的情况下支付。",
         "AI shows you a plan first. It will only execute the booking after you confirm. Payment requires your explicit approval — AI never pays without your go-ahead.",
         "AIはまずプランを表示します。確認後のみ予約を実行します。支払いはお客様の明示的な承認が必要です。",
@@ -7135,8 +8524,8 @@ function _showExecPermissionTip() {
         "AI menampilkan rencana terlebih dahulu. Pemesanan hanya dilakukan setelah Anda konfirmasi. Pembayaran memerlukan persetujuan eksplisit Anda.",
         "يعرض الذكاء الاصطناعي الخطة أولاً. لا يتم تنفيذ الحجز إلا بعد موافقتك. الدفع يتطلب موافقتك الصريحة."
       )}</p>
-      <div class="cx-onboarding-actions" style="margin-top:16px">
-        <button class="cx-onboarding-next" onclick="trackEvent('exec_tip_dismissed',{lang:state.uiLanguage||'EN'}).catch(()={}); this.closest('.cx-onboarding-overlay').remove()">${pickText("明白了", "Got it", "わかりました", "알겠습니다", "Mengerti", "فهمت")}</button>
+      <div class="cx-onboarding-actions cx-onboarding-actions-spaced">
+        <button class="cx-onboarding-next" data-action="dismiss-exec-tip">${pickText("明白了", "Got it", "わかりました", "알겠습니다", "Mengerti", "فهمت")}</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
@@ -7150,7 +8539,7 @@ function renderConfirmCard(task) {
   const pricing = c.pricing || {};
   const breakdown = c.breakdown || {};
   const guarantee = c.guarantee || {};
-  const deliverables = (c.deliverables || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const deliverables = (c.deliverables || []).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("");
   const merchantFee = Number(breakdown.merchantFee || pricing.netPrice || 0);
   const serviceFee = Number(breakdown.serviceFee || pricing.markup || 0);
   const thirdPartyFee = Number(breakdown.thirdPartyFee || 0);
@@ -7261,7 +8650,7 @@ function renderDeliverable(order) {
 
   // "Show to local" card — Chinese text foreigners can show to taxi/restaurant staff
   const showToLocalCard = proof.bilingualAddress && state.uiLanguage !== "ZH"
-    ? `<details open style="margin-top:10px"><summary style="cursor:pointer;font-size:13px;color:var(--color-primary,#1a56db)">${pickText("", "Show this to local staff / driver", "スタッフ・ドライバーに見せる", "직원·기사에게 보여주기")}</summary><div style="margin-top:8px;padding:12px;background:#f0f9ff;border-radius:8px;font-size:15px;line-height:1.7;border:1px solid #bae6fd"><strong>请带我去：</strong><br>${escapeHtml(proof.bilingualAddress.replace(/^CN:\s*/, "").split(" / EN:")[0] || proof.bilingualAddress)}<br>${proof.itinerary && proof.itinerary.includes("CN:") ? `<br>${escapeHtml(proof.itinerary.split(" / EN:")[0].replace("CN: ", ""))}` : ""}</div></details>`
+    ? `<details open class="cx-show-local-card"><summary class="cx-show-local-summary">${pickText("", "Show this to local staff / driver", "スタッフ・ドライバーに見せる", "직원·기사에게 보여주기")}</summary><div class="cx-show-local-body"><strong>请带我去：</strong><br>${escapeHtml(proof.bilingualAddress.replace(/^CN:\s*/, "").split(" / EN:")[0] || proof.bilingualAddress)}<br>${proof.itinerary && proof.itinerary.includes("CN:") ? `<br>${escapeHtml(proof.itinerary.split(" / EN:")[0].replace("CN: ", ""))}` : ""}</div></details>`
     : "";
 
   // Real payment panel (non-sandbox card charge or real QR)
@@ -7275,23 +8664,23 @@ function renderDeliverable(order) {
       ${fx ? `<div class="cdc-usd">&asymp; $${Number(fx.settledAmount || 0).toFixed(2)} USD <span class="cdc-rate">&times; ${fx.rate}</span></div>` : ""}
       ${proof.cardChargeId ? `<div class="cdc-ref">${escapeHtml(proof.cardChargeId)}</div>` : ""}
     </div>` : `
-    <div class="deliverable-qr" style="text-align:center;flex-shrink:0;">
-      <canvas id="${qrId}" width="140" height="140" style="border-radius:8px;display:block;"></canvas>
-      <div class="status" style="font-size:10px;margin-top:4px;">${pickText("\u626b\u7801\u652f\u4ed8", "Scan to pay", "\u30b9\u30ad\u30e3\u30f3\u3057\u3066\u652f\u6255\u3044", "\uc2a4\uce94\ud558\uc5ec \uacb0\uc81c")}</div>
+    <div class="deliverable-qr deliverable-qr-panel">
+      <canvas id="${qrId}" width="140" height="140" class="deliverable-qr-canvas"></canvas>
+      <div class="status deliverable-qr-label">${pickText("\u626b\u7801\u652f\u4ed8", "Scan to pay", "\u30b9\u30ad\u30e3\u30f3\u3057\u3066\u652f\u6255\u3044", "\uc2a4\uce94\ud558\uc5ec \uacb0\uc81c")}</div>
     </div>`) : "";
 
   addCard(`
     <article class="card deliverable-card" data-order-id="${escapeHtml(order.id)}">
       <h3>${pickText("AI 已为您准备好以下入口", "Your China action card is ready", "中国プラットフォームリンクが揃いました", "중국 플랫폼 링크가 준비되었습니다")}</h3>
-      <div class="status">${escapeHtml(proof.bilingualAddress || "")}</div>
-      <div class="status" style="margin-bottom:8px">${escapeHtml(proof.itinerary || "")}</div>
+      <div class="status">${escapeHtml(_localizeVisibleTravelText(proof.bilingualAddress || "", ""))}</div>
+      <div class="status deliverable-itinerary-status">${escapeHtml(_localizeVisibleTravelText(proof.itinerary || "", ""))}</div>
       ${platformGrid}
       ${showToLocalCard}
-      ${payPanel ? `<div class="deliverable-row" style="margin-top:12px"><div class="deliverable-info">
-        <div>${pickText("\u8ba2\u5355\u53f7", "Order", "\u6ce8\u6587\u756a\u53f7", "\uc8fc\ubb38 \ubc88\ud638")}: <span class="code">${escapeHtml(proof.orderNo || order.id)}</span></div>
+      ${payPanel ? `<div class="deliverable-row deliverable-row-spaced"><div class="deliverable-info">
+        <div>${pickText("\u8ba2\u5355\u53f7", "Order", "\u6ce8\u6587\u756a\u53f7", "\uc8fc\ubb38 \ubc88\ud638")}: <span class="code">${escapeHtml(order.id)}</span></div>
         <div>${pickText("\u91d1\u989d", "Amount", "\u91d1\u984d", "\uae08\uc561")}: <strong>${Number(order.price || 0)} ${escapeHtml(order.currency || "CNY")}</strong></div>
       </div>${payPanel}</div>` : ""}
-      <div class="actions" style="margin-top:8px">
+      <div class="actions deliverable-actions-spaced">
         <button class="secondary" data-action="open-order-detail" data-order="${order.id}">${pickText("\u8ba2\u5355\u8be6\u60c5", "Order detail", "\u6ce8\u6587\u8a73\u7d30", "\uc8fc\ubb38 \uc0c1\uc138")}</button>
         <button class="secondary" data-action="open-proof" data-order="${order.id}">${pickText("\u51ed\u8bc1\u5305", "Proof bundle", "\u8a3c\u6190\u30d1\u30c3\u30af", "\uc99d\ube59 \ubc88\ub4e4")}</button>
         <button class="secondary" data-action="share-order" data-order="${order.id}">${pickText("\u5206\u4eab", "Share", "\u5171\u6709", "\uacf5\uc720")}</button>
@@ -7356,12 +8745,12 @@ function _onPaymentConfirmed(orderId) {
   const article = document.querySelector(`[data-order-id="${orderId}"]`);
   if (article) {
     const btn = article.querySelector(`[data-action="simulate-pay"]`);
-    if (btn) btn.style.display = "none";
+    if (btn) btn.classList.add("hidden");
   }
   if (navigator.vibrate) navigator.vibrate([20, 60, 20, 60, 20]);
   addCard(`<article class="card cx-td-card">
     <div class="cx-td-confetti" aria-hidden="true">
-      ${"🎉🌟✨🎊🎈".split("").map((e, i) => `<span style="--d:${i * 72}deg;--r:${30 + i * 11}px">${e}</span>`).join("")}
+      ${"🎉🌟✨🎊🎈".split("").map((e, i) => `<span class="cx-td-confetti-piece cx-td-confetti-piece--${i}">${e}</span>`).join("")}
     </div>
     <div class="cx-td-header">${pickText("\u2713 \u652f\u4ed8\u6210\u529f", "\u2713 Payment confirmed", "\u2713 \u652f\u6255\u5b8c\u4e86", "\u2713 \uACB0\uC81C \uC644\uB8CC")}</div>
     <div class="cx-td-row">${pickText("\u8ba2\u5355\u5df2\u5b8c\u6210\uff0c\u611f\u8c22\u4f7f\u7528 Cross X", "Order complete. Thank you for using Cross X.", "\u3054\u5229\u7528\u3042\u308a\u304c\u3068\u3046\u3054\u3056\u3044\u307e\u3059\u3002", "Cross X\ub97c \uc774\uc6a9\ud574 \uc8fc\uc154\uc11c \uac10\uc0ac\ud569\ub2c8\ub2e4.")}</div>
@@ -7378,24 +8767,24 @@ function _onPaymentConfirmed(orderId) {
 function _showInputModal(title, placeholder, opts = {}) {
   return new Promise(resolve => {
     const overlay = document.createElement("div");
-    overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:9999;padding:16px";
+    overlay.className = "cx-input-modal-overlay";
     const body = opts.options && opts.options.length
-      ? `<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:16px">
+      ? `<div class="cx-input-modal-options">
           ${opts.options.map((o, i) => `
-            <label style="display:flex;align-items:center;gap:10px;cursor:pointer;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:14px">
-              <input type="radio" name="cx-modal-opt" value="${i}" style="accent-color:#1a1a1a"> ${escapeHtml(o)}
+            <label class="cx-input-modal-option">
+              <input type="radio" name="cx-modal-opt" value="${i}" class="cx-input-modal-radio"> ${escapeHtml(o)}
             </label>`).join("")}
          </div>`
       : opts.multiline
-        ? `<textarea id="cx-modal-inp" rows="3" placeholder="${escapeHtml(placeholder || "")}" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;resize:vertical;margin-bottom:16px"></textarea>`
-        : `<input id="cx-modal-inp" type="text" placeholder="${escapeHtml(placeholder || "")}" style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:14px;margin-bottom:16px">`;
+        ? `<textarea id="cx-modal-inp" rows="3" placeholder="${escapeHtml(placeholder || "")}" class="cx-input-modal-field cx-input-modal-field-multiline"></textarea>`
+        : `<input id="cx-modal-inp" type="text" placeholder="${escapeHtml(placeholder || "")}" class="cx-input-modal-field">`;
     overlay.innerHTML = `
-      <div style="background:#fff;border-radius:16px;padding:24px;width:100%;max-width:360px;box-shadow:0 8px 32px rgba(0,0,0,.18)">
-        <div style="font-weight:600;font-size:15px;margin-bottom:14px">${escapeHtml(title)}</div>
+      <div class="cx-input-modal-sheet">
+        <div class="cx-input-modal-title">${escapeHtml(title)}</div>
         ${body}
-        <div style="display:flex;gap:8px">
-          <button id="cx-modal-cancel" style="flex:1;padding:10px;border:1px solid #ddd;border-radius:8px;background:#f8fafc;cursor:pointer;font-size:14px">${pickText("取消","Cancel","キャンセル","취소","Batal","إلغاء")}</button>
-          <button id="cx-modal-ok" style="flex:1;padding:10px;background:#1a1a1a;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:14px">${pickText("确认","OK","確認","확인","OK","موافق")}</button>
+        <div class="cx-input-modal-actions">
+          <button id="cx-modal-cancel" class="cx-input-modal-btn cx-input-modal-btn-cancel">${pickText("取消","Cancel","キャンセル","취소","Batal","إلغاء")}</button>
+          <button id="cx-modal-ok" class="cx-input-modal-btn cx-input-modal-btn-confirm">${pickText("确认","OK","確認","확인","OK","موافق")}</button>
         </div>
       </div>`;
     document.body.appendChild(overlay);
@@ -7420,12 +8809,32 @@ function _showInputModal(title, placeholder, opts = {}) {
   });
 }
 
-function notify(message, type = "info", actionLabel = "", onAction = null) {
+function notify(message, type = "info", actionLabelOrDuration = "", onActionOrDuration = null) {
+  let actionLabel = "";
+  let onAction = null;
+  let duration = undefined;
+
+  if (typeof actionLabelOrDuration === "number") {
+    duration = actionLabelOrDuration;
+  } else if (typeof actionLabelOrDuration === "string") {
+    actionLabel = actionLabelOrDuration;
+  }
+
+  if (typeof onActionOrDuration === "number") {
+    duration = onActionOrDuration;
+  } else if (typeof onActionOrDuration === "function") {
+    onAction = onActionOrDuration;
+  }
+
   if (toast && typeof toast.show === "function") {
-    toast.show({ message, type, actionLabel, onAction });
+    toast.show({ message, type, actionLabel, onAction, duration });
     return;
   }
   addMessage(message);
+}
+
+function showToast(message, type = "info", actionLabelOrDuration = "", onActionOrDuration = null) {
+  notify(message, type, actionLabelOrDuration, onActionOrDuration);
 }
 
 function setLoading(key, value) {
@@ -7470,7 +8879,7 @@ function renderFallbackCard(taskId, reason) {
   addCard(`
     <article class="card">
       <h3>${tUi("fallback_title")}</h3>
-      <div class="status">${pickText("执行受阻", "Execution blocked","実行が中断されました", "실행이 중단되었습니다")}: ${escapeHtml(reason || "unknown reason")}</div>
+      <div class="status">${pickText("执行受阻", "Execution blocked","実行が中断されました", "실행이 중단되었습니다")}: ${escapeHtml(sanitizeClientErrorCode(reason, "execution_failed"))}</div>
       <div class="status">${pickText("失败步骤", "Failed step","失敗したステップ", "실패 단계")}: ${escapeHtml((failedStep && failedStep.label) || pickText("未知", "unknown","不明", "알 수 없음"))}</div>
       <div class="status">${pickText("建议：可先重试；若仍失败可切换路线或人工接管。", "Suggestion: retry first, then switch lane or ask human if needed.","提案: まず再試行し、失敗時はルート切替か有人対応へ。", "권장: 먼저 재시도하고, 실패 시 경로 전환 또는 사람 상담을 사용하세요.")}</div>
       <div class="actions">
@@ -7486,11 +8895,18 @@ function renderFallbackCard(taskId, reason) {
 // ── E1: Travel Execution Chain ────────────────────────────────────────────
 
 const _TRAVEL_STEPS = [
-  { id: "reserve_hotel",   icon: "\u{1F3E8}", label: "\u9501\u5b9a\u9152\u5e97\u623f\u95f4", ms: 2500 },
-  { id: "book_activities", icon: "\u{1F3AB}", label: "\u9884\u8ba2\u666f\u70b9\u7968\u52a1", ms: 3000 },
-  { id: "plan_route",      icon: "\u{1F697}", label: "\u89c4\u5212\u4ea4\u901a\u8def\u7ebf", ms: 2000 },
-  { id: "gen_itinerary",   icon: "\u{1F4CB}", label: "\u751f\u6210\u884c\u7a0b\u5355",   ms: 1500 },
+  { id: "reserve_hotel",   icon: "\u{1F3E8}", label: { ZH: "锁定酒店房间", EN: "Lock hotel room", JA: "ホテル客室を確保", KO: "호텔 객실 확보" }, ms: 2500 },
+  { id: "book_activities", icon: "\u{1F3AB}", label: { ZH: "预订景点票务", EN: "Reserve tickets", JA: "観光チケットを予約", KO: "입장권 예약" }, ms: 3000 },
+  { id: "plan_route",      icon: "\u{1F697}", label: { ZH: "规划交通路线", EN: "Plan transport route", JA: "移動ルートを作成", KO: "이동 경로 계획" }, ms: 2000 },
+  { id: "gen_itinerary",   icon: "\u{1F4CB}", label: { ZH: "生成行程单", EN: "Build final itinerary", JA: "最終旅程を作成", KO: "최종 일정 생성" }, ms: 1500 },
 ];
+
+function _travelStepLabel(step) {
+  if (!step || !step.label) return "";
+  if (typeof step.label === "string") return step.label;
+  const lang = String(state.uiLanguage || "EN").toUpperCase();
+  return step.label[lang] || step.label.EN || step.label.ZH || "";
+}
 
 // Cache avoids passing large JSON through HTML onclick attributes
 const _travelPlanCache = {};
@@ -7509,8 +8925,8 @@ function _toggleOtherPlans(cardId) {
   const othersEl = document.getElementById(`${cardId}-others`);
   const btnEl    = document.getElementById(`${cardId}-expand-btn`);
   if (!othersEl) return;
-  const isOpen = othersEl.style.display !== "none";
-  othersEl.style.display = isOpen ? "none" : "block";
+  const isOpen = !othersEl.classList.contains("hidden");
+  othersEl.classList.toggle("hidden", isOpen);
   if (btnEl) {
     btnEl.classList.toggle("cx-plan-expand-btn--open", !isOpen);
     btnEl.textContent = isOpen
@@ -7520,12 +8936,12 @@ function _toggleOtherPlans(cardId) {
 }
 
 function _planOptionSelect(cardId, idx) {
-  // Guard against double-tap / rapid click — disable all select buttons on first click
+  // Guard against double-tap within 400ms only — do NOT permanently lock the card
   const cardEl = document.getElementById(cardId);
-  if (cardEl?.dataset.planSubmitted) return;
+  if (cardEl?.dataset.planClickLock) return;
   if (cardEl) {
-    cardEl.dataset.planSubmitted = "1";
-    cardEl.querySelectorAll(".cx-lc-cta--select").forEach((b) => { b.disabled = true; });
+    cardEl.dataset.planClickLock = "1";
+    setTimeout(() => { if (cardEl) delete cardEl.dataset.planClickLock; }, 400);
   }
   // Prefer data attributes from the rendered card (supports multiple cards in chat)
   let cd = null;
@@ -7537,34 +8953,59 @@ function _planOptionSelect(cardId, idx) {
         destination: cardEl.dataset.destination || "",
         duration_days: Number(cardEl.dataset.duration || 3),
       };
-    } catch (_e) { console.warn("[planSelect] card data parse failed, using state fallback:", _e.message); }
+    } catch (_e) { console.warn("[planSelect] card data parse failed, using state fallback:", getClientErrorCode(_e, "invalid_payload")); }
   }
   cd = cd || state._lastCardData;
   if (!cd?.plans?.[idx]) { openPlanDetail(cardId, idx); return; }
-  // Brief selection flash on the chosen card before confirm card appears
+  // Selection animation: pulse ring + scale + persistent selected state
   if (cardEl) {
     const planCards = cardEl.querySelectorAll(".cx-list-card");
+    planCards.forEach((c, i) => {
+      c.classList.remove("cx-list-card--selected", "cx-list-card--selecting");
+      // restore CTA buttons on non-selected cards
+      const cta = c.querySelector(".cx-lc-cta--select");
+      if (cta && i !== idx) { cta.disabled = false; }
+    });
     const chosen = planCards[idx];
     if (chosen) {
-      chosen.classList.add("cx-list-card--selected");
-      chosen.style.transition = "box-shadow 0.18s, transform 0.18s";
-      chosen.style.transform = "scale(1.015)";
-      setTimeout(() => { chosen.style.transform = ""; }, 200);
+      chosen.classList.add("cx-list-card--selecting");
+      // After pulse animation, settle into --selected state
+      setTimeout(() => {
+        chosen.classList.remove("cx-list-card--selecting");
+        chosen.classList.add("cx-list-card--selected");
+        // Inject checkmark badge
+        if (!chosen.querySelector(".cx-lc-selected-badge")) {
+          const badge = document.createElement("span");
+          badge.className = "cx-lc-selected-badge";
+          badge.textContent = "✓ " + pickText("已选", "Selected", "選択済", "선택됨");
+          chosen.querySelector(".cx-lc-img-wrap")?.appendChild(badge);
+        }
+      }, 380);
     }
   }
-  // Small delay so user sees the selection before confirm card replaces view
-  setTimeout(() => renderTravelConfirmCard(cd.plans[idx], cd), 180);
+  // Small delay so user sees the selection animation before confirm card appears
+  setTimeout(() => renderTravelConfirmCard(cd.plans[idx], cd), 480);
 }
 
 function renderTravelConfirmCard(plan, cardData) {
   const key = _travelCacheStore(plan, cardData);
   const dest = escapeHtml(cardData.destination || "");
   const dur = cardData.duration_days || 3;
-  const hotel = escapeHtml(plan.hotel?.name || "\u5df2\u786e\u8ba4\u9152\u5e97");
+  const hotelName = paymentDisplayTitle({
+    hotelDisplay: plan.hotelDisplay || plan.hotel?.name || "",
+    hotelName: plan.hotel_name || plan.hotel?.name || "",
+    title: plan.title || "",
+  });
+  const hotel = escapeHtml(hotelName || pickText("已确认酒店","Hotel confirmed","宿泊先確定","호텔 확정"));
   const price = Number(plan.total_price || 0).toLocaleString();
   const tag = escapeHtml(plan.tag || plan.id || "");
+  const reviewLine = escapeHtml(_derivePlanReviewText(plan));
+  const includeItems = _derivePlanIncludes(plan).slice(0, 4);
+  const includeHtml = includeItems.length
+    ? `<ul class="cx-tc-include-list">${includeItems.map((line) => `<li>\u2713 ${escapeHtml(line)}</li>`).join("")}</ul>`
+    : "";
   const stepsHtml = _TRAVEL_STEPS.map(s =>
-    `<div class="cx-tc-step">\u25cb ${s.icon} ${escapeHtml(s.label)}</div>`
+    `<div class="cx-tc-step">\u25cb ${s.icon} ${escapeHtml(_travelStepLabel(s))}</div>`
   ).join("");
   addCard(`
     <article class="card cx-tc-card">
@@ -7573,11 +9014,13 @@ function renderTravelConfirmCard(plan, cardData) {
         <span class="cx-tc-tag">${tag}</span>
       </div>
       <div class="cx-tc-hotel">${hotel}</div>
-      <div class="cx-tc-price">\uffe5${price} <span class="cx-tc-dur">/ ${dur}\u5929</span></div>
+      <div class="cx-tc-price">\uffe5${price} <span class="cx-tc-dur">/ ${dur}${pickText("天","d","日","일")}</span></div>
+      ${reviewLine ? `<div class="status">${pickText("Guest feedback", "Guest feedback", "宿泊者コメント", "투숙객 피드백")}: ${reviewLine}</div>` : ""}
+      ${includeHtml}
       <div class="cx-tc-steps-preview">${stepsHtml}</div>
       <div class="cx-tc-actions">
-        <button class="cx-tc-confirm" onclick="_startTravelExecution('${key}', this.closest('.card'))">\u5f00\u59cb\u9884\u8ba2</button>
-        <button class="cx-tc-cancel" onclick="this.closest('.card').style.display='none'">\u518d\u770b\u770b</button>
+        <button class="cx-tc-confirm" data-action="travel-confirm" data-key="${escapeHtml(key)}">${pickText("开始预订","Start Booking","予約開始","예약 시작")}</button>
+        <button class="cx-tc-cancel" data-action="travel-dismiss">${pickText("再看看","Maybe Later","後で","나중에")}</button>
       </div>
     </article>
   `);
@@ -7587,14 +9030,14 @@ function renderTravelStepsCard(execId, steps) {
   const stepsHtml = steps.map(s =>
     `<div id="cx-tes-${execId}-${s.id}" class="cx-te-step cx-te-step--queued">
       <span class="cx-te-icon">\u25cb</span>
-      <span class="cx-te-label">${s.icon} ${escapeHtml(s.label)}</span>
-      <span class="cx-te-status">\u5f85\u6267\u884c</span>
+      <span class="cx-te-label">${s.icon} ${escapeHtml(_travelStepLabel(s))}</span>
+      <span class="cx-te-status">${pickText("待执行","Pending","待機中","대기 중")}</span>
     </div>`
   ).join("");
   addCard(`
     <article class="card cx-te-card" id="cx-te-${execId}">
-      <div class="cx-te-title">\u6b63\u5728\u4e3a\u60a8\u9884\u8ba2...</div>
-      <div class="cx-te-bar"><div class="cx-te-fill" style="width:0%"></div></div>
+      <div class="cx-te-title">${pickText("正在为您预订...","Booking for you...","予約中...","예약 중...")}</div>
+      <div class="cx-te-bar"><div class="cx-te-fill"></div></div>
       <div class="cx-te-steps">${stepsHtml}</div>
     </article>
   `);
@@ -7607,17 +9050,20 @@ function _updateTravelStep(execId, stepId, status, pct) {
     const icon = el.querySelector(".cx-te-icon");
     if (icon) icon.textContent = status === "running" ? "\u25c9" : status === "success" ? "\u2713" : status === "failed" ? "\u2717" : "\u25cb";
     const st = el.querySelector(".cx-te-status");
-    if (st) st.textContent = status === "running" ? "\u6267\u884c\u4e2d..." : status === "success" ? "\u5b8c\u6210" : status === "failed" ? "\u5931\u8d25" : "\u5f85\u6267\u884c";
+    if (st) st.textContent = status === "running" ? pickText("执行中...", "Running...", "実行中...", "실행 중...") : status === "success" ? pickText("完成", "Done", "完了", "완료") : status === "failed" ? pickText("失败", "Failed", "失敗", "실패") : pickText("待执行", "Pending", "待機中", "대기 중");
   }
   const bar = document.querySelector(`#cx-te-${execId} .cx-te-fill`);
-  if (bar) bar.style.width = pct + "%";
+  if (bar) {
+    const progress = pct >= 100 ? 100 : pct >= 75 ? 75 : pct >= 50 ? 50 : pct >= 25 ? 25 : 0;
+    bar.className = `cx-te-fill cx-te-fill--${progress}`;
+  }
 }
 
 async function _startTravelExecution(cacheKey, confirmCardEl) {
   const { plan, cardData } = _travelCacheGet(cacheKey);
   if (!plan || !cardData) return;
   if (navigator.vibrate) navigator.vibrate([10, 30, 10]);
-  if (confirmCardEl) confirmCardEl.style.display = "none";
+  if (confirmCardEl) confirmCardEl.classList.add("hidden");
   const execId = Math.random().toString(36).slice(2, 8);
   renderTravelStepsCard(execId, _TRAVEL_STEPS);
 
@@ -7670,15 +9116,15 @@ async function _startTravelExecution(cacheKey, confirmCardEl) {
         intent: "travel",
         amount: Number(plan.total_price || 0),
         railId: state._selectedRailId || "alipay_cn",
-        transactionId: executeResult?.order?.proof?.paymentRef || "",
+        transactionId: executeResult?.order?.id || orderId,
       }),
     });
-    const proofData = await proofResp.json();
-    if (proofData.ok) receiptUrl = proofData.receiptUrl ? proofData.receiptUrl + "?download=1" : null;
+    const proofData = await _readJsonResponseSafe(proofResp, {});
+    if (proofData.ok) receiptUrl = proofData.receiptUrl ? buildOrderReceiptUrl(orderId, { download: true }) : null;
     // Remove loading message on completion
     _proofLoadingMsg?.remove();
   } catch (e) {
-    console.warn("[proof] receipt generation failed:", e && e.message);
+    console.warn("[proof] receipt generation failed:", getClientErrorCode(e, "proof_generation_failed"));
     // Remove loading message and show user-visible error
     _proofLoadingMsg?.remove();
     addMessage(pickText("\u6536\u636e\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5", "Failed to generate receipt, please try again", "\u9818\u53ce\u66f8\u306e\u751f\u6210\u306b\u5931\u6557\u3057\u307e\u3057\u305f\u3002\u5f8c\u307b\u3069\u304a\u8a66\u3057\u304f\u3060\u3055\u3044", "\uc601\uc218\uc99d \uc0dd\uc131\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4. \ub098\uc911\uc5d0 \ub2e4\uc2dc \uc2dc\ub3c4\ud558\uc138\uc694"), "agent");
@@ -7699,12 +9145,13 @@ function renderTravelDeliverable(plan, cardData, receiptUrl) {
   const dur = cardData.duration_days || 3;
   const price = Number(plan.total_price || 0).toLocaleString();
   // Amap navigation deep-link (opens Amap app or web)
-  const amapQuery = encodeURIComponent(plan.hotel?.name || cardData.destination || "");
-  const amapNavUrl = `https://uri.amap.com/search?keyword=${amapQuery}&sourceApplication=crossx`;
+  // Prefer precise nav link when hotel coordinates are available
+  const hotelName = plan.hotel?.name || cardData.destination || "";
+  const amapNavUrl = buildAmapNavUrl(hotelName, cardData.destination || "", plan.hotel?.lat ?? plan.hotel?.latitude, plan.hotel?.lng ?? plan.hotel?.longitude);
   // Confetti emoji burst for visual celebration
   const confettiEl = `<div class="cx-td-confetti" aria-hidden="true">
     ${"🎉🌟✨🎊🎈".split("").map((e, i) =>
-      `<span style="--d:${i * 72}deg;--r:${30 + i * 11}px">${e}</span>`
+      `<span class="cx-td-confetti-piece cx-td-confetti-piece--${i}">${e}</span>`
     ).join("")}
   </div>`;
   addCard(`
@@ -7733,11 +9180,11 @@ function renderTravelFailCard(failedStep, plan, cardData) {
   const destText = escapeHtml(cardData.destination || "");
   addCard(`
     <article class="card cx-tf-card">
-      <div class="cx-tf-header">\u2717 \u9884\u8ba2\u9047\u5230\u95ee\u9898</div>
+      <div class="cx-tf-header">\u2717 ${pickText("预订遇到问题","Booking Issue","予約に問題が発生","예약 문제 발생")}</div>
       <div class="cx-tf-reason">${reason}</div>
       <div class="cx-tf-actions">
-        ${backupKey ? `<button class="cx-tf-btn" onclick="_startTravelExecution('${backupKey}', null)">\u5207\u6362\u5907\u9009\u65b9\u6848 \u2192</button>` : ""}
-        <button class="cx-tf-btn cx-tf-btn--sec" onclick="createTaskFromText(${JSON.stringify(`\u91cd\u65b0\u89c4\u5212${destText}`)})">\u91cd\u65b0\u89c4\u5212</button>
+        ${backupKey ? `<button class="cx-tf-btn" data-action="travel-confirm" data-key="${escapeHtml(backupKey)}">${pickText("切换备选方案 →","Try Backup Plan →","代替案に切替 →","대안 플랜 →")}</button>` : ""}
+        <button class="cx-tf-btn cx-tf-btn--sec" data-action="replan-dest" data-dest="${escapeHtml(cardData.destination || "")}">${pickText("重新规划","Replan","再計画","다시 계획")}</button>
       </div>
     </article>
   `);
@@ -7752,28 +9199,69 @@ function _buildRefineBar(cd) {
   const dest = cd.destination || "";
   const dur  = cd.duration_days || 3;
   const pax  = cd.pax || 1;
-  const destQ = dest ? `\u5728${dest}` : "";
+  const destQ = dest
+    ? pickText(`\u5728${dest}`, `in ${dest}`, `${dest}\u3067`, `${dest}\uC5D0\uC11C`)
+    : "";
 
   const chips = [
-    { label: "\u66F4\u4FBF\u5B9C",   q: `${destQ}\u7F8E\u4F46\u66F4\u4FBF\u5B9C\u7684\u9152\u5E97` },
-    { label: `\u6539${dur + 1}\u5929`, q: `\u884C\u7A0B\u6539\u4E3A${dur + 1}\u5929${destQ}` },
-    { label: pax > 1 ? `+\u4EBA\u6570` : `2\u4EBA\u884C`, q: pax > 1
-        ? `\u4EBA\u6570\u6539\u4E3A${pax + 1}\u4EBA${destQ}`
-        : `\u6539\u4E3A2\u4EBA\u884C\u7A0B${destQ}` },
-    { label: "\u591A\u7F8E\u98DF",   q: `${destQ}\u52A0\u5F3A\u7F8E\u98DF\u4F53\u9A8C` },
+    {
+      label: pickText("\u66F4\u4FBF\u5B9C", "Cheaper", "\u3082\u3063\u3068\u5B89\u304F", "\uB354 \uC800\uB834\uD558\uAC8C"),
+      q: pickText(
+        `${destQ}\u66F4\u4FBF\u5B9C\u4F46\u9760\u8C31\u7684\u9152\u5E97`,
+        `Find cheaper but reliable hotels ${destQ}`.trim(),
+        `${destQ}\u3067\u3082\u3063\u3068\u624B\u9803\u3067\u5B89\u5FC3\u306A\u30DB\u30C6\u30EB`,
+        `${destQ} \uB354 \uC800\uB834\uD558\uACE0 \uBBFF\uC744 \uC218 \uC788\uB294 \uD638\uD154`.trim()
+      ),
+    },
+    {
+      label: pickText(`\u6539${dur + 1}\u5929`, `${dur + 1} days`, `${dur + 1}\u65E5\u9593`, `${dur + 1}\uC77C`),
+      q: pickText(
+        `\u884C\u7A0B\u6539\u4E3A${dur + 1}\u5929${destQ}`,
+        `Change the itinerary to ${dur + 1} days ${destQ}`.trim(),
+        `\u65C5\u7A0B\u3092${dur + 1}\u65E5\u9593\u306B\u5909\u66F4${destQ}`,
+        `\uC77C\uC815\uC744 ${dur + 1}\uC77C\uB85C \uBCC0\uACBD ${destQ}`.trim()
+      ),
+    },
+    {
+      label: pax > 1
+        ? pickText("+\u4EBA\u6570", "+1 traveler", "+1\u540D", "+1\uBA85")
+        : pickText("2\u4EBA\u884C", "2 travelers", "2\u540D\u65C5", "2\uC778 \uC5EC\uD589"),
+      q: pax > 1
+        ? pickText(
+            `\u4EBA\u6570\u6539\u4E3A${pax + 1}\u4EBA${destQ}`,
+            `Update the trip to ${pax + 1} travelers ${destQ}`.trim(),
+            `\u4EBA\u6570\u3092${pax + 1}\u540D\u306B\u5909\u66F4${destQ}`,
+            `\uC778\uC6D0\uC744 ${pax + 1}\uBA85\uC73C\uB85C \uBCC0\uACBD ${destQ}`.trim()
+          )
+        : pickText(
+            `\u6539\u4E3A2\u4EBA\u884C\u7A0B${destQ}`,
+            `Change this to a 2-traveler trip ${destQ}`.trim(),
+            `${destQ}\u30672\u540D\u65C5\u306B\u5909\u66F4`,
+            `${destQ} 2\uC778 \uC5EC\uD589\uC73C\uB85C \uBCC0\uACBD`
+          ),
+    },
+    {
+      label: pickText("\u591A\u7F8E\u98DF", "More food", "\u30B0\u30EB\u30E1\u91CD\u8996", "\uB9DB\uC9D1 \uB354"),
+      q: pickText(
+        `${destQ}\u52A0\u5F3A\u7F8E\u98DF\u4F53\u9A8C`,
+        `Add more food experiences ${destQ}`.trim(),
+        `${destQ}\u3067\u30B0\u30EB\u30E1\u4F53\u9A13\u3092\u5897\u3084\u3059`,
+        `${destQ} \uB9DB\uC9D1 \uACBD\uD5D8\uC744 \uB354 \uCD94\uAC00`
+      ),
+    },
   ];
 
   const chipsHtml = chips.map(c =>
-    `<button class="cx-pr-chip" onclick="_sendPlanRefine(${JSON.stringify(c.q)})">${escapeHtml(c.label)}</button>`
+    `<button class="cx-pr-chip" data-action="plan-refine-preset" data-text="${escapeHtml(c.q)}">${escapeHtml(c.label)}</button>`
   ).join("");
 
   return `<div class="cx-plan-refine">
     <div class="cx-pr-label">${pickText("\u8FDB\u4E00\u6B65\u8C03\u6574\u65B9\u6848\uFF1A", "Refine this plan:", "\u30D7\u30E9\u30F3\u3092\u8ABF\u6574\uFF1A", "\uD50C\uB79C \uC870\uC815:")}</div>
     <div class="cx-pr-chips">${chipsHtml}</div>
     <div class="cx-pr-input-row">
-      <input class="cx-pr-input" placeholder="${escapeHtml("\u6216\u8F93\u5165\u81EA\u5B9A\u4E49\u8981\u6C42...")}"
-        onkeydown="if(event.key==='Enter'&&!event.isComposing)_sendPlanRefine(this.value,this)">
-      <button class="cx-pr-send" onclick="_sendPlanRefine(this.previousElementSibling.value,this.previousElementSibling)">\u8C03\u6574</button>
+      <input class="cx-pr-input" placeholder="${escapeHtml(pickText("\u6216\u8F93\u5165\u81EA\u5B9A\u4E49\u8981\u6C42...", "Or type your own request...", "\u8981\u671B\u3092\u5165\u529B...", "\uC9C1\uC811 \uC694\uCCAD \uC785\uB825..."))}"
+        data-role="plan-refine-input">
+      <button class="cx-pr-send" data-action="plan-refine-send">${pickText("\u8C03\u6574", "Update", "\u8ABF\u6574", "\uC870\uC815")}</button>
     </div>
   </div>`;
 }
@@ -7788,20 +9276,20 @@ function _renderSensitivityBar(cd, cardId) {
   const barId = `cx-sbar-${cardId}`;
 
   const pills = [
-    { label: "\u9884\u7B97\u00B120%", patch: { budget: "\u00B120%" }, desc: "3\u4E2A\u65B9\u6848" },
-    { label: "\u66F4\u9AD8\u5957\u9910", patch: { quality: "premium" }, desc: "\u5347\u7EA7\u4F53\u9A8C" },
-    { label: "\u6700\u4F18\u6027\u4EF7", patch: { quality: "budget" }, desc: "\u7701\u9177\u9996\u9009" },
+    { label: pickText("\u9884\u7B97\u00B120%", "Budget \u00B120%", "\u4E88\u7B97 \u00B120%", "\uC608\uC0B0 \u00B120%"), patch: { budget: "\u00B120%" }, desc: pickText("3\u4E2A\u65B9\u6848", "3 options", "3\u6848", "3\uAC1C \uC635\uC158") },
+    { label: pickText("\u66F4\u9AD8\u5957\u9910", "Premium stay", "\u4E0A\u4F4D\u30D7\u30E9\u30F3", "\uC0C1\uC704 \uD50C\uB79C"), patch: { quality: "premium" }, desc: pickText("\u5347\u7EA7\u4F53\u9A8C", "Upgrade experience", "\u4F53\u9A13\u30A2\u30C3\u30D7", "\uACBD\uD5D8 \uC5C5\uADF8\uB808\uC774\uB4DC") },
+    { label: pickText("\u6700\u4F18\u6027\u4EF7", "Best value", "\u30B3\u30B9\u30D1\u91CD\u8996", "\uAC00\uC131\uBE44 \uC6B0\uC120"), patch: { quality: "budget" }, desc: pickText("\u7701\u9177\u9996\u9009", "Save more", "\u7BC0\u7D04\u5411\u3051", "\uC808\uC57D \uC6B0\uC120") },
   ];
 
   const pillsHtml = pills.map(p => `
-    <button class="cx-sbar-pill" onclick="_applySensitivityPatch(${JSON.stringify(p.patch)},'${barId}')">
+    <button class="cx-sbar-pill" data-action="apply-sensitivity-patch" data-patch="${escapeHtml(JSON.stringify(p.patch))}" data-bar-id="${escapeHtml(barId)}">
       ${escapeHtml(p.label)}<span class="cx-sbar-desc">${escapeHtml(p.desc)}</span>
     </button>`).join("");
 
   const bar = document.createElement("div");
   bar.className = "cx-sensitivity-bar";
   bar.id = barId;
-  bar.innerHTML = `<span class="cx-sbar-label">\u70B9\u51FB\u5757\u901F\u8C03\u6574\uFF1A</span>${pillsHtml}`;
+  bar.innerHTML = `<span class="cx-sbar-label">${pickText("\u70B9\u51FB\u5FEB\u901F\u8C03\u6574\uFF1A", "Tap to adjust:", "\u30BF\u30C3\u30D7\u3057\u3066\u8ABF\u6574\uFF1A", "\uB20C\uB7EC\uC11C \uC870\uC815:")}</span>${pillsHtml}`;
   return bar;
 }
 
@@ -7809,23 +9297,23 @@ window._applySensitivityPatch = async function(patch, barId) {
   const sessionId = state._lastSessionId;
   if (!sessionId) return;
   const barEl = document.getElementById(barId);
-  if (barEl) { barEl.style.opacity = "0.5"; barEl.style.pointerEvents = "none"; }
+  if (barEl) barEl.classList.add("cx-sensitivity-bar--busy");
   try {
     const resp = await fetch("/api/plan/refine", {
       method: "PATCH",
       headers: { "Content-Type": "application/json", ..._authHeaders() },
       body: JSON.stringify({ sessionId, patch }),
     });
-    const data = await resp.json();
+    const data = await _readJsonResponseSafe(resp, {});
     if (resp.ok && data.changedCards) {
       const patched = Object.assign({}, state._lastCardData, data.changedCards || {});
       renderCardData(patched, JSON.stringify(patch));
     }
   } catch (_e) {
-    console.warn("[sensitivityPatch] request failed:", _e.message);
+    console.warn("[sensitivityPatch] request failed:", getClientErrorCode(_e, "sensitivity_patch_failed"));
     notify(pickText("调整失败，请稍后重试。", "Adjustment failed. Please retry.", "調整に失敗しました。", "조정에 실패했습니다."), "error");
   }
-  if (barEl) { barEl.style.opacity = ""; barEl.style.pointerEvents = ""; }
+  if (barEl) barEl.classList.remove("cx-sensitivity-bar--busy");
 };
 
 function _sendPlanRefine(text, inputEl) {
@@ -7841,6 +9329,107 @@ function _sendPlanRefine(text, inputEl) {
   }
 }
 
+function shouldUseDirectHotelSmartReply(text, constraints = {}) {
+  void text;
+  void constraints;
+  // Product fix: hotel queries now use the stable /api/tasks main path.
+  // The direct /api/chat/reply branch has shown timeout instability and
+  // inconsistent product behavior during testing.
+  return false;
+}
+
+function resetTransientUiSurfaces() {
+  try { hidePaymentModal(); } catch { /* noop */ }
+  try { closeModal(); } catch { /* noop */ }
+  try { closeSheet(); } catch { /* noop */ }
+}
+
+async function runDirectSmartReplyTurn(text, constraints, conversationHistory) {
+  const loadingRow = addMessage(
+    pickText(
+      "我正在理解你的需求并生成可执行方案...",
+      "I am reasoning on your request and generating executable options...",
+      "要件を解析し、実行可能な提案を生成しています...",
+      "요청을 분析하고 실행 가능한 옵션을 생성하고 있습니다...",
+    ),
+    "agent",
+    { speak: false },
+  );
+  const skeletonId = renderTaskSkeletonCards();
+  if (skeleton && el.chatSolutionStrip) skeleton.render(el.chatSolutionStrip, { count: 3, lines: 4 });
+  setLoading("createTask", true);
+  const typingBubble = _showTypingBubble();
+  setThinkingIndicator(true, pickText(
+    "正在分析你的住宿需求...",
+    "Analyzing your stay requirements...",
+    "宿泊ニーズを分析中...",
+    "숙박 요구사항 분석 중...",
+  ));
+
+  try {
+    const smart = await api("/api/chat/reply", {
+      method: "POST",
+      body: JSON.stringify({
+        message: text,
+        language: state.uiLanguage,
+        currency: state.currency || "USD",
+        city: getCurrentCity(),
+        constraints,
+        conversationHistory,
+      }),
+    });
+
+    resetTransientUiSurfaces();
+    state.lastAiPlan = null;
+    state._lastCardData = null;
+    _planCardData.clear();
+    if (el.chatSolutionStrip) el.chatSolutionStrip.innerHTML = "";
+
+    let replyContent = "";
+    if (smart && (smart.reply || smart.structured)) {
+      renderSmartReplyCard(smart);
+      replyContent = String(smart.reply || smart.structured?.spoken_text || "").trim();
+    } else if (smart && smart.text) {
+      const txt = String(smart.text || "").trim();
+      if (txt) addMessage(txt, "agent", { typewriter: true });
+      replyContent = txt;
+    } else {
+      replyContent = pickText(
+        "抱歉，暂时没有找到合适的酒店方案，请调整一下日期、预算或城市再试。",
+        "No matching hotel options found right now. Adjust the dates, budget, or city and try again.",
+        "条件に合うホテル案が見つかりませんでした。日程・予算・都市を調整して再試行してください。",
+        "조건에 맞는 호텔 옵션을 찾지 못했습니다. 날짜·예산·도시를 조정해 다시 시도해 주세요.",
+      );
+      addMessage(replyContent, "agent");
+    }
+
+    if (replyContent) {
+      const contentForHistory = replyContent.startsWith("{")
+        ? replyContent.slice(0, 400) + (replyContent.length > 400 ? "...[card]" : "")
+        : replyContent.slice(0, 600);
+      state.agentConversation.messages.push({ role: "assistant", content: contentForHistory });
+      if (state.agentConversation.messages.length > 20) {
+        state.agentConversation.messages = state.agentConversation.messages.slice(-20);
+      }
+      saveConversationState();
+    }
+
+    await trackEvent("hotel_smart_reply_direct", {
+      lang: state.uiLanguage || "EN",
+      city: getCurrentCity(),
+    });
+    return smart;
+  } finally {
+    setThinkingIndicator(false);
+    _removeTypingBubble(typingBubble);
+    if (loadingRow && loadingRow.parentElement) loadingRow.remove();
+    clearTaskSkeletonCards(skeletonId);
+    if (skeleton && el.chatSolutionStrip) skeleton.clear(el.chatSolutionStrip);
+    setLoading("createTask", false);
+    flushPendingLanguageRefresh();
+  }
+}
+
 async function _tryDeltaPatch(message) {
   _showTypingBubble && _showTypingBubble();
   try {
@@ -7853,7 +9442,7 @@ async function _tryDeltaPatch(message) {
         currentCardData: state._lastCardData,
       }),
     });
-    const data = await resp.json();
+    const data = await _readJsonResponseSafe(resp, {});
     _removeTypingBubble && _removeTypingBubble();
     if (!resp.ok || !data.patchApplied) throw new Error("patch not applied");
     const patched = Object.assign({}, state._lastCardData, data.changedCards || {});
@@ -7871,7 +9460,7 @@ async function _tryDeltaPatch(message) {
 }
 
 function renderSmartReplyCard(smart) {
-  if (!smart || !smart.reply) return;
+  if (!smart || (!smart.reply && !smart.structured)) return;
 
   // Check if reply is a structured options_card JSON (from slot-filling engine)
   const replyText = String(smart.reply || "").trim();
@@ -7885,7 +9474,8 @@ function renderSmartReplyCard(smart) {
         return;
       }
     } catch {
-      // Not JSON — fall through to normal rendering
+      // Not JSON or malformed — fall through to normal rendering
+      // IMPORTANT: If reply is JSON but thinking exists, use thinking instead
     }
   }
 
@@ -7901,22 +9491,74 @@ function renderSmartReplyCard(smart) {
   };
   const choice = smart && smart.crossXChoice ? smart.crossXChoice : null;
   const choiceOption = choice ? options.find((item) => item.id === choice.optionId) || null : null;
-  const thinkingText = String(
-    smart.thinking
-      || (choice && choice.reason)
-      || String(smart.reply || "")
-          .split(/\n+/)
-          .filter(Boolean)
-          .slice(0, 2)
-          .join(" "),
-  ).trim();
-  const compactReply = compact(String(smart.reply || "").trim(), 180);
+
+  // Build thinkingText — PRIORITY: use server-generated thinking, then extract from reply
+  const _rawThinking = String(smart.thinking || (choice && choice.reason) || "").trim();
+  const _rawReply = String(smart.reply || "").trim();
+
+  // Only use reply text if it's NOT code/JSON — check trimmed value for robustness
+  const _trimmedReply = _rawReply.trim();
+  const _isReplyCode = _trimmedReply.startsWith("{") || _trimmedReply.startsWith("[")
+    || _trimmedReply.startsWith("```") || _trimmedReply.startsWith("response_type")
+    || /"response_type"\s*:/.test(_trimmedReply.slice(0, 80))
+    || /^\s*\{/.test(_rawReply);
+  const _replyAsText = !_isReplyCode
+    ? _rawReply.split(/\n+/).filter(Boolean).slice(0, 2).join(" ")
+    : "";
+
+  // Priority: server thinking > clean reply text > generate from options
+  let thinkingText = "";
+  if (_rawThinking && !_rawThinking.startsWith("{") && !_rawThinking.startsWith("[")) {
+    thinkingText = shouldSummarizeThinkingForCurrentLanguage(_rawThinking)
+      ? _summarizeThinkingText(_rawThinking)
+      : _rawThinking;
+  } else if (_replyAsText) {
+    thinkingText = _replyAsText;
+  } else if (options.length > 0) {
+    // Generate natural reasoning paragraph from options data
+    const gradeS = options.find((o) => o.grade === "S");
+    const gradeA = options.find((o) => o.grade === "A");
+    const topOpt = gradeS || gradeA || options[0];
+    const _city = (smart.constraints && smart.constraints.city) || "";
+    const _budgetCtx = smart && smart.budgetContext && typeof smart.budgetContext === "object" ? smart.budgetContext : null;
+    const _budgetScope = String((_budgetCtx && _budgetCtx.budgetScope) || "").toLowerCase();
+    const _totalBudget = Number((_budgetCtx && _budgetCtx.totalBudget) || (smart.constraints && (smart.constraints.totalBudget || smart.constraints.tripBudget || smart.constraints.total_budget)) || 0) || 0;
+    const _hotelBudgetPerNight = Number((_budgetCtx && _budgetCtx.hotelBudgetPerNight) || (smart.constraints && (smart.constraints.hotelBudgetPerNight || smart.constraints.hotel_budget_per_night || smart.constraints.nightlyBudget || smart.constraints.nightly_budget || smart.constraints.maxHotelNightly)) || 0) || 0;
+    const _budget = _budgetScope === "hotel_nightly" && _hotelBudgetPerNight > 0
+      ? pickText(`酒店每晚预算 ¥${_hotelBudgetPerNight.toLocaleString()}`, `Hotel budget ¥${_hotelBudgetPerNight.toLocaleString()}/night`, `ホテル予算 ¥${_hotelBudgetPerNight.toLocaleString()}/泊`, `호텔 예산 ¥${_hotelBudgetPerNight.toLocaleString()}/박`)
+      : _totalBudget > 0 && _hotelBudgetPerNight > 0
+        ? pickText(`总预算 ¥${_totalBudget.toLocaleString()} · 酒店每晚 ¥${_hotelBudgetPerNight.toLocaleString()}`, `Trip budget ¥${_totalBudget.toLocaleString()} · Hotel ¥${_hotelBudgetPerNight.toLocaleString()}/night`, `総予算 ¥${_totalBudget.toLocaleString()}・ホテル ¥${_hotelBudgetPerNight.toLocaleString()}/泊`, `총 예산 ¥${_totalBudget.toLocaleString()} · 호텔 ¥${_hotelBudgetPerNight.toLocaleString()}/박`)
+        : _totalBudget > 0
+          ? pickText(`总预算 ¥${_totalBudget.toLocaleString()}`, `Trip budget ¥${_totalBudget.toLocaleString()}`, `総予算 ¥${_totalBudget.toLocaleString()}`, `총 예산 ¥${_totalBudget.toLocaleString()}`)
+          : _hotelBudgetPerNight > 0
+            ? pickText(`酒店每晚预算 ¥${_hotelBudgetPerNight.toLocaleString()}`, `Hotel budget ¥${_hotelBudgetPerNight.toLocaleString()}/night`, `ホテル予算 ¥${_hotelBudgetPerNight.toLocaleString()}/泊`, `호텔 예산 ¥${_hotelBudgetPerNight.toLocaleString()}/박`)
+            : "";
+    const _topName = topOpt.hotelName || topOpt.placeName || topOpt.title || topOpt.name || "";
+    const _topGrade = topOpt.grade || "A";
+    const _topScore = topOpt.aiScore || topOpt.score || "";
+    const _optCount = options.length;
+    const _hasLiveHotelData = options.some((o) => o.hotel_source === "trip_live" || o.hotel_source === "ctrip_live" || o.hotel_source === "ctrip_list_live" || o.hotel_source === "ctrip_curated");
+    const _dataNote = _hasLiveHotelData ? "结合实时酒店数据" : "综合平台数据";
+    thinkingText = pickText(
+      `已为您${_city ? `在${_city}` : ""}${_budget ? `（${_budget}）` : ""}筛选出 ${_optCount} 个方案。${_dataNote}，评估了位置、价格、口碑等维度。${_topName ? `推荐等级 ${_topGrade}${_topScore ? ` · 评分 ${_topScore}` : ""} 的「${_topName}」综合表现最佳` : `等级 ${_topGrade} 方案综合表现最佳`}，性价比和用户好评均处于高位。`,
+      `Found ${_optCount} options${_city ? ` in ${_city}` : ""}. Evaluated location, price, and reviews${_hasLiveHotelData ? " using live hotel data" : ""}. ${_topName ? `Grade-${_topGrade} "${_topName}"${_topScore ? ` (score ${_topScore})` : ""} offers the best overall value` : `Grade-${_topGrade} option stands out`}.`,
+      `${_city ? `${_city}で` : ""}${_optCount}件のプランを絞り込みました。${_topName ? `グレード${_topGrade}「${_topName}」` : `グレード${_topGrade}プラン`}が最優秀です。`,
+      `${_city ? `${_city}에서 ` : ""}${_optCount}개 플랜 발견. ${_topName ? `등급 ${_topGrade} "${_topName}"` : `등급 ${_topGrade} 플랜`}이 가장 우수합니다.`
+    );
+  }
+
+  const compactReply = compact(_replyAsText || pickText(
+    "AI 正在为您综合筛选最优方案…",
+    "AI is analyzing options for you…",
+    "AIが最適な選択肢を分析中…",
+    "AI가 최적의 옵션을 분석 중…"
+  ), 180);
   const summaryText = compact(thinkingText || compactReply, 180);
   const sourceBadges = [];
   if (source === "claude") {
     sourceBadges.push("Claude");
   } else if (source === "openai") {
-    sourceBadges.push("OpenAI");
+    sourceBadges.push("AI");
   }
   if (dataSources && dataSources.connectors) {
     if (dataSources.connectors.gaode) sourceBadges.push("Gaode");
@@ -7928,19 +9570,27 @@ function renderSmartReplyCard(smart) {
     }
   }
   if (!sourceBadges.length) {
-    sourceBadges.push(source === "claude" ? "Claude" : source === "openai" ? "OpenAI" : "Local Candidate Pool");
+    sourceBadges.push(source === "claude" ? "Claude" : source === "openai" ? "AI" : "Local Candidate Pool");
   }
-  const sourceSummary =
-    dataSources && dataSources.candidateCounts
-      ? `${pickText("数据源", "Data sources","データソース", "데이터 소스")}: ${sourceBadges.join(" + ")} · ${pickText("候选", "Candidates","候補", "후보")} E${Number(dataSources.candidateCounts.eat || 0)}/T${Number(dataSources.candidateCounts.travel || 0)}`
-      : `${pickText("数据源", "Data sources","データソース", "데이터 소스")}: ${sourceBadges.join(" + ")}`;
+  const sourceSummary = userMode
+    ? pickText(
+        "先给你推荐方案，再给 2 个可直接比较的备选。",
+        "Top recommendation first, then 2 executable alternatives to compare.",
+        "推奨案を先に示し、その後に比較できる代替案を2つ提示します。",
+        "추천안을 먼저 보여주고 바로 비교할 수 있는 대안 2개를 함께 제시합니다.",
+      )
+    : (
+      dataSources && dataSources.candidateCounts
+        ? `${pickText("数据源", "Data sources","データソース", "데이터 소스")}: ${sourceBadges.join(" + ")} · ${pickText("候选", "Candidates","候補", "후보")} E${Number(dataSources.candidateCounts.eat || 0)}/T${Number(dataSources.candidateCounts.travel || 0)}`
+        : `${pickText("数据源", "Data sources","データソース", "데이터 소스")}: ${sourceBadges.join(" + ")}`
+    );
   const choiceCard = choice
     ? `
       <article class="inline-block crossx-choice-card">
-        <div class="status"><strong>⭐ ${escapeHtml(pickText("Cross X 首选", "CrossX Choice", "CrossX 推奨", "CrossX 추천"))}</strong></div>
-        <div><strong>${escapeHtml(choice.title || "-")}</strong></div>
-        <div class="status">${escapeHtml(compact(choice.reason || "-", userMode ? 90 : 140))}</div>
-        <div class="status">${pickText("推荐等级", "Recommendation","推奨レベル", "추천 레벨")}: ${escapeHtml(choice.recommendationLevel || "-")} · ${pickText("评分", "Score","スコア", "점수")} ${Number(choice.score || 0)}</div>
+        <div class="status"><strong>⭐ ${escapeHtml(userMode ? pickText("推荐方案", "Recommended Plan", "おすすめプラン", "추천 플랜") : pickText("Cross X 首选", "CrossX Choice", "CrossX 推奨", "CrossX 추천"))}</strong></div>
+        <div><strong>${escapeHtml(_localizeVisibleTravelText(choice.title || "-", choice.title || "-"))}</strong></div>
+        <div class="status">${escapeHtml(compact(_localizeVisibleTravelText(choice.reason || "-", choice.reason || "-"), userMode ? 90 : 140))}</div>
+        <div class="status">${pickText("推荐等级", "Recommendation","推奨レベル", "추천 레벨")}: ${escapeHtml(_localizeVisibleTravelText(choice.recommendationLevel || "-", choice.recommendationLevel || "-"))} · ${pickText("评分", "Score","スコア", "점수")} ${Number(choice.score || 0)}</div>
         ${
           (choice.prompt || (choiceOption && choiceOption.prompt))
             ? `<div class="actions"><button data-action="run-smart-action" data-kind="execute" data-prompt="${escapeHtml(choice.prompt || choiceOption.prompt)}" data-option="${escapeHtml(choice.optionId || "")}">${userMode ? pickText("采用该建议", "Use this choice","この案を採用", "이 제안 사용") : pickText("执行 CrossX Choice", "Run CrossX Choice", "CrossX Choice を実行", "CrossX Choice 실행")}</button></div>`
@@ -7949,21 +9599,80 @@ function renderSmartReplyCard(smart) {
       </article>
     `
     : "";
-  const optionCards = options
-    .map((item, idx) => {
+  const _gradeOrder = { S: 0, A: 1, B: 2, C: 3 };
+  const parseFirstNumber = (value) => {
+    const raw = String(value || "");
+    const match = raw.replace(/,/g, "").match(/(\d+(?:\.\d+)?)/);
+    return match ? Number(match[1]) : Number.NaN;
+  };
+  const sortedOptions = [...options]
+    .sort((a, b) => (_gradeOrder[a.grade] ?? 9) - (_gradeOrder[b.grade] ?? 9))
+  const compareOptions = sortedOptions.slice(0, 3);
+  const lowestCostOption = compareOptions
+    .map((item) => ({ item, value: parseFirstNumber(item.costRange || item.cost || item.amount || item.totalPrice) }))
+    .filter((entry) => Number.isFinite(entry.value))
+    .sort((a, b) => a.value - b.value)[0]?.item || null;
+  const fastestOption = compareOptions
+    .map((item) => ({ item, value: parseFirstNumber(item.etaWindow || item.eta || item.durationMin) }))
+    .filter((entry) => Number.isFinite(entry.value))
+    .sort((a, b) => a.value - b.value)[0]?.item || null;
+  const compareStrip = compareOptions.length > 1
+    ? `
+      <div class="status"><strong>${escapeHtml(pickText("对比方案", "Compare Options", "比較プラン", "비교 옵션"))}</strong> · ${escapeHtml(pickText("保留推荐，同时给你可直接切换的备选。", "Keep the recommendation, but make the alternatives immediately switchable.", "推奨案を残したまま、代替案へすぐ切り替えられます。", "추천안을 유지하면서 대안으로 바로 전환할 수 있습니다."))}</div>
+      <div class="solution-strip">
+        ${compareOptions
+          .map((item, idx) => {
+            const compareLabel =
+              item.id === (choice && choice.optionId)
+                ? pickText("当前推荐", "Recommended", "現在の推奨", "현재 추천")
+                : item.id === (lowestCostOption && lowestCostOption.id)
+                  ? pickText("更省预算", "Lower cost", "より低コスト", "더 낮은 비용")
+                  : item.id === (fastestOption && fastestOption.id)
+                    ? pickText("更快执行", "Faster to execute", "より早く実行", "더 빠른 실행")
+                    : pickText("备选方案", "Alternative", "代替案", "대안");
+            const compareMeta = [
+              item.costRange ? `${pickText("费用", "Cost", "費用", "비용")}: ${item.costRange}` : "",
+              item.etaWindow ? `ETA ${item.etaWindow}` : "",
+              item.riskLevel ? `${pickText("风险", "Risk", "リスク", "리스크")}: ${item.riskLevel}` : "",
+            ].filter(Boolean).slice(0, 2).join(" · ");
+            const compareReason = compact(
+              (Array.isArray(item.reasons) && item.reasons[0]) || item.reason || "",
+              70,
+            );
+            return `
+              <article class="solution-compare-card${item.id === (choice && choice.optionId) ? " lane-recommended" : ""}">
+                <span class="solution-compare-card__label">${escapeHtml(compareLabel)}</span>
+                <strong>${idx + 1}. ${escapeHtml(paymentDisplayTitle(item) || item.title || "-")}</strong>
+                ${compareMeta ? `<div class="solution-compare-card__meta">${escapeHtml(compareMeta)}</div>` : ""}
+                ${compareReason ? `<p>${escapeHtml(compareReason)}</p>` : ""}
+                <button class="secondary" data-action="run-smart-option" data-intent="${escapeHtml(item.prompt || item.title || "")}" data-option="${escapeHtml(item.id || "")}">${escapeHtml(pickText("采用此方案", "Use this option", "この案を使う", "이 옵션 사용"))}</button>
+              </article>
+            `;
+          })
+          .join("")}
+      </div>
+    `
+    : "";
+  const optionCards = sortedOptions.map((item, idx) => {
       const reasons = Array.isArray(item.reasons) ? item.reasons.filter(Boolean).slice(0, 2) : [];
       const comments = Array.isArray(item.comments) ? item.comments.filter(Boolean).slice(0, 1) : [];
       const candidates = Array.isArray(item.candidates) ? item.candidates.slice(0, 3) : [];
       const details = [];
-      if (item.placeDisplay || item.placeName) details.push(`${pickText("地点", "Place","地点", "장소")}: ${escapeHtml(item.placeDisplay || item.placeName)}`);
-      if (item.hotelDisplay || item.hotelName) details.push(`${pickText("酒店", "Hotel","ホテル", "호텔")}: ${escapeHtml(item.hotelDisplay || item.hotelName)}`);
-      if (item.transportMode) details.push(`${pickText("交通", "Transport","交通", "교통")}: ${escapeHtml(item.transportMode)}`);
+      const gradeClass = item.grade === "S" ? "grade-S" : item.grade === "A" ? "grade-A" : "";
+      const bestBadge = item.grade === "S"
+        ? `<div class="cx-best-badge">⭐ ${pickText("最优推荐", "Best Pick", "ベスト", "최우선 추천")}</div>`
+        : item.grade === "A"
+        ? `<div class="cx-best-badge cx-best-a">✦ ${pickText("强推荐", "Top Rated", "おすすめ", "강추")}</div>`
+        : "";
+      if (item.placeDisplay || item.placeName) details.push(`${pickText("地点", "Place","地点", "장소")}: ${escapeHtml(_localizeVisibleTravelText(item.placeDisplay || item.placeName, item.placeDisplay || item.placeName))}`);
+      if (item.hotelDisplay || item.hotelName) details.push(`${pickText("酒店", "Hotel","ホテル", "호텔")}: ${escapeHtml(_localizeVisibleTravelText(item.hotelDisplay || item.hotelName, item.hotelDisplay || item.hotelName))}`);
+      if (item.transportMode) details.push(`${pickText("交通", "Transport","交通", "교통")}: ${escapeHtml(_localizeVisibleTravelText(item.transportMode, item.transportMode))}`);
       if (item.etaWindow) details.push(`ETA: ${escapeHtml(item.etaWindow)}`);
-      if (item.costRange) details.push(`${pickText("费用", "Cost","費用", "비용")}: ${escapeHtml(item.costRange)}`);
-      const reasonRows = reasons.map((reason) => `<li>${escapeHtml(compact(reason, userMode ? 80 : 100))}</li>`).join("");
-      const commentRows = comments.map((comment) => `<div class="status">${pickText("评论", "Comment","コメント", "코멘트")}: ${escapeHtml(compact(comment, userMode ? 80 : 120))}</div>`).join("");
+      if (item.costRange) details.push(`${pickText("费用", "Cost","費用", "비용")}: ${escapeHtml(_localizeVisibleTravelText(item.costRange, item.costRange))}`);
+      const reasonRows = reasons.map((reason) => `<li>${escapeHtml(compact(_localizeVisibleTravelText(reason, reason), userMode ? 80 : 100))}</li>`).join("");
+      const commentRows = comments.map((comment) => `<div class="status">${pickText("评论", "Comment","コメント", "코멘트")}: ${escapeHtml(compact(_localizeVisibleTravelText(comment, comment), userMode ? 80 : 120))}</div>`).join("");
       const executionSummary = Array.isArray(item.executionPlan) && item.executionPlan.length
-        ? `<div class="status">${pickText("将为你完成", "Will execute","実行内容", "실행 내용")}: ${escapeHtml(item.executionPlan.slice(0, 3).join(" · "))}</div>`
+        ? `<div class="status">${pickText("将为你完成", "Will execute","実行内容", "실행 내용")}: ${escapeHtml(_localizeVisibleTravelText(item.executionPlan.slice(0, 3).join(" · "), item.executionPlan.slice(0, 3).join(" · ")))}</div>`
         : "";
       const nextActionsRaw = Array.isArray(item.nextActions) ? item.nextActions : [];
       const nextActions = userMode
@@ -7991,7 +9700,7 @@ function renderSmartReplyCard(smart) {
               <img class="smart-candidate-image" src="${escapeHtml(assetUrl(candidate.imageUrl || "/assets/solution-flow.svg"))}" alt="${escapeHtml(candidate.name || "candidate")}" />
               <div>
                 <strong>${escapeHtml(candidate.name || "-")}</strong>
-                <div class="status">${escapeHtml(candidate.category || "-")} · ${pickText("评分", "Score","スコア", "점수")} ${Number(candidate.score || 0)}</div>
+                <div class="status">${escapeHtml(_localizeVisibleTravelText(candidate.category || "-", candidate.category || "-"))} · ${pickText("评分", "Score","スコア", "점수")} ${Number(candidate.score || 0)}</div>
               </div>
             </div>
           `,
@@ -8007,18 +9716,33 @@ function renderSmartReplyCard(smart) {
         );
         const userMetaBits = [
           item.etaWindow ? `ETA ${escapeHtml(item.etaWindow)}` : "",
-          item.costRange ? `${pickText("费用", "Cost","費用", "비용")}: ${escapeHtml(item.costRange)}` : "",
-          item.riskLevel ? `${pickText("风险", "Risk","リスク", "리스크")}: ${escapeHtml(item.riskLevel)}` : "",
-          `${pickText("推荐", "Rank","推奨", "추천")}: ${escapeHtml(item.recommendationLevel || "-")}`,
+          item.costRange ? `${pickText("费用", "Cost","費用", "비용")}: ${escapeHtml(_localizeVisibleTravelText(item.costRange, item.costRange))}` : "",
+          item.riskLevel ? `${pickText("风险", "Risk","リスク", "리스크")}: ${escapeHtml(_localizeVisibleTravelText(item.riskLevel, item.riskLevel))}` : "",
+          `${pickText("推荐", "Rank","推奨", "추천")}: ${escapeHtml(_localizeVisibleTravelText(item.recommendationLevel || "-", item.recommendationLevel || "-"))}`,
         ].filter(Boolean);
+        const hotelProvider = getHotelProviderMeta(item.hotel_source || item.source);
+        const nativeHotelPrice = fmtNativeHotelPrice(item.hotel_native_price, item.hotel_native_currency);
+        const displayTitle = paymentDisplayTitle(item);
+        const hotelFacts = _deriveSmartHotelOptionFacts(item);
+        const hotelBullets = _deriveSmartHotelOptionBullets(item);
+        const providerReviewHtml = (item.hotel_ctrip_score || item.hotel_ctrip_review_count || (item.hotel_ctrip_tags && item.hotel_ctrip_tags.length) || (item.hotel_ctrip_reviews && item.hotel_ctrip_reviews.length))
+          ? `
+            <div class="cx-ctrip-hotel-data">
+              ${item.hotel_ctrip_score ? `<span class="cx-ctrip-score">★ ${escapeHtml(String(item.hotel_ctrip_score))}</span>` : ""}
+              ${item.hotel_ctrip_review_count ? `<span class="cx-ctrip-review-count">${Number(item.hotel_ctrip_review_count).toLocaleString()} ${pickText("条评论","reviews","件のレビュー","건 리뷰")}</span>` : ""}
+              ${nativeHotelPrice ? `<span class="cx-ctrip-review-count">${pickText("实时价","Live price","実売価格","실시간 요금")}: ${escapeHtml(nativeHotelPrice)}</span>` : ""}
+              ${(item.hotel_ctrip_tags || []).slice(0, 3).map(t => `<span class="cx-ctrip-tag">${escapeHtml(t)}</span>`).join("")}
+              ${item.hotel_ctrip_url ? `<a class="cx-ctrip-book-btn" href="${escapeHtml(item.hotel_ctrip_url)}" target="_blank" rel="noopener">🏨 ${escapeHtml((hotelProvider && hotelProvider.actionView) || pickText("查看酒店","View hotel","ホテルを見る","호텔 보기"))}</a>` : ""}
+            </div>`
+          : "";
         return `
-          <article class="smart-option-card smart-option-card-user">
-            <img class="smart-option-image media-photo cx-lazy-img" data-cx-search="${escapeHtml(item.placeDisplay || item.placeName || item.hotelDisplay || item.hotelName || item.title || "")}" data-cx-cat="${escapeHtml(item.hotelName || item.hotelDisplay ? 'hotel' : 'food')}" src="${escapeHtml(assetUrl(_localPlaceholder(item)))}" alt="${escapeHtml(item.title || "option image")}" loading="lazy" onerror="this.src='/assets/solution-flow.svg'" />
+          <article class="smart-option-card smart-option-card-user${gradeClass ? ' '+gradeClass : ''}">
+            ${bestBadge}            <img class="smart-option-image media-photo cx-lazy-img" data-cx-search="${escapeHtml(item.placeDisplay || item.placeName || item.hotelDisplay || item.hotelName || item.title || "")}" data-cx-cat="${escapeHtml(item.hotelName || item.hotelDisplay ? 'hotel' : (item.placeName || item.placeDisplay ? 'food' : 'travel'))}" src="${escapeHtml(assetUrl(_localPlaceholder(item)))}" alt="${escapeHtml(item.title || "option image")}" loading="lazy" data-fallback-src="/assets/solution-flow.svg" />
             <div class="smart-option-body">
               <div class="smart-option-title">
-                <strong>${idx + 1}. ${escapeHtml(item.title || "-")}</strong>
+                <strong>${idx + 1}. ${escapeHtml(displayTitle || "-")}</strong>
                 <span class="status-badge lane-grade">${escapeHtml(item.grade || "B")}</span>
-                ${item.accepts_foreign_guests === true ? `<span class="status-badge" style="background:#2563eb;color:#fff;margin-left:4px">${pickText("外籍可入住 ✓", "Foreign guests OK ✓", "外国人OK ✓", "외국인 가능 ✓")}</span>` : item.accepts_foreign_guests === false ? `<span class="status-badge" style="background:#ef4444;color:#fff;margin-left:4px">${pickText("不接受外籍", "No foreign guests", "外国人不可", "외국인 불가")}</span>` : ""}
+                ${item.accepts_foreign_guests === true ? `<span class="status-badge cx-foreign-guest-badge cx-foreign-guest-badge-ok">${pickText("外籍可入住 ✓", "Foreign guests OK ✓", "外国人OK ✓", "외국인 가능 ✓")}</span>` : item.accepts_foreign_guests === false ? `<span class="status-badge cx-foreign-guest-badge cx-foreign-guest-badge-fail">${pickText("不接受外籍", "No foreign guests", "外国人不可", "외국인 불가")}</span>` : ""}
               </div>
               <div class="smart-meta-row">
                 ${userMetaBits.map((bit) => `<span class="smart-meta-chip">${bit}</span>`).join("")}
@@ -8026,11 +9750,14 @@ function renderSmartReplyCard(smart) {
               <div class="smart-option-why">
                 <strong>${pickText("推荐理由", "Why this","推薦理由", "추천 이유")}：</strong>${escapeHtml(userPrimaryReason)}
               </div>
+              ${hotelFacts.length ? `<div class="cx-lc-hotel-tags">${hotelFacts.map((fact) => `<span class="cx-ctrip-tag">${escapeHtml(fact)}</span>`).join("")}</div>` : ""}
+              ${providerReviewHtml}
               ${commentRows}
+              ${hotelBullets.length ? `<ul class="option-features">${hotelBullets.map((line) => `<li>${escapeHtml(compact(line, userMode ? 110 : 140))}</li>`).join("")}</ul>` : ""}
               <div class="actions">
                 <button data-action="run-smart-option" data-intent="${escapeHtml(item.prompt || item.title || "")}" data-option="${escapeHtml(item.id || "")}"
-                  data-cost="${escapeHtml(item.costRange || item.cost || "")}" data-title="${escapeHtml(item.title || "")}"
-                  onclick="window.crossxShowPayment && window.crossxShowPayment({title:${JSON.stringify(item.title||'')},costRange:${JSON.stringify(item.costRange||'')},price:${JSON.stringify(item.costRange||'')}}); return false;">
+                  data-cost="${escapeHtml(item.costRange || item.cost || "")}" data-title="${escapeHtml(displayTitle || "")}"
+                  data-show-payment="1" data-payment-title="${escapeHtml(displayTitle || '')}" data-payment-cost="${escapeHtml(item.costRange||'')}">
                   ${pickText("立即预订", "Book Now","今すぐ予約", "지금 예약")}
                 </button>
                 ${actionRows}
@@ -8039,18 +9766,30 @@ function renderSmartReplyCard(smart) {
           </article>
         `;
       }
+      const hotelProvider = getHotelProviderMeta(item.hotel_source || item.source);
+      const nativeHotelPrice = fmtNativeHotelPrice(item.hotel_native_price, item.hotel_native_currency);
       return `
-        <article class="smart-option-card">
-          <img class="smart-option-image media-photo cx-lazy-img" data-cx-search="${escapeHtml(item.placeDisplay || item.placeName || item.hotelDisplay || item.hotelName || item.title || "")}" data-cx-cat="${escapeHtml(item.hotelName || item.hotelDisplay ? 'hotel' : 'food')}" src="${escapeHtml(assetUrl(_localPlaceholder(item)))}" alt="${escapeHtml(item.title || "option image")}" loading="lazy" onerror="this.src='/assets/solution-flow.svg'" />
+        <article class="smart-option-card${gradeClass ? ' '+gradeClass : ''}">
+          ${bestBadge}
+          <img class="smart-option-image media-photo cx-lazy-img" data-cx-search="${escapeHtml(item.placeDisplay || item.placeName || item.hotelDisplay || item.hotelName || item.title || "")}" data-cx-cat="${escapeHtml(item.hotelName || item.hotelDisplay ? 'hotel' : (item.placeName || item.placeDisplay ? 'food' : 'travel'))}" src="${escapeHtml(assetUrl(_localPlaceholder(item)))}" alt="${escapeHtml(item.title || "option image")}" loading="lazy" data-fallback-src="/assets/solution-flow.svg" />
           <div class="smart-option-body">
             <div class="smart-option-title">
-              <strong>${idx + 1}. ${escapeHtml(item.title || "-")}</strong>
+              <strong>${idx + 1}. ${escapeHtml(_localizeVisibleTravelText(item.title || "-", item.title || "-"))}</strong>
               <span class="status-badge lane-grade">${escapeHtml(item.grade || "B")}</span>
-              ${item.accepts_foreign_guests === true ? `<span class="status-badge" style="background:#2563eb;color:#fff;margin-left:4px">${pickText("外籍可入住 ✓", "Foreign guests OK ✓", "外国人OK ✓", "외국인 가능 ✓")}</span>` : item.accepts_foreign_guests === false ? `<span class="status-badge" style="background:#ef4444;color:#fff;margin-left:4px">${pickText("不接受外籍", "No foreign guests", "外国人不可", "외국인 불가")}</span>` : ""}
+              ${item.accepts_foreign_guests === true ? `<span class="status-badge cx-foreign-guest-badge cx-foreign-guest-badge-ok">${pickText("外籍可入住 ✓", "Foreign guests OK ✓", "外国人OK ✓", "외국인 가능 ✓")}</span>` : item.accepts_foreign_guests === false ? `<span class="status-badge cx-foreign-guest-badge cx-foreign-guest-badge-fail">${pickText("不接受外籍", "No foreign guests", "外国人不可", "외국인 불가")}</span>` : ""}
             </div>
-            <div class="status">${escapeHtml(item.recommendationLevel || "-")}</div>
+            <div class="status">${escapeHtml(_localizeVisibleTravelText(item.recommendationLevel || "-", item.recommendationLevel || "-"))}</div>
             ${commentRows}
             ${details.length ? `<div class="status">${details.slice(0, 4).join(" · ")}</div>` : ""}
+            ${(item.hotel_ctrip_score || item.hotel_ctrip_review_count || (item.hotel_ctrip_reviews && item.hotel_ctrip_reviews.length)) ? `
+            <div class="cx-ctrip-hotel-data">
+              ${item.hotel_ctrip_score ? `<span class="cx-ctrip-score">★ ${escapeHtml(String(item.hotel_ctrip_score))}</span>` : ""}
+              ${item.hotel_ctrip_review_count ? `<span class="cx-ctrip-review-count">${Number(item.hotel_ctrip_review_count).toLocaleString()} ${pickText("条评论","reviews","件のレビュー","건 리뷰")}</span>` : ""}
+              ${nativeHotelPrice ? `<span class="cx-ctrip-review-count">${pickText("实时价","Live price","実売価格","실시간 요금")}: ${escapeHtml(nativeHotelPrice)}</span>` : ""}
+              ${(item.hotel_ctrip_tags || []).map(t => `<span class="cx-ctrip-tag">${escapeHtml(t)}</span>`).join("")}
+              ${(item.hotel_ctrip_reviews || []).slice(0, 2).map(r => `<div class="cx-ctrip-review-item">「${escapeHtml(r)}」</div>`).join("")}
+              ${item.hotel_ctrip_url ? `<a class="cx-ctrip-book-btn" href="${escapeHtml(item.hotel_ctrip_url)}" target="_blank" rel="noopener">🏨 ${escapeHtml((hotelProvider && hotelProvider.actionBook) || pickText("查看酒店","Open hotel","ホテルを見る","호텔 보기"))}</a>` : ""}
+            </div>` : ""}
             ${executionSummary}
             <div class="status">${pickText("筛选理由", "Why selected","選定理由", "선정 이유")}:</div>
             <ul class="steps">${reasonRows || `<li>${pickText("暂无理由", "No reason","理由なし", "이유 없음")}</li>`}</ul>
@@ -8073,84 +9812,73 @@ function renderSmartReplyCard(smart) {
   clearChatCards({ keepDeliverable: true, keepSmartReply: false });
   addCard(`
     <article class="card smart-reply-card">
-      <h3>${pickText("定制化解决方案", "Tailored Solutions","カスタム提案", "맞춤 솔루션")}</h3>
+      <h3>${pickText(userMode ? "推荐与备选方案" : "定制化解决方案", userMode ? "Recommended + Alternatives" : "Tailored Solutions", userMode ? "推奨案と代替案" : "カスタム提案", userMode ? "추천안과 대안" : "맞춤 솔루션")}</h3>
       <div class="status">${escapeHtml(summaryText)}</div>
       <div class="status">${escapeHtml(sourceSummary)}</div>
       ${
-        source !== "openai"
-          ? `<div class="status">${pickText("当前为本地策略引擎回复。配置 OPENAI_API_KEY 后将自动切换为 ChatGPT。", "Fallback engine active. Configure OPENAI_API_KEY to switch to ChatGPT.","現在はフォールバック応答です。OPENAI_API_KEY 設定後に ChatGPT へ切替します。", "현재 폴백 엔진 응답입니다. OPENAI_API_KEY 설정 시 ChatGPT로 전환됩니다.")}</div>
-             ${
-               smart && smart.fallbackReason
-                 ? `<div class="status">${pickText("回退原因", "Fallback reason","フォールバック理由", "폴백 사유")}: <span class="code">${escapeHtml(String(smart.fallbackReason))}</span></div>`
-                 : ""
-             }`
-          : ""
+        source !== "openai" && source !== "local-execution" && !userMode
+          ? `<div class="status">${pickText("当前为本地策略引擎回复。AI 服务恢复后将自动切换为智能模型。", "Fallback engine active. The app will switch back to the AI model once the service recovers.","現在はフォールバック応答です。AI サービス復旧後に自動で AI モデルへ戻ります。", "현재 폴백 엔진 응답입니다. AI 서비스가 복구되면 자동으로 전환됩니다.")}</div>${smart && smart.fallbackReason ? `<div class="status">${pickText("切换至本地引擎", "Using local engine","ローカルエンジン使用中", "로컬 엔진 사용 중")}</div>` : ""}`
+          : source === "local-execution" && !userMode
+            ? `<div class="status">${pickText("当前为本地执行摘要回复，已基于实时/候选数据给出可直接执行的方案卡。", "Using local execution summary. The option cards below are ready to execute from live/candidate data.", "現在はローカル実行サマリーです。下のオプションカードはそのまま実行できます。", "현재 로컬 실행 요약입니다. 아래 옵션 카드는 바로 실행 가능합니다.")}</div>`
+            : ""
       }
       ${choiceCard}
+      ${compareStrip}
       ${
         optionCards
-          ? `<div class="status">${pickText(`可选方案（${options.length}选）`, `Options (${options.length})`, `選択可能な提案（${options.length}）`, `선택 가능한 옵션 (${options.length})`)}${userMode && allOptions.length > options.length ? ` · ${escapeHtml(pickText("其余方案可通过\u201c换一批\u201c继续获取。", "Use refresh to load more options.","他の案は「再提案」で取得できます。", "다른 옵션은 새로고침으로 확인하세요."))}` : ""}</div><div class="smart-options-grid">${optionCards}</div>`
-          : (allOptions.length === 0
-              ? `<div class="status empty-state" style="padding:12px 0;color:var(--text-secondary)">
-                  ${pickText(
-                    "暂无符合条件的结果。可以尝试：换一个城市、调整日期或预算，或直接告诉我你的具体需求。",
-                    "No results found. Try a different city, adjust your dates or budget, or describe what you\u2019re looking for.",
-                    "条件に合う結果が見つかりませんでした。都市・日程・予算を変えてみるか、ご希望を詳しくお知らせください。",
-                    "결과를 찾지 못했습니다. 다른 도시, 날짜 또는 예산을 조정하거나 원하는 내용을 구체적으로 알려주세요."
-                  )}
-                  <div class="actions" style="margin-top:8px">
-                    <button data-action="send-message" data-message="${escapeHtml(pickText("请帮我重新搜索，条件可以放宽一些", "Please search again with broader criteria", "条件を広げて再検索してください", "조건을 넓혀 다시 검색해 주세요"))}">${pickText("重新搜索", "Search again", "再検索", "다시 검색")}</button>
-                  </div>
-                </div>`
-              : "")
+          ? `<div class="status">${pickText(userMode ? `方案明细（${options.length}选）` : `可选方案（${options.length}选）`, userMode ? `Option details (${options.length})` : `Options (${options.length})`, userMode ? `プラン詳細（${options.length}）` : `選択可能な提案（${options.length}）`, userMode ? `옵션 상세 (${options.length})` : `선택 가능한 옵션 (${options.length})`)}${userMode && allOptions.length > options.length ? ` · ${escapeHtml(pickText("其余方案可通过\u201c换一批\u201d继续获取。", "Use refresh to load more options.","他の案は「再提案」で取得できます。", "다른 옵션은 새로고침으로 확인하세요."))}` : ""}</div><div class="smart-options-grid">${optionCards}</div>`
+          : `<div class="status">${escapeHtml(pickText("当前没有可直接执行的备选方案。", "No executable options are available right now.", "現在すぐ実行できる候補がありません。", "지금 바로 실행 가능한 옵션이 없습니다."))}</div><div class="actions cx-empty-state-actions"><button data-action="send-message" data-message="${escapeHtml(pickText("请帮我重新搜索，条件可以放宽一些", "Please search again with broader criteria", "条件を広げて再検索してください", "조건을 넓혀 다시 검색해 주세요"))}">${pickText("重新搜索", "Search again", "再検索", "다시 검색")}</button></div>`
       }
     </article>
   `);
   speakAssistantMessage(thinkingText || smart.reply);
-  // Async: replace placeholder images with Wikipedia photos
-  setTimeout(() => _lazyLoadOptionImages(), 100);
+  _lazyLoadOptionImages();
 }
 
 // ── Local placeholder URL helper ────────────────────────────────────────────
 function _localPlaceholder(item) {
   if (item.hotelName || item.hotelDisplay) return "/api/placeholder?cat=hotel";
   if (item.transportMode) return "/api/placeholder?cat=taxi";
-  return "/api/placeholder?cat=food";
+  if (item.placeName || item.placeDisplay) return "/api/placeholder?cat=food";
+  return "/api/placeholder?cat=travel";
 }
 
-// ── Lazy load Wikipedia images for option cards ─────────────────────────────
-async function _lazyLoadOptionImages() {
+// ── Lazy load destination scenery images for option cards ────────────────────
+// Uses /api/city-photo (server-proxied) so images work in China (no CDN blocks).
+// Always uses destination city name for ALL card types — shows "where you're going".
+function _lazyLoadOptionImages() {
   const imgs = document.querySelectorAll(".cx-lazy-img[data-cx-search]");
   if (!imgs.length) return;
-  const city = state.selectedConstraints && state.selectedConstraints.city || "";
-  const queries = [];
-  imgs.forEach((img, idx) => {
-    // Use place name; for hotels with fake names, strip English alias and fallback to city
-    let q = img.dataset.cxSearch || "";
-    // Strip English alias in parens like "上海优享商务酒店 (Value Business Stay)"
-    const cleaned = q.replace(/\s*\(.*?\)\s*/g, "").trim();
-    // If looks like a fake/generic name (contains "酒店" but no famous place) use city instead
-    const isFakeName = /酒店|Hotel|hotel/.test(cleaned) && !/万豪|希尔顿|喜来登|洲际|君悦|四季|文华|半岛/.test(cleaned);
-    const searchQ = isFakeName ? city : (cleaned || city);
-    if (searchQ) queries.push({ id: String(idx), q: searchQ, city, cat: img.dataset.cxCat || "default" });
+
+  // Get city from multiple fallback sources
+  const city = (state.selectedConstraints && state.selectedConstraints.city)
+    || (state.agentConversation && state.agentConversation.slots && state.agentConversation.slots.city)
+    || getCurrentCity()
+    || "";
+
+  imgs.forEach((img) => {
+    if (!img.isConnected) return;
+    const raw = img.dataset.cxSearch || "";
+    // Always use city for all card types — shows destination scenery
+    const searchTerm = city || raw.replace(/\s*\(.*?\)\s*/g, "").split(/[\s，,、（(]/)[0].trim();
+    if (!searchTerm) return;
+
+    // Use server-proxied endpoint — works in China
+    const url = `/api/city-photo?city=${encodeURIComponent(searchTerm)}`;
+    const newImg = new Image();
+    newImg.onload = () => {
+      img.classList.add("img-fade-swap", "img-error-zero");
+      setTimeout(() => {
+        if (img.isConnected) {
+          img.src = url;
+          img.classList.remove("img-error-zero");
+          img.classList.remove("cx-lazy-img");
+        }
+      }, 150);
+    };
+    // On error, keep existing placeholder — no visible change
+    newImg.src = url;
   });
-  if (!queries.length) return;
-  try {
-    const res = await fetch("/api/rag/images", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ queries }),
-    });
-    if (!res.ok) return;
-    const { results } = await res.json();
-    imgs.forEach((img, idx) => {
-      const url = results[String(idx)];
-      if (url && img.isConnected) {
-        img.src = url;
-        img.classList.remove("cx-lazy-img");
-      }
-    });
-  } catch {}
 }
 
 /**
@@ -8158,72 +9886,129 @@ async function _lazyLoadOptionImages() {
  * Equivalent to the React <ItineraryCards> component — three gradient cards
  * with hotel/transport/dining/features and a "Book Now" CTA.
  */
-// ── Affiliate booking button ───────────────────────────────────────────────
-// Routing strategy:
-//   ZH users  → Level 1: Amap app deep-link → Level 2: Ctrip H5 (Chinese)
-//   Non-ZH    → Booking.com EN (no Chinese app assumption)
-function _handleBooking(name, externalId) {
+async function openManagedBookingPayment({ title = "", totalCost = 0, optionId = "", currency = "CNY", planSnapshot = null } = {}) {
+  const safeTitle = String(title || "").trim();
+  const amountNum = Number(String(totalCost || "").replace(/[^\d.]/g, "")) || 0;
+  let orderId = "";
+  if (amountNum > 0) {
+    try {
+      const created = await api("/api/booking/create", {
+        method: "POST",
+        body: JSON.stringify({
+          optionId: optionId || safeTitle || `booking_${Date.now()}`,
+          totalCost: amountNum,
+          currency,
+          planSnapshot,
+        }),
+      });
+      orderId = created && created.orderId ? String(created.orderId) : "";
+    } catch (err) {
+      console.warn("[booking] failed to create managed order:", getClientErrorCode(err, "managed_order_failed"));
+    }
+  }
+  if (window.crossxShowPayment) {
+    window.crossxShowPayment({
+      title: safeTitle,
+      costRange: amountNum > 0 ? String(amountNum) : "",
+      price: amountNum > 0 ? String(amountNum) : "",
+      orderId,
+    });
+    return true;
+  }
+  return false;
+}
+
+async function openTravelPlanPayment(cacheKey, triggerEl = null) {
+  const cached = _travelCacheGet(cacheKey);
+  const plan = cached && cached.plan;
+  const cardData = cached && cached.cardData;
+  if (!plan || !cardData) return false;
+  const hotelTitle = paymentDisplayTitle({
+    hotelDisplay: plan.hotelDisplay || plan.hotel?.name || "",
+    hotelName: plan.hotel_name || plan.hotel?.name || "",
+    title: plan.title || "",
+  }) || pickText("定制行程方案", "Custom itinerary", "カスタム旅程", "맞춤 일정");
+  const opened = await openManagedBookingPayment({
+    title: hotelTitle,
+    totalCost: plan.total_price || 0,
+    optionId: plan.id || cacheKey || `travel_${Date.now()}`,
+    currency: "CNY",
+    planSnapshot: {
+      destination: cardData.destination || "",
+      duration_days: Number(cardData.duration_days || 0),
+      hotel_name: plan.hotel_name || plan.hotel?.name || "",
+      hotelDisplay: plan.hotelDisplay || plan.hotel?.name || "",
+      title: plan.title || "",
+      total_price: Number(plan.total_price || 0),
+      tag: plan.tag || plan.id || "",
+    },
+  });
+  if (!opened) {
+    notify(
+      pickText(
+        "站内支付页面暂不可用，请稍后重试。",
+        "In-app checkout is temporarily unavailable. Please try again.",
+        "アプリ内決済を開けませんでした。後ほどお試しください。",
+        "앱 내 결제를 열 수 없습니다. 잠시 후 다시 시도해 주세요."
+      ),
+      "warning",
+    );
+    if (triggerEl) triggerEl.disabled = false;
+    return false;
+  }
+  return true;
+}
+
+// ── Managed hotel booking entrypoint ───────────────────────────────────────
+function _handleBooking(name, externalId, priceHint = "") {
   const safeName = name || "";
-  const isZH = (state.uiLanguage || "ZH") === "ZH";
   const hasAmapId = externalId && !externalId.startsWith("synthetic_");
   trackEvent("book_click", { item: safeName.slice(0, 60), has_amap: hasAmapId ? "1" : "0", lang: state.uiLanguage || "ZH" }).catch(() => {});
-
-  if (!isZH) {
-    // Non-ZH users: Booking.com English interface for hotels
-    window.open(`https://www.booking.com/search.html?ss=${encodeURIComponent(safeName)}&lang=en-us`, "_blank");
-    return;
-  }
-
-  // ZH users: Level 1 — Amap app deep-link (600ms fallback to Ctrip H5)
-  if (hasAmapId) {
-    const amapUrl = `amapuri://poi?id=${encodeURIComponent(externalId)}&name=${encodeURIComponent(safeName)}`;
-    const fallback = setTimeout(() => {
-      window.open(`https://m.ctrip.com/webapp/hotel/hotels/list?keyword=${encodeURIComponent(safeName)}&sourcesite=crossx`, "_blank");
-    }, 600);
-    window.location.href = amapUrl;
-    window.addEventListener("blur", () => clearTimeout(fallback), { once: true });
-    return;
-  }
-  // ZH Level 2 fallback: Ctrip H5 hotel search
-  window.open(`https://m.ctrip.com/webapp/hotel/hotels/list?keyword=${encodeURIComponent(safeName)}&sourcesite=crossx`, "_blank");
+  openManagedBookingPayment({
+    title: safeName,
+    totalCost: priceHint,
+    optionId: externalId || safeName || `hotel_${Date.now()}`,
+  }).then((opened) => {
+    if (!opened) {
+      notify(
+        pickText(
+          "站内支付页面暂不可用，请稍后重试。",
+          "In-app checkout is temporarily unavailable. Please try again.",
+          "アプリ内決済を開けませんでした。後ほどお試しください。",
+          "앱 내 결제를 열 수 없습니다. 잠시 후 다시 시도해 주세요."
+        ),
+        "warning",
+      );
+    }
+  });
 }
 function _buildBookBtnHtml(name, externalId) {
   if (!name) return "";
-  const safeId   = escapeHtml(externalId || "");
   const safeName = escapeHtml(name);
-  const isZH     = (state.uiLanguage || "EN") === "ZH";
-
-  if (isZH) {
-    const label = "前往预订";
-    return `<div class="cx-book-btn-wrap">` +
-      `<button class="cx-book-btn" onclick="_handleBooking(${JSON.stringify(name)},${JSON.stringify(externalId || '')})">` +
-      `✈️ ${label}</button></div>`;
-  }
-  // International users: show Booking.com + Agoda + Klook choices
-  const bookingUrl = escapeHtml(PLATFORM_DEEPLINKS.booking.url(name));
-  const agodaUrl   = escapeHtml(PLATFORM_DEEPLINKS.agoda.url(name));
-  const klookUrl   = escapeHtml(PLATFORM_DEEPLINKS.klook.url(name));
+  const label = pickText("站内预订", "Book in CrossX", "CrossXで予約", "CrossX에서 예약");
   return `<div class="cx-book-btn-wrap cx-book-multi">` +
-    `<a class="cx-book-btn cx-book-booking" href="${bookingUrl}" target="_blank" rel="noopener">🏨 Booking.com</a>` +
-    `<a class="cx-book-btn cx-book-agoda"   href="${agodaUrl}"   target="_blank" rel="noopener">🏩 Agoda</a>` +
-    `<a class="cx-book-btn cx-book-klook"   href="${klookUrl}"   target="_blank" rel="noopener">🎫 Klook</a>` +
+    `<button class="cx-book-btn cx-book-booking" data-action="book-item" data-name="${safeName}" data-external-id="${escapeHtml(externalId || "")}">🏨 ${escapeHtml(label)}</button>` +
     `</div>`;
 }
 
 // ── Platform deeplink helpers ──────────────────────────────────────────────
 const PLATFORM_DEEPLINKS = {
-  ctrip:    { name:"携程",       color: "#00A0E9", icon: "✈️", url: (kw) => `https://m.ctrip.com/webapp/hotel/list/?hotelname=${encodeURIComponent(kw)}` },
-  meituan:  { name:"美团",       color: "#F5A623", icon: "🍜", url: (kw) => `https://i.meituan.com/s/search.html?q=${encodeURIComponent(kw)}` },
-  didi:     { name:"滴滴",       color: "#FF6600", icon: "🚕", url: ()   => "https://www.didiglobal.com/" },
-  taobao:   { name:"淘宝",       color: "#FF4400", icon: "🛒", url: (kw) => `https://s.taobao.com/search?q=${encodeURIComponent(kw)}` },
-  booking:  { name:"Booking",   color: "#003580", icon: "🏨", url: (kw) => {
-    const langMap = { ZH: "zh-cn", "ZH-TW": "zh-tw", JA: "ja", KO: "ko", AR: "ar", ID: "id" };
+  ctrip:    { name:"携程",       theme: "ctrip",   icon: "✈️", url: (kw) => `https://m.ctrip.com/webapp/hotel/list/?hotelname=${encodeURIComponent(kw)}` },
+  meituan:  { name:"美团",       theme: "meituan", icon: "🍜", url: (kw) => `https://i.meituan.com/s/search.html?q=${encodeURIComponent(kw)}` },
+  didi:     { name:"滴滴",       theme: "didi",    icon: "🚕", url: ()   => "https://www.didiglobal.com/" },
+  taobao:   { name:"淘宝",       theme: "taobao",  icon: "🛒", url: (kw) => `https://s.taobao.com/search?q=${encodeURIComponent(kw)}` },
+  booking:  { name:"Booking",   theme: "booking", icon: "🏨", url: (kw) => {
+    const langMap = { ZH: "zh-cn", "ZH-TW": "zh-tw", JA: "ja", KO: "ko", AR: "ar", ID: "id", ES: "es", HI: "en-gb", VI: "vi" };
     const lang = langMap[state.uiLanguage] || "en-us";
     return `https://www.booking.com/search.html?ss=${encodeURIComponent(kw)}&lang=${lang}`;
   }},
-  agoda:    { name:"Agoda",     color: "#5B2D8E", icon: "🏩", url: (kw) => `https://www.agoda.com/search?city=${encodeURIComponent(kw)}&checkIn=&checkOut=&rooms=1&adults=2&children=0` },
-  klook:    { name:"Klook",     color: "#FF6B35", icon: "🎫", url: (kw) => `https://www.klook.com/search/?query=${encodeURIComponent(kw)}` },
-  default:  { name:"Search",    color: "#6B7280", icon: "🔗", url: (kw) => `https://www.google.com/search?q=${encodeURIComponent(kw + " China hotel")}` },
+  agoda:    { name:"Agoda",     theme: "agoda",   icon: "🏩", url: (kw) => {
+    const localeMap = { ZH: "zh-cn", "ZH-TW": "zh-tw", JA: "ja-jp", KO: "ko-kr", AR: "ar-sa", ID: "id-id", ES: "es-es", HI: "en-gb", VI: "vi-vn" };
+    const locale = localeMap[state.uiLanguage] || "en-us";
+    return `https://www.agoda.com/search?city=${encodeURIComponent(kw)}&checkIn=&checkOut=&rooms=1&adults=2&children=0&locale=${encodeURIComponent(locale)}`;
+  }},
+  klook:    { name:"Klook",     theme: "klook",   icon: "🎫", url: (kw) => `https://www.klook.com/search/?query=${encodeURIComponent(kw)}` },
+  default:  { name:"Search",    theme: "default", icon: "🔗", url: (kw) => `https://www.google.com/search?q=${encodeURIComponent(kw + " China hotel")}` },
 };
 
 function renderPaymentPanel(opt) {
@@ -8239,9 +10024,8 @@ function renderPaymentPanel(opt) {
       <div class="payment-item-row">
         <span class="payment-item-icon">${pl.icon}</span>
         <span class="payment-item-name">${escapeHtml(item.name)}</span>
-        <span class="payment-item-amount">¥${escapeHtml(amt)}</span>
-        <a class="payment-item-link" href="${escapeHtml(href)}" target="_blank" rel="noopener"
-           style="background:${pl.color}">${escapeHtml(pl.name)}</a>
+        <span class="payment-item-amount">${escapeHtml(fmtCNY(item.amount || 0))}</span>
+        <a class="payment-item-link payment-item-link--${escapeHtml(pl.theme || "default")}" href="${escapeHtml(href)}" target="_blank" rel="noopener">${escapeHtml(pl.name)}</a>
       </div>`;
   }).join("");
 
@@ -8254,12 +10038,11 @@ function renderPaymentPanel(opt) {
       <div class="payment-panel-title">${pickText("预订明细", "Booking Details", "予約内訳", "예약 내역")}</div>
       <div class="payment-items-list">${itemRows}</div>
       <div class="payment-total-row">
-        <span>${pickText("总预算", "Total", "合計", "합계")}</span>
-        <span class="payment-grand-total">¥${escapeHtml(total)}</span>
+        <span>${pickText("方案总价", "Plan Total", "プラン合計", "플랜 총액")}</span>
+        <span class="payment-grand-total">${escapeHtml(fmtCNY(opt.total_cost || 0))}</span>
       </div>
       <button class="payment-confirm-btn"
-        data-opt-id="${optId}" data-opt-tag="${optTag}"
-        onclick="handleAgentPaymentConfirm(this)">
+        data-action="agent-payment-confirm" data-opt-id="${optId}" data-opt-tag="${optTag}">
         <span class="payment-btn-icon">✓</span>
         ${pickText("确认方案 · 开始预订", "Confirm & Book","プランを確認・予約", "플랜 확인 · 예약")}
       </button>
@@ -8274,7 +10057,7 @@ function renderMealPlanSection(opt) {
   // Show first 2 days as preview, rest collapsed
   const preview = days.slice(0, 2).map((d) => `
     <div class="meal-day-row">
-      <span class="meal-day-label">Day ${d.day}</span>
+      <span class="meal-day-label">${pickText(`第${d.day}天`, `Day ${d.day}`, `${d.day}日目`, `${d.day}일차`)}</span>
       <span class="meal-slot"><span class="meal-type">${pickText("早","B","朝","조")}</span>${escapeHtml(d.breakfast || "-")}</span>
       <span class="meal-slot"><span class="meal-type">${pickText("中","L","昼","점")}</span>${escapeHtml(d.lunch || "-")}</span>
       <span class="meal-slot"><span class="meal-type">${pickText("晚","D","夜","저")}</span>${escapeHtml(d.dinner || "-")}</span>
@@ -8306,31 +10089,44 @@ function _actFallbackImg(act) {
 // ── Platform deep-link buttons renderer ──────────────────────────────────
 // Renders a compact row of platform buttons from a platform_links object.
 // actType guides which platforms are most relevant (hotels vs restaurants vs sightseeing).
-function _renderPlatformLinks(links, actType) {
+function _renderPlatformLinks(links, actType, transportMeta = null) {
   if (!links) return "";
   const t = String(actType || "").toLowerCase();
   const isHotel     = /hotel|checkin|checkout|酒店|住宿|入住/.test(t);
   const isFood      = /meal|food|breakfast|lunch|dinner|meals|餐|饮|饭|菜|小吃|早餐|午餐|晚餐/.test(t);
   const isTransport = /transport|city_change|交通|火车|飞机|高铁|地铁|出行/.test(t);
+  const transportStateSuffix = isTransport
+    ? (transportMeta?.inventory_status === "live_or_verified"
+        ? pickText(" · 实时", " · Live", " · リアルタイム", " · 실시간")
+        : transportMeta?.inventory_status === "estimated"
+          ? pickText(" · 估算", " · Estimated", " · 推定", " · 추정")
+          : transportMeta?.inventory_status === "user_check_required"
+            ? pickText(" · 自核", " · Self-check", " · 要確認", " · 직접확인")
+            : "")
+    : "";
 
   let btns = [];
   if (isHotel) {
-    if (links.ctrip)   btns.push({ href: links.ctrip,   label: "携程订酒店", emoji: "🏨" });
-    if (links.booking) btns.push({ href: links.booking,  label: "Booking",  emoji: "🌐" });
+    if (links.ctrip)   btns.push({ href: links.ctrip,   label: pickText("携程订酒店", "Ctrip Hotel", "Ctripホテル", "씨트립 호텔"), emoji: "🏨" });
+    if (links.fliggy)  btns.push({ href: links.fliggy,  label: pickText("飞猪酒店", "Fliggy Hotel", "Fliggyホテル", "플리기 호텔"), emoji: "🛫" });
+    if (links.booking) btns.push({ href: links.booking,  label: "Booking.com",  emoji: "🌐" });
     if (links.agoda)   btns.push({ href: links.agoda,    label: "Agoda",    emoji: "🌐" });
+    if (links.didi)    btns.push({ href: links.didi,     label: pickText("滴滴到酒店", "DiDi to Hotel", "ホテルまでDiDi", "호텔까지 DiDi"), emoji: "🚗" });
   } else if (isFood) {
-    if (links.meituan)  btns.push({ href: links.meituan,  label: "美团",    emoji: "🍽️" });
-    if (links.dianping) btns.push({ href: links.dianping, label: "大众点评", emoji: "⭐" });
-    if (links.amap)     btns.push({ href: links.amap,     label: "高德地图", emoji: "📍" });
+    if (links.meituan)  btns.push({ href: links.meituan,  label: pickText("美团", "Meituan", "美団", "메이퇀"), emoji: "🍽️" });
+    if (links.dianping) btns.push({ href: links.dianping, label: pickText("大众点评", "Dianping", "大衆点評", "따중디엔핑"), emoji: "⭐" });
+    if (links.amap)     btns.push({ href: links.amap,     label: pickText("高德地图", "Amap", "高徳地図", "가오더 지도"), emoji: "📍" });
+    if (links.didi)     btns.push({ href: links.didi,     label: pickText("滴滴前往", "DiDi Ride", "DiDiで移動", "DiDi 호출"), emoji: "🚗" });
   } else if (isTransport) {
-    if (links.ctrip_flight) btns.push({ href: links.ctrip_flight, label: "携程机票", emoji: "✈️" });
-    if (links.train_12306)  btns.push({ href: links.train_12306,  label: "12306火车", emoji: "🚄" });
-    if (links.didi)         btns.push({ href: links.didi,         label: "滴滴出行", emoji: "🚗" });
+    if (links.ctrip_flight)  btns.push({ href: links.ctrip_flight,  label: `${pickText("携程机票", "Ctrip Flight", "Ctrip航空券", "씨트립 항공권")}${transportStateSuffix}`, emoji: "✈️" });
+    if (links.fliggy_flight) btns.push({ href: links.fliggy_flight, label: `${pickText("飞猪机票", "Fliggy Flight", "Fliggy航空券", "플리기 항공권")}${transportStateSuffix}`, emoji: "🛫" });
+    if (links.train_12306)   btns.push({ href: links.train_12306,   label: `${pickText("12306查票", "12306查票 / 自核", "12306空席確認 / 要確認", "12306 좌석 확인 / 직접확인")}${transportStateSuffix && transportMeta?.inventory_status !== "user_check_required" ? transportStateSuffix : ""}`, emoji: "🚄" });
+    if (links.didi)          btns.push({ href: links.didi,          label: `${pickText("滴滴出行", "DiDi", "DiDi", "디디")}${transportStateSuffix}`, emoji: "🚗" });
   } else {
     // Sightseeing / attraction
-    if (links.amap)         btns.push({ href: links.amap,         label: "高德导航", emoji: "📍" });
-    if (links.ctrip)        btns.push({ href: links.ctrip,        label: "携程景点", emoji: "🎯" });
-    if (links.xiaohongshu)  btns.push({ href: links.xiaohongshu,  label: "小红书",   emoji: "📖" });
+    if (links.amap)         btns.push({ href: links.amap,         label: pickText("高德导航", "Amap Nav", "高徳ナビ", "가오더 내비"), emoji: "📍" });
+    if (links.ctrip)        btns.push({ href: links.ctrip,        label: pickText("携程景点", "Ctrip Sight", "Ctrip観光", "씨트립 관광"), emoji: "🎯" });
+    if (links.xiaohongshu)  btns.push({ href: links.xiaohongshu,  label: pickText("小红书", "Xiaohongshu", "小紅書", "샤오홍슈"), emoji: "📖" });
   }
   if (!btns.length) return "";
   const btnHtml = btns.map(b =>
@@ -8380,7 +10176,8 @@ function renderQuickActionCard(smart) {
     const tip = escapeHtml(payload.tip || "");
     const btnRows = platforms.map((p) => `
       <a href="${escapeHtml(p.url || p.fallback_url || "#")}"
-         onclick="quickActionTrack('${escapeHtml(p.id || "")}')"
+         data-action="quick-action-track"
+         data-platform-id="${escapeHtml(p.id || "")}"
          class="qa-platform-btn${p.recommended ? " qa-platform-btn--primary" : ""}">
         ${p.recommended ? `<svg class="qa-btn-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>` : ""}
         <span>${escapeHtml(p.label || "")}</span>
@@ -8412,7 +10209,7 @@ function renderQuickActionCard(smart) {
         <h2 class="qa-translate-zh">${zhText}</h2>
         <div class="qa-translate-footer">
           <span class="qa-translate-hint">${ctxTip}</span>
-          <button class="qa-tts-btn" onclick="quickActionSpeak(${JSON.stringify(ttsText)})" title="Play audio">
+          <button class="qa-tts-btn" data-action="quick-action-speak" data-text="${escapeHtml(ttsText)}" title="Play audio">
             <svg class="w-6 h-6 ml-1" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd"></path></svg>
           </button>
         </div>
@@ -8492,59 +10289,59 @@ function quickActionSpeak(text) {
 
 // ── Clarification Chips Card ──────────────────────────────────────────────
 function renderClarifyCard(structured) {
-  const questionText = structured.spoken_text || "请补充以下信息以生成您的专属方案：";
+  const questionText = structured.spoken_text || pickText("请补充以下信息以生成您的专属方案：", "Please provide details to create your personalized plan:", "プラン作成のため、詳細を入力してください：", "맞춤 플랜 생성을 위한 정보를 입력해 주세요：");
   const missing = Array.isArray(structured.missing_slots) ? structured.missing_slots : [];
 
   // Predefined quick-select options per slot
   const SLOT_CHIPS = {
     budget: {
-      label:"预算范围",
+      label: pickText("预算范围","Budget Range","予算範囲","예산 범위"),
       icon: "¥",
       options: [
-        { label: "< ¥5,000",    value:"预算5000以内" },
-        { label: "¥5k – 10k",   value:"预算5000到10000" },
-        { label: "¥10k – 30k",  value:"预算1万到3万" },
-        { label: "> ¥30k",      value:"预算3万以上，追求极致体验" },
+        { label: "< ¥5,000",   value: pickText("预算5000以内", "Budget under CNY 5,000", "予算5,000元以内", "예산 5,000위안 이하") },
+        { label: "¥5k – 10k",  value: pickText("预算5000到10000", "Budget CNY 5,000 to 10,000", "予算5,000〜10,000元", "예산 5,000~10,000위안") },
+        { label: "¥10k – 30k", value: pickText("预算1万到3万", "Budget CNY 10,000 to 30,000", "予算1万〜3万元", "예산 1만~3만위안") },
+        { label: "> ¥30k",     value: pickText("预算3万以上，追求极致体验", "Budget above CNY 30,000 with premium experience", "予算3万元以上で最高級体験", "예산 3만위안 이상, 프리미엄 경험 선호") },
       ],
     },
     destination: {
-      label:"目的地",
+      label: pickText("目的地","Destination","目的地","목적지"),
       icon: "📍",
       options: [
-        { label:"上海", value:"去上海" },
-        { label:"深圳", value:"去深圳" },
-        { label:"北京", value:"去北京" },
-        { label:"三亚", value:"去三亚" },
+        { label: pickText("上海","Shanghai","上海","상하이"), value: pickText("去上海", "Go to Shanghai", "上海へ行く", "상하이로 가기") },
+        { label: pickText("深圳","Shenzhen","深圳","선전"),   value: pickText("去深圳", "Go to Shenzhen", "深圳へ行く", "선전으로 가기") },
+        { label: pickText("北京","Beijing","北京","베이징"),  value: pickText("去北京", "Go to Beijing", "北京へ行く", "베이징으로 가기") },
+        { label: pickText("三亚","Sanya","三亜","산야"),      value: pickText("去三亚", "Go to Sanya", "三亜へ行く", "싼야로 가기") },
       ],
     },
     duration_days: {
-      label:"行程天数",
+      label: pickText("行程天数","Duration","旅行日数","여행 일수"),
       icon: "📅",
       options: [
-        { label: "2天", value:"行程2天" },
-        { label: "3天", value:"行程3天" },
-        { label: "5天", value:"行程5天" },
-        { label: "7天+", value:"行程7天以上" },
+        { label: pickText("2天","2 days","2日間","2일"), value: pickText("行程2天", "Trip duration is 2 days", "旅行日数は2日", "여행 기간은 2일") },
+        { label: pickText("3天","3 days","3日間","3일"), value: pickText("行程3天", "Trip duration is 3 days", "旅行日数は3日", "여행 기간은 3일") },
+        { label: pickText("5天","5 days","5日間","5일"), value: pickText("行程5天", "Trip duration is 5 days", "旅行日数は5日", "여행 기간은 5일") },
+        { label: pickText("7天+","7+ days","7日以上","7일+"), value: pickText("行程7天以上", "Trip duration is 7 days or more", "旅行日数は7日以上", "여행 기간은 7일 이상") },
       ],
     },
     party_size: {
-      label:"出行人数",
+      label: pickText("出行人数","Party Size","人数","인원"),
       icon: "👥",
       options: [
-        { label: "1人", value: "1个人" },
-        { label: "2人", value: "2个人" },
-        { label: "3-4人", value: "3到4个人" },
-        { label: "5人+", value: "5人以上" },
+        { label: pickText("1人","1 person","1名","1인"),      value: pickText("1个人", "1 traveler", "1名です", "1명입니다") },
+        { label: pickText("2人","2 people","2名","2인"),      value: pickText("2个人", "2 travelers", "2名です", "2명입니다") },
+        { label: pickText("3-4人","3–4 pax","3~4名","3~4인"), value: pickText("3到4个人", "3 to 4 travelers", "3〜4名です", "3~4명입니다") },
+        { label: pickText("5人+","5+ pax","5名以上","5인+"),  value: pickText("5人以上", "5 or more travelers", "5名以上です", "5명 이상입니다") },
       ],
     },
     food_preference: {
-      label:"饮食偏好",
+      label: pickText("饮食偏好","Dietary Preference","食の好み","식이 선호"),
       icon: "🍽️",
       options: [
-        { label:"无特别要求", value:"饮食没有特别要求" },
-        { label:"清真", value:"需要清真餐饮" },
-        { label:"素食", value:"需要素食餐饮" },
-        { label:"海鲜/粤菜", value:"喜欢海鲜和粤菜" },
+        { label: pickText("无特别要求","No preference","こだわりなし","특별 없음"), value: pickText("饮食没有特别要求", "No dietary restrictions", "食事制限なし", "식단 제한 없음") },
+        { label: pickText("清真","Halal","ハラール","할랄"),                       value: pickText("需要清真餐饮", "Need halal food options", "ハラール対応が必要", "할랄 음식이 필요합니다") },
+        { label: pickText("素食","Vegetarian","ベジタリアン","채식"),              value: pickText("需要素食餐饮", "Need vegetarian food options", "ベジタリアン対応が必要", "채식 옵션이 필요합니다") },
+        { label: pickText("海鲜/粤菜","Seafood/Cantonese","海鮮/広東","해산물/광동"), value: pickText("喜欢海鲜和粤菜", "Prefer seafood and Cantonese cuisine", "海鮮と広東料理が好み", "해산물과 광둥요리를 선호합니다") },
       ],
     },
   };
@@ -8559,7 +10356,7 @@ function renderClarifyCard(structured) {
   // B2: Unified layout — chips are quick-fill shortcuts; text input for free-form response
   const groupsHtml = chipGroups.map(({ slot, group }) => {
     const chips = group.options.map((opt) =>
-      `<button class="clarify-chip" onclick="_clarifyChipFill(this, ${JSON.stringify(opt.value)})">
+      `<button class="clarify-chip" data-action="clarify-chip-fill" data-value="${escapeHtml(opt.value)}">
         <span class="clarify-chip-label">${escapeHtml(opt.label)}</span>
       </button>`
     ).join("");
@@ -8572,8 +10369,8 @@ function renderClarifyCard(structured) {
   // AI-already-knows badges (confidence display)
   const SLOT_DISPLAY = {
     destination: { icon: "\u{1F4CD}", label: (v) => String(v) },
-    duration:    { icon: "\u23F1", label: (v) => `${v}\u5929` },
-    party_size:  { icon: "\u{1F465}", label: (v) => `${v}\u4EBA` },
+    duration:    { icon: "\u23F1", label: (v) => pickText(`${v}天`, `${v} days`, `${v}日`, `${v}일`) },
+    party_size:  { icon: "\u{1F465}", label: (v) => pickText(`${v}人`, `${v} pax`, `${v}名`, `${v}명`) },
   };
   const extracted = structured.extracted_slots && typeof structured.extracted_slots === "object"
     ? structured.extracted_slots : {};
@@ -8584,7 +10381,7 @@ function renderClarifyCard(structured) {
       return `<span class="cx-known-badge">${d.icon} ${escapeHtml(d.label(v))} <span class="cx-known-check">\u2713</span></span>`;
     }).join("");
   const knownRow = knownBadges
-    ? `<div class="cx-known-row"><span class="cx-known-label">AI\u5DF2\u77E5\u6559</span>${knownBadges}</div>`
+    ? `<div class="cx-known-row"><span class="cx-known-label">${pickText("AI 已知条件", "AI already knows", "AI が把握済み", "AI가 이미 파악함")}</span>${knownBadges}</div>`
     : "";
 
   addCard(`
@@ -8593,15 +10390,14 @@ function renderClarifyCard(structured) {
         <div class="clarify-icon">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
         </div>
-        <div class="clarify-title">\u8865\u5145\u4FE1\u606F</div>
+        <div class="clarify-title">${pickText("补充信息", "Add details", "追加情報", "추가 정보")}</div>
       </div>
       ${knownRow}
       <div class="clarify-question">${escapeHtml(questionText)}</div>
       ${groupsHtml}
       <div class="b2-clarify-input-row">
-        <input type="text" class="b2-clarify-input" placeholder="\u76F4\u63A5\u8F93\u5165\uFF0C\u6216\u70B9\u51FB\u4E0A\u65B9\u5FEB\u6377\u9009\u9879..."
-          onkeydown="if(event.key==='Enter'&&!event.isComposing)_clarifySend(this.closest('.clarify-card'))">
-        <button class="b2-clarify-send" onclick="_clarifySend(this.closest('.clarify-card'))">\u53D1\u9001</button>
+        <input type="text" class="b2-clarify-input" placeholder="${escapeHtml(pickText("直接输入，或点击上方快捷选项...", "Type directly or tap a quick option above...", "直接入力、または上のクイック選択を使用...", "직접 입력하거나 위의 빠른 옵션을 누르세요..."))}">
+        <button class="b2-clarify-send" data-action="clarify-send">${pickText("发送", "Send", "送信", "전송")}</button>
       </div>
     </article>
   `);
@@ -8638,7 +10434,7 @@ function _buildRatingBar(cardId, cd) {
   const dur  = cd.duration_days || 0;
   const stars = [1,2,3,4,5].map(i =>
     `<button class="cx-star" data-star="${i}" aria-label="${i} star"
-       onclick="submitPlanRating(${JSON.stringify(cardId)},${i},${JSON.stringify(cd.destination||'')},${dur},this)">★</button>`
+       data-action="submit-plan-rating" data-card-id="${escapeHtml(cardId)}" data-rating="${i}" data-destination="${dest}" data-duration-days="${dur}">★</button>`
   ).join("");
   return `<div class="cx-rating-bar" id="rbar-${cardId}">
     <span class="cx-rating-label">${pickText("方案满意吗？","Rate this plan","評価する","평가하기")}</span>
@@ -8678,34 +10474,89 @@ const _LIST_CARD_TAG_STYLES = {
   premium:  { bg: "#fffbeb", color: "#92400e", border: "#fcd34d" },
 };
 
+function _getListCardTone(planId) {
+  const tone = String(planId || "balanced").toLowerCase();
+  return Object.prototype.hasOwnProperty.call(_LIST_CARD_TAG_STYLES, tone) ? tone : "balanced";
+}
+
+function _getActIconTone(type) {
+  const t = String(type || "").toLowerCase();
+  if (/^(transport|city_change)$/i.test(t)) return "transport";
+  if (/^(meal|food|restaurant|eat|lunch|dinner|breakfast)$/i.test(t)) return "meal";
+  if (/^(activity|sightseeing|attraction|museum|temple|park)$/i.test(t)) return "activity";
+  if (/^(checkin|hotel)$/i.test(t)) return "hotel";
+  if (/^checkout$/i.test(t)) return "checkout";
+  if (/^shopping$/i.test(t)) return "shopping";
+  if (/^(rest|free)$/i.test(t)) return "rest";
+  return "default";
+}
+
+function _buildActIcon(type, icon) {
+  return `<span class="act-icon act-icon--${_getActIconTone(type)}">${icon}</span>`;
+}
+
+function _buildItineraryHeaderHtml(planTag, hotelName = "") {
+  const safePlanTag = escapeHtml(planTag || "");
+  const safeHotelName = escapeHtml(hotelName || "");
+  const planHtml = `<span class="plan-itinerary-title-accent">${safePlanTag}</span>`;
+  const hotelHtml = safeHotelName ? ` · <span class="plan-itinerary-title-muted">${safeHotelName}</span>` : "";
+  return pickText(
+    `逐日行程 · ${planHtml}${hotelHtml} 方案`,
+    `Itinerary · ${planHtml}${hotelHtml}`,
+    `日程 · ${planHtml}`,
+    `일정 · ${planHtml}`,
+  );
+}
+
 // ── P8.8: Global city hero map — curated real landmark photos (Unsplash) ──────
 // Fixed Unsplash photo IDs for each major Chinese city landmark.
 // Falls back to a scenic travel photo if city not in map.
 const GLOBAL_CITY_HERO_MAP = {
-  "北京":   "/api/placeholder?cat=travel&label=Beijing",
-  "上海":   "/api/placeholder?cat=travel&label=Shanghai",
-  "深圳":   "/api/placeholder?cat=travel&label=Shenzhen",
-  "广州":   "/api/placeholder?cat=travel&label=Guangzhou",
-  "成都":   "/api/placeholder?cat=travel&label=Chengdu",
-  "重庆":   "/api/placeholder?cat=travel&label=Chongqing",
-  "杭州":   "/api/placeholder?cat=travel&label=Hangzhou",
-  "苏州":   "/api/placeholder?cat=travel&label=Suzhou",
-  "西安":   "/api/placeholder?cat=travel&label=Xi'an",
-  "南京":   "/api/placeholder?cat=travel&label=Nanjing",
-  "三亚":   "/api/placeholder?cat=travel&label=Sanya",
-  "丽江":   "/api/placeholder?cat=travel&label=Lijiang",
-  "大理":   "/api/placeholder?cat=travel&label=Dali",
-  "桂林":   "/api/placeholder?cat=travel&label=Guilin",
-  "张家界": "/api/placeholder?cat=travel&label=Zhangjiajie",
-  "黄山":   "/api/placeholder?cat=travel&label=Huangshan",
-  "青岛":   "/api/placeholder?cat=travel&label=Qingdao",
-  "厦门":   "/api/placeholder?cat=travel&label=Xiamen",
-  "拉萨":   "/api/placeholder?cat=travel&label=Lhasa",
-  "哈尔滨": "/api/placeholder?cat=travel&label=Harbin",
-  "新疆":   "/api/placeholder?cat=travel&label=Xinjiang",
-  "乌鲁木齐": "/api/placeholder?cat=travel&label=Urumqi",
+  // Chinese names → server-proxied real photo
+  "北京":   "/api/city-photo?city=Beijing",
+  "上海":   "/api/city-photo?city=Shanghai",
+  "深圳":   "/api/city-photo?city=Shenzhen",
+  "广州":   "/api/city-photo?city=Guangzhou",
+  "成都":   "/api/city-photo?city=Chengdu",
+  "重庆":   "/api/city-photo?city=Chongqing",
+  "杭州":   "/api/city-photo?city=Hangzhou",
+  "苏州":   "/api/city-photo?city=Suzhou",
+  "西安":   "/api/city-photo?city=Xian",
+  "南京":   "/api/city-photo?city=Nanjing",
+  "三亚":   "/api/city-photo?city=Sanya",
+  "丽江":   "/api/city-photo?city=Lijiang",
+  "大理":   "/api/city-photo?city=Dali",
+  "桂林":   "/api/city-photo?city=Guilin",
+  "张家界": "/api/city-photo?city=Zhangjiajie",
+  "黄山":   "/api/city-photo?city=Huangshan",
+  "青岛":   "/api/city-photo?city=Qingdao",
+  "厦门":   "/api/city-photo?city=Xiamen",
+  "拉萨":   "/api/city-photo?city=Lhasa",
+  "哈尔滨": "/api/city-photo?city=Harbin",
+  "新疆":   "/api/city-photo?city=Xinjiang",
+  "乌鲁木齐": "/api/city-photo?city=Urumqi",
+  // English names (for constraint-based city queries)
+  "Beijing":    "/api/city-photo?city=Beijing",
+  "Shanghai":   "/api/city-photo?city=Shanghai",
+  "Shenzhen":   "/api/city-photo?city=Shenzhen",
+  "Guangzhou":  "/api/city-photo?city=Guangzhou",
+  "Chengdu":    "/api/city-photo?city=Chengdu",
+  "Chongqing":  "/api/city-photo?city=Chongqing",
+  "Hangzhou":   "/api/city-photo?city=Hangzhou",
+  "Suzhou":     "/api/city-photo?city=Suzhou",
+  "Xian":       "/api/city-photo?city=Xian",
+  "Nanjing":    "/api/city-photo?city=Nanjing",
+  "Sanya":      "/api/city-photo?city=Sanya",
+  "Lijiang":    "/api/city-photo?city=Lijiang",
+  "Dali":       "/api/city-photo?city=Dali",
+  "Guilin":     "/api/city-photo?city=Guilin",
+  "Zhangjiajie":"/api/city-photo?city=Zhangjiajie",
+  "Qingdao":    "/api/city-photo?city=Qingdao",
+  "Xiamen":     "/api/city-photo?city=Xiamen",
+  "Lhasa":      "/api/city-photo?city=Lhasa",
+  "Harbin":     "/api/city-photo?city=Harbin",
 };
-const _CITY_HERO_FALLBACK = "/api/placeholder?cat=travel&label=China";
+const _CITY_HERO_FALLBACK = "/api/city-photo?city=China";
 
 function _getCityHeroUrl(dest) {
   // Coze hero_image takes top priority (live data from real Coze workflow)
@@ -8717,32 +10568,223 @@ function _getCityHeroUrl(dest) {
   return GLOBAL_CITY_HERO_MAP[key] || _CITY_HERO_FALLBACK;
 }
 
+// Normalize AI plan tags — fallback for when AI returns Chinese tags in non-ZH mode
+const _PLAN_TAG_FALLBACK = {
+  budget:   () => pickText("性价比之选","Budget Pick","コスパ重視","실속형"),
+  balanced: () => pickText("最佳平衡","Best Balance","バランス重視","균형형"),
+  premium:  () => pickText("极致体验","Premium","プレミアム","프리미엄"),
+};
+function _normalizePlanTag(p) {
+  if (!p.tag) return _PLAN_TAG_FALLBACK[p.id]?.() || "";
+  // If UI is not ZH but tag looks Chinese, replace with localized fallback
+  if (state.uiLanguage !== "ZH" && /[\u4e00-\u9fff]/.test(p.tag)) {
+    return _PLAN_TAG_FALLBACK[p.id]?.() || p.tag;
+  }
+  return p.tag;
+}
+
+function _normalizeReviewCountText(value) {
+  if (!value && value !== 0) return "";
+  const raw = String(value).trim();
+  if (!raw) return "";
+  const numeric = raw.match(/[\d,.]+/);
+  if (numeric) {
+    const label = pickText("条点评", "reviews", "件のレビュー", "건 리뷰");
+    return `${numeric[0]} ${label}`;
+  }
+  return raw;
+}
+
+function _isMostlyChineseText(value) {
+  const raw = String(value || "");
+  const chineseCount = (raw.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latinCount = (raw.match(/[A-Za-z]/g) || []).length;
+  if (chineseCount === 0) return false;
+  return chineseCount >= Math.max(4, latinCount);
+}
+
+function _sanitizeHotelDisplayName(value) {
+  let text = String(value || "").trim();
+  if (!text) return text;
+  const compress = (input) => String(input || "").split(/\s+/).filter(Boolean).join(" ").trim();
+  text = compress(text.replaceAll("（", "(").replaceAll("【", "(").replaceAll("）", ")").replaceAll("】", ")"));
+  if (text.toLowerCase().endsWith("canton fair free shuttle bus")) {
+    text = compress(text.slice(0, -"canton fair free shuttle bus".length));
+  }
+  if (/( branch| store| shop)$/i.test(text)) {
+    text = compress(text.replace(/( branch| store| shop)$/i, ""));
+  }
+  if (text.endsWith(")")) {
+    const openIdx = text.lastIndexOf("(");
+    if (openIdx >= 0) {
+      const inner = compress(text.slice(openIdx + 1, -1));
+      const innerLower = inner.toLowerCase();
+      if (["canton fair free shuttle bus", "free shuttle bus", "metro station", "subway station", "branch", "store", "shop"].includes(innerLower)) {
+        text = compress(text.slice(0, openIdx));
+      } else if (innerLower.endsWith(" branch")) {
+        text = compress(text.slice(0, openIdx)) + " (" + inner.slice(0, -7).trim() + ")";
+      }
+    }
+  }
+  return compress(text).replace("( )", "").replace(" )", ")").replace("( ", "(");
+}
+
+function _sanitizeHotelAreaLabel(value) {
+  const text = String(value || "").trim();
+  if (!text) return text;
+  return _localizeVisibleTravelText(text, text);
+}
+
+function _derivePlanReviewText(plan) {
+  const hotel = plan && plan.hotel ? plan.hotel : {};
+  const direct = [
+    hotel.guest_review,
+    plan.guest_review,
+    plan.hotel_guest_review,
+    plan.review,
+    plan.user_review,
+    Array.isArray(plan.hotel_ctrip_reviews) ? plan.hotel_ctrip_reviews[0] : "",
+  ].map((v) => String(v || "").trim()).find(Boolean);
+  if (direct) {
+    const localizedDirect = _localizeVisibleTravelText(direct, "");
+    if (localizedDirect) return localizedDirect;
+  }
+
+  const rating = Number(hotel.rating || plan.hotel_rating || plan.hotel_ctrip_score || 0);
+  const reviewCount = _normalizeReviewCountText(hotel.review_count || plan.hotel_review_count || plan.hotel_ctrip_review_count || "");
+  const area = _sanitizeHotelAreaLabel(hotel.area || plan.hotel_area || "");
+  const breakfast = hotel.breakfastInfo || plan.breakfastInfo || "";
+  const parts = [
+    rating > 0 ? pickText(`评分 ${rating.toFixed(1)}`, `${rating.toFixed(1)} rating`, `${rating.toFixed(1)} 評価`, `${rating.toFixed(1)} 평점`) : "",
+    reviewCount,
+    area ? pickText(`位于${area}`, `Located in ${area}`, `${area}に位置`, `${area}에 위치`) : "",
+    breakfast ? pickText(`早餐: ${breakfast}`, `Breakfast: ${breakfast}`, `朝食: ${breakfast}`, `조식: ${breakfast}`) : "",
+  ].filter(Boolean);
+  return _localizeVisibleTravelText(parts.join(" · "), "");
+}
+
+function _derivePlanHighlights(plan) {
+  const hotel = plan && plan.hotel ? plan.hotel : {};
+  const tags = [
+    ...(Array.isArray(plan.highlights) ? plan.highlights : []),
+    ...(Array.isArray(hotel.tags) ? hotel.tags : []),
+    ...(Array.isArray(plan.hotel_tags) ? plan.hotel_tags : []),
+    ...(Array.isArray(plan.hotel_ctrip_tags) ? plan.hotel_ctrip_tags : []),
+  ]
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .filter((item, idx, arr) => arr.indexOf(item) === idx);
+  return tags
+    .map((item) => _localizeVisibleTravelText(item, ""))
+    .filter(Boolean);
+}
+
+function _derivePlanIncludes(plan) {
+  const includes = [];
+  const hotel = plan && plan.hotel ? plan.hotel : {};
+  const breakfast = hotel.breakfastInfo || plan.breakfastInfo || "";
+  if (breakfast) includes.push(pickText(`包含 ${breakfast}`, `Includes ${breakfast}`, `${breakfast} 付き`, `${breakfast} 포함`));
+  if (plan.transport_plan) includes.push(String(plan.transport_plan));
+  (plan.comments || []).forEach((item) => includes.push(String(item || "").trim()));
+  (plan.executionPlan || []).forEach((item) => includes.push(String(item || "").trim()));
+  _derivePlanHighlights(plan).forEach((item) => includes.push(item));
+  const cleaned = includes
+    .map((item) => _localizeVisibleTravelText(item, ""))
+    .filter(Boolean)
+    .filter((item, idx, arr) => arr.indexOf(item) === idx)
+    .filter((item) => state.uiLanguage === "ZH" || !_isMostlyChineseText(item));
+  if (cleaned.length) return cleaned;
+  return _TRAVEL_STEPS.slice(0, 3).map((step) => _travelStepLabel(step));
+}
+
+function _derivePlanCardFacts(plan) {
+  const hotel = plan && plan.hotel ? plan.hotel : {};
+  const facts = [];
+  const rating = Number(hotel.rating || plan.hotel_rating || plan.hotel_ctrip_score || 0);
+  const reviewCount = _normalizeReviewCountText(hotel.review_count || plan.hotel_review_count || plan.hotel_ctrip_review_count || "");
+  const breakfast = hotel.breakfastInfo || plan.breakfastInfo || "";
+  const area = _sanitizeHotelAreaLabel(hotel.area || plan.hotel_area || "");
+  if (rating > 0) facts.push(`★ ${rating.toFixed(1)}`);
+  if (reviewCount) facts.push(reviewCount);
+  if (breakfast) facts.push(_localizeVisibleTravelText(pickText(`含 ${breakfast}`, breakfast, breakfast, breakfast), breakfast));
+  if (area) facts.push(area);
+  return facts.slice(0, 4);
+}
+
+function _deriveSmartHotelOptionFacts(item) {
+  const facts = [];
+  const score = Number(item.hotel_ctrip_score || item.touristFriendlyScore || 0);
+  const reviewCount = _normalizeReviewCountText(item.hotel_ctrip_review_count || "");
+  const nativeHotelPrice = fmtNativeHotelPrice(item.hotel_native_price, item.hotel_native_currency);
+  if (score > 0) facts.push(`★ ${score.toFixed(1)}`);
+  if (reviewCount) facts.push(reviewCount);
+  if (item.costRange) facts.push(String(item.costRange));
+  if (nativeHotelPrice) facts.push(`${pickText("实时价", "Live price", "実売価格", "실시간 요금")}: ${nativeHotelPrice}`);
+  return facts.slice(0, 4);
+}
+
+function _deriveSmartHotelOptionBullets(item) {
+  const lines = [];
+  const reviewText = Array.isArray(item.hotel_ctrip_reviews) ? item.hotel_ctrip_reviews : [];
+  const tagText = Array.isArray(item.hotel_ctrip_tags) ? item.hotel_ctrip_tags : [];
+  const comments = Array.isArray(item.comments) ? item.comments : [];
+  const reasons = Array.isArray(item.reasons) ? item.reasons : [];
+  const execution = Array.isArray(item.executionPlan) ? item.executionPlan : [];
+  reviewText.forEach((entry) => lines.push(String(entry || "").trim()));
+  tagText.forEach((entry) => lines.push(String(entry || "").trim()));
+  comments.forEach((entry) => lines.push(String(entry || "").trim()));
+  reasons.forEach((entry) => lines.push(String(entry || "").trim()));
+  execution.forEach((entry) => lines.push(String(entry || "").trim()));
+  const cleaned = lines
+    .filter(Boolean)
+    .filter((entry, idx, arr) => arr.indexOf(entry) === idx)
+    .filter((entry) => state.uiLanguage === "ZH" || !_isMostlyChineseText(entry));
+  if (cleaned.length) return cleaned.slice(0, 4);
+  const fallback = [];
+  if (item.placeDisplay || item.placeName) fallback.push(`${pickText("Area", "Area", "エリア", "지역")}: ${String(item.placeDisplay || item.placeName)}`);
+  if (item.etaWindow) fallback.push(`ETA: ${String(item.etaWindow)}`);
+  if (item.accepts_foreign_guests === true) fallback.push(pickText("支持外籍入住", "Foreign guests accepted", "外国籍宿泊可", "외국인 투숙 가능"));
+  if (item.paymentFriendly) fallback.push(String(item.paymentFriendly));
+  return fallback.slice(0, 4);
+}
+
 function _buildListCard(p, idx, cardId, dur, pax, dest) {
   // P8.6: Card layout polymorphism — driven by layout_type from backend
   const layoutType  = state._layoutType || "travel_full";
   const isFoodCard  = layoutType === "food_only";
   const isStayFocus = layoutType === "stay_focus";
 
-  const style = _LIST_CARD_TAG_STYLES[p.id] || _LIST_CARD_TAG_STYLES.balanced;
+  const tagTone = _getListCardTone(p.id);
   const isRec = p.is_recommended;
 
   // P8.3: for recommended plan, prefer Coze MOR net price if available
   const cozePrice = isRec && state.cozeData?.total_price ? Number(state.cozeData.total_price) : 0;
   const rawPrice  = cozePrice > 0 ? cozePrice : Number(p.total_price || 0);
+  const hotelNode = p.hotel || {};
+  const reviewText = _derivePlanReviewText(p);
+  const planHighlights = _derivePlanHighlights(p).slice(0, 3);
+  const planIncludes = _derivePlanIncludes(p).slice(0, 4);
+  const planFacts = _derivePlanCardFacts(p);
 
   // ── Polymorphic field mapping ────────────────────────────────────────────
   // food_only  → item name / avg_price / queue badge
   // stay_focus → hotel name + rating focus
   // travel_full → default hotel + price display
   const displayTitle = isFoodCard
-    ? escapeHtml(p.name || p.restaurant_name || p.item_name || dest || "")
-    : escapeHtml(p.hotel?.name || "");
+    ? escapeHtml(_localizeVisibleTravelText(p.name || p.restaurant_name || p.item_name || "", `${_localizeUiCityName(dest)} ${pickText("精选餐厅", "Dining pick", "おすすめ店", "추천 식당")}`))
+    : escapeHtml(_localizeVisibleTravelText(paymentDisplayTitle({
+      hotelDisplay: p.hotelDisplay || hotelNode.name || "",
+      hotelName: p.hotel_name || hotelNode.name || "",
+      title: p.title || "",
+    }) || "", `${_localizeUiCityName(dest)} ${pickText("优选酒店", "Selected hotel", "おすすめホテル", "추천 호텔")}`));
 
   const displayRating = isFoodCard
     ? (p.rating || p.item_rating || p.score || 0)
-    : (p.hotel?.rating || 0);
+    : (hotelNode.rating || p.hotel_rating || p.hotel_ctrip_score || 0);
 
-  const displayRevCount = isFoodCard ? "" : escapeHtml(p.hotel?.review_count || "");
+  const displayRevCount = isFoodCard ? "" : escapeHtml(_normalizeReviewCountText(hotelNode.review_count || p.hotel_review_count || p.hotel_ctrip_review_count || ""));
+  const displayGuestRev = isFoodCard ? "" : escapeHtml(_localizeVisibleTravelText(reviewText || "", ""));
+  const displayHotelTags = isFoodCard ? [] : planHighlights;
 
   const priceDisplay = isFoodCard
     ? (p.avg_price
@@ -8752,11 +10794,11 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
 
   // Queue badge replaces review count on food cards
   const queueBadge = isFoodCard && state.cozeData?.restaurant_queue > 0
-    ? `<span class="act-coze-queue" style="margin-bottom:6px">⏳ ${pickText("排队约","~","約","대기")}${state.cozeData.restaurant_queue}${pickText("分钟","min","分","분")}</span>`
+    ? `<span class="act-coze-queue act-coze-queue--meta">⏳ ${pickText("排队约","~","約","대기")}${state.cozeData.restaurant_queue}${pickText("分钟","min","分","분")}</span>`
     : "";
 
   const coverIcon = isFoodCard ? "🍜" : isStayFocus ? "🏨" : "✈️";
-  const aiAnalysis = escapeHtml((p.highlights || []).slice(0, 2).join(" · ").slice(0, 90));
+  const aiAnalysis = escapeHtml(_localizeVisibleTravelText((planIncludes.slice(0, 2).join(" · ") || p.transport_plan || "").slice(0, 120), ""));
   const statusBarId = `cx-sb-${cardId}-${idx}`;
   const cardCls = `cx-list-card${isRec ? " cx-list-card--rec" : ""}`;
 
@@ -8771,15 +10813,15 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
   const coverLabel  = escapeHtml(isFoodCard ? (p.name || p.restaurant_name || dest || "") : (dest || p.hotel?.name || ""));
   const coverHtml  = `<div class="cx-lc-img-cover">
        <span class="cx-cover-city">${coverLabel}</span>
-       <span style="font-size:20px">${coverIcon}</span>
+       <span class="cx-lc-cover-icon">${coverIcon}</span>
      </div>`;
   const imgHtml = heroUrl
     ? `<img class="cx-lc-img" src="${heroUrl}" alt="${coverLabel}" loading="lazy"
-         onerror="if(this.src!=='${fallbackUrl}'){this.src='${fallbackUrl}';}else{this.style.display='none';this.nextElementSibling.style.display='flex';}">`
-       + `<div class="cx-lc-img-cover" style="display:none">${coverHtml}</div>`
+         data-fallback-src="${fallbackUrl}" data-error-hide="1" data-error-show-next="1">`
+       + `<div class="cx-lc-img-cover hidden">${coverHtml}</div>`
     : `<img class="cx-lc-img" src="${fallbackUrl}" alt="${coverLabel}" loading="lazy"
-         onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
-       + `<div class="cx-lc-img-cover" style="display:none">${coverHtml}</div>`;
+         data-error-hide="1" data-error-show-next="1">`
+       + `<div class="cx-lc-img-cover hidden">${coverHtml}</div>`;
 
   // Mini timeline: food → label as 特色菜 / activity → Day N / default → Day N
   const hlList = (p.highlights || []).slice(0, 3);
@@ -8793,21 +10835,21 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
           <div class="cx-mt-dot"></div>
           <div class="cx-mt-line"></div>
           <span class="cx-mt-label">${timelineLabel(i)}</span>
-          <span class="cx-mt-text">${escapeHtml(h)}</span>
+          <span class="cx-mt-text">${escapeHtml(_localizeVisibleTravelText(h, pickText("Plan highlight", "Plan highlight", "プランの見どころ", "플랜 하이라이트")))}</span>
         </div>`).join("") +
       `</div>`
     : "";
 
   return `
   <div class="${cardCls}" data-plan-id="${escapeHtml(p.id || "")}" data-layout="${layoutType}"
-    onclick="openPlanDetail('${cardId}', ${idx})">
+    data-action="open-plan-detail" data-card-id="${escapeHtml(cardId)}" data-plan-idx="${idx}">
     <div class="cx-lc-img-wrap">
       ${imgHtml}
       ${isRec ? `<span class="cx-lc-badge">${pickText("AI 优选","AI Pick","AI おすすめ","AI 추천")}</span>` : ""}
     </div>
     <div class="cx-lc-body">
       <div class="cx-lc-top">
-        <span class="cx-lc-tag" style="color:${style.color}">${escapeHtml(p.tag || "")}</span>
+        <span class="cx-lc-tag cx-lc-tag--${tagTone}">${escapeHtml(_normalizePlanTag(p))}</span>
         <div class="cx-lc-price-col">
           <div class="cx-lc-price">${priceDisplay}</div>
           ${rawPrice > 0 && dur > 1 ? `<div class="cx-lc-perday">\u00A5${Math.round(rawPrice / dur).toLocaleString()}${pickText("\/\u5929","\/d","\/\u65E5","\/\uC77C")}</div>` : ""}
@@ -8817,62 +10859,116 @@ function _buildListCard(p, idx, cardId, dur, pax, dest) {
       <div class="cx-lc-hotel">${displayTitle}</div>
       <div class="cx-lc-meta">
         ${displayRating   ? `<span>★ ${displayRating}</span>` : ""}
-        ${displayRevCount ? `<span style="color:#9ca3af">${displayRevCount}</span>` : ""}
+        ${displayRevCount ? `<span class="cx-lc-review-count">${displayRevCount}</span>` : ""}
         ${queueBadge}
       </div>
+      ${planFacts.length ? `<div class="cx-lc-hotel-tags">${planFacts.map((fact) => `<span class="cx-ctrip-tag">${escapeHtml(fact)}</span>`).join("")}</div>` : ""}
+      ${displayHotelTags.length ? `<div class="cx-lc-hotel-tags">${displayHotelTags.slice(0, 3).map(t => `<span class="cx-ctrip-tag">${escapeHtml(t)}</span>`).join("")}</div>` : ""}
+      ${displayGuestRev ? `<div class="cx-lc-guest-rev">「${displayGuestRev}」</div>` : ""}
       ${miniTimeline}
+      ${planIncludes.length ? `<ul class="option-features option-features--spaced">${planIncludes.slice(0, 3).map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>` : ""}
       ${aiAnalysis ? `<div class="cx-lc-analysis">${aiAnalysis}</div>` : ""}
       <div class="cx-status-bar" id="${statusBarId}">
         <span class="cx-sb-icon">⏳</span>
         <span class="cx-sb-text">${pickText("正在加载优惠...","Loading offers...","特典を取得中...","혜택 로딩 중...")}</span>
       </div>
     </div>
-    <button class="cx-lc-cta cx-lc-cta--select" onclick="event.stopPropagation(); _planOptionSelect('${cardId}', ${idx})">
+    <button class="cx-lc-cta cx-lc-cta--select" data-action="plan-option-select" data-card-id="${escapeHtml(cardId)}" data-plan-idx="${idx}">
       ${pickText("选择此方案 →","Select Plan →","このプランを選ぶ →","이 플랜 선택 →")}
     </button>
   </div>`;
 }
 
 /**
- * refreshPlanCardLanguage — Re-renders plan card text in the new language
- * without destroying the DOM node (keeps coupon bar state, day-tab state etc.).
- * Called after every language switch when state.lastAiPlan is set.
+ * refreshPlanCardLanguage — Updates translated text IN-PLACE on existing plan cards.
+ *
+ * CRITICAL: Must NOT call renderCardData() — that function destroys and recreates
+ * the entire card (clearChatCards + addCard), which wipes map state, coupon state,
+ * day-tab state, and causes the "plan disappears on language switch" bug.
+ *
+ * Instead: patch only the text nodes that contain i18n strings, leaving all other
+ * DOM state (map canvas, initialized flags, active tabs, etc.) untouched.
  */
 function refreshPlanCardLanguage() {
-  const saved = state.lastAiPlan;
-  if (!saved?.cd?.plans?.length) return;
-  const cd = saved.cd;
-  const article = document.querySelector(".plan-card--v2");
-  if (!article) return;
-  const cardId = article.id;
-  const planList = article.querySelector(".cx-plan-list");
-  if (!planList) return;
+  const cd = state.lastAiPlan?.cd || state._lastCardData;
+  if (!cd) return; // No plan rendered yet — nothing to update
 
-  // Step 1: blur during swap so the text replacement is invisible
-  planList.classList.add("cx-smooth-refresh");
+  // Find all rendered plan cards in the chat feed
+  const planCards = el.chatFeed
+    ? [...el.chatFeed.querySelectorAll("article.plan-card")]
+    : [];
 
-  // Step 2: re-render cards with updated pickText values
-  const dur = cd.duration_days || 3;
-  const pax = cd.pax || 1;
-  planList.innerHTML = cd.plans.map((p, idx) => _buildListCard(p, idx, cardId, dur, pax, cd.destination || "")).join("");
-
-  // Step 3: update static labels inside article (section headers, disclaimer)
-  const headers = article.querySelectorAll(".plan-section-header");
-  if (headers[0]) headers[0].textContent = pickText("选择你的方案","Choose Your Plan","プランを選ぶ","플랜 선택");
-  const disc = article.querySelector(".payment-disclaimer");
-  if (disc) disc.textContent = pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "\u78ba\u8a8d\u3059\u308b\u3068 Cross X \u304c\u5168\u4e88\u7d04\u3092\u30ed\u30c3\u30af\u3057\u307e\u3059 \u00b7 \u624b\u6570\u6599\u306a\u3057", "\ud655\uc778\ud558\uba74 Cross X\uac00 \ubaa8\ub4e0 \uc608\uc57d\uc744 \uc78a\uae08\uc778\uc2b5\ub2c8\ub2e4 \u00b7 \uc218\uc218\ub8cc \uc5c6\uc74c");
-
-  // Step 4: unblur (double rAF ensures transition plays every time)
-  requestAnimationFrame(() => requestAnimationFrame(() => planList.classList.remove("cx-smooth-refresh")));
-
-  // Step 5: re-fetch coupon bars for re-rendered status bars
-  const dest = cd.destination || "";
-  if (dest) {
-    cd.plans.forEach((_, idx) => {
-      const barEl = planList.querySelector(`#cx-sb-${cardId}-${idx}`);
-      if (barEl && _couponCache.has(dest)) _applyCouponBar(barEl, _couponCache.get(dest));
-    });
+  if (!planCards.length) {
+    // No card in DOM yet (e.g. card was never rendered or was cleared by new session).
+    // Do NOT call renderCardData here — that would duplicate/destroy cards.
+    return;
   }
+
+  // Patch i18n strings in-place on each existing card
+  for (const card of planCards) {
+    // Title
+    const titleEl = card.querySelector(".plan-card-title");
+    if (titleEl && cd.title) {
+      titleEl.textContent = _localizeVisibleTravelText(cd.title, _fallbackPlanTitle(cd.destination || ""))
+        || pickText("定制方案对比", "Custom Plans", "カスタムプラン", "맞춤 플랜");
+    }
+
+    // Meta (duration/pax)
+    const metaEl = card.querySelector(".plan-card-meta");
+    if (metaEl && cd.destination) {
+      const dest = escapeHtml(_localizeUiCityName(cd.destination));
+      const dur = cd.duration_days || 3;
+      const pax = cd.pax || 1;
+      metaEl.innerHTML = `📍 ${dest ? dest + "  ·  " : ""}${dur}${pickText("天", "d", "日", "일")}${pax > 1 ? "  ·  " + pax + pickText("人", "pax", "名", "명") : ""}`;
+    }
+
+    // Spoken hero text
+    if (state.lastAiPlan?.spokenText) {
+      const spokenEl = card.querySelector(".cx-spoken-hero");
+      if (spokenEl) {
+        spokenEl.textContent = _localizeVisibleTravelText(
+          state.lastAiPlan.spokenText,
+          `Get ready for your trip in ${_localizeUiCityName(cd.destination || "")}!`
+        );
+      }
+    }
+
+    // Section headers
+    const recommendHdr = card.querySelector(".cx-section-header--recommend");
+    if (recommendHdr) {
+      recommendHdr.textContent = pickText("为你推荐", "Recommended for You", "あなたへのおすすめ", "추천 플랜");
+    }
+
+    // Update data-language attribute so downstream map/booking logic picks correct lang
+    card.dataset.language = state.uiLanguage || "ZH";
+
+    // Patch individual plan option labels inside plan list
+    const planItems = card.querySelectorAll("[data-plan-idx]");
+    if (planItems.length && Array.isArray(cd.plans)) {
+      planItems.forEach((item) => {
+        const idx = parseInt(item.dataset.planIdx, 10);
+        const plan = cd.plans[idx];
+        if (!plan) return;
+        const nameEl = item.querySelector(".plan-name, .cx-plan-name");
+        if (nameEl && plan.name) nameEl.textContent = _localizeVisibleTravelText(plan.name, plan.name);
+        const descEl = item.querySelector(".plan-desc, .cx-plan-desc");
+        if (descEl && plan.description) descEl.textContent = _localizeVisibleTravelText(plan.description, plan.description);
+      });
+    }
+  }
+}
+
+function flushPendingLanguageRefresh() {
+  if (!state._pendingLanguageRefresh || isAiBusy()) return;
+  state._pendingLanguageRefresh = false;
+  // Redraw session banner now that the AI is idle (was deferred during stream).
+  const sessionBanner = document.querySelector(".cx-scb-row");
+  if (sessionBanner) {
+    sessionBanner.remove();
+    _renderSessionContextBanner();
+  }
+  refreshPlanCardLanguage();
+  rerenderAgentFlowCards();
 }
 
 // ── card_data renderer — 3-plan comparison + day itinerary ────────────────
@@ -8887,7 +10983,7 @@ function renderCardData(cd, spokenText) {
   // ── 3-PLAN COMPARISON MODE ─────────────────────────────────────────────
   if (hasPlans) {
     const cardId = "plan-" + Math.random().toString(36).slice(2, 8);
-    const dest = escapeHtml(cd.destination || "");
+    const dest = escapeHtml(_localizeUiCityName(cd.destination || ""));
     const dur = cd.duration_days || 3;
     const pax = cd.pax || 1;
 
@@ -8899,30 +10995,41 @@ function renderCardData(cd, spokenText) {
       return bi >= 0 ? bi : Math.min(1, cd.plans.length - 1);
     })();
 
-    // 默认只渲染推荐方案；其余折叠，需点击展开
-    const recCard   = _buildListCard(cd.plans[_recIdx], _recIdx, cardId, dur, pax, cd.destination || "");
-    const otherCards = cd.plans
-      .filter((_, i) => i !== _recIdx)
-      .map((p, i) => {
-        const origIdx = cd.plans.indexOf(p);
-        return _buildListCard(p, origIdx, cardId, dur, pax, cd.destination || "");
-      }).join("");
-    const planCards = recCard +
-      (otherCards ? `
-        <div class="cx-plan-others" id="${cardId}-others" style="display:none">${otherCards}</div>
-        <button class="cx-plan-expand-btn" id="${cardId}-expand-btn"
-          onclick="_toggleOtherPlans('${cardId}')">
-          ${pickText("查看其他方案 ↓","See Other Plans ↓","他のプランを見る ↓","다른 플랜 보기 ↓")}
-        </button>` : "");
+    // Always show all plan options; keep the recommended one highlighted and pinned first.
+    const orderedPlans = [
+      ...cd.plans
+        .map((plan, idx) => ({ plan, idx }))
+        .filter(({ idx }) => idx === _recIdx),
+      ...cd.plans
+        .map((plan, idx) => ({ plan, idx }))
+        .filter(({ idx }) => idx !== _recIdx),
+    ];
+    const planCards = orderedPlans
+      .map(({ plan, idx }) => _buildListCard(plan, idx, cardId, dur, pax, cd.destination || ""))
+      .join("");
 
-    // AP-04: Data quality banner — warn for synthetic/mock; confirm for live Amap data
+    // AP-04: Data quality banner
     const qualityBanner = cd._dataQuality === "live"
       ? `<div class="cx-quality-banner cx-quality-banner--live"><span class="cx-quality-banner-icon">✅</span>${pickText(
-          "实时数据（高德地图）· 价格与可用性均来自实时接口",
-          "Live data (Amap) · Prices and availability from real-time APIs",
-          "リアルタイムデータ（高徳地図）· 実際の情報",
-          "실시간 데이터 (Amap) · 실시간 API 기반"
+          "实时旅行数据 · 酒店价格与可用性来自实时供应商",
+          "Live travel data · Hotel prices and availability come from real-time providers",
+          "リアルタイム旅行データ · ホテル価格と空室は実際の供給元に基づきます",
+          "실시간 여행 데이터 · 호텔 가격과 가능 여부는 실시간 공급원 기준입니다"
         )}</div>`
+      : cd._dataQuality === "ctrip_live_gated"
+        ? `<div class="cx-quality-banner cx-quality-banner--live"><span class="cx-quality-banner-icon">🏨</span>${pickText(
+            "酒店列表来自携程实时目录 · 未登录场景下房价可能受限，请点携程查看最新价格",
+            "Hotels come from Ctrip's live directory · Anonymous hotel rates may be gated, so open Ctrip for the latest price",
+            "ホテル一覧はCtripの最新ディレクトリから取得 · 未ログイン時の料金は制限される場合があります",
+            "호텔 목록은 씨트립 실시간 디렉터리 기반 · 비로그인 상태에서는 요금이 제한될 수 있습니다"
+          )}</div>`
+      : cd._dataQuality === "ctrip_curated"
+        ? `<div class="cx-quality-banner cx-quality-banner--live"><span class="cx-quality-banner-icon">🏨</span>${pickText(
+            "酒店来自携程精选数据 · 点击携程按钮查看实时价格",
+            "Hotels sourced from Ctrip directory · Tap Ctrip for live rates",
+            "携程から厳選したホテル · Ctripで最新価格を確認",
+            "씨트립 엄선 호텔 · 실시간 가격은 씨트립에서 확인"
+          )}</div>`
       : (cd._dataQuality === "synthetic" || cd._dataQuality === "mock")
         ? `<div class="cx-quality-banner"><span class="cx-quality-banner-icon">⚠️</span>${pickText(
             "当前数据来自模拟资源库，真实价格及可用性请出行前确认",
@@ -8939,10 +11046,10 @@ function renderCardData(cd, spokenText) {
       const _isMultiCity = (cd.days || []).some(d => d.city && d.city !== cd.destination);
       const dayTabsHtml = `<div class="plan-day-tabs" id="${cardId}-tabs">` +
         cd.days.map((d, i) => {
-          const cityBadge = _isMultiCity && d.city ? `<span class="day-tab-city">${escapeHtml(d.city)}</span>` : "";
-          return `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})">Day ${d.day}${cityBadge}</button>`;
+          const cityBadge = _isMultiCity && d.city ? `<span class="day-tab-city">${escapeHtml(_localizeUiCityName(d.city))}</span>` : "";
+          return `<button class="day-tab${i === 0 ? " active" : ""}" data-action="switch-plan-day" data-card-id="${escapeHtml(cardId)}" data-day="${i}">${pickText(`第${d.day}天`, `Day ${d.day}`, `${d.day}日目`, `${d.day}일차`)}${cityBadge}</button>`;
         }).join("") +
-        `<button class="day-tab" data-day="map" onclick="switchPlanDay('${cardId}','map')">🗺 地图</button>` +
+        `<button class="day-tab" data-action="switch-plan-day" data-card-id="${escapeHtml(cardId)}" data-day="map">🗺 ${pickText("地图","Map","地図","지도")}</button>` +
         "</div>";
 
       const _mapPanelHtml1 = _buildMapPanelHtml(cardId, cd.destination, cd.days);
@@ -8951,8 +11058,46 @@ function renderCardData(cd, spokenText) {
         const icHtml = _buildIntercityHtml(d.intercity_transport);
         const _dayCity  = d.city || cd.destination || "";
         const _dayHotel = d.hotel?.name || "";
-        const activities = (d.activities || []).map((act) => {
+        const activitySource = Array.isArray(d.activities) && d.activities.length
+          ? d.activities
+          : (() => {
+              const fallback = [];
+              if (d.intercity_transport && d.intercity_transport.detail) {
+                fallback.push({
+                  type: "transport",
+                  name: pickText("Arrival transfer", "Arrival transfer", "到着移動", "도착 이동"),
+                  note: d.intercity_transport.detail,
+                  cost: d.intercity_transport.price_cny || 0,
+                  time: d.intercity_transport.departure_time || "",
+                });
+              }
+              if (d.hotel?.name) {
+                fallback.push({
+                  type: "hotel",
+                  name: d.hotel.name,
+                  note: d.hotel.tip || _derivePlanReviewText({ hotel: d.hotel }),
+                  cost_cny: d.hotel.cost_cny || 0,
+                });
+              }
+              (Array.isArray(cd.plans) ? _derivePlanIncludes(cd.plans.find((plan) => plan.is_recommended) || cd.plans[0] || {}) : [])
+                .slice(0, 2)
+                .forEach((line, idx) => fallback.push({
+                  type: "activity",
+                  name: pickText(`Plan highlight ${idx + 1}`, `Plan highlight ${idx + 1}`, `プランの見どころ ${idx + 1}`, `플랜 하이라이트 ${idx + 1}`),
+                  note: line,
+                }));
+              return fallback;
+            })();
+        const activities = activitySource.map((act) => {
           const cfg = ACT_TYPE_CONFIG[act.type] || ACT_TYPE_CONFIG.default;
+          const isTransportRow = /^(transport|city_change)$/i.test(act.type || "");
+          const fallbackActName = isTransportRow
+            ? pickText("交通安排", "Transport leg", "移動", "교통")
+            : pickText(`Plan highlight ${di + 1}`, `Plan highlight ${di + 1}`, `プランの見どころ ${di + 1}`, `플랜 하이라이트 ${di + 1}`);
+          const localizedActName = _localizeVisibleTravelText(act.name || "", fallbackActName);
+          const localizedActNote = _localizeVisibleTravelText(act.desc || act.note || "", "");
+          const localizedVibe2 = _localizeVisibleTravelText(act.real_vibe || act.real_vibes || "", "");
+          const localizedTip2 = _localizeVisibleTravelText(act.insider_tip || act.insider_tips || "", "");
           const actImgSrc = act.image_url || act.real_photo_url || _actFallbackImg(act);
           const costRaw = act.cost_cny || act.cost || 0;
           const costFmt = costRaw > 0 ? `¥${Number(costRaw).toLocaleString()}` : pickText("免费","Free","無料","무료");
@@ -8971,9 +11116,8 @@ function renderCardData(cd, spokenText) {
           const cozeTicket = isSight && state.cozeData?.ticket_availability
             ? `<span class="act-coze-ticket">🟢 ${pickText("有票·可代订","Tickets available","チケットあり","티켓 가능")}</span>` : "";
           // Local nav strip (skip transport/city_change rows)
-          const isTransportRow = /^(transport|city_change)$/i.test(act.type || "");
           const localNavHtml = (!isTransportRow && _dayCity && act.name)
-            ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
+            ? `<div class="act-local-nav act-local-nav--loading" data-action="fetch-local-nav"
                 data-city="${escapeHtml(_dayCity)}" data-hotel="${escapeHtml(_dayHotel)}" data-place="${escapeHtml(act.name)}">
                 <span class="act-local-nav-label">📍 ${pickText("导航","Navigate","ナビ","내비")}</span>
                 <span class="act-local-nav-modes">${pickText("点击查看","Tap to view","タップして確認","탭하여 확인")}</span>
@@ -8981,26 +11125,29 @@ function renderCardData(cd, spokenText) {
           return `${transitHtml}
             <div class="act-row">
               <div class="act-drag-handle">\u22EE</div>
-              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.src='${isFood?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}'">
+              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" data-fallback-src="${isFood?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}">
               <div class="act-body">
-                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._verified ? '<span class="cx-verified-badge" title="已通过数据源验证">✓</span>' : ''}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue}${cozeTicket}</div>
-                ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
+                    <div class="act-name">${timeBadge}${_buildActIcon(act.type, cfg.icon)}${escapeHtml(localizedActName)}${act._verified ? `<span class="cx-verified-badge" title="${pickText('已通过数据源验证','Verified by data source','データソース検証済み','데이터 검증됨')}">✓</span>` : ''}${act._unverified ? `<span class="cx-unverified-badge" title="${pickText('AI生成，未经实地验证','AI-generated, unverified','AI生成、未検証','AI 생성, 미검증')}">⚠</span>` : ''}${cozeQueue}${cozeTicket}</div>
+                ${localizedActNote ? `<div class="act-note">${escapeHtml(localizedActNote)}</div>` : ""}
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
-                ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
-                ${(act.insider_tip||act.insider_tips) ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip||act.insider_tips)}</div>` : ""}
+                ${localizedVibe2 ? `<div class="act-vibes">"${escapeHtml(localizedVibe2)}"</div>` : ""}
+                ${localizedTip2 ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(localizedTip2)}</div>` : ""}
                 ${localNavHtml}
-                ${act.platform_links ? _renderPlatformLinks(act.platform_links, act.type) : ""}
+                ${act.platform_links ? _renderPlatformLinks(act.platform_links, act.type, d.intercity_transport || null) : ""}
               </div>
               <span class="act-cost${costCls}">${costFmt}</span>
-              <button class="act-delete-btn" onclick="deleteActivity(this)" title="删除">✕</button>
+              <button class="act-delete-btn" data-action="delete-activity" title="${pickText('删除','Delete','削除','삭제')}">✕</button>
             </div>`;
         }).join("");
         const hotelHtml = d.hotel ? (() => {
           const h = d.hotel;
           const hc = h.cost_cny > 0 ? `<span class="act-hotel-cost">¥${Number(h.cost_cny).toLocaleString()}${pickText("/晚","/night","/泊","/박")}</span>` : "";
-          const bookBtn = h.name ? `<button class="cx-hotel-book-btn" onclick="_handleBooking(${JSON.stringify(h.name||'')},${JSON.stringify(h.external_id||'')})">🏨 ${pickText("立即预订","Book Now","今すぐ予約","지금 예약")}</button>` : "";
+          const bookBtn = h.name ? `<button class="cx-hotel-book-btn" data-action="book-item" data-name="${escapeHtml(h.name || "")}" data-external-id="${escapeHtml(h.external_id || "")}">🏨 ${pickText("立即预订","Book Now","今すぐ予約","지금 예약")}</button>` : "";
           const hotelPlatformLinks = h.platform_links ? _renderPlatformLinks(h.platform_links, "hotel") : "";
-          return `<div class="act-hotel-card"><div class="act-hotel-header"><span>🏨</span><span class="act-hotel-name">${escapeHtml(h.name||"")}</span>${h.type?`<span class="act-hotel-type">${escapeHtml(h.type)}</span>`:""} ${hc}</div>${h.area?`<div class="act-hotel-area">📍 ${escapeHtml(h.area)}</div>`:""}${h.tip?`<div class="act-hotel-tip">💡 ${escapeHtml(h.tip)}</div>`:""}${bookBtn}${hotelPlatformLinks}</div>`;
+          const hotelName = _localizeVisibleTravelText(h.name || "", `${_localizeUiCityName(cd.destination || _dayCity || "")} ${pickText("优选酒店", "Selected hotel", "おすすめホテル", "추천 호텔")}`);
+          const hotelArea = _localizeVisibleTravelText(h.area || "", "");
+          const hotelTip = _localizeVisibleTravelText(h.tip || "", "");
+          return `<div class="act-hotel-card"><div class="act-hotel-header"><span>🏨</span><span class="act-hotel-name">${escapeHtml(hotelName)}</span>${h.type?`<span class="act-hotel-type">${escapeHtml(_localizeVisibleTravelText(h.type, h.type))}</span>`:""} ${hc}</div>${hotelArea?`<div class="act-hotel-area">📍 ${escapeHtml(hotelArea)}</div>`:""}${hotelTip?`<div class="act-hotel-tip">💡 ${escapeHtml(hotelTip)}</div>`:""}${bookBtn}${hotelPlatformLinks}</div>`;
         })() : "";
         const budgetHtml = d.day_budget ? (() => {
           const b = d.day_budget;
@@ -9008,13 +11155,13 @@ function renderCardData(cd, spokenText) {
           return `<div class="act-day-budget"><div class="act-day-budget-items">${parts}</div>${b.total>0?`<div class="act-day-budget-total">${pickText("合计","Total","合計","합계")} ¥${b.total}</div>`:""}</div>`;
         })() : "";
         return `<div class="plan-day-panel${di === 0 ? " active" : ""}" data-panel="${di}" id="${cardId}-panel-${di}">
-          <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
+          <div class="day-panel-label"><span>${escapeHtml(_localizeVisibleTravelText(d.label || "", pickText(`第${d.day}天`, `Day ${d.day}`, `${d.day}日目`, `${d.day}일차`)))}</span><button class="cx-edit-toggle" data-action="toggle-day-edit" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
           ${icHtml}<div class="day-activities">${activities}</div>${hotelHtml}${budgetHtml}
         </div>`;
       }).join("");
 
       const arrivalNote = cd.arrival_note
-        ? `<div class="arrival-banner">✈️ ${escapeHtml(cd.arrival_note)}</div>`
+        ? `<div class="arrival-banner">✈️ ${escapeHtml(_localizeVisibleTravelText(cd.arrival_note, `Welcome to ${_localizeUiCityName(cd.destination || "")}!`))}</div>`
         : "";
 
       dayItineraryHtml = `
@@ -9028,7 +11175,7 @@ function renderCardData(cd, spokenText) {
     } else if (hasPlans) {
       // Summary mode: days will be fetched on demand when user clicks "查看逐日行程"
       dayItineraryHtml = `
-        <div class="plan-itinerary-section plan-itinerary-section--pending" style="display:none" id="${cardId}-itinerary-pending">
+        <div class="plan-itinerary-section plan-itinerary-section--pending hidden" id="${cardId}-itinerary-pending">
           <div class="plan-section-header">${pickText("逐日行程","Day-by-Day Itinerary","日程表","일정표")}</div>
           <div class="plan-detail-loading">
             <div class="plan-detail-spinner"></div>
@@ -9041,6 +11188,7 @@ function renderCardData(cd, spokenText) {
     addCard(`
       <article class="card smart-reply-card plan-card plan-card--v2" id="${cardId}"
         data-plans="${escapeHtml(JSON.stringify(cd.plans || []))}"
+        data-days="${escapeHtml(JSON.stringify(cd.days || []))}"
         data-destination="${escapeHtml(cd.destination || "")}"
         data-duration="${cd.duration_days || 3}"
         data-message="${escapeHtml(state.lastPlanMessage || "")}"
@@ -9051,16 +11199,16 @@ function renderCardData(cd, spokenText) {
         <div class="plan-card-hero">
           <img class="plan-card-hero-img" src="${_getCityHeroUrl(cd.destination || "")}"
             alt="${escapeHtml(cd.destination || "")}" loading="lazy"
-            onerror="this.style.opacity='0'">
+            data-error-opacity-zero="1">
           <div class="plan-card-hero-overlay">
-            <h3 class="plan-card-title">${escapeHtml(cd.title || pickText("定制方案对比","Custom Plans","カスタムプラン","맞춤 플랜"))}</h3>
+            <h3 class="plan-card-title">${escapeHtml(_localizeVisibleTravelText(cd.title || "", _fallbackPlanTitle(cd.destination || "")) || pickText("定制方案对比","Custom Plans","カスタムプラン","맞춤 플랜"))}</h3>
             ${dest || dur ? `<div class="plan-card-meta">📍 ${dest ? dest + "  ·  " : ""}${dur}${pickText("天","d","日","일")}${pax > 1 ? "  ·  " + pax + pickText("人","pax","名","명") : ""}</div>` : ""}
             <button class="cx-fav-btn" title="${pickText("收藏","Save","お気に入り","저장")}"
-              onclick="_toggleFavorite('${cardId}',${JSON.stringify(cd.destination||"")},${JSON.stringify(cd.title||cd.destination||"")},${dur},${pax})">${(state.favorites||[]).some(f=>f.destination===(cd.destination||"")) ? "\u2665" : "\u2661"}</button>
+              data-action="toggle-favorite" data-card-id="${escapeHtml(cardId)}" data-destination="${escapeHtml(cd.destination || "")}" data-title="${escapeHtml(cd.title || cd.destination || "")}" data-dur="${dur}" data-pax="${pax}">${(state.favorites||[]).some(f=>f.destination===(cd.destination||"")) ? "\u2665" : "\u2661"}</button>
           </div>
         </div>
-        <div id="${cardId}-weather" class="cx-weather-strip cx-weather-strip--loading">⏳ 正在获取天气预报...</div>
-        ${spokenText ? `<div class="cx-spoken-hero" id="${cardId}-spoken">${escapeHtml(spokenText)}</div>` : ""}
+        <div id="${cardId}-weather" class="cx-weather-strip cx-weather-strip--loading">${pickText("⏳ 正在获取天气预报...", "⏳ Loading weather...", "⏳ 天気予報を取得中...", "⏳ 날씨 정보 로딩 중...")}</div>
+        ${spokenText ? `<div class="cx-spoken-hero" id="${cardId}-spoken">${escapeHtml(_localizeVisibleTravelText(spokenText, `Get ready for your trip in ${_localizeUiCityName(cd.destination || "")}!`))}</div>` : ""}
         ${qualityBanner}
         <div class="plan-section-header cx-section-header--recommend">
           ${pickText("为你推荐","Recommended for You","あなたへのおすすめ","추천 플랜")}
@@ -9071,10 +11219,10 @@ function renderCardData(cd, spokenText) {
         ${_buildRatingBar(cardId, cd)}
         <div class="cx-sbar-mount" id="cx-sbar-mount-${cardId}"></div>
         <div class="cx-plan-action-bar">
-          <button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 ${pickText("分享行程", "Share","共有", "공유", "Bagikan")}</button>
-          <button class="cx-hist-btn" onclick="openPlanHistory('${cardId}')">📋 ${pickText("改稿历史", "History","改稿履歴", "수정 이력")}</button>
-          <button class="cx-invite-btn" onclick="sharePlanInvite('${cardId}')">👥 ${pickText("邀请同行", "Invite","同行者を招待", "동행자 초대")}</button>
-          <button class="cx-save-trip-btn" onclick="_saveItineraryToTrips('${cardId}')">💾 ${pickText("保存到行程", "Save to Trips","旅程に保存", "트립에 저장", "Simpan ke Trips", "حفظ في الرحلات")}</button>
+          <button class="cx-share-btn" data-action="open-share-card" data-card-id="${escapeHtml(cardId)}">\ud83d\udce4 ${pickText("分享行程", "Share","共有", "공유", "Bagikan")}</button>
+          <button class="cx-hist-btn" data-action="open-plan-history" data-card-id="${escapeHtml(cardId)}">📋 ${pickText("改稿历史", "History","改稿履歴", "수정 이력")}</button>
+          <button class="cx-invite-btn" data-action="share-plan-invite" data-card-id="${escapeHtml(cardId)}">👥 ${pickText("邀请同行", "Invite","同行者を招待", "동행자 초대")}</button>
+          <button class="cx-save-trip-btn" data-action="save-itinerary-to-trips" data-card-id="${escapeHtml(cardId)}">💾 ${pickText("保存到行程", "Save to Trips","旅程に保存", "트립에 저장", "Simpan ke Trips", "حفظ في الرحلات")}</button>
         </div>
         <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "\u78ba\u8a8d\u3059\u308b\u3068 Cross X \u304c\u5168\u4e88\u7d04\u3092\u30ed\u30c3\u30af\u3057\u307e\u3059 \u00b7 \u624b\u6570\u6599\u306a\u3057", "\ud655\uc778\ud558\uba74 Cross X\uac00 \ubaa8\ub4e0 \uc608\uc57d\uc744 \uc78a\uae08\uc778\uc2b5\ub2c8\ub2e4 \u00b7 \uc218\uc218\ub8cc \uc5c6\uc74c")}</p>
       </article>
@@ -9125,7 +11273,7 @@ function renderCardData(cd, spokenText) {
 
   // ── LEGACY MODE: single plan with days[] or items[] ────────────────────
   const total = Number(cd.total_price || 0);
-  const totalFmt = total.toLocaleString();
+  const totalFmt = fmtCNY(total);
   const tags = Array.isArray(cd.tags) ? cd.tags.map((t) => `<span class="plan-tag">${escapeHtml(t)}</span>`).join("") : "";
 
   const tripMeta = [
@@ -9143,12 +11291,12 @@ function renderCardData(cd, spokenText) {
     const _hBookHtml = _buildBookBtnHtml(h.name, h.external_id);
     hotelHtml = `
       <div class="plan-hotel-strip">
-        <img class="plan-hotel-img" src="${_getCityHeroUrl(cd.destination || h.name || "")}" alt="${escapeHtml(h.name)}" loading="lazy" onerror="this.src='/assets/solution-travel.svg'">
+        <img class="plan-hotel-img" src="${_getCityHeroUrl(cd.destination || h.name || "")}" alt="${escapeHtml(h.name)}" loading="lazy" data-fallback-src="/assets/solution-travel.svg">
         <div class="plan-hotel-info">
           <div class="plan-hotel-name">${escapeHtml(h.name)}</div>
           <div class="plan-hotel-meta">${escapeHtml(h.type || "")}${h.price_per_night ? ` · ${formatCNY(h.price_per_night)}/${pickText("晚","night","泊","박")}` : ""}${cd.duration_days ? ` · ${cd.duration_days}${pickText("晚","nights","泊","박")}` : ""}</div>
         </div>
-        <span class="plan-hotel-price">¥${hotelTotalFmt}</span>
+        <span class="plan-hotel-price">${fmtCNY(h.total || 0)}</span>
       </div>
       ${_hBookHtml}`;
   }
@@ -9164,9 +11312,9 @@ function renderCardData(cd, spokenText) {
     dayTabsHtml = `<div class="plan-day-tabs" id="${cardId}-tabs">` +
       cd.days.map((d, i) => {
         const cityBadge2 = _isMultiCity2 && d.city ? `<span class="day-tab-city">${escapeHtml(d.city)}</span>` : "";
-        return `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})" data-day="${i}">Day ${d.day}${cityBadge2}</button>`;
+        return `<button class="day-tab${i === 0 ? " active" : ""}" data-action="switch-plan-day" data-card-id="${escapeHtml(cardId)}" data-day="${i}">${pickText(`第${d.day}天`, `Day ${d.day}`, `${d.day}日目`, `${d.day}일차`)}${cityBadge2}</button>`;
       }).join("") +
-      `<button class="day-tab" data-day="map" onclick="switchPlanDay('${cardId}','map')">🗺 地图</button>` +
+      `<button class="day-tab" data-action="switch-plan-day" data-card-id="${escapeHtml(cardId)}" data-day="map">🗺 ${pickText("地图", "Map", "地図", "지도")}</button>` +
       `</div>`;
 
     _mapPanelHtml2 = _buildMapPanelHtml(cardId, cd.destination, cd.days);
@@ -9183,8 +11331,13 @@ function renderCardData(cd, spokenText) {
         const costCls  = costRaw === 0 ? " act-cost--free" : "";
         const mins = act.duration_min || 0;
         const durFmt = mins > 0 ? (mins >= 60 ? `${Math.floor(mins/60)}h${mins%60?""+mins%60+"m":""}` : `${mins}m`) : "";
-        const transitHtml = act.transport_to
-          ? `<div class="act-transit"><span>🗺</span>${escapeHtml(act.transport_to)}</div>` : "";
+        const localizedActName2 = _localizeVisibleTravelText(act.name || "", act.name || "");
+        const localizedActNote2 = _localizeVisibleTravelText(act.desc || act.note || "", "");
+        const localizedTransit2 = _localizeVisibleTravelText(act.transport_to || "", act.transport_to || "");
+        const localizedVibe2 = _localizeVisibleTravelText(act.real_vibe || act.real_vibes || "", "");
+        const localizedTip2 = _localizeVisibleTravelText(act.insider_tip || act.insider_tips || "", "");
+        const transitHtml = localizedTransit2
+          ? `<div class="act-transit"><span>🗺</span>${escapeHtml(localizedTransit2)}</div>` : "";
         const timeBadge = act.time ? `<span class="act-time-badge">${escapeHtml(act.time)}</span>` : "";
         const isFood2 = /food|restaurant|eat|meal|lunch|dinner|breakfast/i.test(act.type||"") || act.type === "food";
         const isSight2 = /sight|attraction|museum|temple|park|activity/i.test(act.type||"") || act.type === "sightseeing";
@@ -9194,7 +11347,7 @@ function renderCardData(cd, spokenText) {
           ? `<span class="act-coze-ticket">🟢 ${pickText("有票·可代订","Tickets available","チケットあり","티켓 가능")}</span>` : "";
         const isTransportRow2 = /^(transport|city_change)$/i.test(act.type || "");
         const localNavHtml2 = (!isTransportRow2 && _dayCity2 && act.name)
-          ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
+          ? `<div class="act-local-nav act-local-nav--loading" data-action="fetch-local-nav"
               data-city="${escapeHtml(_dayCity2)}" data-hotel="${escapeHtml(_dayHotel2)}" data-place="${escapeHtml(act.name)}">
               <span class="act-local-nav-label">📍 ${pickText("导航","Navigate","ナビ","내비")}</span>
               <span class="act-local-nav-modes">${pickText("点击查看","Tap to view","タップして確認","탭하여 확인")}</span>
@@ -9202,25 +11355,23 @@ function renderCardData(cd, spokenText) {
         return `${transitHtml}
           <div class="act-row">
             <div class="act-drag-handle">\u22EE</div>
-            <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.src='${isFood2?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}'">
+            <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" data-fallback-src="${isFood2?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}">
             <div class="act-body">
-              <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._verified ? '<span class="cx-verified-badge" title="已通过数据源验证">✓</span>' : ''}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue2}${cozeTicket2}</div>
-              ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
+              <div class="act-name">${timeBadge}${_buildActIcon(act.type, cfg.icon)}${escapeHtml(localizedActName2)}${act._verified ? `<span class="cx-verified-badge" title="${pickText('已通过数据源验证','Verified by data source','データソース検証済み','데이터 검증됨')}">✓</span>` : ''}${act._unverified ? `<span class="cx-unverified-badge" title="${pickText('AI生成，未经实地验证','AI-generated, unverified','AI生成、未検証','AI 생성, 미검증')}">⚠</span>` : ''}${cozeQueue2}${cozeTicket2}</div>
+              ${localizedActNote2 ? `<div class="act-note">${escapeHtml(localizedActNote2)}</div>` : ""}
               ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
-              ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
-              ${(act.insider_tip||act.insider_tips) ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip||act.insider_tips)}</div>` : ""}
+              ${localizedVibe2 ? `<div class="act-vibes">"${escapeHtml(localizedVibe2)}"</div>` : ""}
+              ${localizedTip2 ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(localizedTip2)}</div>` : ""}
               ${localNavHtml2}
             </div>
             <span class="act-cost${costCls}">${costFmt}</span>
-            <button class="act-delete-btn" onclick="deleteActivity(this)" title="删除">✕</button>
+            <button class="act-delete-btn" data-action="delete-activity" title="${pickText('删除','Delete','削除','삭제')}">✕</button>
           </div>`;
       }).join("");
       const _hotelHtml2 = d.hotel ? (() => {
         const h = d.hotel;
         const hc = h.cost_cny > 0 ? `<span class="act-hotel-cost">¥${Number(h.cost_cny).toLocaleString()}${pickText("/晚","/night","/泊","/박")}</span>` : "";
-        const _hbn2 = escapeHtml(h.name||"").replace(/'/g,"\\'");
-        const _hbi2 = escapeHtml(h.external_id||"").replace(/'/g,"\\'");
-        const bookBtn2 = h.name ? `<button class="cx-hotel-book-btn" onclick="_handleBooking('${_hbn2}','${_hbi2}')">🏨 ${pickText("立即预订","Book Now","今すぐ予約","지금 예약")}</button>` : "";
+        const bookBtn2 = h.name ? `<button class="cx-hotel-book-btn" data-action="book-item" data-name="${escapeHtml(h.name || "")}" data-external-id="${escapeHtml(h.external_id || "")}">🏨 ${pickText("立即预订","Book Now","今すぐ予約","지금 예약")}</button>` : "";
         return `<div class="act-hotel-card"><div class="act-hotel-header"><span>🏨</span><span class="act-hotel-name">${escapeHtml(h.name||"")}</span>${h.type?`<span class="act-hotel-type">${escapeHtml(h.type)}</span>`:""} ${hc}</div>${h.area?`<div class="act-hotel-area">📍 ${escapeHtml(h.area)}</div>`:""}${h.tip?`<div class="act-hotel-tip">💡 ${escapeHtml(h.tip)}</div>`:""}${bookBtn2}</div>`;
       })() : "";
       const _budgetHtml2 = d.day_budget ? (() => {
@@ -9229,7 +11380,7 @@ function renderCardData(cd, spokenText) {
         return `<div class="act-day-budget"><div class="act-day-budget-items">${parts}</div>${b.total>0?`<div class="act-day-budget-total">${pickText("合计","Total","合計","합계")} ¥${b.total}</div>`:""}</div>`;
       })() : "";
       return `<div class="plan-day-panel${di === 0 ? " active" : ""}" data-panel="${di}" id="${cardId}-panel-${di}">
-        <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
+        <div class="day-panel-label"><span>${escapeHtml(d.label || pickText(`第${d.day}天`, `Day ${d.day}`, `${d.day}日目`, `${d.day}일차`))}</span><button class="cx-edit-toggle" data-action="toggle-day-edit" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
         ${_icHtml2}<div class="day-activities">${activities}</div>${_hotelHtml2}${_budgetHtml2}
       </div>`;
     }).join("");
@@ -9242,7 +11393,7 @@ function renderCardData(cd, spokenText) {
       const itemImgSrc = item.image_url || item.real_photo_url || _actFallbackImg(item);
       const priceFmt = Number(item.price || 0).toLocaleString();
       return `<div class="cd-item-row">
-        <img class="cd-item-img" src="${itemImgSrc}" alt="${escapeHtml(item.name || "")}" loading="lazy" onerror="this.src='/assets/solution-eat.svg'">
+        <img class="cd-item-img" src="${itemImgSrc}" alt="${escapeHtml(item.name || "")}" loading="lazy" data-fallback-src="/assets/solution-eat.svg">
         <div class="cd-item-body">
           <div class="cd-item-name">${escapeHtml(item.name || "")}</div>
           <div class="cd-item-desc">${escapeHtml(item.description || "")}</div>
@@ -9261,17 +11412,12 @@ function renderCardData(cd, spokenText) {
     { label: pickText("活动","Activities","アクティビティ","활동"), key: "activities", color: "#8b5cf6" },
     { label: pickText("杂项","Misc.","その他","기타"), key: "misc", color: "#94a3b8" },
   ].filter((e) => bb[e.key] > 0);
-  const bbTotal = bbEntries.reduce((s, e) => s + (bb[e.key] || 0), 0) || 1;
-  const budgetBar = bbEntries.map((e) => {
-    const pct = Math.max(4, Math.round(bb[e.key] / bbTotal * 100));
-    return `<div class="bb-seg" style="width:${pct}%;background:${e.color}" title="${e.label} ¥${Number(bb[e.key]).toLocaleString()}"></div>`;
-  }).join("");
   const budgetLegend = bbEntries.map((e) =>
-    `<span class="bb-legend-item"><span class="bb-dot" style="background:${e.color}"></span>${e.label} ¥${Number(bb[e.key]).toLocaleString()}</span>`
+    `<span class="bb-legend-item"><span class="bb-dot bb-dot--${escapeHtml(e.key)}"></span>${e.label} ${fmtCNY(bb[e.key])}</span>`
   ).join("");
 
   const btn = cd.action_button || {};
-  const btnText = btn.text || `${pickText("确认方案 · 开始预订","Confirm & Book","プランを確認・予約","플랜 확인 · 예약")} ¥${totalFmt}`;
+  const btnText = btn.text || `${pickText("确认方案 · 开始预订","Confirm & Book","プランを確認・予約","플랜 확인 · 예약")} ${totalFmt}`;
   const btnPayload = JSON.stringify(btn.payload || {});
 
   const arrivalNote = cd.arrival_note
@@ -9281,11 +11427,25 @@ function renderCardData(cd, spokenText) {
   // AP-04: quality banner for legacy single-plan card
   const legacyQualityBanner = cd._dataQuality === "live"
     ? `<div class="cx-quality-banner cx-quality-banner--live"><span class="cx-quality-banner-icon">✅</span>${pickText(
-        "实时数据（高德地图）· 价格与可用性均来自实时接口",
-        "Live data (Amap) · Prices and availability from real-time APIs",
-        "リアルタイムデータ（高徳地図）· 実際の情報",
-        "실시간 데이터 (Amap) · 실시간 API 기반"
+        "实时旅行数据 · 酒店价格与可用性来自实时供应商",
+        "Live travel data · Hotel prices and availability come from real-time providers",
+        "リアルタイム旅行データ · ホテル価格と空室は実際の供給元に基づきます",
+        "실시간 여행 데이터 · 호텔 가격과 가능 여부는 실시간 공급원 기준입니다"
       )}</div>`
+    : cd._dataQuality === "ctrip_live_gated"
+      ? `<div class="cx-quality-banner cx-quality-banner--live"><span class="cx-quality-banner-icon">🏨</span>${pickText(
+          "酒店列表来自携程实时目录 · 未登录场景下房价可能受限，请点携程查看最新价格",
+          "Hotels come from Ctrip's live directory · Anonymous hotel rates may be gated, so open Ctrip for the latest price",
+          "ホテル一覧はCtripの最新ディレクトリから取得 · 未ログイン時の料金は制限される場合があります",
+          "호텔 목록은 씨트립 실시간 디렉터리 기반 · 비로그인 상태에서는 요금이 제한될 수 있습니다"
+        )}</div>`
+    : cd._dataQuality === "ctrip_curated"
+      ? `<div class="cx-quality-banner cx-quality-banner--live"><span class="cx-quality-banner-icon">🏨</span>${pickText(
+          "酒店来自携程精选数据 · 点击携程按钮查看实时价格",
+          "Hotels sourced from Ctrip directory · Tap Ctrip for live rates",
+          "携程から厳選したホテル · Ctripで最新価格を確認",
+          "씨트립 엄선 호텔 · 실시간 가격은 씨트립에서 확인"
+        )}</div>`
     : (cd._dataQuality === "synthetic" || cd._dataQuality === "mock")
       ? `<div class="cx-quality-banner"><span class="cx-quality-banner-icon">⚠️</span>${pickText(
           "当前数据来自模拟资源库，真实价格及可用性请出行前确认",
@@ -9305,7 +11465,7 @@ function renderCardData(cd, spokenText) {
         </div>
         <div class="plan-total-price">
           <span class="price-label">${pickText("总计","Total","合計","합계")}</span>
-          <span class="price-amount">¥${escapeHtml(totalFmt)}</span>
+          <span class="price-amount">${escapeHtml(totalFmt)}</span>
         </div>
       </div>
       ${tags ? `<div class="plan-tags">${tags}</div>` : ""}
@@ -9323,14 +11483,12 @@ function renderCardData(cd, spokenText) {
       ${dayTabsHtml}
       ${dayPanelsHtml}
       ${_mapPanelHtml2}
-      ${budgetBar ? `<div class="budget-breakdown-bar">${budgetBar}</div>
-      <div class="bb-legend">${budgetLegend}</div>` : ""}
+      ${budgetLegend ? `<div class="bb-legend">${budgetLegend}</div>` : ""}
       <button class="payment-confirm-btn"
-        data-payload="${escapeHtml(btnPayload)}"
-        onclick="handleCardPaymentConfirm(this)">
-        ${pickText("确认行程 · 开始预订","Confirm & Book","行程を確認・予約","여정 확인 · 예약")} ¥${escapeHtml(totalFmt)}
+        data-action="card-payment-confirm" data-payload="${escapeHtml(btnPayload)}">
+        ${pickText("确认行程 · 开始预订","Confirm & Book","行程を確認・予約","여정 확인 · 예약")} ${escapeHtml(totalFmt)}
       </button>
-      <div style="text-align:center;margin:8px 0 2px"><button class="cx-share-btn" onclick="openShareCard('${cardId}')">\ud83d\udce4 \u5206\u4eab\u884c\u7a0b</button></div>
+      <div class="cx-share-row"><button class="cx-share-btn" data-action="open-share-card" data-card-id="${escapeHtml(cardId)}">📤 ${pickText("分享行程", "Share", "共有", "공유")}</button></div>
       <p class="payment-disclaimer">${pickText("确认后 Cross X 为您锁定资源并安排预订 · 不收取手续费", "Confirm to lock all bookings · No service fee", "\u78ba\u8a8d\u3059\u308b\u3068 Cross X \u304c\u5168\u4e88\u7d04\u3092\u30ed\u30c3\u30af\u3057\u307e\u3059 \u00b7 \u624b\u6570\u6599\u306a\u3057", "\ud655\uc778\ud558\uba74 Cross X\uac00 \ubaa8\ub4e0 \uc608\uc57d\uc744 \uc78a\uae08\uc778\uc2b5\ub2c8\ub2e4 \u00b7 \uc218\uc218\ub8cc \uc5c6\uc74c")}</p>
     </article>
   `);
@@ -9357,7 +11515,7 @@ function _recordPlanVersion(cardId, cd, spokenText) {
 
 function openPlanHistory(cardId) {
   const versions = _planVersionHistory.get(cardId) || [];
-  if (versions.length < 2) { showToast("暂无历史版本"); return; }
+  if (versions.length < 2) { showToast(pickText("暂无历史版本", "No history", "履歴なし", "이력 없음")); return; }
 
   document.getElementById("cx-plan-hist-modal")?.remove();
   const modal = document.createElement("div");
@@ -9365,15 +11523,15 @@ function openPlanHistory(cardId) {
   modal.className = "cx-share-modal"; // reuse backdrop style
   const items = versions.slice().reverse().map((v, i) => {
     const dt = new Date(v.ts);
-    const label = `${dt.getHours()}:${String(dt.getMinutes()).padStart(2,"0")} · ${escapeHtml(v.cd.destination || "方案")} ${v.cd.duration_days || ""}天`;
+    const label = `${dt.getHours()}:${String(dt.getMinutes()).padStart(2,"0")} · ${escapeHtml(v.cd.destination || pickText("方案","Plan","プラン","플랜"))} ${v.cd.duration_days || ""}${pickText("天","d","日","일")}`;
     const isCurrent = i === 0;
     return `<div class="cx-hist-item${isCurrent ? " cx-hist-item--current" : ""}">
-      <div class="cx-hist-label">${isCurrent ? "✦ 当前版本" : `版本 ${versions.length - i}`}　${label}</div>
-      ${!isCurrent ? `<button class="cx-hist-restore" onclick="restorePlanVersion('${cardId}',${versions.length - 1 - i})">还原</button>` : ""}
+      <div class="cx-hist-label">${isCurrent ? pickText("✦ 当前版本","✦ Current","✦ 現在","✦ 현재") : `${pickText("版本","v","バージョン","버전")} ${versions.length - i}`}　${label}</div>
+      ${!isCurrent ? `<button class="cx-hist-restore" data-action="restore-plan-version" data-card-id="${escapeHtml(cardId)}" data-version-idx="${versions.length - 1 - i}">${pickText("还原","Restore","復元","복원")}</button>` : ""}
     </div>`;
   }).join("");
 
-  modal.innerHTML = `<div class="cx-sm-box"><div class="cx-sm-header"><span>📋 改稿历史</span><button class="cx-sm-close">✕</button></div><div style="padding:12px 16px;display:flex;flex-direction:column;gap:8px">${items}</div></div>`;
+  modal.innerHTML = `<div class="cx-sm-box"><div class="cx-sm-header"><span>📋 ${pickText("改稿历史", "History", "改稿履歴", "수정 이력")}</span><button class="cx-sm-close">✕</button></div><div class="cx-hist-modal-body">${items}</div></div>`;
   modal.querySelector(".cx-sm-close").addEventListener("click", () => modal.remove());
   modal.addEventListener("click", e => { if (e.target === modal) modal.remove(); });
   document.body.appendChild(modal);
@@ -9384,14 +11542,14 @@ function restorePlanVersion(cardId, versionIdx) {
   if (!versions || !versions[versionIdx]) return;
   const { cd, spokenText } = versions[versionIdx];
   document.getElementById("cx-plan-hist-modal")?.remove();
-  showToast("已还原历史版本");
+  showToast(pickText("已还原历史版本", "Version restored", "バージョンを復元しました", "버전 복원됨"));
   renderCardData(cd, spokenText);
 }
 
 // ── Multi-person invite: encode plan as URL param ─────────────────────────
 function sharePlanInvite(cardId) {
   const cd = _planCardData.get(cardId) || state.lastAiPlan?.cd;
-  if (!cd) { showToast("\u6682\u65e0\u65b9\u6848\u6570\u636e"); return; }
+  if (!cd) { showToast(pickText("暂无方案数据", "No plan data", "プランデータなし", "플랜 데이터 없음")); return; }
   try {
     // Generate a short token for social feedback tracking
     const _rb = new Uint8Array(6); crypto.getRandomValues(_rb);
@@ -9417,13 +11575,13 @@ function sharePlanInvite(cardId) {
     const inviteUrl = `${location.origin}${location.pathname}?cx_invite=${encoded}`;
     if (navigator.clipboard) {
       navigator.clipboard.writeText(inviteUrl).then(() => {
-        showToast("\u9080\u8bf7\u94fe\u63a5\u5df2\u590d\u5236\uff0c\u53d1\u7ed9\u540c\u884c\u4eba\u5373\u53ef \ud83d\udc65");
+        showToast(pickText("邀请链接已复制，发给同行人即可 👥", "Invite link copied! Share with your buddy 👥", "招待リンクをコピーしました 👥", "초대 링크 복사됨 👥"));
       }).catch(() => _showInviteModal(inviteUrl));
     } else {
       _showInviteModal(inviteUrl);
     }
   } catch (e) {
-    showToast("\u751f\u6210\u9080\u8bf7\u94fe\u63a5\u5931\u8d25");
+    showToast(pickText("生成邀请链接失败", "Failed to generate invite link", "招待リンク生成失敗", "초대 링크 생성 실패"));
   }
 }
 
@@ -9432,12 +11590,12 @@ function _showInviteModal(url) {
   const modal = document.createElement("div");
   modal.id = "cx-invite-modal";
   modal.className = "cx-share-modal";
-  modal.innerHTML = `<div class="cx-sm-box"><div class="cx-sm-header"><span>👥 邀请同行人</span><button class="cx-sm-close">✕</button></div><div style="padding:16px"><p style="font-size:13px;color:#6b7280;margin:0 0 10px">将以下链接发给同行人，他们可以查看并基于此方案继续规划：</p><textarea readonly style="width:100%;height:80px;font-size:12px;border:1px solid #e5e7eb;border-radius:8px;padding:8px;resize:none;color:#374151">${escapeHtml(url)}</textarea></div><div class="cx-sm-actions"><button class="cx-sm-dl-btn" id="cxInviteCopyBtn">📋 复制链接</button></div></div>`;
+  modal.innerHTML = `<div class="cx-sm-box"><div class="cx-sm-header"><span>👥 ${pickText("邀请同行人", "Invite Travel Buddy", "同行者を招待", "동행자 초대")}</span><button class="cx-sm-close">✕</button></div><div class="cx-invite-modal-body"><p class="cx-invite-modal-copy">${pickText("将以下链接发给同行人，他们可以查看并基于此方案继续规划：", "Share this link with your travel buddy to view and continue planning:", "以下のリンクを同行者に共有して、プランを確認・続行できます：", "동행자에게 이 링크를 공유하여 플랜을 확인하고 계속 계획할 수 있습니다：")}</p><textarea readonly class="cx-invite-modal-textarea">${escapeHtml(url)}</textarea></div><div class="cx-sm-actions"><button class="cx-sm-dl-btn" id="cxInviteCopyBtn">📋 ${pickText("复制链接", "Copy Link", "リンクをコピー", "링크 복사")}</button></div></div>`;
   modal.querySelector(".cx-sm-close").addEventListener("click", () => modal.remove());
   modal.addEventListener("click", e => { if (e.target === modal) modal.remove(); });
   modal.querySelector("#cxInviteCopyBtn").addEventListener("click", async () => {
     await navigator.clipboard.writeText(url).catch(() => {});
-    showToast("已复制！");
+    showToast(pickText("已复制！", "Copied!", "コピーしました！", "복사됨!"));
     modal.remove();
   });
   document.body.appendChild(modal);
@@ -9544,7 +11702,7 @@ function _checkInviteViewNotification() {
         const newViews = total - lastNotified;
         notified[token] = total;
         localStorage.setItem("crossx_view_notified_v1", JSON.stringify(notified));
-        setTimeout(() => showToast(`\u2728 \u4f60\u7684${escapeHtml(dest)}\u884c\u7a0b\u88ab ${newViews} \u4eba\u67e5\u770b\u4e86`), 500);
+        setTimeout(() => showToast(pickText(`✨ 你的${escapeHtml(dest)}行程被 ${newViews} 人查看了`, `✨ Your ${escapeHtml(dest)} trip got ${newViews} views`, `✨ あなたの${escapeHtml(dest)}旅程が ${newViews} 人に見られました`, `✨ ${escapeHtml(dest)} 여정이 ${newViews}명에게 조회됨`)), 500);
         break; // show one at a time
       }
     }
@@ -9605,7 +11763,7 @@ function _showInviteLandingBanner(payload) {
 
   const plansHtml = plans.map(p => `
     <div class="cx-ilb-plan-row">
-      <span class="cx-ilb-plan-tag">${escapeHtml(p.tag || "")}</span>
+      <span class="cx-ilb-plan-tag">${escapeHtml(_normalizePlanTag(p))}</span>
       <span class="cx-ilb-plan-hotel">${escapeHtml(p.hotel || "")}</span>
       <span class="cx-ilb-plan-price">${p.price ? "\u00a5" + Number(p.price).toLocaleString() : ""}</span>
     </div>`).join("");
@@ -9625,10 +11783,10 @@ function _showInviteLandingBanner(payload) {
     <div class="cx-ilb-divider"></div>
     <div class="cx-ilb-cta-label">\u4f60\u60f3\u600e\u4e48\u505a\uff1f</div>
     <div class="cx-ilb-actions">
-      <button class="cx-ilb-btn cx-ilb-btn--primary" onclick="_inviteActBasedOn()">\u57fa\u4e8e\u6b64\u65b9\u6848\u91cd\u65b0\u5b9a\u5236</button>
-      <button class="cx-ilb-btn cx-ilb-btn--secondary" onclick="_inviteActFresh()">\u91cd\u65b0\u89c4\u5212 ${dest}</button>
+      <button class="cx-ilb-btn cx-ilb-btn--primary" data-action="invite-act-based-on">\u57fa\u4e8e\u6b64\u65b9\u6848\u91cd\u65b0\u5b9a\u5236</button>
+      <button class="cx-ilb-btn cx-ilb-btn--secondary" data-action="invite-act-fresh">\u91cd\u65b0\u89c4\u5212 ${dest}</button>
     </div>
-    <button class="cx-ilb-dismiss" onclick="document.getElementById('cx-invite-landing')?.remove()">\u2715</button>
+    <button class="cx-ilb-dismiss" data-action="dismiss-invite-landing">\u2715</button>
   `;
   // Insert at top of chat messages
   const feed = document.getElementById("chatMessages") || document.getElementById("chat-messages");
@@ -9638,6 +11796,7 @@ function _showInviteLandingBanner(payload) {
 
 // ── Cached Amap web key (fetched once, reused across all map tabs) ─────────
 let _amapWebKey = null;
+let _amapSecurityCode = null; // Amap JS API v2.0 安全密钥（_AMapSecurityConfig）
 
 // ── Itinerary edit mode: drag-and-drop reorder + delete ───────────────────
 let _cxDragEl = null; // element currently being dragged
@@ -9702,7 +11861,7 @@ function toggleDayEdit(btn) {
   if (!panel) return;
   const editing = panel.classList.toggle("plan-day-panel--editing");
   btn.classList.toggle("active", editing);
-  btn.title = editing ? "完成编辑" : "编辑行程";
+  btn.title = editing ? pickText("完成编辑", "Done editing", "編集完了", "편집 완료") : pickText("编辑行程", "Edit itinerary", "旅程を編集", "여정 편집");
   btn.textContent = editing ? "✓" : "✏️";
   panel.querySelectorAll(".act-row").forEach((row) => { row.draggable = editing; });
   if (editing) _initDragListeners(panel);
@@ -9716,12 +11875,10 @@ function deleteActivity(btn) {
     btn.dataset.confirmDelete = "1";
     const origText = btn.textContent;
     btn.textContent = pickText("确认?", "Sure?", "確認?", "확인?");
-    btn.style.background = "var(--color-danger, #ef4444)";
-    btn.style.color = "#fff";
+    btn.classList.add("act-delete-btn--confirm");
     const reset = setTimeout(() => {
       btn.textContent = origText;
-      btn.style.background = "";
-      btn.style.color = "";
+      btn.classList.remove("act-delete-btn--confirm");
       delete btn.dataset.confirmDelete;
     }, 2000);
     btn.dataset.confirmResetTimer = reset;
@@ -9730,16 +11887,26 @@ function deleteActivity(btn) {
   clearTimeout(Number(btn.dataset.confirmResetTimer));
   // Also remove an immediately preceding transit strip if any
   const prev = row.previousElementSibling;
-  row.style.maxHeight = row.offsetHeight + "px";
-  row.style.overflow  = "hidden";
-  row.style.transition = "opacity 0.18s, max-height 0.25s, padding 0.25s";
-  requestAnimationFrame(() => {
-    row.style.opacity   = "0";
-    row.style.maxHeight = "0";
-    row.style.paddingTop    = "0";
-    row.style.paddingBottom = "0";
+  const rowStyles = window.getComputedStyle(row);
+  const collapse = row.animate([
+    {
+      opacity: 1,
+      maxHeight: `${row.offsetHeight}px`,
+      paddingTop: rowStyles.paddingTop,
+      paddingBottom: rowStyles.paddingBottom,
+    },
+    {
+      opacity: 0,
+      maxHeight: "0px",
+      paddingTop: "0px",
+      paddingBottom: "0px",
+    },
+  ], {
+    duration: 270,
+    easing: "ease",
+    fill: "forwards",
   });
-  setTimeout(() => {
+  collapse.onfinish = () => {
     if (prev?.classList.contains("act-transit")) prev.remove();
     row.remove();
 
@@ -9749,10 +11916,7 @@ function deleteActivity(btn) {
       const remainingActivities = dayPanel.querySelectorAll(".act-row");
       if (remainingActivities.length === 0) {
         const emptyMsg = document.createElement("div");
-        emptyMsg.className = "status";
-        emptyMsg.style.padding = "16px";
-        emptyMsg.style.textAlign = "center";
-        emptyMsg.style.color = "var(--color-text-secondary, #888)";
+        emptyMsg.className = "status cx-empty-state-note cx-empty-state-note--center";
         emptyMsg.textContent = pickText("该天暂无活动。点击「编辑」添加新活动。", "No activities for this day. Click 'Edit' to add.", "この日のアクティビティはありません。「編集」をクリックして追加してください。", "이 날 활동이 없습니다. '편집'을 클릭하여 추가하세요.");
         dayPanel.querySelector(".day-activities")?.appendChild(emptyMsg);
       }
@@ -9766,22 +11930,14 @@ function deleteActivity(btn) {
       cd._userModified = true;
       state.lastAiPlan = { cd, spokenText: state.lastAiPlan?.spokenText };
     }
-  }, 270);
+  };
 }
 
 // ── Share card generation ──────────────────────────────────────────────────
 function _cityGradient(city) {
-  const GRADS = [
-    "linear-gradient(135deg,#1e3a5f 0%,#0f766e 100%)",
-    "linear-gradient(135deg,#7c3aed 0%,#db2777 100%)",
-    "linear-gradient(135deg,#b45309 0%,#92400e 100%)",
-    "linear-gradient(135deg,#0f4c81 0%,#1e40af 100%)",
-    "linear-gradient(135deg,#166534 0%,#15803d 100%)",
-    "linear-gradient(135deg,#7f1d1d 0%,#be185d 100%)",
-  ];
   let h = 0;
   for (let i = 0; i < city.length; i++) h = (h * 31 + city.charCodeAt(i)) & 0xffff;
-  return GRADS[h % GRADS.length];
+  return h % 6;
 }
 
 function _buildShareCardHtml(cd) {
@@ -9791,8 +11947,8 @@ function _buildShareCardHtml(cd) {
   const heroUrl = _getCityHeroUrl(cd.destination || "");
   const grad = _cityGradient(cd.destination || "");
   const total = Number(cd.total_price || 0);
-  const totalFmt = total ? `¥${total.toLocaleString()}` : "";
-  const perDay = (total && daysN) ? `¥${Math.round(total / Number(daysN)).toLocaleString()}/天` : "";
+  const totalFmt = total ? fmtCNY(total) : "";
+  const perDay = (total && daysN) ? `${fmtCNY(Math.round(total / Number(daysN)))}/${pickText("天","day","日","일")}` : "";
 
   // Build day highlights — up to 4 days, 2 activities each
   const dayItems = (cd.days || []).slice(0, 4).map((d, i) => {
@@ -9812,13 +11968,13 @@ function _buildShareCardHtml(cd) {
 
   // Meta chips row
   const chips = [
-    daysN ? `${daysN}天` : "",
-    pax > 1 ? `${pax}人` : "",
+    daysN ? `${daysN}${pickText("天","d","日","일")}` : "",
+    pax > 1 ? `${pax}${pickText("人","pax","名","명")}` : "",
     perDay ? perDay : (totalFmt || ""),
   ].filter(Boolean).map(c => `<span class="cx-sc-chip">${escapeHtml(c)}</span>`).join("");
 
-  return `<div class="cx-sc-root" style="background:${grad}">
-    ${heroUrl ? `<img class="cx-sc-hero-img" src="${heroUrl}" crossorigin="anonymous" onerror="this.src='/assets/solution-flow.svg'">` : ""}
+  return `<div class="cx-sc-root cx-sc-root--theme-${grad}">
+    ${heroUrl ? `<img class="cx-sc-hero-img" src="${heroUrl}" crossorigin="anonymous" data-fallback-src="/assets/solution-flow.svg">` : ""}
     <div class="cx-sc-overlay">
       <div class="cx-sc-brand-row">
         <span class="cx-sc-brand-icon">\u2708\ufe0f</span>
@@ -9855,7 +12011,7 @@ function _showShareModal(blob, fileName) {
         <button class="cx-sm-close">\u2715</button>
       </div>
       <div class="cx-sm-preview">
-        <img src="${url}" style="max-width:100%;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.15);" alt="\u5206\u4eab\u56fe">
+        <img class="cx-sm-preview-img" src="${url}" alt="\u5206\u4eab\u56fe">
       </div>
       <div class="cx-sm-social-hint">
         <span class="cx-sm-hint-icon">\ud83d\udcf1</span>
@@ -9885,8 +12041,8 @@ function _showShareModal(blob, fileName) {
   modal.querySelector(".cx-sm-copy-btn").addEventListener("click", async () => {
     try {
       await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-      showToast("\u56fe\u7247\u5df2\u590d\u5236\u5230\u526a\u8d34\u677f");
-    } catch { showToast("\u8bf7\u957f\u6309\u56fe\u7247\u4fdd\u5b58"); }
+      showToast(pickText("图片已复制到剪贴板", "Image copied to clipboard", "画像をコピーしました", "이미지 복사됨"));
+    } catch { showToast(pickText("请长按图片保存", "Long press to save image", "画像を長押しして保存", "이미지를 길게 눌러 저장")); }
   });
   // Invite link copy — use the last generated plan's invite URL if available
   const inviteBtn = modal.querySelector("#cx-sm-invite-copy");
@@ -9900,7 +12056,7 @@ function _showShareModal(blob, fileName) {
       } else {
         const inviteUrl = location.href.split("?")[0];
         try { await navigator.clipboard.writeText(inviteUrl); } catch { /* ignore */ }
-        showToast("\u94fe\u63a5\u5df2\u590d\u5236");
+        showToast(pickText("链接已复制", "Link copied", "リンクをコピーしました", "링크 복사됨"));
       }
     });
   }
@@ -9912,9 +12068,9 @@ function _showShareModal(blob, fileName) {
 
 async function openShareCard(cardId) {
   const cd = _planCardData.get(cardId) || state.lastAiPlan?.cd;
-  if (!cd) { showToast("\u6682\u65e0\u884c\u7a0b\u6570\u636e"); return; }
+  if (!cd) { showToast(pickText("暂无行程数据", "No itinerary data", "旅程データなし", "여정 데이터 없음")); return; }
   const btn = document.querySelector(`#${cardId} .cx-share-btn`);
-  if (btn) { btn.disabled = true; btn.textContent = "\u23f3 \u751f\u6210\u4e2d\u2026"; }
+  if (btn) { btn.disabled = true; btn.textContent = pickText("⏳ 生成中…", "⏳ Generating…", "⏳ 生成中…", "⏳ 생성 중…"); }
   try {
     // Ensure render container exists
     let renderEl = document.getElementById("cx-share-render");
@@ -9952,10 +12108,10 @@ async function openShareCard(cardId) {
       _showShareModal(blob, fileName);
     }
   } catch (e) {
-    console.error("share card error", e);
-    showToast("\u751f\u6210\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5");
+    console.error("share card error", getClientErrorCode(e, "share_card_failed"));
+    showToast(pickText("生成失败，请重试", "Generation failed, please retry", "生成に失敗しました", "생성 실패, 재시도해 주세요"));
   } finally {
-    if (btn) { btn.disabled = false; btn.textContent = "\ud83d\udce4 \u5206\u4eab\u884c\u7a0b"; }
+    if (btn) { btn.disabled = false; btn.textContent = `📤 ${pickText("分享行程", "Share", "共有", "공유")}`; }
   }
 }
 
@@ -9966,6 +12122,10 @@ function switchPlanDay(cardId, dayIdx) {
   const mapPanel = document.getElementById(`${cardId}-map-panel`);
   if (!tabs || !panels) return;
   const isMap = dayIdx === "map";
+  if (!isMap) {
+    const panelCount = panels.querySelectorAll(".plan-day-panel").length;
+    if (typeof dayIdx !== "number" || dayIdx < 0 || dayIdx >= panelCount) return;
+  }
   tabs.querySelectorAll(".day-tab").forEach((t, i) =>
     t.classList.toggle("active", isMap ? t.dataset.day === "map" : i === dayIdx)
   );
@@ -9980,39 +12140,48 @@ function switchPlanDay(cardId, dayIdx) {
 const _weatherCache = new Map(); // city → {ts, data}; 1h client-side cache
 const _WEATHER_CLIENT_TTL = 60 * 60 * 1000;
 
-const _WEEK_DAYS = ["周日","周一","周二","周三","周四","周五","周六"];
+const _WEEK_DAYS = {
+  ZH: ["周日","周一","周二","周三","周四","周五","周六"],
+  EN: ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"],
+  JA: ["日","月","火","水","木","金","土"],
+  KO: ["일","월","화","수","목","금","토"],
+};
 
 async function fetchWeatherStrip(cardId, city) {
   const el = document.getElementById(`${cardId}-weather`);
   if (!el || !city) return;
+  const lang = state.uiLanguage || "ZH";
+  const cacheKey = `${lang}:${city}`;
 
   // Client-side cache check
-  const cached = _weatherCache.get(city);
+  const cached = _weatherCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < _WEATHER_CLIENT_TTL) {
     _renderWeatherStrip(el, cached.data, city);
     return;
   }
 
   try {
-    const r = await fetch(`/api/weather?city=${encodeURIComponent(city)}&days=5`);
-    const data = await r.json();
-    if (!data.ok) { el.textContent = ""; el.style.display = "none"; return; }
-    _weatherCache.set(city, { ts: Date.now(), data });
+    const r = await fetch(`/api/weather?city=${encodeURIComponent(city)}&days=5&lang=${encodeURIComponent(lang)}`);
+    const data = await _readJsonResponseSafe(r, {});
+    if (!data.ok) { el.textContent = ""; el.classList.add("hidden"); return; }
+    _weatherCache.set(cacheKey, { ts: Date.now(), data });
     _renderWeatherStrip(el, data, city);
   } catch {
     el.textContent = "";
-    el.style.display = "none";
+    el.classList.add("hidden");
   }
 }
 
 function _renderWeatherStrip(el, data, city) {
+  el.classList.remove("hidden");
   el.classList.remove("cx-weather-strip--loading");
   const cur = data.current || {};
 
   // Day pills
   const dayPills = (data.forecast || []).map((d, i) => {
     const dt = new Date(d.date);
-    const label = i === 0 ? "今天" : (i === 1 ? "明天" : _WEEK_DAYS[dt.getDay()]);
+    const _wdMap = _WEEK_DAYS[state.uiLanguage] || _WEEK_DAYS.EN;
+    const label = i === 0 ? pickText("今天","Today","今日","오늘") : (i === 1 ? pickText("明天","Tomorrow","明日","내일") : _wdMap[dt.getDay()]);
     return `<div class="cx-ws-day${i === 0 ? " cx-ws-day--today" : ""}">
       <div class="cx-ws-d-label">${label}</div>
       <div class="cx-ws-d-icon">${d.icon}</div>
@@ -10023,13 +12192,13 @@ function _renderWeatherStrip(el, data, city) {
 
   el.innerHTML = `
     <div class="cx-ws-header">
-      <span class="cx-ws-city">🌤 ${escapeHtml(city)} 天气</span>
+      <span class="cx-ws-city">🌤 ${escapeHtml(_localizeUiCityName(city))} ${pickText("天气","Weather","天気","날씨")}</span>
       <span class="cx-ws-source">Open-Meteo</span>
     </div>
     <div class="cx-ws-now">
       <span class="cx-ws-now-icon">${cur.icon || "🌤️"}</span>
       <span class="cx-ws-now-temp">${cur.temp_c}°C</span>
-      <span class="cx-ws-now-meta">${cur.label} · 体感${cur.feels_c}° · 湿度${cur.humidity}%</span>
+      <span class="cx-ws-now-meta">${cur.label} · ${pickText("体感","Feels like","体感","체감")}${cur.feels_c}° · ${pickText("湿度","Humidity","湿度","습도")}${cur.humidity}%</span>
     </div>
     <div class="cx-ws-days">${dayPills}</div>
     ${data.tip ? `<div class="cx-ws-tip">${data.tip}</div>` : ""}`;
@@ -10072,7 +12241,7 @@ function _injectHolidayBanner(articleEl, cd) {
 
   const banner = document.createElement("div");
   banner.className = "cx-holiday-banner";
-  banner.innerHTML = `<span class="cx-hb-icon">🎉</span><div class="cx-hb-text"><strong>${escapeHtml(hit.name)}</strong>：${escapeHtml(hit.warn)}</div><button class="cx-hb-close" onclick="this.parentNode.remove()">✕</button>`;
+  banner.innerHTML = `<span class="cx-hb-icon">🎉</span><div class="cx-hb-text"><strong>${escapeHtml(hit.name)}</strong>：${escapeHtml(hit.warn)}</div><button class="cx-hb-close" data-action="close-holiday-banner">✕</button>`;
   // Insert after quality banner or at top of card body
   const qualityBanner = articleEl.querySelector(".cx-quality-banner");
   if (qualityBanner) qualityBanner.after(banner);
@@ -10086,16 +12255,29 @@ function _injectHolidayBanner(articleEl, cd) {
 function _collectMapActivities(days) {
   const acts = [];
   (days || []).forEach((d) => {
-    if (d.hotel?.name) acts.push({ name: d.hotel.name, type: "hotel" });
+    if (d.hotel?.name) acts.push({
+      name: d.hotel.name,
+      type: "hotel",
+      // Preserve pre-geocoded coordinates from the plan data to avoid redundant lookups
+      lat: d.hotel.lat ?? d.hotel.latitude ?? null,
+      lng: d.hotel.lng ?? d.hotel.longitude ?? null,
+    });
     (d.activities || []).filter((a) => !/^(transport|city_change)$/i.test(a.type || ""))
-      .forEach((a) => { if (a.name) acts.push({ name: a.name, type: a.type || "sight" }); });
+      .forEach((a) => {
+        if (a.name) acts.push({
+          name: a.name,
+          type: a.type || "sight",
+          lat: a.lat ?? a.latitude ?? null,
+          lng: a.lng ?? a.longitude ?? null,
+        });
+      });
   });
   return acts;
 }
 
 function _buildMapPanelHtml(cardId, destination, days) {
   const acts = _collectMapActivities(days);
-  return `<div id="${cardId}-map-panel" class="cx-map-wrap" data-city="${escapeHtml(destination || "")}" data-activities="${escapeHtml(JSON.stringify(acts))}"><div id="${cardId}-map" class="cx-map"><div class="cx-map-placeholder"><span class="cx-map-placeholder-icon">🗺️</span><span>切换此标签加载地图</span></div></div><div class="cx-map-legend" id="${cardId}-map-legend"></div></div>`;
+  return `<div id="${cardId}-map-panel" class="cx-map-wrap" data-city="${escapeHtml(destination || "")}" data-activities="${escapeHtml(JSON.stringify(acts))}"><div id="${cardId}-map" class="cx-map"><div class="cx-map-placeholder"><span class="cx-map-placeholder-icon">🗺️</span><span>${pickText("切换此标签加载地图", "Switch to this tab to load map", "このタブで地図を読み込む", "이 탭으로 전환하여 지도 로드")}</span></div></div><div class="cx-map-legend" id="${cardId}-map-legend"></div></div>`;
 }
 
 // ── Amap JS SDK map: geocode activities + render interactive pin map ───────
@@ -10104,7 +12286,8 @@ async function initPlanMap(cardId) {
   const mapDiv   = document.getElementById(`${cardId}-map`);
   if (!mapPanel || !mapDiv) return;
   if (mapDiv.dataset.initialized === "1") return; // already rendered
-  mapDiv.dataset.initialized = "1";
+  // Mark busy early to prevent double-trigger, but clear on failure so user can retry
+  mapDiv.dataset.initialized = "loading";
 
   const city = (mapPanel.dataset.city || "").trim();
   let activities = [];
@@ -10117,22 +12300,33 @@ async function initPlanMap(cardId) {
     mapDiv.innerHTML = `<div class="cx-map-placeholder"><span class="cx-map-placeholder-icon">${icon}</span><span>${text}</span></div>`;
   };
 
-  if (!city || !activities.length) { showPlaceholder("📍", "暂无地点数据"); return; }
+  if (!city || !activities.length) { showPlaceholder("📍", pickText("暂无地点数据", "No location data", "位置データなし", "위치 데이터 없음")); return; }
 
-  showPlaceholder("⏳", "地图加载中...");
+  showPlaceholder("⏳", pickText("地图加载中...", "Loading map...", "地図読み込み中...", "지도 로딩 중..."));
 
-  // 1. Fetch Amap web key from backend (cached after first fetch)
+  // 1. Fetch Amap web key + security code from backend (cached after first fetch)
+  // credentials:"same-origin" ensures browser sends Origin header (required by validateMapKeyOrigin)
+  // Only cache on success — keep null on network error so the next tab-switch retries
   if (_amapWebKey === null) {
     try {
-      const r = await fetch("/api/map-key");
-      const d = await r.json();
-      _amapWebKey = d.key || "";
-    } catch { _amapWebKey = ""; }
+      const r = await fetch("/api/map-key", { credentials: "same-origin" });
+      if (r.ok) {
+        const d = await _readJsonResponseSafe(r, {});
+        _amapWebKey = d.key || "";
+        _amapSecurityCode = d.securityCode || "";
+      }
+      // else: leave _amapWebKey null so we retry next time
+    } catch { /* network error — will retry next map-tab open */ }
   }
   const amapKey = _amapWebKey;
 
   if (!amapKey) {
-    showPlaceholder("⚠️", "地图未配置（需 AMAP_WEB_KEY）");
+    // Key lookup has not completed yet, or map capability is unavailable.
+    const msg = _amapWebKey === null
+      ? pickText("地图密钥获取失败，请刷新重试", "Map key fetch failed, tap to retry", "地図キー取得失敗、再試行してください", "지도 키 가져오기 실패, 재시도")
+      : pickText("地图服务暂不可用，请稍后重试", "Map service is temporarily unavailable. Try again later.", "地図サービスは一時的に利用できません。後でもう一度お試しください。", "지도 서비스를 일시적으로 사용할 수 없습니다. 잠시 후 다시 시도하세요.");
+    showPlaceholder("⚠️", msg);
+    mapDiv.dataset.initialized = ""; // allow retry
     if (legendEl) legendEl.innerHTML = activities.slice(0, 10).map((a, i) =>
       `<span><span class="cx-map-legend-num">${i + 1}</span>${escapeHtml(a.name)}</span>`
     ).join("");
@@ -10141,6 +12335,11 @@ async function initPlanMap(cardId) {
 
   // 2. Load Amap JS SDK v2.0 lazily
   if (!window.AMap) {
+    // JS API v2.0 requires _AMapSecurityConfig to be set BEFORE the script loads.
+    // Without this, the SDK silently fails or returns INVALID_USER_KEY errors.
+    if (_amapSecurityCode) {
+      window._AMapSecurityConfig = { securityJsCode: _amapSecurityCode };
+    }
     await new Promise((resolve, reject) => {
       const s = document.createElement("script");
       s.src = `https://webapi.amap.com/maps?v=2.0&key=${encodeURIComponent(amapKey)}`;
@@ -10148,25 +12347,38 @@ async function initPlanMap(cardId) {
       s.onerror = () => reject(new Error("Amap SDK load failed"));
       document.head.appendChild(s);
     }).catch(() => null);
-    if (!window.AMap) { showPlaceholder("❌", "地图加载失败，请检查网络"); return; }
+    if (!window.AMap) { showPlaceholder("❌", pickText("地图加载失败，请检查网络", "Map load failed, check network", "地図読み込み失敗、ネットワークを確認", "지도 로드 실패, 네트워크 확인")); mapDiv.dataset.initialized = ""; return; }
   }
 
-  // 3. Geocode activity names via backend
-  const names = [...new Set(activities.map((a) => a.name))].slice(0, 15);
-  let geocoded = [];
-  try {
-    const gr = await fetch("/api/geocode-places", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ..._authHeaders() },
-      body: JSON.stringify({ places: names, city }),
-    });
-    const gd = await gr.json();
-    geocoded = (gd.results || []).filter((g) => g.loc);
-  } catch { /* ignore */ }
+  // 3. Geocode activity names via backend — skip entries that already carry coordinates
+  const alreadyKnown = activities.filter((a) => a.lat != null && a.lng != null);
+  const needsGeocode = activities.filter((a) => a.lat == null || a.lng == null);
+  const names = [...new Set(needsGeocode.map((a) => a.name))].slice(0, 15);
 
-  if (!geocoded.length) { showPlaceholder("📍", "地点定位失败，请稍后重试"); return; }
+  let geocoded = [
+    // Pre-seed with already-known coords (no network round-trip needed)
+    ...alreadyKnown.map((a) => ({ name: a.name, loc: `${a.lng},${a.lat}` })),
+  ];
 
-  // 4. Build map
+  if (names.length) {
+    try {
+      const gr = await fetch("/api/geocode-places", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ..._authHeaders() },
+        body: JSON.stringify({ places: names, city }),
+      });
+      const gd = await _readJsonResponseSafe(gr, {});
+      // Merge geocode results with pre-known coords (pre-known takes precedence)
+      const fromApi = (gd.results || []).filter((g) => g.loc);
+      const knownNames = new Set(alreadyKnown.map((a) => a.name));
+      geocoded = [...geocoded, ...fromApi.filter((g) => !knownNames.has(g.name))];
+    } catch { /* ignore — pre-known coords still render */ }
+  }
+
+  if (!geocoded.length) { showPlaceholder("📍", pickText("地点定位失败，请稍后重试", "Location lookup failed, please retry", "位置の取得に失敗しました", "위치 조회 실패")); mapDiv.dataset.initialized = ""; return; }
+
+  // 4. Build map — mark initialized only on success
+  mapDiv.dataset.initialized = "1";
   mapDiv.innerHTML = "";
   const lnglats = geocoded.map((g) => {
     const [lng, lat] = g.loc.split(",").map(Number);
@@ -10187,11 +12399,13 @@ async function initPlanMap(cardId) {
 
   if (lnglats.length > 1) map.setFitView();
 
-  // Update legend
+  // Update legend with clickable items that open precise navigation
   if (legendEl) {
-    legendEl.innerHTML = geocoded.slice(0, 10).map((g, i) =>
-      `<span><span class="cx-map-legend-num">${i + 1}</span>${escapeHtml(g.name)}</span>`
-    ).join("");
+    legendEl.innerHTML = geocoded.slice(0, 10).map((g, i) => {
+      const [lng, lat] = g.loc.split(",").map(Number);
+      const navUrl = buildAmapNavUrl(g.name, city, lng, lat);
+      return `<a href="${escapeHtml(navUrl)}" target="_blank" rel="noopener" title="${pickText("打开导航", "Open navigation", "ナビを開く", "내비 열기")}"><span class="cx-map-legend-num">${i + 1}</span>${escapeHtml(g.name)}</a>`;
+    }).join("");
   }
 }
 
@@ -10203,8 +12417,8 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
 
   // Toggle behaviour: if already showing, hide
   const itinerarySec = card.querySelector(".plan-itinerary-section");
-  if (itinerarySec && itinerarySec.style.display !== "none" && !itinerarySec.classList.contains("plan-itinerary-section--pending")) {
-    itinerarySec.style.display = "none";
+  if (itinerarySec && !itinerarySec.classList.contains("hidden") && !itinerarySec.classList.contains("plan-itinerary-section--pending")) {
+    itinerarySec.classList.add("hidden");
     if (btn) {
       btn.textContent = btn.dataset.origText || pickText("查看逐日行程 ↓","View Itinerary ↓","日程を見る ↓","일정 보기 ↓");
       btn.classList.remove("opt-detail-btn--active");
@@ -10231,23 +12445,18 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
     if (secHeader) {
       const optCard = card.querySelector(`.cx-list-card[data-plan-id="${planId}"]`);
       const planTag = optCard?.querySelector(".cx-lc-tag")?.textContent || planId;
-      secHeader.innerHTML = pickText(
-        `逐日行程 · <span style="color:var(--color-primary)">${escapeHtml(planTag)}</span> 方案`,
-        `Itinerary · <span style="color:var(--color-primary)">${escapeHtml(planTag)}</span>`,
-        `日程 · <span style="color:var(--color-primary)">${escapeHtml(planTag)}</span>`,
-        `일정 · <span style="color:var(--color-primary)">${escapeHtml(planTag)}</span>`,
-      );
+      secHeader.innerHTML = _buildItineraryHeaderHtml(planTag);
     }
   };
 
   // Case 1: days already rendered (non-pending section)
   if (itinerarySec && !itinerarySec.classList.contains("plan-itinerary-section--pending")) {
-    itinerarySec.style.display = "";
+    itinerarySec.classList.remove("hidden");
     updateHeader(itinerarySec);
     // P3: on mobile, clone into Bottom Sheet instead of inline scroll
     if (window.innerWidth <= 768) {
       const clone = itinerarySec.cloneNode(true);
-      clone.style.display = "";
+      clone.classList.remove("hidden");
       openSheet(pickText("逐日行程", "Itinerary","日程", "일정"), clone);
     } else {
       setTimeout(() => itinerarySec.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
@@ -10257,7 +12466,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
 
   // Case 2: pending section — need to fetch days on demand
   if (itinerarySec && itinerarySec.classList.contains("plan-itinerary-section--pending")) {
-    itinerarySec.style.display = "";
+    itinerarySec.classList.remove("hidden");
     updateHeader(itinerarySec);
     // P3: on mobile, move section into Bottom Sheet (live ref — fetchDetailBatch populates it)
     if (window.innerWidth <= 768) {
@@ -10267,7 +12476,9 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
     }
 
     // Only fetch once — check if already loading or done
-    if (itinerarySec.dataset.fetched) return;
+    if (itinerarySec.dataset.loading === "1") return;
+    if (itinerarySec.dataset.fetched === "1") return;
+    itinerarySec.dataset.loading = "1";
     itinerarySec.dataset.fetched = "1";
 
     // Get context from card data attributes
@@ -10280,12 +12491,15 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
     // Get the selected plan summary — enrich with card-level fields
     let plans = [];
     try { plans = JSON.parse(card.dataset.plans || "[]"); } catch { /* ignore */ }
+    const cardDataForDetail = (_planCardData && _planCardData.get(cardId)) || state.lastAiPlan?.cd || null;
     const planSummary = plans[planIdx] || plans.find((p) => p.id === planId) || plans[0] || {};
     if (!planSummary.destination) planSummary.destination = card.dataset.destination || "";
     // tier: plan objects use `id` (budget/balanced/premium), detail API expects `tier`
     if (!planSummary.tier) planSummary.tier = planSummary.id || "balanced";
-    // duration_days: stored on article element, not on individual plan objects
+    // duration_days and days live on the card-level plan, not on individual option rows.
     if (!planSummary.duration_days) planSummary.duration_days = parseInt(card.dataset.duration || "3", 10) || 3;
+    if (!Array.isArray(planSummary.days) && Array.isArray(cardDataForDetail?.days)) planSummary.days = cardDataForDetail.days;
+    if (!planSummary.arrival_note && cardDataForDetail?.arrival_note) planSummary.arrival_note = cardDataForDetail.arrival_note;
 
     // Render activity rows HTML (shared between initial load and "load more")
     const buildDayPanelHtml = (days, startGlobalIdx) =>
@@ -10309,8 +12523,13 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
             ? (mins >= 60 ? `${Math.floor(mins / 60)}h${mins % 60 ? (mins % 60) + "m" : ""}` : `${mins}m`)
             : "";
           // Transit strip above the activity card
-          const transitHtml = act.transport_to
-            ? `<div class="act-transit"><span>🗺</span>${escapeHtml(act.transport_to)}</div>`
+          const localizedActName3 = _localizeVisibleTravelText(act.name || "", act.name || "");
+          const localizedActNote3 = _localizeVisibleTravelText(act.desc || act.note || "", "");
+          const localizedTransit3 = _localizeVisibleTravelText(act.transport_to || "", act.transport_to || "");
+          const localizedVibe3 = _localizeVisibleTravelText(act.real_vibe || act.real_vibes || "", "");
+          const localizedTip3 = _localizeVisibleTravelText(act.insider_tip || act.insider_tips || "", "");
+          const transitHtml = localizedTransit3
+            ? `<div class="act-transit"><span>🗺</span>${escapeHtml(localizedTransit3)}</div>`
             : "";
           const timeBadge = act.time
             ? `<span class="act-time-badge">${escapeHtml(act.time)}</span>`
@@ -10324,7 +12543,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
             ? `<span class="act-coze-ticket">🟢 ${pickText("有票·可代订","Tickets available","チケットあり","티켓 가능")}</span>` : "";
           const isTransportRow3 = /^(transport|city_change)$/i.test(act.type || "");
           const localNavHtml3 = (!isTransportRow3 && _dayCity3 && act.name)
-            ? `<div class="act-local-nav act-local-nav--loading" onclick="fetchLocalNav(this)"
+            ? `<div class="act-local-nav act-local-nav--loading" data-action="fetch-local-nav"
                 data-city="${escapeHtml(_dayCity3)}" data-hotel="${escapeHtml(_dayHotel3)}" data-place="${escapeHtml(act.name)}">
                 <span class="act-local-nav-label">📍 ${pickText("导航","Navigate","ナビ","내비")}</span>
                 <span class="act-local-nav-modes">${pickText("点击查看","Tap to view","タップして確認","탭하여 확인")}</span>
@@ -10332,17 +12551,17 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
           return `${transitHtml}
             <div class="act-row">
               <div class="act-drag-handle">\u22EE</div>
-              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" onerror="this.src='${isFood3?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}'">
+              <img class="act-img" src="${actImgSrc}" alt="${escapeHtml(act.name || "")}" loading="lazy" data-fallback-src="${isFood3?'/assets/solution-eat.svg':'/assets/solution-travel.svg'}">
               <div class="act-body">
-                <div class="act-name">${timeBadge}<span class="act-icon" style="color:${cfg.color}">${cfg.icon}</span>${escapeHtml(act.name || "")}${act._verified ? '<span class="cx-verified-badge" title="已通过数据源验证">✓</span>' : ''}${act._unverified ? '<span class="cx-unverified-badge" title="AI生成，未经实地验证">⚠</span>' : ''}${cozeQueue3}${cozeTicket3}</div>
-                ${(act.desc||act.note) ? `<div class="act-note">${escapeHtml(act.desc||act.note)}</div>` : ""}
+                <div class="act-name">${timeBadge}${_buildActIcon(act.type, cfg.icon)}${escapeHtml(localizedActName3)}${act._verified ? `<span class="cx-verified-badge" title="${pickText('已通过数据源验证','Verified by data source','データソース検証済み','데이터 검증됨')}">✓</span>` : ''}${act._unverified ? `<span class="cx-unverified-badge" title="${pickText('AI生成，未经实地验证','AI-generated, unverified','AI生成、未検証','AI 생성, 미검증')}">⚠</span>` : ''}${cozeQueue3}${cozeTicket3}</div>
+                ${localizedActNote3 ? `<div class="act-note">${escapeHtml(localizedActNote3)}</div>` : ""}
                 ${durFmt ? `<div class="act-duration">⏱ ${durFmt}</div>` : ""}
-                ${(act.real_vibe||act.real_vibes) ? `<div class="act-vibes">"${escapeHtml(act.real_vibe||act.real_vibes)}"</div>` : ""}
-                ${(act.insider_tip||act.insider_tips) ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(act.insider_tip||act.insider_tips)}</div>` : ""}
+                ${localizedVibe3 ? `<div class="act-vibes">"${escapeHtml(localizedVibe3)}"</div>` : ""}
+                ${localizedTip3 ? `<div class="act-tips"><span class="act-tips-icon">💡</span>${escapeHtml(localizedTip3)}</div>` : ""}
                 ${localNavHtml3}
               </div>
               <span class="act-cost${costCls}">${costFmt}</span>
-              <button class="act-delete-btn" onclick="deleteActivity(this)" title="删除">✕</button>
+              <button class="act-delete-btn" data-action="delete-activity" title="${pickText('删除','Delete','削除','삭제')}">✕</button>
             </div>`;
         }).join("");
 
@@ -10378,7 +12597,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         })() : "";
 
         return `<div class="plan-day-panel${globalIdx === 0 ? " active" : ""}" data-panel="${globalIdx}" id="${cardId}-panel-${globalIdx}">
-          <div class="day-panel-label"><span>${escapeHtml(d.label || `Day ${d.day}`)}</span><button class="cx-edit-toggle" onclick="toggleDayEdit(this)" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
+          <div class="day-panel-label"><span>${escapeHtml(d.label || pickText(`第${d.day}天`, `Day ${d.day}`, `${d.day}日目`, `${d.day}일차`))}</span><button class="cx-edit-toggle" data-action="toggle-day-edit" title="${pickText('编辑行程','Edit day','日程を編集','일정 수정')}">✏️</button></div>
           ${intercityHtml}
           <div class="day-activities">${activities}</div>
           ${hotelHtml}
@@ -10387,7 +12606,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
       }).join("");
 
     // Fetch days batch via SSE stream and render; appends more tabs/panels if subsequent batch
-    const fetchDetailBatch = async (startDay) => {
+    const fetchDetailBatch = async (startDay, triggerBtn = null) => {
       try {
         // Detail endpoint now streams SSE — read until "batch" event arrives
         const _detailResp = await fetch("/api/plan/detail", {
@@ -10421,7 +12640,12 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
         if (!result || !Array.isArray(result.days) || !result.days.length) {
           const loadEl = itinerarySec.querySelector(".plan-detail-loading");
           if (loadEl) loadEl.innerHTML =
-            `<span style="color:#ef4444">${pickText("行程详情加载失败，请重试","Failed to load itinerary","日程の読み込みに失敗","일정 로드 실패")}</span>`;
+            `<span class="plan-detail-error">${pickText("行程详情加载失败，请重试","Failed to load itinerary","日程の読み込みに失敗","일정 로드 실패")}</span>`;
+          if (triggerBtn) {
+            triggerBtn.disabled = false;
+            triggerBtn.textContent = pickText(`加载 Day ${startDay}+ 行程 ↓`, `Load Day ${startDay}+ ↓`, `Day ${startDay}+ を読み込む`, `Day ${startDay}+ 로드`);
+          }
+          delete itinerarySec.dataset.fetched;
           return;
         }
 
@@ -10437,9 +12661,9 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
             ? `<div class="arrival-banner">✈️ ${escapeHtml(result.arrival_note)}</div>` : "";
           const dayTabsHtml = `<div class="plan-day-tabs" id="${cardId}-tabs">` +
             result.days.map((d, i) =>
-              `<button class="day-tab${i === 0 ? " active" : ""}" onclick="switchPlanDay('${cardId}',${i})">Day ${d.day}</button>`
+              `<button class="day-tab${i === 0 ? " active" : ""}" data-action="switch-plan-day" data-card-id="${escapeHtml(cardId)}" data-day="${i}">${pickText(`第${d.day}天`, `Day ${d.day}`, `${d.day}日目`, `${d.day}일차`)}</button>`
             ).join("") +
-            `<button class="day-tab" data-day="map" onclick="switchPlanDay('${cardId}','map')">🗺 地图</button>` +
+            `<button class="day-tab" data-action="switch-plan-day" data-card-id="${escapeHtml(cardId)}" data-day="map">🗺 ${pickText("地图","Map","地図","지도")}</button>` +
             "</div>";
 
           const _dest3 = planSummary?.destination || card.dataset.destination || "";
@@ -10460,7 +12684,7 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
               const idx = globalOffset + i;
               const tab = document.createElement("button");
               tab.className = "day-tab";
-              tab.textContent = `Day ${d.day}`;
+              tab.textContent = pickText(`第${d.day}天`, `Day ${d.day}`, `${d.day}日目`, `${d.day}일차`);
               tab.onclick = () => switchPlanDay(cardId, idx);
               tabsContainer.appendChild(tab);
             });
@@ -10483,14 +12707,21 @@ async function revealPlanItinerary(cardId, planId, planIdx, btn) {
           moreBtn.onclick = async () => {
             moreBtn.disabled = true;
             moreBtn.textContent = pickText("加载中...", "Loading...", "読み込み中...", "로딩 중...");
-            await fetchDetailBatch(nextStart);
+            await fetchDetailBatch(nextStart, moreBtn);
           };
           itinerarySec.appendChild(moreBtn);
         }
 
       } catch (err) {
+        delete itinerarySec.dataset.fetched;
+        if (triggerBtn) {
+          triggerBtn.disabled = false;
+          triggerBtn.textContent = pickText(`加载 Day ${startDay}+ 行程 ↓`, `Load Day ${startDay}+ ↓`, `Day ${startDay}+ を読み込む`, `Day ${startDay}+ 로드`);
+        }
         const loadEl = itinerarySec.querySelector(".plan-detail-loading");
-        if (loadEl) loadEl.innerHTML = `<span style="color:#ef4444">${pickText("行程详情加载失败","Failed","失敗","실패")}: ${escapeHtml(err.message)}</span>`;
+        if (loadEl) loadEl.innerHTML = `<span class="plan-detail-error">${pickText("行程详情加载失败","Failed","失敗","실패")}: ${escapeHtml(describeClientError(err, "plan_detail_provider_unavailable"))}</span>`;
+      } finally {
+        delete itinerarySec.dataset.loading;
       }
     };
 
@@ -10526,14 +12757,9 @@ function selectPlanOption(cardId, planId, planIdx, btn) {
   if (itinerarySec) {
     const secHeader = itinerarySec.querySelector(".plan-section-header");
     if (secHeader) {
-      const planTag = chosenPlan.tag || planId;
+      const planTag = _normalizePlanTag(chosenPlan) || chosenPlan.tag || planId;
       const hotelName = chosenPlan.hotel?.name || "";
-      secHeader.innerHTML = pickText(
-        `逐日行程 · <span style="color:var(--color-primary)">${escapeHtml(planTag)}</span>${hotelName ? ` · <span style="font-weight:400;opacity:.75">${escapeHtml(hotelName)}</span>` : ""}`,
-        `Itinerary · <span style="color:var(--color-primary)">${escapeHtml(planTag)}</span>${hotelName ? ` · <span style="font-weight:400;opacity:.75">${escapeHtml(hotelName)}</span>` : ""}`,
-        `行程 · <span style="color:var(--color-primary)">${escapeHtml(planTag)}</span>`,
-        `일정 · <span style="color:var(--color-primary)">${escapeHtml(planTag)}</span>`,
-      );
+      secHeader.innerHTML = _buildItineraryHeaderHtml(planTag, hotelName);
     }
     // Scroll to itinerary
     setTimeout(() => itinerarySec.scrollIntoView({ behavior: "smooth", block: "start" }), 200);
@@ -10566,7 +12792,7 @@ function buildBookingGuideHTML(plan, destination) {
   const refId = "CX" + Date.now().toString(36).toUpperCase().slice(-6);
 
   const lineItems = [
-    hotelName && { icon: "🏨", label: hotelName, sub: hotelDuration > 0 ? `¥${hotelPPN.toLocaleString()}/晚 × ${hotelDuration}晚` : "", amount: hotelNights },
+    hotelName && { icon: "🏨", label: hotelName, sub: hotelDuration > 0 ? `¥${hotelPPN.toLocaleString()}/${pickText("晚","night","泊","박")} × ${hotelDuration}${pickText("晚","nights","泊","박")}` : "", amount: hotelNights },
     bb.transport && { icon: "✈️", label: pickText("城际交通", "City Transport","交通費", "교통비"), sub: plan.transport_plan?.split("，")[0] || "", amount: bb.transport },
     bb.meals && { icon: "🍜", label: pickText("餐饮", "Meals","食費", "식비"), sub: pickText("全程", "Full trip","全行程", "전체"), amount: bb.meals },
     bb.activities && { icon: "🎯", label: pickText("景点活动", "Activities","アクティビティ", "활동"), sub: pickText("门票含景区预约", "Tickets incl.","入場料込み", "입장료 포함"), amount: bb.activities },
@@ -10599,20 +12825,20 @@ function buildBookingGuideHTML(plan, destination) {
     <div class="cx-checkout-note">
       ${pickText("💡 价格基于实时数据估算，请在平台完成最终预订并获取官方确认。", "💡 Prices are estimated. Complete your booking on the platform to get an official confirmation.", "💡 価格は見積もりです。プラットフォームで予約を完了し、公式確認書を取得してください。", "💡 가격은 견적입니다. 플랫폼에서 예약을 완료하고 공식 확인서를 받으세요.")}
     </div>
-    <button class="cx-checkout-cta" onclick="crossXConfirmBooking(this, '${escapeHtml(hotelName)}', '${escapeHtml(destination)}', ${totalPrice})">
+    <button class="cx-checkout-cta" data-action="checkout-confirm-booking" data-hotel-name="${escapeHtml(hotelName)}" data-destination="${escapeHtml(destination)}" data-total-price="${totalPrice}">
       <span class="cx-checkout-cta-icon">✦</span>
       ${hotelName ? pickText(`预订「${hotelName}」`, `Book "${hotelName}"`, `「${hotelName}」を予約`, `"${hotelName}" 예약`) : pickText("查看预订平台", "View Booking Options", "予約プラットフォームを選択", "예약 플랫폼 보기")}
     </button>
     <div class="cx-checkout-assist">
-      <button class="cx-checkout-text-btn" onclick="addMessage(${JSON.stringify(pickText("我想修改方案", "I want to modify the plan","プランを変更したい", "플랜을 수정하고 싶어요"))}, 'user'); createTaskFromText(${JSON.stringify(pickText("我想修改方案", "modify plan","プランを変更したい", "플랜 수정"))})">
+      <button class="cx-checkout-text-btn" data-action="checkout-quick-task" data-message="${escapeHtml(pickText("我想修改方案", "I want to modify the plan","プランを変更したい", "플랜을 수정하고 싶어요"))}" data-task-text="${escapeHtml(pickText("我想修改方案", "modify plan","プランを変更したい", "플랜 수정"))}">
         ${pickText("调整方案", "Modify Plan","プランを調整", "플랜 조정")}
       </button>
       <span class="cx-checkout-dot">·</span>
-      <button class="cx-checkout-text-btn" onclick="addMessage(${JSON.stringify(pickText("我需要礼宾顾问协助", "I need concierge help","コンシェルジュの助けが必要", "컨시어지 도움이 필요합니다"))}, 'user'); createTaskFromText(${JSON.stringify(pickText("需要礼宾顾问协助", "concierge help","コンシェルジュ支援", "컨시어지 지원"))})">
+      <button class="cx-checkout-text-btn" data-action="checkout-quick-task" data-message="${escapeHtml(pickText("我需要礼宾顾问协助", "I need concierge help","コンシェルジュの助けが必要", "컨시어지 도움이 필요합니다"))}" data-task-text="${escapeHtml(pickText("需要礼宾顾问协助", "concierge help","コンシェルジュ支援", "컨시어지 지원"))}">
         ${pickText("礼宾顾问", "Concierge","コンシェルジュ", "컨시어지")}
       </button>
       <span class="cx-checkout-dot">·</span>
-      <button class="cx-checkout-text-btn cx-feedback-btn" onclick="_reportRecommendation(this)">
+      <button class="cx-checkout-text-btn cx-feedback-btn" data-action="report-recommendation">
         ${pickText("反馈问题", "Report Issue","問題を報告", "문제 신고", "Laporkan Masalah", "الإبلاغ عن مشكلة")}
       </button>
     </div>
@@ -10632,14 +12858,20 @@ async function _saveItineraryToTrips(cardId) {
   try {
     const resp = await api("/api/trips", {
       method: "POST",
-      body: JSON.stringify({ title, city: dest, note: pickText("由 AI Chat 生成", "Generated from AI Chat", "AIチャットで生成", "AI 채팅에서 생성"), durationDays: days }),
+      body: JSON.stringify({
+        title,
+        city: dest,
+        note: pickText("由 AI Chat 生成", "Generated from AI Chat", "AIチャットで生成", "AI 채팅에서 생성"),
+        durationDays: days,
+        itinerarySnapshot: cd || null,
+      }),
     });
     if (resp && resp.trip) {
       notify(pickText("行程已保存到「行程计划」✓", "Saved to Trips ✓", "旅程プランに保存しました ✓", "트립에 저장했습니다 ✓"), "success");
       await loadTrips();
     }
   } catch (err) {
-    notify(pickText(`保存失败：${err.message}`, `Save failed: ${err.message}`, `保存失敗: ${err.message}`, `저장 실패: ${err.message}`), "error");
+    notify(pickText(`保存失败：${describeClientError(err)}`, `Save failed: ${describeClientError(err)}`, `保存失敗: ${describeClientError(err)}`, `저장 실패: ${describeClientError(err)}`), "error");
   }
 }
 
@@ -10668,32 +12900,6 @@ async function _reportRecommendation(btn) {
   }).catch(() => {});
   notify(pickText("感谢反馈，我们会及时修正数据。", "Thanks for your feedback — we'll fix it soon.", "フィードバックをありがとうございます。", "피드백 감사합니다."), "success");
   if (btn) { btn.textContent = pickText("已反馈 ✓", "Reported ✓", "報告済み ✓", "신고됨 ✓"); btn.disabled = true; }
-}
-
-async function _applyInvoice(evt, orderId) {
-  const form = evt.target;
-  const email = form.email.value.trim();
-  const title = form.title ? form.title.value.trim() : "";
-  const taxId = form.taxId ? form.taxId.value.trim() : "";
-  const resultEl = document.getElementById(`invoiceResult_${orderId}`);
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!email || !emailRegex.test(email)) {
-    if (resultEl) resultEl.textContent = pickText("请输入有效邮箱地址。", "Please enter a valid email address.", "有効なメールアドレスを入力してください。", "유효한 이메일 주소를 입력하세요.");
-    return;
-  }
-  if (resultEl) resultEl.textContent = pickText("提交中…", "Submitting…", "送信中…", "제출 중…");
-  try {
-    await api(`/api/orders/${orderId}/invoice`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ..._authHeaders() },
-      body: JSON.stringify({ email, title, taxId }),
-    });
-    if (resultEl) resultEl.textContent = pickText("发票申请已提交，请查收邮件。", "Invoice request submitted — check your email.", "請求書を申請しました。メールをご確認ください。", "영수증 신청이 완료되었습니다. 이메일을 확인하세요.");
-    notify(pickText("发票申请已提交", "Invoice request submitted", "請求書を申請しました", "영수증 신청 완료"), "success");
-    form.reset();
-  } catch (err) {
-    if (resultEl) resultEl.textContent = pickText("提交失败，请重试。", "Submission failed — please retry.", "送信に失敗しました。再試行してください。", "제출 실패 — 다시 시도하세요.");
-  }
 }
 
 // ── Export / share conversation (P0) ──────────────────────────────────────────
@@ -10758,6 +12964,66 @@ const _CURRENCY_SYMBOL_MAP = {
   ARS: "$", BRL: "R$", RUB: "\u20bd", AED: "\u062f.\u0625",
 };
 
+// CNY → other currency approximate rates (updated 2026-Q1)
+const _CNY_RATES = {
+  CNY: 1, USD: 0.138, EUR: 0.128, GBP: 0.109, JPY: 20.5, KRW: 183,
+  SAR: 0.518, INR: 11.6, IDR: 2253, MXN: 2.77, ARS: 136, BRL: 0.76,
+  RUB: 12.6, AED: 0.508,
+};
+
+/**
+ * fmtCNY — convert a CNY amount to the user's selected currency.
+ * Uses live rates from _fxLive when available, otherwise static fallback.
+ * Always respects state.currency (explicit user selection).
+ */
+function fmtCNY(cnyAmount) {
+  const c = (state && state.currency) || "CNY";
+  const sym = _CURRENCY_SYMBOL_MAP[c] || c + " ";
+  const raw = Number(cnyAmount || 0);
+  if (!raw) return sym + "0";
+  if (c === "CNY") return sym + raw.toLocaleString();
+  // Try live rates first, then fall back to static
+  const liveRate = _fxLive && _fxLive.rates && _fxLive.rates[c];
+  const rate = liveRate || _CNY_RATES[c] || 1;
+  const converted = c === "JPY" || c === "KRW" || c === "IDR"
+    ? Math.round(raw * rate)
+    : parseFloat((raw * rate).toFixed(2));
+  return sym + converted.toLocaleString();
+}
+
+function getHotelProviderMeta(source) {
+  const src = String(source || "").toLowerCase();
+  if (src === "trip_live") {
+    return {
+      badgeTitle: pickText("Trip.com 实时酒店价格", "Trip.com live hotel pricing", "Trip.comのリアルタイムホテル価格", "Trip.com 실시간 호텔 요금"),
+      badgeLabel: "Trip.com",
+      actionBook: pickText("在 Trip.com 预订", "Book on Trip.com", "Trip.comで予約", "Trip.com에서 예약"),
+      actionView: pickText("在 Trip.com 查看", "View on Trip.com", "Trip.comで表示", "Trip.com에서 보기"),
+    };
+  }
+  if (src === "ctrip_live" || src === "ctrip_list_live" || src === "ctrip_curated") {
+    return {
+      badgeTitle: pickText("携程酒店数据", "Ctrip hotel data", "Ctripホテルデータ", "씨트립 호텔 데이터"),
+      badgeLabel: pickText("携程数据", "Ctrip", "Ctrip", "씨트립"),
+      actionBook: pickText("在携程预订", "Book on Ctrip", "Ctripで予約", "씨트립 예약"),
+      actionView: pickText("在携程查看", "View on Ctrip", "Ctripで見る", "씨트립에서 보기"),
+    };
+  }
+  return null;
+}
+
+function fmtNativeHotelPrice(amount, currency) {
+  const raw = Number(amount || 0);
+  const code = String(currency || "").toUpperCase();
+  if (!raw || !code) return "";
+  const sym = _CURRENCY_SYMBOL_MAP[code] || "";
+  const formatted = raw.toLocaleString(undefined, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: raw % 1 === 0 ? 0 : 2,
+  });
+  return sym ? `${sym}${formatted} ${code}` : `${formatted} ${code}`;
+}
+
 function _initCurrencySelector() {
   if (!el.currencySwitch) return;
   el.currencySwitch.value = state.currency;
@@ -10783,7 +13049,7 @@ function _initFontSize() {
     if (!isNaN(saved) && saved >= 0 && saved < _FS_STEPS.length) idx = saved;
   } catch { /* ignore */ }
   const apply = () => {
-    document.documentElement.style.fontSize = `${_FS_STEPS[idx]}%`;
+    document.documentElement.dataset.fsIdx = String(idx);
     el.fsDecBtn.disabled = idx <= 0;
     el.fsIncBtn.disabled = idx >= _FS_STEPS.length - 1;
     el.fsDecBtn.classList.toggle("cx-fs-btn--active", idx < _FS_DEFAULT_IDX);
@@ -10801,7 +13067,7 @@ function _initFontSize() {
 function _updateShareItinBtnVisibility() {
   if (!el.shareItinBtn) return;
   const hasMessages = state.agentConversation.messages && state.agentConversation.messages.length > 1;
-  el.shareItinBtn.style.display = hasMessages ? "" : "none";
+  el.shareItinBtn.classList.toggle("hidden", !hasMessages);
 }
 
 async function generateShareLink(btn) {
@@ -10832,7 +13098,7 @@ async function generateShareLink(btn) {
       prompt(pickText("复制此链接：", "Copy this link:", "このリンクをコピー:", "이 링크를 복사하세요:"), url);
     }
   } catch (err) {
-    notify(pickText(`分享失败：${err.message}`, `Share failed: ${err.message}`, `共有失敗: ${err.message}`, `공유 실패: ${err.message}`), "error");
+    notify(formatClientActionError(err, "分享失败", "Share failed", "共有失敗", "공유 실패"), "error");
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -10908,6 +13174,35 @@ const _CITY_TO_COUNTRY = {
   mumbai: "IN", delhi: "IN", bangalore: "IN",
   hawaii: "HI",
 };
+
+const _COUNTRY_TO_DIAL_PREFIX = {
+  CN: "+86", US: "+1", GB: "+44", AU: "+61", JP: "+81", KR: "+82", SG: "+65",
+  MY: "+60", ID: "+62", TH: "+66", PH: "+63", IN: "+91", DE: "+49", FR: "+33",
+  SA: "+966", AE: "+971", QA: "+974", KW: "+965", BH: "+973", OM: "+968",
+  EG: "+20", JO: "+962", NZ: "+64", NL: "+31", VN: "+84", ES: "+34", PT: "+351",
+  TR: "+90", ZA: "+27",
+};
+
+function _inferCountryCodeFromContext() {
+  const candidates = [
+    state.selectedConstraints && state.selectedConstraints.city,
+    state.currentCity,
+    state.city,
+    state.agentConversation && state.agentConversation.slots && state.agentConversation.slots.city,
+    getCurrentCity ? getCurrentCity() : "",
+  ].map((value) => String(value || "").toLowerCase().trim()).filter(Boolean);
+  for (const candidate of candidates) {
+    for (const [city, countryCode] of Object.entries(_CITY_TO_COUNTRY)) {
+      if (candidate.includes(city)) return countryCode;
+    }
+  }
+  return "";
+}
+
+function _inferDialPrefixFromContext() {
+  const countryCode = _inferCountryCodeFromContext();
+  return _COUNTRY_TO_DIAL_PREFIX[countryCode] || "";
+}
 
 function _getEmergencyBlockHtml(destination) {
   if (!destination) return "";
@@ -11101,118 +13396,45 @@ function _initImageUpload() {
   });
 }
 
-// ── CrossX booking platform selector — replaced fake confirmation ─────────────
+// ── CrossX booking confirmation → in-app payment modal ──────────────────────
 function crossXConfirmBooking(btn, hotelName, destination, totalPrice) {
-  const sheet = btn.closest(".cx-checkout-sheet");
   const searchTerm = hotelName || destination || "";
-  const isZH = state.uiLanguage === "ZH";
-
-  // Extract dates from session constraints for pre-filled booking URLs
-  const _sc       = state.selectedConstraints || {};
-  const _checkIn  = _sc.check_in  || _sc.checkIn  || _sc.checkin  || "";
-  const _checkOut = _sc.check_out || _sc.checkOut || _sc.checkout || "";
-  const _navLc = (navigator.language || "").toLowerCase();
-  const _bookingLang = state.uiLanguage === "JA" ? "ja" : state.uiLanguage === "KO" ? "ko" : state.uiLanguage === "ZH" ? "zh-cn" : state.uiLanguage === "ID" ? "id" : state.uiLanguage === "AR" ? "ar" : _navLc.startsWith("es") ? "es" : _navLc.startsWith("fr") ? "fr" : _navLc.startsWith("de") ? "de" : _navLc.startsWith("pt") ? "pt-br" : "en-us";
-  const _agodaLang   = state.uiLanguage === "JA" ? "ja-jp" : state.uiLanguage === "KO" ? "ko-kr" : state.uiLanguage === "ID" ? "id-id" : state.uiLanguage === "AR" ? "ar-ae" : _navLc.startsWith("es") ? "es-es" : _navLc.startsWith("fr") ? "fr-fr" : _navLc.startsWith("de") ? "de-de" : "en-us";
-  function _bookingUrl(base, kw) {
-    let url = base + `?ss=${encodeURIComponent(kw)}&lang=${_bookingLang}&group_adults=2`;
-    if (_checkIn)  url += `&checkin=${encodeURIComponent(_checkIn)}`;
-    if (_checkOut) url += `&checkout=${encodeURIComponent(_checkOut)}`;
-    return url;
-  }
-  function _agodaUrl(kw) {
-    let url = `https://www.agoda.com/search?city=${encodeURIComponent(kw)}&rooms=1&adults=2&children=0&locale=${_agodaLang}`;
-    if (_checkIn)  url += `&checkIn=${encodeURIComponent(_checkIn)}`;
-    if (_checkOut) url += `&checkOut=${encodeURIComponent(_checkOut)}`;
-    return url;
-  }
-  function _ctripUrl(kw) {
-    let url = `https://m.ctrip.com/webapp/hotel/list/?hotelname=${encodeURIComponent(kw)}`;
-    if (_checkIn)  url += `&checkindate=${encodeURIComponent(_checkIn)}`;
-    if (_checkOut) url += `&checkoutdate=${encodeURIComponent(_checkOut)}`;
-    return url;
-  }
-
-  const _titleLabel = searchTerm
-    ? pickText(`预订 ${searchTerm}`, `Book ${searchTerm}`, `${searchTerm} を予約`, `${searchTerm} 예약`)
-    : pickText("选择预订平台完成预订", "Choose a booking platform", "予約プラットフォームを選択", "예약 플랫폼을 선택하세요");
-  const _mapsQuery = encodeURIComponent(`${searchTerm} ${destination || ""}`.trim());
-  const _mapsUrl   = isZH
-    ? `https://uri.amap.com/search?keyword=${encodeURIComponent(searchTerm)}&city=${encodeURIComponent(destination || "")}`
-    : `https://www.google.com/maps/search/?api=1&query=${_mapsQuery}`;
-  const _mapsLabel = pickText("查看地图", "View on Map", "地図で見る", "지도에서 보기", "Lihat di Peta", "عرض على الخريطة");
-  const _mapsLinkHtml = searchTerm ? `<a class="cx-book-btn cx-book-maps" href="${escapeHtml(_mapsUrl)}" target="_blank" rel="noopener">🗺 ${escapeHtml(_mapsLabel)}</a>` : "";
-
-  let linksHtml;
-  if (isZH) {
-    const ctripUrl   = escapeHtml(_ctripUrl(searchTerm));
-    const meituanUrl = escapeHtml(PLATFORM_DEEPLINKS.meituan.url(searchTerm));
-    linksHtml = `
-      <div class="cx-confirm-panel" id="cx-confirm-panel-current">
-        <img class="cx-confirm-img hidden" id="cx-confirm-img-current" src="" alt="" />
-        <div class="cx-confirm-title">${escapeHtml(_titleLabel)}</div>
-        <div class="cx-book-btn-wrap cx-book-multi" style="margin-top:12px">
-          <a class="cx-book-btn cx-book-ctrip"   href="${ctripUrl}"   target="_blank" rel="noopener">🏨 携程 Ctrip</a>
-          <a class="cx-book-btn cx-book-meituan"  href="${meituanUrl}" target="_blank" rel="noopener">🛎️ 美团 Meituan</a>
-          ${_mapsLinkHtml}
-        </div>
-        <div class="cx-confirm-note">${pickText("点击后将在平台完成预订，官方确认由平台直接发送到您的账号。", "", "", "")}</div>
-      </div>`;
-  } else {
-    const bookingUrl = escapeHtml(_bookingUrl("https://www.booking.com/search.html", searchTerm));
-    const agodaUrl   = escapeHtml(_agodaUrl(searchTerm));
-    const klookUrl   = escapeHtml(PLATFORM_DEEPLINKS.klook.url(searchTerm));
-    linksHtml = `
-      <div class="cx-confirm-panel" id="cx-confirm-panel-current">
-        <img class="cx-confirm-img hidden" id="cx-confirm-img-current" src="" alt="" />
-        <div class="cx-confirm-title">${escapeHtml(_titleLabel)}</div>
-        <div class="cx-book-btn-wrap cx-book-multi" style="margin-top:12px">
-          <a class="cx-book-btn cx-book-booking" href="${bookingUrl}" target="_blank" rel="noopener">🏨 Booking.com</a>
-          <a class="cx-book-btn cx-book-agoda"   href="${agodaUrl}"   target="_blank" rel="noopener">🏩 Agoda</a>
-          <a class="cx-book-btn cx-book-klook"   href="${klookUrl}"   target="_blank" rel="noopener">🎫 Klook</a>
-          ${_mapsLinkHtml}
-        </div>
-        <div class="cx-confirm-note">${pickText("", "Tap a platform to complete your real booking. Your confirmation will be sent directly by the platform.", "上記をタップしてプラットフォームで予約を完了してください。確認書はプラットフォームから直接送信されます。", "위 플랫폼을 탭하여 예약을 완료하세요. 확인서는 플랫폼에서 직접 발송됩니다.", "Ketuk platform di atas untuk menyelesaikan pemesanan. Konfirmasi akan dikirim langsung oleh platform.", "انقر على منصة لإتمام حجزك الحقيقي. سيتم إرسال التأكيد مباشرة من المنصة.")}</div>
-      </div>`;
-  }
-
-  btn.style.display = "none";
-  // Inject emergency numbers block for the destination (v8.0 P1)
-  const _emHtml = _getEmergencyBlockHtml(destination || searchTerm);
-  if (_emHtml && sheet) sheet.insertAdjacentHTML("beforeend", _emHtml);
-  if (sheet) sheet.insertAdjacentHTML("beforeend", linksHtml);
-
-  // P0-1: Fetch place photo from Wikipedia and inject if found
-  if (searchTerm) {
-    const uniqueId = `cx-img-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-    const imgEl = document.getElementById("cx-confirm-img-current");
-    if (imgEl) {
-      imgEl.id = uniqueId; // Replace with unique ID to avoid race conditions
-    }
-
-    fetch(`/api/rag/image?q=${encodeURIComponent(searchTerm)}`)
-      .then((r) => { if (!r.ok) throw new Error("photo not found"); return r.json(); })
-      .then(({ imageUrl }) => {
-        if (!imageUrl) return;
-        const targetImg = document.getElementById(uniqueId);
-        if (!targetImg) return;
-        targetImg.src = imageUrl;
-        targetImg.alt = searchTerm;
-        targetImg.classList.remove("hidden");
-      })
-      .catch(() => {});
-  }
-
-  // Clear the panel ID so future panels can use it
-  setTimeout(() => {
-    const panel = document.getElementById("cx-confirm-panel-current");
-    if (panel) panel.removeAttribute("id");
-  }, 100);
+  btn.disabled = true;
+  btn.classList.add("cx-checkout-cta--success");
+  btn.innerHTML = `<span class="cx-checkout-cta-icon">✓</span>${escapeHtml(pickText("打开站内支付", "Open In-App Checkout", "アプリ内決済を開く", "앱 내 결제 열기"))}`;
+  openManagedBookingPayment({
+    title: searchTerm,
+    totalCost: totalPrice,
+    optionId: `managed_${Date.now()}`,
+    planSnapshot: {
+      hotelName: hotelName || "",
+      destination: destination || "",
+      totalPrice: Number(totalPrice || 0) || 0,
+    },
+  }).catch((err) => {
+    console.warn("[booking] failed to open in-app checkout:", getClientErrorCode(err, "checkout_unavailable"));
+    notify(
+      pickText(
+        "站内支付暂时不可用，请稍后重试。",
+        "In-app checkout is temporarily unavailable. Please try again.",
+        "アプリ内決済が一時的に利用できません。後ほどお試しください。",
+        "앱 내 결제가 일시적으로 불가합니다. 잠시 후 다시 시도해 주세요."
+      ),
+      "warning",
+    );
+    btn.disabled = false;
+    btn.classList.remove("cx-checkout-cta--success");
+  });
 }
 
 // ── Typewriter animation for analysis text ───────────────────────────────
 function animateAnalysisText(el, text, speedMs = 20) {
   if (!el || !text) return;
+  if (_isCompactMobileViewport()) {
+    el.textContent = text;
+    el.classList.add("done");
+    return;
+  }
   el.textContent = "";
   el.classList.remove("done");
   let i = 0;
@@ -11236,7 +13458,7 @@ function _renderFollowUpChips(suggestions) {
   const chatEl = document.getElementById("chat-messages");
   if (!chatEl) return;
   const chipsHtml = suggestions.map((s) =>
-    `<button class="cx-followup-chip" onclick="createTaskFromText(${JSON.stringify(s)})">${escapeHtml(s)}</button>`
+    `<button class="cx-followup-chip" data-action="run-intent" data-intent="${escapeHtml(s)}">${escapeHtml(s)}</button>`
   ).join("");
   const wrapper = document.createElement("div");
   wrapper.className = "cx-followup-chips";
@@ -11260,8 +13482,20 @@ function renderItineraryOptionsCard(structured) {
   const tagColors = { opt_a: "card-tier-a", opt_b: "card-tier-b card-tier-recommended", opt_c: "card-tier-c" };
 
   // Arrival transport banner
+  const arrivalSurfaceKind = String(structured.arrival_surface_kind || "airport").toLowerCase();
+  const arrivalSurfaceLabel = String(structured.arrival_surface_label || "").trim();
+  const arrivalBannerIcon = arrivalSurfaceKind === "station"
+    ? "🚉→🏨"
+    : arrivalSurfaceKind === "airport"
+      ? "✈️→🏨"
+      : "📍→🏨";
+  const arrivalBannerTitle = arrivalSurfaceKind === "station"
+    ? pickText("车站到酒店：", "Station → Hotel: ", "駅→ホテル：", "역→호텔：")
+    : arrivalSurfaceKind === "airport"
+      ? pickText("机场到酒店：", "Airport → Hotel: ", "空港→ホテル：", "공항→호텔：")
+      : pickText("到达点到酒店：", "Arrival → Hotel: ", "到着地点→ホテル：", "도착지→호텔：");
   const arrivalBanner = structured.arrival_transport
-    ? `<div class="arrival-banner"><span class="arrival-icon">✈️→🏨</span> <strong>${pickText("机场到酒店：", "Airport → Hotel: ", "空港→ホテル：", "공항→호텔：")}</strong>${escapeHtml(structured.arrival_transport)}</div>`
+    ? `<div class="arrival-banner"><span class="arrival-icon">${arrivalBannerIcon}</span> <strong>${escapeHtml(arrivalSurfaceLabel ? `${arrivalBannerTitle}${arrivalSurfaceLabel} · ` : arrivalBannerTitle)}</strong>${escapeHtml(structured.arrival_transport)}</div>`
     : "";
 
   const optCards = opts.map((opt, i) => {
@@ -11270,23 +13504,38 @@ function renderItineraryOptionsCard(structured) {
     const featureRows = Array.isArray(opt.features)
       ? opt.features.map((f) => `<li><span class="check-mark">✓</span> ${escapeHtml(f)}</li>`).join("")
       : "";
-    const totalFmt = opt.total_cost ? Number(opt.total_cost).toLocaleString() : "-";
+    const totalFmt = opt.total_cost ? fmtCNY(opt.total_cost) : "-";
+    const hotelProvider = getHotelProviderMeta(opt.hotel_source);
+    const nativeHotelPrice = fmtNativeHotelPrice(opt.hotel_native_price, opt.hotel_native_currency);
 
     // Budget breakdown bar
     const bd = opt.budget_breakdown || {};
     const total = opt.total_cost || 1;
+    const budgetStatusTone = opt.budget_status === "over"
+      ? "budget-status--over"
+      : opt.budget_status === "under"
+        ? "budget-status--under"
+        : "budget-status--within";
+    const budgetStatusLabel = opt.budget_status === "over"
+      ? pickText("超出预算", "Over Budget", "予算超過", "예산 초과")
+      : opt.budget_status === "under"
+        ? pickText("低于预算", "Below Budget", "予算未満", "예산 이하")
+        : pickText("预算内", "Within Budget", "予算内", "예산 내");
+    const budgetStatusRow = opt.budget_note
+      ? `<div class="option-budget-status ${budgetStatusTone}"><span class="option-budget-status__label">${escapeHtml(budgetStatusLabel)}</span><span class="option-budget-status__note">${escapeHtml(opt.budget_note)}</span></div>`
+      : "";
     const breakdownBar = (bd.hotel || bd.transport || bd.meals)
       ? `<div class="budget-breakdown-bar">
-          ${bd.hotel   ? `<div class="bb-seg bb-hotel"   style="width:${Math.round(bd.hotel/total*100)}%"   title="${pickText("酒店","Hotel","ホテル","호텔")} ¥${bd.hotel.toLocaleString()}">🏨</div>` : ""}
-          ${bd.meals   ? `<div class="bb-seg bb-meals"   style="width:${Math.round(bd.meals/total*100)}%"   title="${pickText("餐饮","Food","食事","식사")} ¥${bd.meals.toLocaleString()}">🍜</div>` : ""}
-          ${bd.transport? `<div class="bb-seg bb-transport" style="width:${Math.round(bd.transport/total*100)}%" title="${pickText("交通","Transport","交通","교통")} ¥${bd.transport.toLocaleString()}">🚇</div>` : ""}
-          ${bd.misc    ? `<div class="bb-seg bb-misc"    style="width:${Math.round(bd.misc/total*100)}%"    title="${pickText("其他","Other","その他","기타")} ¥${bd.misc.toLocaleString()}">📦</div>` : ""}
+          ${bd.hotel ? `<div class="bb-row"><span class="bb-label">🏨 ${pickText("酒店","Hotel","ホテル","호텔")}</span><progress class="bb-meter bb-meter--hotel" max="100" value="${Math.round(bd.hotel / total * 100)}"></progress><span class="bb-value">${fmtCNY(bd.hotel)}</span></div>` : ""}
+          ${bd.meals ? `<div class="bb-row"><span class="bb-label">🍜 ${pickText("餐饮","Food","食事","식사")}</span><progress class="bb-meter bb-meter--meals" max="100" value="${Math.round(bd.meals / total * 100)}"></progress><span class="bb-value">${fmtCNY(bd.meals)}</span></div>` : ""}
+          ${bd.transport ? `<div class="bb-row"><span class="bb-label">🚇 ${pickText("交通","Transport","交通","교통")}</span><progress class="bb-meter bb-meter--transport" max="100" value="${Math.round(bd.transport / total * 100)}"></progress><span class="bb-value">${fmtCNY(bd.transport)}</span></div>` : ""}
+          ${bd.misc ? `<div class="bb-row"><span class="bb-label">📦 ${pickText("其他","Other","その他","기타")}</span><progress class="bb-meter bb-meter--misc" max="100" value="${Math.round(bd.misc / total * 100)}"></progress><span class="bb-value">${fmtCNY(bd.misc)}</span></div>` : ""}
         </div>
         <div class="bb-legend">
-          ${bd.hotel    ? `<span>🏨 ${pickText("酒店","Hotel","ホテル","호텔")} ¥${Number(bd.hotel).toLocaleString()}</span>` : ""}
-          ${bd.meals    ? `<span>🍜 ${pickText("餐饮","Food","食事","식사")} ¥${Number(bd.meals).toLocaleString()}</span>` : ""}
-          ${bd.transport? `<span>🚇 ${pickText("交通","Transport","交通","교통")} ¥${Number(bd.transport).toLocaleString()}</span>` : ""}
-          ${bd.misc     ? `<span>📦 ${pickText("其他","Other","その他","기타")} ¥${Number(bd.misc).toLocaleString()}</span>` : ""}
+          ${bd.hotel    ? `<span>🏨 ${pickText("酒店","Hotel","ホテル","호텔")} ${fmtCNY(bd.hotel)}</span>` : ""}
+          ${bd.meals    ? `<span>🍜 ${pickText("餐饮","Food","食事","식사")} ${fmtCNY(bd.meals)}</span>` : ""}
+          ${bd.transport? `<span>🚇 ${pickText("交通","Transport","交通","교통")} ${fmtCNY(bd.transport)}</span>` : ""}
+          ${bd.misc     ? `<span>📦 ${pickText("其他","Other","その他","기타")} ${fmtCNY(bd.misc)}</span>` : ""}
         </div>`
       : "";
 
@@ -11295,16 +13544,23 @@ function renderItineraryOptionsCard(structured) {
         ${isRecommended ? `<div class="recommended-badge">${pickText("✦ 推荐 · 最佳性价比", "✦ Best Value","おすすめ", "추천")}</div>` : ""}
         <div class="option-header">
           <span class="option-tag">${escapeHtml(opt.tag || pickText(`方案 ${i + 1}`, `Plan ${i + 1}`, `プラン ${i + 1}`, `플랜 ${i + 1}`))}</span>
-          <div class="option-price">
-            <span class="price-currency">¥</span>
-            <span class="price-amount">${escapeHtml(totalFmt)}</span>
-          </div>
+          <div class="option-price">${escapeHtml(totalFmt)}</div>
         </div>
+        ${budgetStatusRow}
         <div class="option-details">
           <div class="option-detail-row">
             <span class="detail-label">🏨</span>
-            <span><strong>${escapeHtml(opt.hotel_name || "-")}</strong>${opt.hotel_area ? ` · ${escapeHtml(opt.hotel_area)}` : ""}${opt.hotel_includes_breakfast ? ` <em>(${pickText("含早","Incl. breakfast","朝食付き","조식포함")})</em>` : ""} <span class="price-per-night">¥${Number(opt.hotel_price_per_night || 0).toLocaleString()}/${pickText("晚","night","泊","박")}</span></span>
+            <span><strong>${escapeHtml(_sanitizeHotelDisplayName(opt.hotel_name || "-"))}</strong>${opt.hotel_area ? ` · ${escapeHtml(_sanitizeHotelAreaLabel(opt.hotel_area))}` : ""}${opt.hotel_includes_breakfast ? ` <em>(${pickText("含早","Incl. breakfast","朝食付き","조식포함")})</em>` : ""} <span class="price-per-night">${fmtCNY(opt.hotel_price_per_night || 0)}/${pickText("晚","night","泊","박")}</span>${nativeHotelPrice ? ` <span class="cx-native-price">(${pickText("实时", "Live", "実売", "실시간")} ${escapeHtml(nativeHotelPrice)})</span>` : ""}${hotelProvider ? `<span class="cx-live-badge" title="${escapeHtml(hotelProvider.badgeTitle)}">📊 ${escapeHtml(hotelProvider.badgeLabel)}</span>` : ""}</span>
           </div>
+          ${(opt.hotel_ctrip_score || opt.hotel_ctrip_review_count || (opt.hotel_ctrip_tags && opt.hotel_ctrip_tags.length) || (opt.hotel_ctrip_reviews && opt.hotel_ctrip_reviews.length)) ? `
+          <div class="cx-ctrip-hotel-data">
+            ${opt.hotel_ctrip_score ? `<span class="cx-ctrip-score">★ ${opt.hotel_ctrip_score}</span>` : ""}
+            ${opt.hotel_ctrip_review_count ? `<span class="cx-ctrip-review-count">${Number(opt.hotel_ctrip_review_count).toLocaleString()} ${pickText("条评论","reviews","件のレビュー","건 리뷰")}</span>` : ""}
+            ${nativeHotelPrice ? `<span class="cx-ctrip-review-count">${pickText("实时价","Live price","実売価格","실시간 요금")}: ${escapeHtml(nativeHotelPrice)}</span>` : ""}
+            ${(opt.hotel_ctrip_tags || []).map(t => `<span class="cx-ctrip-tag">${escapeHtml(t)}</span>`).join("")}
+            ${(opt.hotel_ctrip_reviews || []).slice(0, 2).map(r => `<div class="cx-ctrip-review-item">「${escapeHtml(r)}」</div>`).join("")}
+            ${opt.hotel_ctrip_url ? `<a class="cx-ctrip-book-btn" href="${escapeHtml(opt.hotel_ctrip_url)}" target="_blank" rel="noopener">🏨 ${escapeHtml((hotelProvider && hotelProvider.actionBook) || pickText("查看酒店","Open hotel","ホテルを見る","호텔 보기"))}</a>` : ""}
+          </div>` : (opt.hotel_ctrip_url ? `<div class="cx-ctrip-hotel-data"><a class="cx-ctrip-book-btn" href="${escapeHtml(opt.hotel_ctrip_url)}" target="_blank" rel="noopener">🏨 ${escapeHtml((hotelProvider && hotelProvider.actionView) || pickText("查看酒店","View hotel","ホテルを見る","호텔 보기"))}</a></div>` : "")}
           <div class="option-detail-row">
             <span class="detail-label">🚇</span>
             <span>${escapeHtml(opt.transport_day_plan || opt.transport_plan || "-")}</span>
@@ -11326,6 +13582,9 @@ function renderItineraryOptionsCard(structured) {
     structured.pax ? `${structured.pax}${pickText("人", " people","名", "명")}` : "",
     structured.arrival_date ? `${pickText("到达", "Arrives","到着", "도착")} ${escapeHtml(structured.arrival_date)}` : "",
   ].filter(Boolean).join("  ·  ");
+  const budgetSummary = structured.budget_summary
+    ? `<div class="status spoken-intro">${escapeHtml(structured.budget_summary)}</div>`
+    : "";
 
   clearChatCards({ keepDeliverable: true, keepSmartReply: false });
   addCard(`
@@ -11333,6 +13592,7 @@ function renderItineraryOptionsCard(structured) {
       <h3>${pickText("AI 为您规划了 3 套完整方案", "3 AI-Crafted Plans Ready to Book", "AIが3つのプランをご提案", "AI가 3개 플랜 준비")}</h3>
       ${tripMeta ? `<div class="status trip-meta">${tripMeta}</div>` : ""}
       ${intro ? `<div class="status spoken-intro">${intro}</div>` : ""}
+      ${budgetSummary}
       ${arrivalBanner}
       <div class="itinerary-options-grid">${optCards}</div>
     </article>
@@ -11345,7 +13605,7 @@ function renderItineraryOptionsCard(structured) {
 function handleCardPaymentConfirm(btn) {
   btn.textContent = pickText("✓ 已确认 · 请点击各平台完成预订", "✓ Confirmed · Tap each platform to book", "確認済み", "확인됨");
   btn.disabled = true;
-  btn.style.background = "var(--color-success, #22c55e)";
+  btn.classList.add("cx-pay-confirmed");
   const card = btn.closest(".plan-card");
   if (card) {
     const links = card.querySelectorAll(".cd-item-book");
@@ -11372,7 +13632,7 @@ function handleAgentPaymentConfirm(btn) {
   }
   btn.textContent = pickText("✓ 方案已确认 · 请逐一完成预订", "✓ Confirmed", "\u2713 \u30d7\u30e9\u30f3\u78ba\u5b9a \u00b7 \u5404\u30d7\u30e9\u30c3\u30c8\u30d5\u30a9\u30fc\u30e0\u3067\u4e88\u7d04\u3092\u5b8c\u4e86", "\u2713 \ud50c\ub79c \ud655\uc815 \u00b7 \uac01 \ud50c\ub7ab\ud3fc\uc5d0\uc11c \uc608\uc57d \uc644\ub8cc");
   btn.disabled = true;
-  btn.style.background = "var(--color-success, #22c55e)";
+  btn.classList.add("cx-pay-confirmed");
   addMessage(pickText(`已选「${optTag}」方案！依次点击各平台按钮完成预订。`, `"${optTag}" confirmed! Tap each platform button.`, `\u300c${optTag}\u300d\u30d7\u30e9\u30f3\u3092\u9078\u629e\u3057\u307e\u3057\u305f\uff01\u5404\u30d7\u30e9\u30c3\u30c8\u30d5\u30a9\u30fc\u30e0\u30dc\u30bf\u30f3\u3092\u9806\u306b\u30af\u30ea\u30c3\u30af\u3057\u3066\u304f\u3060\u3055\u3044\u3002`, `\u300c${optTag}\u300d \ud50c\ub79c\uc744 \uc120\ud0dd\ud588\uc2b5\ub2c8\ub2e4! \uac01 \ud50c\ub7ab\ud3fc \ubc84\ud2bc\uc744 \uc21c\uc11c\ub300\ub85c \ud074\ub9ad\ud558\uc138\uc694.`), "agent");
 }
 
@@ -11399,7 +13659,6 @@ async function runHotelBookingAction(payload, optionId = "unknown") {
     idType: "passport",
     idNo: `P${Date.now().toString().slice(-6)}${idx + 1}`,
   }));
-  const outOrderNo = `CXH${Date.now().toString().slice(-10)}${Math.floor(Math.random() * 900 + 100)}`;
   const created = await api("/hotel/order/create", {
     method: "POST",
     body: JSON.stringify({
@@ -11414,7 +13673,6 @@ async function runHotelBookingAction(payload, optionId = "unknown") {
       contactName: "Cross X Guest",
       contactPhone: "18800000000",
       arrivalTime: "18:00",
-      outOrderNo,
       totalPrice: data.totalPrice || 0,
       paymentMode: "wechat_c",
       autoPaid: true,
@@ -11432,17 +13690,17 @@ async function runHotelBookingAction(payload, optionId = "unknown") {
       : pickText("订单已创建。", "Order created.","注文を作成しました。", "주문이 생성되었습니다.");
   addMessage(
     pickText(
-      `已创建酒店订单 ${created.outOrderNo}，状态：${created.orderStatus}。${paymentHint}`,
-      `Hotel order ${created.outOrderNo} created. Status: ${created.orderStatus}. ${paymentHint}`,
-      `ホテル注文 ${created.outOrderNo} を作成。状態: ${created.orderStatus}。${paymentHint}`,
-      `호텔 주문 ${created.outOrderNo} 생성. 상태: ${created.orderStatus}. ${paymentHint}`,
+      `已创建酒店订单 ${created.orderId}，状态：${created.orderStatus}。${paymentHint}`,
+      `Hotel order ${created.orderId} created. Status: ${created.orderStatus}. ${paymentHint}`,
+      `ホテル注文 ${created.orderId} を作成。状態: ${created.orderStatus}。${paymentHint}`,
+      `호텔 주문 ${created.orderId} 생성. 상태: ${created.orderStatus}. ${paymentHint}`,
     ),
     "agent",
   );
   if (created && created.orderId) {
     await loadOrderDetail(created.orderId).catch(() => {});
   }
-  await trackEvent("hotel_order_created_from_chat", { optionId, outOrderNo: created.outOrderNo || "" });
+  await trackEvent("hotel_order_created_from_chat", { optionId, orderId: created.orderId || "" });
 }
 
 async function captureLocationFromBrowser(triggerBtn = null) {
@@ -11482,57 +13740,50 @@ async function captureLocationFromBrowser(triggerBtn = null) {
             source: "browser_geolocation",
           }),
         });
-        if (el.locationTag) {
-          el.locationTag.textContent = `${data.city || "Shanghai"} · GPS`;
+        const resolvedCity = String(data.city || "").trim();
+        const resolvedCityZh = String(data.cityZh || resolvedCity).trim();
+        if (!resolvedCity) {
+          notify(
+            pickText(
+              "已拿到定位坐标，但还没能准确识别城市，请手动选择城市。",
+              "Coordinates were captured, but the city could not be resolved. Please choose the city manually.",
+              "位置座標は取得できましたが都市を特定できませんでした。都市を手動で選択してください。",
+              "좌표는 가져왔지만 도시를 정확히 확인하지 못했습니다. 도시를 직접 선택해 주세요.",
+            ),
+            "warning",
+          );
+          return;
         }
-        state.selectedConstraints.city = data.city || "Shanghai";
+        _updateLocationTag(resolvedCity, {
+          cityZh: resolvedCityZh || resolvedCity,
+          cityEn: resolvedCity,
+          hasGps: true,
+        });
+        state.selectedConstraints.city = resolvedCity;
         state.selectedConstraints.origin = "current_location";
+        state._gpsLat = Number(coords.latitude);
+        state._gpsLng = Number(coords.longitude);
+        _persistConstraints();
         syncChipSelectionFromConstraints();
         updateContextSummary();
         renderQuickGoals();
         notify(
           pickText(
-            `定位成功：${data.city || "Shanghai"}`,
-            `Location updated: ${data.city || "Shanghai"}`,
-            `位置情報を更新しました: ${data.city || "Shanghai"}`,
-            `위치가 업데이트되었습니다: ${data.city || "Shanghai"}`,
+            `定位成功：${resolvedCityZh || resolvedCity}`,
+            `Location updated: ${resolvedCity}`,
+            `位置情報を更新しました: ${resolvedCity}`,
+            `위치가 업데이트되었습니다: ${resolvedCity}`,
           ),
           "success",
         );
         await Promise.all([loadNearSuggestions(), loadAuditLogs()]);
       } catch (err) {
-        // Fallback: try IP-based location
-        try {
-          const ipData = await api("/api/user/location", {
-            method: "POST",
-            body: JSON.stringify({ lat: null, lng: null, source: "ip_fallback" }),
-          });
-          if (ipData && ipData.city) {
-            if (el.locationTag) el.locationTag.textContent = `${ipData.city} · IP`;
-            state.selectedConstraints.city = ipData.city;
-            state.selectedConstraints.origin = "ip_fallback";
-            syncChipSelectionFromConstraints();
-            updateContextSummary();
-            renderQuickGoals();
-            notify(
-              pickText(
-                `已通过网络IP估算位置：${ipData.city}（如不准确请手动选择城市）`,
-                `Location estimated via IP: ${ipData.city}. Tap a city chip to override.`,
-                `IPから位置を推定しました: ${ipData.city}（正確でない場合は都市を選択してください）`,
-                `IP로 위치 추정: ${ipData.city}. 도시 칩을 눌러 변경하세요.`,
-              ),
-              "warning",
-            );
-            await Promise.all([loadNearSuggestions(), loadAuditLogs()]);
-            return;
-          }
-        } catch { /* IP fallback also failed, show manual prompt below */ }
         notify(
           pickText(
-            "定位失败，请检查浏览器定位权限，或在上方点击城市手动选择。",
-            "Location failed. Check browser permissions or tap a city chip above to set manually.",
-            "位置情報の取得に失敗しました。ブラウザ権限を確認するか、都市を手動で選択してください。",
-            "위치 확인 실패. 브라우저 권한을 확인하거나 도시 칩을 눌러 수동으로 선택하세요.",
+            "定位失败，请检查浏览器定位权限；如果城市不准，请手动选择城市，不再使用不可靠的 IP 估算。",
+            "Location failed. Check browser permission; if the city is wrong, choose it manually instead of relying on IP guesswork.",
+            "位置取得に失敗しました。ブラウザ権限を確認してください。都市が不正確な場合は IP 推定ではなく手動選択を使ってください。",
+            "위치 확인에 실패했습니다. 브라우저 권한을 확인해 주세요. 도시가 부정확하면 IP 추정보다 수동 선택을 사용하세요.",
           ),
           "error",
         );
@@ -11612,11 +13863,16 @@ async function createTaskFromText(text) {
   }
   // Store for on-demand detail fetch (revealPlanItinerary uses this)
   state.lastPlanMessage = text;
+  state._restoredConversation = null;
+  state._sessionRestored = false;
+  const _sessionBanner = document.getElementById("sessionContextBanner");
+  if (_sessionBanner) _sessionBanner.remove();
   // Now store current user message and persist
   state.agentConversation.messages.push({ role: "user", content: text });
   if (state.agentConversation.messages.length > 20) state.agentConversation.messages = state.agentConversation.messages.slice(-20);
   saveConversationState();
-  addMessage(text, "user");
+  addMessage(text, "user", { forceReveal: true });
+  resetTransientUiSurfaces();
   let smartReplyPromise = Promise.resolve(null);
   const loadingRow = addMessage(
     pickText(
@@ -11626,7 +13882,7 @@ async function createTaskFromText(text) {
       "요청을 분析하고 실행 가능한 옵션을 생성하고 있습니다...",
     ),
     "agent",
-    { speak: false },
+    { speak: false, forceReveal: true },
   );
   const skeletonId = renderTaskSkeletonCards();
   const inferred = inferConstraintsFromIntent(text);
@@ -11635,6 +13891,14 @@ async function createTaskFromText(text) {
     ...inferred,
   };
   state.selectedConstraints = mergedConstraints;
+  _persistConstraints();
+
+  if (shouldUseDirectHotelSmartReply(text, mergedConstraints)) {
+    syncChipSelectionFromConstraints();
+    updateContextSummary();
+    return runDirectSmartReplyTurn(text, mergedConstraints, conversationHistory);
+  }
+
   // ── Use SSE streaming plan builder for all chat queries ──────────────────
   let _thinkingStream   = null;
   let _planSkeleton     = null;
@@ -11656,17 +13920,20 @@ async function createTaskFromText(text) {
           // P8.7: Unified REALTIME_THINKING_MAP — no fixed hotel/generic text ever.
           // Context extracted once from the user's message (closure over `text`).
           const _dest   = _extractDestFromText(text);
-          const _foodKw = _extractFoodKw(text);
+          const _foodKw = _detectThinkingIntent(text) === "food" ? _extractFoodKw(text) : null;
           const _toolName = code.startsWith("TOOL:") ? code.slice(5) : code;
+          const fn = REALTIME_THINKING_MAP[_toolName];
+          const _fallbackText = pickText("AI 处理中...", "AI processing...", "AI 処理中...", "AI 처리 중...");
+          const _evText = fn
+            ? fn(_dest, _foodKw)
+            : normalizeThinkingStatusText(label, _fallbackText);
           // First tool call: swap typing bubble for context-aware skeleton
           if (code.startsWith("TOOL:") && !_toolSkeletonEl) {
             _removeTypingBubble(_typingBubble);
             _showToolSkeleton(_toolName, _extractDestFromText(text));
           }
           const stepCode  = TOOL_STEP_MAP[_toolName] || code;  // map agent tool → step id
-          appendThinkingStep(_thinkingStream, stepCode, label);
-          const fn = REALTIME_THINKING_MAP[_toolName];
-          const _evText = fn ? fn(_dest, _foodKw) : label || pickText("AI 处理中...", "AI processing...", "AI 処理中...", "AI 처리 중...");
+          appendThinkingStep(_thinkingStream, stepCode, _evText);
           // Sticky: show real server label for 3s, prevents rotation from overwriting it
           _lastEventLabel   = _evText;
           _eventStickyUntil = Date.now() + 3000;
@@ -11720,9 +13987,10 @@ async function createTaskFromText(text) {
   // AI typing bubble — shows immediately in chat feed while AI is computing
   const _typingBubble = _showTypingBubble();
   // P8.6: Intent-aware thinking phases — align copy to what the user is actually asking
-  const _iFood  = /餐厅|美食|好吃|推荐.*吃|吃什么|小吃|eat|restaurant|food|dining/i.test(text);
-  const _iStay  = /酒店|住宿|宾馆|民宿|hotel|hostel|stay|accommodation/i.test(text);
-  const _iSight = /景点|游览|门票|博物馆|景区|打卡|scenic|attraction|museum/i.test(text);
+  const _thinkingIntent = _detectThinkingIntent(text);
+  const _iFood  = _thinkingIntent === "food";
+  const _iStay  = _thinkingIntent === "stay";
+  const _iSight = _thinkingIntent === "activity";
   const thinkingPhases = _iFood ? [
     pickText("正在理解你的美食偏好...", "Parsing your food preferences...", "食の好みを解析中...", "음식 취향 분석 중..."),
     pickText("搜索本地特色餐厅...", "Searching local eateries...", "地元レストランを検索中...", "현지 맛집 검색 중..."),
@@ -11762,7 +14030,6 @@ async function createTaskFromText(text) {
     const data = await api("/api/tasks", {
       method: "POST",
       body: JSON.stringify({
-        userId: (_getAuthUserId && _getAuthUserId()) || "demo",
         intent: text,
         constraints: mergedConstraints,
         tripId: state.activeTripId || undefined,
@@ -11853,8 +14120,8 @@ async function createTaskFromText(text) {
         if (text) {
           setTimeout(() => {
             const _retryChip = document.createElement("div");
-            _retryChip.style.cssText = "display:flex;gap:8px;padding:0 16px 12px;flex-wrap:wrap";
-            _retryChip.innerHTML = `<button class="cx-followup-chip" onclick="createTaskFromText(${JSON.stringify(text)})">${pickText("🔄 重试刚才的请求", "🔄 Retry my request", "🔄 同じリクエストを再試行", "🔄 다시 시도")}</button>`;
+            _retryChip.className = "cx-followup-chips cx-followup-chips--inline";
+            _retryChip.innerHTML = `<button class="cx-followup-chip" data-action="run-intent" data-intent="${escapeHtml(text)}">${pickText("🔄 重试刚才的请求", "🔄 Retry my request", "🔄 同じリクエストを再試行", "🔄 다시 시도")}</button>`;
             if (el.chatFeed) el.chatFeed.appendChild(_retryChip);
           }, 100);
         }
@@ -11876,8 +14143,8 @@ async function createTaskFromText(text) {
         if (text) {
           setTimeout(() => {
             const _retryChip2 = document.createElement("div");
-            _retryChip2.style.cssText = "display:flex;gap:8px;padding:0 16px 12px;flex-wrap:wrap";
-            _retryChip2.innerHTML = `<button class="cx-followup-chip" onclick="createTaskFromText(${JSON.stringify(text)})">${pickText("🔄 重试刚才的请求", "🔄 Retry my request", "🔄 同じリクエストを再試行", "🔄 다시 시도")}</button>`;
+            _retryChip2.className = "cx-followup-chips cx-followup-chips--inline";
+            _retryChip2.innerHTML = `<button class="cx-followup-chip" data-action="run-intent" data-intent="${escapeHtml(text)}">${pickText("🔄 重试刚才的请求", "🔄 Retry my request", "🔄 同じリクエストを再試行", "🔄 다시 시도")}</button>`;
             if (el.chatFeed) el.chatFeed.appendChild(_retryChip2);
           }, 100);
         }
@@ -11946,6 +14213,7 @@ async function createTaskFromText(text) {
     clearTaskSkeletonCards(skeletonId);
     if (skeleton && el.chatSolutionStrip) skeleton.clear(el.chatSolutionStrip);
     setLoading("createTask", false);
+    flushPendingLanguageRefresh();
   }
 }
 
@@ -11971,7 +14239,6 @@ async function runPromptWithExecution(prompt, meta = {}) {
   const data = await api("/api/tasks", {
     method: "POST",
     body: JSON.stringify({
-      userId: (_getAuthUserId && _getAuthUserId()) || "demo",
       intent: text,
       constraints: mergedConstraints,
       tripId: state.activeTripId || undefined,
@@ -12038,18 +14305,18 @@ async function confirmAndExecute(taskId, options = {}) {
         ? await new Promise(resolve => {
             // TOTP 2FA modal — user enters 6-digit code from authenticator app
             const overlay = document.createElement("div");
-            overlay.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:9999";
+            overlay.className = "cx-totp-overlay";
             overlay.innerHTML = `
-              <div style="background:#fff;border-radius:12px;padding:28px 32px;width:320px;box-shadow:0 8px 32px rgba(0,0,0,.18);text-align:center">
-                <div style="font-size:32px;margin-bottom:8px;">🔐</div>
-                <div style="font-weight:600;margin-bottom:4px">${pickText("高额二次验证", "High-Amount Verification", "高額認証", "고액 인증")}</div>
-                <div style="font-size:13px;color:#64748b;margin-bottom:12px">${pickText("支付金额", "Amount", "支払金額", "금액")}: <strong>${amount} CNY</strong></div>
+              <div class="cx-totp-panel">
+                <div class="cx-totp-icon">🔐</div>
+                <div class="cx-totp-title">${pickText("高额二次验证", "High-Amount Verification", "高額認証", "고액 인증")}</div>
+                <div class="cx-totp-amount">${pickText("支付金额", "Amount", "支払金額", "금액")}: <strong>${amount} CNY</strong></div>
                 <input id="cx-totp-input" type="tel" inputmode="numeric" maxlength="6" placeholder="${pickText('6位验证码', '6-digit code', '6桁コード', '6자리 코드')}"
-                  style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:22px;text-align:center;letter-spacing:6px;margin-bottom:8px"/>
-                <div id="cx-totp-err" style="color:#ef4444;font-size:12px;min-height:16px;margin-bottom:8px"></div>
-                <div style="display:flex;gap:8px">
-                  <button id="cx-totp-cancel" style="flex:1;padding:10px;border:1px solid #ddd;border-radius:8px;background:#f8fafc;cursor:pointer">${pickText("取消", "Cancel", "キャンセル", "취소")}</button>
-                  <button id="cx-totp-confirm" style="flex:1;padding:10px;background:#1a1a1a;color:#fff;border:none;border-radius:8px;cursor:pointer">${pickText("确认支付", "Confirm", "支払い確認", "결제 확인")}</button>
+                  class="cx-totp-input"/>
+                <div id="cx-totp-err" class="cx-totp-error"></div>
+                <div class="cx-totp-actions">
+                  <button id="cx-totp-cancel" class="cx-totp-btn cx-totp-btn-cancel">${pickText("取消", "Cancel", "キャンセル", "취소")}</button>
+                  <button id="cx-totp-confirm" class="cx-totp-btn cx-totp-btn-confirm">${pickText("确认支付", "Confirm", "支払い確認", "결제 확인")}</button>
                 </div>
               </div>`;
             document.body.appendChild(overlay);
@@ -12110,9 +14377,10 @@ async function confirmAndExecute(taskId, options = {}) {
   } catch (err) {
     if (state.executionMockTimer) clearTimeout(state.executionMockTimer);
     setLoopProgress("support");
-    trackEvent("task_execution_failed", { reason: (err.message || "unknown").slice(0, 120) }, taskId).catch(() => {});
+    const safeReason = sanitizeClientErrorCode(err && err.message, "execution_failed");
+    trackEvent("task_execution_failed", { reason: safeReason }, taskId).catch(() => {});
     notify(pickText("执行失败，已提供兜底方案。", "Execution failed. Fallback ready.","実行失敗。フォールバックを提示しました。", "실행 실패. 대체 경로를 준비했습니다."), "error");
-    renderFallbackCard(taskId, err.message);
+    renderFallbackCard(taskId, safeReason);
     await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
     return { ok: false, reason: "execute_failed", error: err };
   } finally {
@@ -12132,7 +14400,8 @@ function switchTab(tabName, options = {}) {
     ), "warning");
     return;
   }
-  if (state.singleDialogMode && tabName !== "chat" && !options.force) {
+  const allowSingleDialogHub = canUseFulfillmentHub() && tabName === "trips";
+  if (state.singleDialogMode && tabName !== "chat" && !allowSingleDialogHub && !options.force) {
     notify(
       pickText(
         "当前为单对话模式。点击右上角可切换到工作台模式。",
@@ -12256,10 +14525,10 @@ function renderDrawerTab() {
   if (state.currentSubtab === "overview") {
     const recommendation = state.currentTaskRecommendation;
     const fallback = (detail.fallbackEvents || [])
-      .map((f) => `<li>${escapeHtml(f.kind)} · ${escapeHtml(f.note)} <span class="status">${new Date(f.at).toLocaleString()}</span></li>`)
+      .map((f) => `<li>${escapeHtml(_localizeVisibleTravelText(f.kind || "", f.kind || "-"))} · ${escapeHtml(_localizeVisibleTravelText(f.note || "", "-"))} <span class="status">${new Date(f.at).toLocaleString()}</span></li>`)
       .join("");
     const lifecycle = (detail.lifecycle || [])
-      .map((item) => `<li><strong>${escapeHtml(item.label || item.state)}</strong> <span class="status">${new Date(item.at).toLocaleString()} · ${escapeHtml(item.note || "")}</span></li>`)
+      .map((item) => `<li><strong>${escapeHtml(_localizeVisibleTravelText(item.label || item.state || "", localizeStatus(item.state || "-")))}</strong> <span class="status">${new Date(item.at).toLocaleString()} · ${escapeHtml(_localizeVisibleTravelText(item.note || "", ""))}</span></li>`)
       .join("");
     const p = detail.progress || {};
     const taskTypeLabel = (() => {
@@ -12269,28 +14538,20 @@ function renderDrawerTab() {
       if (v === "support") return pickText("售后", "Support","サポート", "지원");
       return v || "-";
     })();
-    const flags = Object.entries(detail.flagSnapshot || {})
-      .map(([name, item]) => {
-        const activeLabel = item.active
-          ? pickText("已启用", "Active","有効", "활성")
-          : pickText("未启用", "Inactive","無効", "비활성");
-        return `<li>${escapeHtml(name)} · <strong>${activeLabel}</strong> <span class="status">${pickText("灰度", "Rollout","ロールアウト", "롤아웃")} ${item.rollout}% · ${pickText("分桶", "Bucket","バケット", "버킷")} ${item.bucket}</span></li>`;
-      })
-      .join("");
     const recoComments = recommendation && recommendation.comments
-      ? recommendation.comments.slice(0, 2).map((item) => `<li>${escapeHtml(item)}</li>`).join("")
+      ? recommendation.comments.slice(0, 2).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("")
       : "";
     const recoReasons = recommendation && recommendation.reasons
-      ? recommendation.reasons.slice(0, 2).map((item) => `<li>${escapeHtml(item)}</li>`).join("")
+      ? recommendation.reasons.slice(0, 2).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("")
       : "";
     const recommendationCard =
       recommendation && recommendation.imagePath
         ? `
       <article class="card">
         <h3>${pickText("推荐路线", "Recommended Lane","推奨ルート", "추천 경로")}</h3>
-        <div class="status">${escapeHtml(recommendation.subtitle || pickText("任务级推荐", "Task-scoped recommendation","タスク別推奨", "작업 기준 추천"))}</div>
+        <div class="status">${escapeHtml(_localizeVisibleTravelText(recommendation.subtitle || "", pickText("任务级推荐", "Task-scoped recommendation","タスク別推奨", "작업 기준 추천")))}</div>
         <img class="media-photo" src="${escapeHtml(assetUrl(recommendation.imagePath))}" alt="${pickText("任务推荐", "Task recommendation","タスク推奨", "작업 추천")}" />
-        <div class="status">${pickText("推荐提示词", "Recommended prompt","推奨プロンプト", "추천 프롬프트")}: ${escapeHtml(recommendation.recommendedPrompt || "-")}</div>
+        <div class="status">${pickText("推荐提示词", "Recommended prompt","推奨プロンプト", "추천 프롬프트")}: ${escapeHtml(_localizeVisibleTravelText(recommendation.recommendedPrompt || "", "-"))}</div>
         <h3>${pickText("相关评论", "Related Comments","関連コメント", "관련 코멘트")}</h3>
         <ul class="steps">${recoComments || `<li>${pickText("暂无评论。", "No comments.","コメントはありません。", "코멘트가 없습니다.")}</li>`}</ul>
         <h3>${pickText("推荐原因", "Why This Lane","推奨理由", "추천 이유")}</h3>
@@ -12300,11 +14561,11 @@ function renderDrawerTab() {
         : "";
     el.drawerBody.innerHTML = `
       <article class="card">
-        <h3>${escapeHtml((detail.overview && detail.overview.intent) || "-")}</h3>
+        <h3>${escapeHtml(_localizeVisibleTravelText((detail.overview && detail.overview.intent) || "", "-"))}</h3>
         <div>${pickText("状态", "Status","状態", "상태")}: ${escapeHtml(localizeStatus((detail.overview && detail.overview.status) || "-"))}</div>
         <div>${pickText("类型", "Type","タイプ", "유형")}: ${escapeHtml(taskTypeLabel)}</div>
         <div class="status">${pickText("进度", "Progress","進捗", "진행률")}: ${pickText("成功", "Success","成功", "성공")} ${Number(p.success || 0)} / ${Number(p.total || 0)} · ${pickText("执行中", "Running","実行中", "실행중")} ${Number(p.running || 0)} · ${pickText("兜底", "Fallback","フォールバック", "대체")} ${Number(p.fallback || 0)} · ${pickText("失败", "Failed","失敗", "실패")} ${Number(p.failed || 0)}</div>
-        <div>${pickText("原因说明", "Reasoning","理由", "근거")}: ${escapeHtml((detail.overview && detail.overview.reasoning) || "-")}</div>
+        <div>${pickText("原因说明", "Reasoning","理由", "근거")}: ${escapeHtml(_localizeVisibleTravelText((detail.overview && detail.overview.reasoning) || "", "-"))}</div>
         <div>${pickText("支付通道", "Payment rail","決済レール", "결제 레일")}: ${escapeHtml((detail.overview && detail.overview.paymentRail) || "alipay_cn")}</div>
         ${
           detail.overview && detail.overview.pricing
@@ -12312,7 +14573,7 @@ function renderDrawerTab() {
             : ""
         }
         <div>${pickText("创建时间", "Created","作成日時", "생성 시각")}: ${detail.overview && detail.overview.createdAt ? new Date(detail.overview.createdAt).toLocaleString() : "-"}</div>
-        <div>${pickText("人工接管", "Handoff","有人対応", "사람 상담")}: ${detail.handoff ? `<span class="code">${escapeHtml(detail.handoff.ticketId)}</span> (${escapeHtml(detail.handoff.status)})` : pickText("未请求", "Not requested","未リクエスト", "요청되지 않음")}</div>
+        <div>${pickText("人工接管", "Handoff","有人対応", "사람 상담")}: ${detail.handoff ? `<span class="code">${escapeHtml(detail.handoff.ticketId)}</span> (${escapeHtml(localizeStatus(detail.handoff.status || "-"))})` : pickText("未请求", "Not requested","未リクエスト", "요청되지 않음")}</div>
         <div class="status">${detail.handoff ? `${pickText("请求时间", "Requested","依頼時刻", "요청 시각")}: ${new Date(detail.handoff.requestedAt).toLocaleString()}` : ""}</div>
         <div class="status">${detail.handoff && detail.handoff.updatedAt ? `${pickText("更新时间", "Updated","更新時刻", "업데이트 시각")}: ${new Date(detail.handoff.updatedAt).toLocaleString()}` : ""}</div>
         <div class="actions">
@@ -12327,10 +14588,6 @@ function renderDrawerTab() {
       <article class="card">
         <h3>${pickText("兜底事件", "Fallback Events","フォールバックイベント", "대체 실행 이벤트")}</h3>
         <ul class="steps">${fallback || `<li>${pickText("未触发兜底。", "No fallback triggered.","フォールバックは未発生です。", "대체 실행이 발생하지 않았습니다.")}</li>`}</ul>
-      </article>
-      <article class="card">
-        <h3>${pickText("灰度标记（快照）", "Feature Flags (Snapshot)","機能フラグ（スナップショット）", "기능 플래그 (스냅샷)")}</h3>
-        <ul class="steps">${flags || `<li>${pickText("暂无标记。", "No flags.","フラグはありません。", "플래그가 없습니다.")}</li>`}</ul>
       </article>
       ${recommendationCard}
     `;
@@ -12364,13 +14621,6 @@ function renderDrawerTab() {
         <h3>${pickText("执行步骤", "Execution Steps","実行ステップ", "실행 단계")}</h3>
         <ol class="steps">${steps}</ol>
       </article>
-      <article class="card">
-        <h3>MCP ${pickText("摘要", "Summary","サマリー", "요약")}</h3>
-        <div>${pickText("查询", "Query","照会", "조회")}: <span class="code">${escapeHtml((detail.mcpSummary && detail.mcpSummary.query) || "-")}</span></div>
-        <div>${pickText("预订", "Book","予約", "예약")}: <span class="code">${escapeHtml((detail.mcpSummary && detail.mcpSummary.book) || "-")}</span></div>
-        <div>${pickText("支付", "Pay","支払い", "결제")}: <span class="code">${escapeHtml((detail.mcpSummary && detail.mcpSummary.pay) || "-")}</span></div>
-        <div>${pickText("状态", "Status","状態", "상태")}: <span class="code">${escapeHtml((detail.mcpSummary && detail.mcpSummary.status) || "-")}</span></div>
-      </article>
     `;
     motion.bindPressables(el.drawerBody);
     return;
@@ -12381,7 +14631,7 @@ function renderDrawerTab() {
       ? detail.payments
           .map(
             (p) =>
-              `<li>${p.amount} ${escapeHtml(p.currency)} · ${escapeHtml(p.status)} · ${escapeHtml(p.railLabel || p.railId || "-")} · ${new Date(p.at).toLocaleString()} ${p.gatewayRef ? `<span class="code">${escapeHtml(p.gatewayRef)}</span>` : ""}</li>`,
+              `<li>${p.amount} ${escapeHtml(p.currency)} · ${escapeHtml(localizeStatus(p.status || "-"))} · ${escapeHtml(_localizeVisibleTravelText(p.railLabel || p.railId || "", p.railId || "-"))} · ${new Date(p.at).toLocaleString()}</li>`,
           )
           .join("")
       : `<li>${pickText("暂无支付记录。", "No payment records.","支払い記録はありません。", "결제 기록이 없습니다.")}</li>`;
@@ -12396,37 +14646,35 @@ function renderDrawerTab() {
   }
 
   const proof = detail.proof;
+  const proofOrderDisplay = (detail.payments && detail.payments[0] && detail.payments[0].orderId) || "-";
   const evidence = (detail.evidenceItems || [])
     .map(
       (item) =>
-        `<li><strong>${escapeHtml(item.title || item.type)}</strong> <span class="status">${escapeHtml(item.hash || "-")} · ${new Date(item.generatedAt).toLocaleString()}</span><div class="status">${escapeHtml(item.content || "")}</div></li>`,
+        `<li><strong>${escapeHtml(_localizeVisibleTravelText(item.title || item.type || "", pickText("证据", "Evidence","証拠", "증빙")))}</strong> <span class="status">${escapeHtml(item.hash || "-")} · ${new Date(item.generatedAt).toLocaleString()}</span><div class="status">${escapeHtml(_localizeVisibleTravelText(item.content || "", ""))}</div></li>`,
     )
     .join("");
   const chain = (detail.proofChain || [])
     .map(
       (c) =>
         `<li>
-          <strong>${escapeHtml(c.op)}</strong> · ${escapeHtml(c.toolType)}
-          <span class="status">${escapeHtml(c.responseStatus)} · ${c.latency || 0}ms · ${pickText("契约", "Contract","契約", "계약")} ${escapeHtml(c.contractId || "-")}</span>
-          <div class="status">${pickText("请求", "Request","リクエスト", "요청")}: ${escapeHtml(c.requestSummary || "-")}</div>
-          <div class="status">${pickText("响应", "Response","レスポンス", "응답")}: ${escapeHtml(c.responseSummary || "-")}</div>
-          <div class="status">${pickText("选择理由", "Why selected","選定理由", "선정 이유")}: ${escapeHtml(c.selectionReason || "-")}</div>
+          <strong>${escapeHtml(_localizeVisibleTravelText(c.op || "", pickText("操作", "Operation","操作", "작업")))}</strong> · ${escapeHtml(_localizeVisibleTravelText(c.toolType || "", c.toolType || "-"))}
+          <span class="status">${escapeHtml(_localizeVisibleTravelText(c.responseStatus || "", c.responseStatus || "-"))} · ${c.latency || 0}ms</span>
         </li>`,
     )
     .join("");
   const moments = (detail.keyMoments || [])
-    .map((m) => `<li><strong>${escapeHtml(m.kind)}</strong> · ${new Date(m.at).toLocaleString()} <span class="status">${escapeHtml(m.note)}</span></li>`)
+    .map((m) => `<li><strong>${escapeHtml(_localizeVisibleTravelText(m.kind || "", pickText("节点", "Moment","時点", "시점")))}</strong> · ${new Date(m.at).toLocaleString()} <span class="status">${escapeHtml(_localizeVisibleTravelText(m.note || "", ""))}</span></li>`)
     .join("");
 
   el.drawerBody.innerHTML = proof
     ? `
       <article class="card">
         <h3>${tTerm("proof")}</h3>
-        <div>${pickText("订单号", "Order","注文番号", "주문 번호")}: <span class="code">${escapeHtml(proof.orderNo)}</span></div>
+        <div>${pickText("订单号", "Order","注文番号", "주문 번호")}: <span class="code">${escapeHtml(proofOrderDisplay)}</span></div>
         <div>QR: <span class="code">${escapeHtml(proof.qrText)}</span></div>
-        <div>${pickText("地址", "Address","住所", "주소")}: ${escapeHtml(proof.bilingualAddress)}</div>
-        <div>${pickText("行程", "Itinerary","行程", "일정")}: ${escapeHtml(proof.itinerary || "")}</div>
-        ${proof.navLink || proof.meituanLink || proof.didiLink ? `<div class="actions" style="flex-wrap:wrap;gap:6px;margin:8px 0">
+        <div>${pickText("地址", "Address","住所", "주소")}: ${escapeHtml(_localizeVisibleTravelText(proof.bilingualAddress || "", proof.bilingualAddress || ""))}</div>
+        <div>${pickText("行程", "Itinerary","行程", "일정")}: ${escapeHtml(_localizeVisibleTravelText(proof.itinerary || "", ""))}</div>
+        ${proof.navLink || proof.meituanLink || proof.didiLink ? `<div class="actions cx-proof-link-row">
           ${proof.navLink ? `<a class="secondary" href="${escapeHtml(proof.navLink)}" target="_blank" rel="noopener">${pickText("高德导航", "Amap Nav", "Amapナビ", "Amap 내비")}</a>` : ""}
           ${proof.meituanLink ? `<a class="secondary" href="${escapeHtml(proof.meituanLink)}" target="_blank" rel="noopener">${pickText("美团预订", "Meituan Book", "美団予約", "메이퇀 예약")}</a>` : ""}
           ${proof.didiLink ? `<a class="secondary" href="${escapeHtml(proof.didiLink)}" target="_blank" rel="noopener">${pickText("滴滴出行", "Didi Ride", "DiDi乗車", "디디 탑승")}</a>` : ""}
@@ -12462,7 +14710,7 @@ async function openTaskDetail(taskId) {
     renderDrawerTab();
     openDrawer();
   } catch (_e) {
-    console.error("[drawer] openTaskDetail failed:", _e.message);
+    console.error("[drawer] openTaskDetail failed:", getClientErrorCode(_e, "task_detail_failed"));
     notify(pickText("加载任务详情失败，请重试。", "Failed to load task details. Please retry.", "タスクの読み込みに失敗しました。", "작업 로드에 실패했습니다."), "error");
   }
 }
@@ -12518,10 +14766,10 @@ function renderNearMap(item, mapPreview) {
   }
   const map = item.map || {};
   el.nearMapPreview.innerHTML = `
-    <img class="near-map-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || (mapPreview && mapPreview.imagePath) || "/assets/solution-flow.svg"))}" alt="near map preview" loading="lazy" onerror="this.src='${item.type==="eat"?"/assets/solution-eat.svg":item.type==="stay"?"/assets/solution-travel.svg":"/assets/solution-flow.svg"}'" />
-    <div><strong>${escapeHtml(item.title)}</strong></div>
-    <div class="status">${escapeHtml(item.placeName || "-")} · <span class="status-badge lane-grade">${escapeHtml(item.recommendationGrade || "-")}</span> ${escapeHtml(item.recommendationLevel || "-")}</div>
-    <div class="status">${pickText("路线", "Route","ルート", "경로")}: ${escapeHtml(map.route || "-")} · ${pickText("距离", "Distance","距離", "거리")}: ${Number(map.distanceKm || 0)} km</div>
+    <img class="near-map-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || (mapPreview && mapPreview.imagePath) || "/assets/solution-flow.svg"))}" alt="near map preview" loading="lazy" data-fallback-src="${item.type==="eat"?"/assets/solution-eat.svg":item.type==="stay"?"/assets/solution-travel.svg":"/assets/solution-flow.svg"}" />
+    <div><strong>${escapeHtml(_localizeVisibleTravelText(item.title || "", item.title || ""))}</strong></div>
+    <div class="status">${escapeHtml(_localizeVisibleTravelText(item.placeName || "-", item.placeName || "-"))} · <span class="status-badge lane-grade">${escapeHtml(item.recommendationGrade || "-")}</span> ${escapeHtml(_localizeVisibleTravelText(item.recommendationLevel || "-", item.recommendationLevel || "-"))}</div>
+    <div class="status">${pickText("路线", "Route","ルート", "경로")}: ${escapeHtml(_localizeVisibleTravelText(map.route || "-", map.route || "-"))} · ${pickText("距离", "Distance","距離", "거리")}: ${Number(map.distanceKm || 0)} km</div>
     <div class="status">ETA ${escapeHtml(item.eta || "-")} · ${pickText("成功率", "Success","成功率", "성공률")} ${(Number(item.successRate7d || 0) * 100).toFixed(0)}%</div>
     <div class="actions">
       <button data-action="run-intent" data-intent="${escapeHtml(item.title)}">${pickText("一键执行", "One-click Execute","ワンクリック実行", "원클릭 실행")}</button>
@@ -12578,7 +14826,7 @@ async function loadNearSuggestions() {
   } catch (err) {
     if (skeleton && el.nearList) skeleton.clear(el.nearList); // Clear skeleton for all errors including abort
     if (err && err.name === "AbortError") return; // intentional cancel — no error shown
-    if (el.nearList) el.nearList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载附近信息失败，请稍后重试。", "Failed to load nearby suggestions.", "近くの情報の読み込みに失敗しました。", "근처 정보 불러오기 실패.")}</p><div class="actions"><button onclick="loadNearSuggestions()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    if (el.nearList) el.nearList.innerHTML = `<article class="card"><p class="cx-state-error">${pickText("加载附近信息失败，请稍后重试。", "Failed to load nearby suggestions.", "近くの情報の読み込みに失敗しました。", "근처 정보 불러오기 실패.")}</p><div class="actions"><button data-action="load-near-suggestions">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
     return;
   }
   if (_nearSignal.aborted) return; // tab switched while request was in flight
@@ -12607,15 +14855,15 @@ async function loadNearSuggestions() {
     const _noItemsAtAll = state.nearItems.length === 0;
     const _city = state.selectedConstraints.city || getCurrentCity() || "Shanghai";
     el.nearList.innerHTML = _noItemsAtAll
-      ? `<article class="card" style="text-align:center;padding:24px 16px">
-          <p style="font-size:32px;margin:0 0 8px">📍</p>
-          <p style="font-weight:600">${pickText(`${_city}暂无附近数据`, `No nearby data for ${_city}`, `${_city}周辺のデータがありません`, `${_city} 근처 데이터 없음`)}</p>
-          <p style="font-size:13px;color:var(--color-text-secondary,#888)">${pickText("可尝试切换城市或直接在对话中描述你的需求。", "Try switching to a different city, or just describe your need in chat.", "別の都市に切り替えるか、チャットで直接ご要望をお伝えください。", "다른 도시로 전환하거나 채팅에서 직접 필요 사항을 설명하세요.")}</p>
-          <div class="actions" style="justify-content:center;margin-top:12px">
+      ? `<article class="card cx-empty-card">
+          <p class="cx-empty-icon">📍</p>
+          <p class="cx-empty-title">${pickText(`${_city}暂无附近数据`, `No nearby data for ${_city}`, `${_city}周辺のデータがありません`, `${_city} 근처 데이터 없음`)}</p>
+          <p class="cx-empty-copy">${pickText("可尝试切换城市或直接在对话中描述你的需求。", "Try switching to a different city, or just describe your need in chat.", "別の都市に切り替えるか、チャットで直接ご要望をお伝えください。", "다른 도시로 전환하거나 채팅에서 직접 필요 사항을 설명하세요.")}</p>
+          <div class="actions actions-center actions-top-gap">
             <button data-action="send-message" data-message="${escapeHtml(pickText(`推荐${_city}附近餐厅`, `Recommend restaurants near ${_city}`, `${_city}近くのレストランを推薦して`, `${_city} 근처 레스토랑 추천`))}">${pickText("在对话中寻找", "Ask in Chat", "チャットで探す", "채팅에서 찾기")}</button>
           </div>
         </article>`
-      : `<article class="card"><p>${pickText("当前筛选下没有结果。", "No results match your filters.", "現在のフィルターに一致する結果はありません。", "현재 필터 조건에 맞는 결과가 없습니다.")}</p><div class="actions"><button onclick="_clearNearFilters()">${pickText("清除筛选", "Clear Filters", "フィルターをリセット", "필터 초기화")}</button></div></article>`;
+      : `<article class="card"><p>${pickText("当前筛选下没有结果。", "No results match your filters.", "現在のフィルターに一致する結果はありません。", "현재 필터 조건에 맞는 결과가 없습니다.")}</p><div class="actions"><button data-action="clear-near-filters">${pickText("清除筛选", "Clear Filters", "フィルターをリセット", "필터 초기화")}</button></div></article>`;
     renderNearMap(null, data.mapPreview || null);
     return;
   }
@@ -12628,24 +14876,24 @@ async function loadNearSuggestions() {
     .map(
       (item) => `
       <article class="card ${item.id === state.selectedNearItemId ? "lane-recommended" : ""}">
-        <h3>${escapeHtml(item.title)}</h3>
-        <img class="near-card-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || "/assets/solution-flow.svg"))}" alt="${escapeHtml(item.placeName || item.title)}" loading="lazy" onerror="this.src='${item.type==="eat"?"/assets/solution-eat.svg":item.type==="stay"?"/assets/solution-travel.svg":"/assets/solution-flow.svg"}'" />
-        <div class="status">${escapeHtml(item.placeName || "-")} · <span class="status-badge lane-grade">${escapeHtml(item.recommendationGrade || "-")}</span> ${escapeHtml(item.recommendationLevel || "-")}${item.dietary === "halal" ? ` · <span class="status-badge" style="background:#16a34a;color:#fff">${item.halal_certified ? pickText("官方清真认证 ✓", "Halal Certified ✓","ハラール認証 ✓", "할랄 인증 ✓") : pickText("清真标注", "Halal (self-labeled)","ハラール（自称）", "할랄 (자칭)")}</span>` : ""}${item.accepts_foreign_guests === false ? ` · <span class="status-badge" style="background:#ef4444;color:#fff">${pickText("不接受外籍旅客", "No foreign guests","外国人不可", "외국인 불가")}</span>` : item.accepts_foreign_guests === true ? ` · <span class="status-badge" style="background:#2563eb;color:#fff">${pickText("外籍旅客可入住 ✓", "Foreign guests OK ✓","外国人OK ✓", "외국인 가능 ✓")}</span>` : ""}</div>
+        <h3>${escapeHtml(_localizeVisibleTravelText(item.title || "", item.title || ""))}</h3>
+        <img class="near-card-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || "/assets/solution-flow.svg"))}" alt="${escapeHtml(item.placeName || item.title)}" loading="lazy" data-fallback-src="${item.type==="eat"?"/assets/solution-eat.svg":item.type==="stay"?"/assets/solution-travel.svg":"/assets/solution-flow.svg"}" />
+        <div class="status">${escapeHtml(_localizeVisibleTravelText(item.placeName || "-", item.placeName || "-"))} · <span class="status-badge lane-grade">${escapeHtml(item.recommendationGrade || "-")}</span> ${escapeHtml(_localizeVisibleTravelText(item.recommendationLevel || "-", item.recommendationLevel || "-"))}${item.dietary === "halal" ? ` · <span class="status-badge cx-badge-halal">${item.halal_certified ? pickText("官方清真认证 ✓", "Halal Certified ✓","ハラール認証 ✓", "할랄 인증 ✓") : pickText("清真标注", "Halal (self-labeled)","ハラール（自称）", "할랄 (자칭)")}</span>` : ""}${item.accepts_foreign_guests === false ? ` · <span class="status-badge cx-badge-foreign-no">${pickText("不接受外籍旅客", "No foreign guests","外国人不可", "외국인 불가")}</span>` : item.accepts_foreign_guests === true ? ` · <span class="status-badge cx-badge-foreign-ok">${pickText("外籍旅客可入住 ✓", "Foreign guests OK ✓","外国人OK ✓", "외국인 가능 ✓")}</span>` : ""}</div>
         <div class="status">ETA ${escapeHtml(item.eta)} · ${pickText("成功率", "Success","成功率", "성공률")} ${(Number(item.successRate7d || 0) * 100).toFixed(0)}% · ${pickText("风险", "Risk","リスク", "리스크")} ${escapeHtml(localizeRiskValue(item.risk, item.riskCode))}</div>
-        <div class="status">${pickText("费用", "Cost","費用", "비용")} ${escapeHtml(item.costRange || "-")}${item.rating ? ` · ${Number(item.rating).toFixed(1)} ★` : ""}</div>
-        ${item.address ? `<div class="status" style="font-size:12px;color:var(--color-text-secondary,#888)">${escapeHtml(item.address)}</div>` : ""}
-        ${item.accepts_foreign_guests && state.uiLanguage !== "ZH" ? `<div style="margin:4px 0"><span class="status-badge" style="background:#dcfce7;color:#166534;font-size:11px">${pickText("", "Foreign-friendly ✓", "外国人OK ✓", "외국인 환영 ✓", "", "ترحيب بالأجانب ✓")}</span>${item.foreignCardNote ? ` <span class="status" style="font-size:11px">${escapeHtml(item.foreignCardNote)}</span>` : ""}</div>` : ""}
-        <div class="status">${pickText("推荐理由", "Why recommended","推奨理由", "추천 이유")}: ${escapeHtml(item.why || "-")}</div>
-        <div class="status">${pickText("一键后执行", "After one click","ワンクリック後の処理", "원클릭 후 실행")}: ${escapeHtml(item.executeWill || "-")}</div>
+        <div class="status">${pickText("费用", "Cost","費用", "비용")} ${escapeHtml(_localizeVisibleTravelText(item.costRange || "-", item.costRange || "-"))}${item.rating ? ` · ${Number(item.rating).toFixed(1)} ★` : ""}</div>
+        ${item.address ? `<div class="status cx-status-note-mini">${escapeHtml(_localizeVisibleTravelText(item.address, item.address))}</div>` : ""}
+        ${item.accepts_foreign_guests && state.uiLanguage !== "ZH" ? `<div class="cx-inline-note-row"><span class="status-badge cx-badge-foreign-friendly">${pickText("", "Foreign-friendly ✓", "外国人OK ✓", "외국인 환영 ✓", "", "ترحيب بالأجانب ✓")}</span>${item.foreignCardNote ? ` <span class="status cx-status-note-tiny">${escapeHtml(_localizeVisibleTravelText(item.foreignCardNote, item.foreignCardNote))}</span>` : ""}</div>` : ""}
+        <div class="status">${pickText("推荐理由", "Why recommended","推奨理由", "추천 이유")}: ${escapeHtml(_localizeVisibleTravelText(item.why || "-", item.why || "-"))}</div>
+        <div class="status">${pickText("一键后执行", "After one click","ワンクリック後の処理", "원클릭 후 실행")}: ${escapeHtml(_localizeVisibleTravelText(item.executeWill || "-", item.executeWill || "-"))}</div>
         <div class="actions">
           <button class="secondary" data-action="select-near-item" data-item="${escapeHtml(item.id)}">${pickText("地图预览", "Preview on map","地図で確認", "지도에서 보기")}</button>
           <button data-action="run-intent" data-intent="${escapeHtml(item.title)}">${pickText("在聊天中执行", "Run in Chat","チャットで実行", "채팅에서 실행")}</button>
           ${item.navLink ? `<a class="secondary" href="${escapeHtml(item.navLink)}" target="_blank" rel="noopener">${state.uiLanguage === "ZH" ? "高德导航" : state.uiLanguage === "JA" ? "Amapナビ" : state.uiLanguage === "KO" ? "Amap 내비" : "Amap Nav"}</a>` : state.uiLanguage !== "ZH" ? `<a class="secondary" href="https://www.google.com/maps/search/?api=1&query=${encodeURIComponent((item.placeName || item.title) + ' ' + (item.address || ''))}" target="_blank" rel="noopener">${pickText("Google地图", "Google Maps", "Googleマップ", "구글 지도")}</a>` : ""}
-          ${item.meituanLink ? `<a class="secondary" href="${escapeHtml(item.meituanLink)}" target="_blank" rel="noopener">${state.uiLanguage === "ZH" ? "美团" : "Meituan"}</a>` : ""}
-          ${item.dianpingLink ? `<a class="secondary" href="${escapeHtml(item.dianpingLink)}" target="_blank" rel="noopener">${state.uiLanguage === "ZH" ? "大众点评" : "Dianping"}</a>` : ""}
+          ${item.meituanLink ? `<a class="secondary" href="${escapeHtml(item.meituanLink)}" target="_blank" rel="noopener">${pickText("美团","Meituan","美団","메이퇀")}</a>` : ""}
+          ${item.dianpingLink ? `<a class="secondary" href="${escapeHtml(item.dianpingLink)}" target="_blank" rel="noopener">${pickText("大众点评","Dianping","大衆点評","다이중뎬핑")}</a>` : ""}
           ${item.bookingComLink ? `<a class="secondary" href="${escapeHtml(item.bookingComLink)}" target="_blank" rel="noopener">Booking.com</a>` : item.bookingUrl ? `<a class="secondary" href="${escapeHtml(item.bookingUrl)}" target="_blank" rel="noopener">${pickText("立即预订", "Book Now","今すぐ予約", "지금 예약")}</a>` : ""}
           ${item.agodaLink ? `<a class="secondary" href="${escapeHtml(item.agodaLink)}" target="_blank" rel="noopener">Agoda</a>` : ""}
-          ${item.didiLink ? `<a class="secondary" href="${escapeHtml(item.didiLink)}" target="_blank" rel="noopener">${state.uiLanguage === "ZH" ? "滴滴" : "Didi"}</a>` : ""}
+          ${item.didiLink ? `<a class="secondary" href="${escapeHtml(item.didiLink)}" target="_blank" rel="noopener">${pickText("滴滴","Didi","滴滴","디디")}</a>` : ""}
         </div>
       </article>
     `,
@@ -12655,7 +14903,7 @@ async function loadNearSuggestions() {
     const shown = visible.slice(0, state._nearPage * _nearPageSize);
     const hasMore = visible.length > shown.length;
     el.nearList.innerHTML = _renderNearItems(shown) +
-      (hasMore ? `<div class="actions" style="margin:8px 0"><button id="nearLoadMoreBtn" class="secondary">${pickText(`加载更多（还有${visible.length - shown.length}条）`, `Load more (${visible.length - shown.length} more)`, `さらに表示（残り${visible.length - shown.length}件）`, `더 보기（${visible.length - shown.length}개 남음）`)}</button></div>` : "");
+      (hasMore ? `<div class="actions actions-block-gap"><button id="nearLoadMoreBtn" class="secondary">${pickText(`加载更多（还有${visible.length - shown.length}条）`, `Load more (${visible.length - shown.length} more)`, `さらに表示（残り${visible.length - shown.length}件）`, `더 보기（${visible.length - shown.length}개 남음）`)}</button></div>` : "");
     motion.bindPressables(el.nearList);
     const moreBtn = document.getElementById("nearLoadMoreBtn");
     if (moreBtn) moreBtn.addEventListener("click", () => { state._nearPage += 1; _renderNearList(); });
@@ -12671,6 +14919,8 @@ function renderActiveTripHint() {
   const active = state.tripPlans.find((trip) => trip.id === state.activeTripId) || null;
   if (!active) {
     el.activeTripHint.textContent = "";
+    renderPlannerWorkspaceIntro();
+    renderFulfillmentHubIntro();
     return;
   }
   el.activeTripHint.textContent = pickText(
@@ -12679,6 +14929,8 @@ function renderActiveTripHint() {
     `現在の旅程: ${active.title}（${localizeStatus(active.status)}）`,
     `현재 트립: ${active.title} (${localizeStatus(active.status)})`,
   );
+  renderPlannerWorkspaceIntro();
+  renderFulfillmentHubIntro();
 }
 
 async function loadTrips() {
@@ -12686,21 +14938,48 @@ async function loadTrips() {
   if (skeleton && !el.tripList.children.length) {
     skeleton.render(el.tripList, { count: 2, lines: 4 });
   }
+  if (!_authBootstrapResolved) {
+    if (!_deferredTripsLoadTimer) {
+      _deferredTripsLoadTimer = window.setTimeout(() => {
+        _deferredTripsLoadTimer = 0;
+        if (_authBootstrapResolved) loadTrips().catch(() => {});
+      }, 180);
+    }
+    return;
+  }
+  if (!_canUsePrivateUserApis()) {
+    if (skeleton) skeleton.clear(el.tripList);
+    state.tripPlans = [];
+    state.activeTripId = "";
+    el.tripList.innerHTML = `<article class="card cx-empty-card"><p>${pickText("请登录后查看行程。", "Sign in to view your trips.", "旅程を確認するにはサインインしてください。", "트립을 보려면 로그인하세요.")}</p><div class="actions actions-center"><button data-action="show-login-modal">${pickText("登录", "Sign in", "サインイン", "로그인")}</button></div></article>`;
+    renderActiveTripHint();
+    renderConciergeHome();
+    renderFulfillmentHubIntro();
+    return;
+  }
   let data;
   try {
     data = await api("/api/trips?limit=50&offset=0");
   } catch (err) {
     if (skeleton) skeleton.clear(el.tripList);
     if (String(err.message || "").includes("401") || String(err.message || "").includes("unauthorized")) {
-      el.tripList.innerHTML = `<article class="card" style="text-align:center;padding:24px 16px"><p>${pickText("请登录后查看行程。", "Sign in to view your trips.", "旅程を確認するにはサインインしてください。", "트립을 보려면 로그인하세요.")}</p><div class="actions" style="justify-content:center"><button onclick="_showLoginModal()">${pickText("登录", "Sign in", "サインイン", "로그인")}</button></div></article>`;
+      state.tripPlans = [];
+      state.activeTripId = "";
+      el.tripList.innerHTML = `<article class="card cx-empty-card"><p>${pickText("请登录后查看行程。", "Sign in to view your trips.", "旅程を確認するにはサインインしてください。", "트립을 보려면 로그인하세요.")}</p><div class="actions actions-center"><button data-action="show-login-modal">${pickText("登录", "Sign in", "サインイン", "로그인")}</button></div></article>`;
+      renderConciergeHome();
+      renderFulfillmentHubIntro();
       return;
     }
-    el.tripList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载行程失败，请稍后重试。", "Failed to load trips. Please try again.", "旅程の読み込みに失敗しました。", "트립을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadTrips()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    el.tripList.innerHTML = `<article class="card"><p class="cx-state-error">${pickText("加载行程失败，请稍后重试。", "Failed to load trips. Please try again.", "旅程の読み込みに失敗しました。", "트립을 불러오지 못했습니다.")}</p><div class="actions"><button data-action="load-trips">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    renderConciergeHome();
+    renderFulfillmentHubIntro();
     return;
   }
   if (skeleton) skeleton.clear(el.tripList);
   if (!data || !data.trips) {
-    el.tripList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载行程失败，请稍后重试。", "Failed to load trips. Please try again.", "旅程の読み込みに失敗しました。", "트립을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadTrips()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    el.tripList.innerHTML = `<article class="card"><p class="cx-state-error">${pickText("加载行程失败，请稍后重试。", "Failed to load trips. Please try again.", "旅程の読み込みに失敗しました。", "트립을 불러오지 못했습니다.")}</p><div class="actions"><button data-action="load-trips">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    renderConciergeHome();
+    renderFulfillmentHubIntro();
     return;
   }
   state.tripPlans = Array.isArray(data.trips) ? data.trips : [];
@@ -12710,8 +14989,10 @@ async function loadTrips() {
     state.activeTripId = preferred ? preferred.id : "";
   }
   if (!state.tripPlans.length) {
-    el.tripList.innerHTML = `<article class="card"><p>${pickText("暂无行程计划。", "No trip plan yet.", "旅程プランはありません。", "트립 플랜이 없습니다.")}</p><div class="actions"><button onclick="switchTab('chat')">${pickText("去规划第一个行程 →", "Start planning →", "旅程を計画する →", "여행 계획하기 →")}</button></div></article>`;
+    el.tripList.innerHTML = `<article class="card"><p>${pickText("暂无行程计划。", "No trip plan yet.", "旅程プランはありません。", "트립 플랜이 없습니다.")}</p><div class="actions"><button data-action="go-tab" data-tab="chat">${pickText("去规划第一个行程 →", "Start planning →", "旅程を計画する →", "여행 계획하기 →")}</button></div></article>`;
     renderActiveTripHint();
+    renderConciergeHome();
+    renderFulfillmentHubIntro();
     return;
   }
   el.tripList.innerHTML = state.tripPlans
@@ -12721,12 +15002,12 @@ async function loadTrips() {
       const isActive = trip.id === state.activeTripId;
       return `
       <article class="card ${isActive ? "lane-recommended" : ""}">
-        <h3>${escapeHtml(trip.title)}</h3>
-        <div>${pickText("城市", "City","都市", "도시")}: ${escapeHtml(trip.city || "-")}</div>
+        <h3>${escapeHtml(_localizeVisibleTravelText(trip.title || "", trip.title || ""))}</h3>
+        <div>${pickText("城市", "City","都市", "도시")}: ${escapeHtml(_localizeUiCityName(trip.city || "-", state.uiLanguage))}</div>
         <div>${pickText("状态", "Status","状態", "상태")}: <span class="status-badge ${escapeHtml(trip.status || "active")}">${escapeHtml(localizeStatus(trip.status || "active"))}</span></div>
         <div class="status">${pickText("任务", "Tasks","タスク", "작업")}: ${Number(progress.totalTasks || 0)} · ${pickText("订单", "Orders","注文", "주문")}: ${Number(progress.orderCount || 0)} · ${pickText("凭证", "Proof","証憑", "증빙")}: ${Number(progress.proofCount || 0)}</div>
         <div class="status">${pickText("完成率", "Completion","完了率", "완료율")}: ${(Number(progress.completedRate || 0) * 100).toFixed(0)}% · ${pickText("执行中", "Running","実行中", "실행중")} ${Number(counts.executing || 0)} · ${pickText("售后中", "Support","サポート中", "지원중")} ${Number(counts.support || 0)}</div>
-        <div class="status">${escapeHtml(trip.note || "")}</div>
+        <div class="status">${escapeHtml(_localizeVisibleTravelText(trip.note || "", ""))}</div>
         <div class="actions">
           <button class="secondary" data-action="activate-trip" data-trip="${escapeHtml(trip.id)}">${isActive ? pickText("已激活", "Active","有効", "활성") : pickText("设为当前行程", "Set Active Trip","現在の旅程に設定", "활성 트립으로 설정")}</button>
           <button class="secondary" data-action="open-trip-detail" data-trip="${escapeHtml(trip.id)}">${pickText("行程详情", "Trip detail","旅程詳細", "트립 상세")}</button>
@@ -12742,9 +15023,11 @@ async function loadTrips() {
     .join("");
   // Show "load more" if there are more trips beyond current page
   if (data.total > state.tripPlans.length) {
-    el.tripList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" onclick="loadMoreTrips(${state.tripPlans.length})">${pickText(`加载更多（共${data.total}条）`, `Load more (${data.total} total)`, `もっと見る（計${data.total}件）`, `더 보기 (총 ${data.total}개)`)}</button></div>`);
+    el.tripList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" data-action="load-more-trips" data-offset="${state.tripPlans.length}">${pickText(`加载更多（共${data.total}条）`, `Load more (${data.total} total)`, `もっと見る（計${data.total}件）`, `더 보기 (총 ${data.total}개)`)}</button></div>`);
   }
   renderActiveTripHint();
+  renderConciergeHome();
+  renderFulfillmentHubIntro();
   motion.bindPressables(el.tripList);
 }
 
@@ -12759,12 +15042,57 @@ async function loadMoreTrips(offset) {
   // Append new cards + new load-more if needed
   more.forEach(trip => {
     const isActive = trip.id === state.activeTripId;
-    el.tripList.insertAdjacentHTML("beforeend", `<article class="card ${isActive ? "lane-recommended" : ""}"><h3>${escapeHtml(trip.title)}</h3><div>${escapeHtml(trip.city || "-")}</div><div><span class="status-badge ${escapeHtml(trip.status || "active")}">${escapeHtml(localizeStatus(trip.status || "active"))}</span></div><div class="actions"><button class="secondary" data-action="activate-trip" data-trip="${escapeHtml(trip.id)}">${pickText("设为当前行程","Set Active","有効化","활성화")}</button><button class="secondary" data-action="open-trip-detail" data-trip="${escapeHtml(trip.id)}">${pickText("行程详情","Detail","詳細","상세")}</button></div></article>`);
+    el.tripList.insertAdjacentHTML("beforeend", `<article class="card ${isActive ? "lane-recommended" : ""}"><h3>${escapeHtml(_localizeVisibleTravelText(trip.title || "", trip.title || ""))}</h3><div>${escapeHtml(_localizeUiCityName(trip.city || "-", state.uiLanguage))}</div><div><span class="status-badge ${escapeHtml(trip.status || "active")}">${escapeHtml(localizeStatus(trip.status || "active"))}</span></div><div class="actions"><button class="secondary" data-action="activate-trip" data-trip="${escapeHtml(trip.id)}">${pickText("设为当前行程","Set Active Trip","現在の旅程に設定","활성 트립으로 설정")}</button><button class="secondary" data-action="open-trip-detail" data-trip="${escapeHtml(trip.id)}">${pickText("行程详情","Trip detail","旅程詳細","트립 상세")}</button></div></article>`);
   });
   if (data.total > state.tripPlans.length) {
-    el.tripList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" onclick="loadMoreTrips(${state.tripPlans.length})">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
+    el.tripList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" data-action="load-more-trips" data-offset="${state.tripPlans.length}">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
   }
+  renderFulfillmentHubIntro();
   motion.bindPressables(el.tripList);
+}
+
+function renderTripSnapshotSection(trip) {
+  const snapshot = trip && trip.itinerarySnapshot && typeof trip.itinerarySnapshot === "object" ? trip.itinerarySnapshot : null;
+  if (!snapshot) {
+    return `
+      <article class="card">
+        <h3>${pickText("已保存方案", "Saved itinerary", "保存済み旅程", "저장된 일정")}</h3>
+        <div class="status">${pickText("该行程暂无已保存的方案快照。后续保存到 Trips 的方案会显示在这里。", "No saved itinerary snapshot yet. Newly saved plans will appear here.", "保存済み旅程スナップショットはまだありません。今後 Trips に保存したプランがここに表示されます。", "저장된 일정 스냅샷이 아직 없습니다. 이후 Trips에 저장한 플랜이 여기에 표시됩니다.")}</div>
+      </article>
+    `;
+  }
+  const plans = Array.isArray(snapshot.plans) ? snapshot.plans : [];
+  const days = Array.isArray(snapshot.days) ? snapshot.days : [];
+  const planRows = plans.map((plan) => {
+    const hotelName = plan && plan.hotel && plan.hotel.name ? plan.hotel.name : "";
+    return `
+      <li>
+        <strong>${escapeHtml(plan.tag || plan.id || "-")}</strong>
+        <div class="status">${hotelName ? `${escapeHtml(hotelName)} · ` : ""}${pickText("预算", "Budget", "予算", "예산")}: ${Number(plan.total_price || 0) ? `¥${Number(plan.total_price || 0).toLocaleString()}` : "-"}</div>
+        <div class="status">${escapeHtml(_localizeVisibleTravelText(plan.transport_plan || "", ""))}</div>
+      </li>
+    `;
+  }).join("");
+  const dayRows = days.map((day) => {
+    const activities = Array.isArray(day.activities) ? day.activities : [];
+    const items = activities.slice(0, 6).map((activity) => `<li>${escapeHtml(activity.time || "-")} · ${escapeHtml(_localizeVisibleTravelText(activity.name || "-", activity.name || "-"))}</li>`).join("");
+    return `
+      <article class="card">
+        <h4>${escapeHtml(day.label || `${pickText("第", "Day ", "Day ", "Day ")}${day.day || ""}`)}</h4>
+        <ul class="steps">${items || `<li>${pickText("暂无活动明细。", "No activity detail.", "アクティビティ詳細なし。", "활동 상세 없음.")}</li>`}</ul>
+      </article>
+    `;
+  }).join("");
+  return `
+    <article class="card">
+      <h3>${pickText("已保存方案", "Saved itinerary", "保存済み旅程", "저장된 일정")}</h3>
+      <div class="status">${escapeHtml(snapshot.title || trip.title || "-")}</div>
+      <div class="status">${pickText("目的地", "Destination", "目的地", "목적지")}: ${escapeHtml(_localizeUiCityName(snapshot.destination || trip.city || "-", state.uiLanguage))} · ${pickText("天数", "Days", "日数", "일수")}: ${Number(snapshot.duration_days || days.length || 0) || "-"}</div>
+      <div class="status">${pickText("人数", "Travelers", "人数", "인원")}: ${Number(snapshot.pax || 0) || "-"}</div>
+      <ul class="steps">${planRows || `<li>${pickText("暂无方案选项。", "No saved options.", "保存済みプランなし。", "저장된 옵션 없음.")}</li>`}</ul>
+    </article>
+    ${dayRows || ""}
+  `;
 }
 
 async function openTripDetail(tripId, trigger = null) {
@@ -12773,15 +15101,15 @@ async function openTripDetail(tripId, trigger = null) {
   const trip = data.trip || {};
   const tasks = Array.isArray(trip.tasks) ? trip.tasks : [];
   const lifecycle = (trip.lifecycle || [])
-    .map((node) => `<li><strong>${escapeHtml(node.label || node.state || "-")}</strong> <span class="status">${new Date(node.at).toLocaleString()} · ${escapeHtml(node.note || "")}</span></li>`)
+    .map((node) => `<li><strong>${escapeHtml(_localizeVisibleTravelText(node.label || node.state || "-", node.label || node.state || "-"))}</strong> <span class="status">${new Date(node.at).toLocaleString()} · ${escapeHtml(_localizeVisibleTravelText(node.note || "", ""))}</span></li>`)
     .join("");
   const taskRows = tasks
     .map(
       (task) => `
       <li>
-        <strong>${escapeHtml(task.intent || task.taskId)}</strong>
+        <strong>${escapeHtml(_localizeVisibleTravelText(task.intent || task.taskId, task.taskId || "-"))}</strong>
         <div class="status">${escapeHtml(task.taskId)} · <span class="status-badge ${escapeHtml(task.status)}">${escapeHtml(localizeStatus(task.status))}</span></div>
-        <div class="status">${pickText("类型", "Type","タイプ", "유형")}: ${escapeHtml(task.type || "-")} · Lane: ${escapeHtml(task.laneId || "-")}</div>
+        <div class="status">${pickText("类型", "Type","タイプ", "유형")}: ${escapeHtml(_localizeVisibleTravelText(task.type || "-", task.type || "-"))} · ${pickText("通道", "Lane", "レーン", "레인")}: ${escapeHtml(task.laneId || "-")}</div>
         ${
           task.order
             ? `<div class="status">${pickText("订单", "Order","注文", "주문")}: ${escapeHtml(task.order.orderId)} · ${Number(task.order.amount || 0)} ${escapeHtml(task.order.currency || "CNY")} · ${pickText("凭证", "Proof","証憑", "증빙")} ${Number(task.order.proofCount || 0)}</div>`
@@ -12797,21 +15125,22 @@ async function openTripDetail(tripId, trigger = null) {
     .join("");
 
   if (el.drawerTitle) {
-    el.drawerTitle.textContent = `${pickText("行程详情", "Trip Detail","旅程詳細", "트립 상세")} · ${escapeHtml(trip.title || tripId)}`;
+    el.drawerTitle.textContent = `${pickText("行程详情", "Trip Detail","旅程詳細", "트립 상세")} · ${escapeHtml(_localizeVisibleTravelText(trip.title || tripId, trip.title || tripId))}`;
   }
   if (el.drawerBody) {
     el.drawerBody.innerHTML = `
       <article class="card">
-        <h3>${escapeHtml(trip.title || tripId)}</h3>
-        <div>${pickText("城市", "City","都市", "도시")}: ${escapeHtml(trip.city || "-")} · <span class="status-badge ${escapeHtml(trip.status || "active")}">${escapeHtml(localizeStatus(trip.status || "active"))}</span></div>
+        <h3>${escapeHtml(_localizeVisibleTravelText(trip.title || tripId, trip.title || tripId))}</h3>
+        <div>${pickText("城市", "City","都市", "도시")}: ${escapeHtml(_localizeUiCityName(trip.city || "-", state.uiLanguage))} · <span class="status-badge ${escapeHtml(trip.status || "active")}">${escapeHtml(localizeStatus(trip.status || "active"))}</span></div>
         <div class="status">${pickText("任务", "Tasks","タスク", "작업")}: ${Number(trip.progress && trip.progress.totalTasks ? trip.progress.totalTasks : 0)} · ${pickText("订单", "Orders","注文", "주문")}: ${Number(trip.progress && trip.progress.orderCount ? trip.progress.orderCount : 0)} · ${pickText("凭证", "Proof","証憑", "증빙")}: ${Number(trip.progress && trip.progress.proofCount ? trip.progress.proofCount : 0)}</div>
-        <div class="status">${escapeHtml(trip.note || "")}</div>
+        <div class="status">${escapeHtml(_localizeVisibleTravelText(trip.note || "", ""))}</div>
         <div class="actions">
           <button class="secondary" data-action="activate-trip" data-trip="${escapeHtml(trip.id)}">${pickText("设为当前行程", "Set Active Trip","現在の旅程に設定", "활성 트립으로 설정")}</button>
           <button class="secondary" data-action="trip-status" data-trip="${escapeHtml(trip.id)}" data-status="paused">${pickText("暂停行程", "Pause trip","旅程を一時停止", "트립 일시중지")}</button>
           <button class="secondary" data-action="trip-status" data-trip="${escapeHtml(trip.id)}" data-status="active">${pickText("恢复行程", "Resume trip","旅程を再開", "트립 재개")}</button>
         </div>
       </article>
+      ${renderTripSnapshotSection(trip)}
       <article class="card">
         <h3>${pickText("生命周期", "Lifecycle","ライフサイクル", "라이프사이클")}</h3>
         <ol class="steps">${lifecycle || `<li>${pickText("暂无数据。", "No lifecycle data.","データがありません。", "데이터가 없습니다.")}</li>`}</ol>
@@ -12836,36 +15165,47 @@ async function loadOrders() {
   } catch (err) {
     if (skeleton && el.ordersList) skeleton.clear(el.ordersList);
     if (String(err.message || "").includes("401") || String(err.message || "").includes("unauthorized")) {
-      if (el.ordersList) el.ordersList.innerHTML = `<article class="card" style="text-align:center;padding:24px 16px"><p>${pickText("请登录后查看订单。", "Sign in to view your orders.", "注文を確認するにはサインインしてください。", "주문을 보려면 로그인하세요.")}</p><div class="actions" style="justify-content:center"><button onclick="_showLoginModal()">${pickText("登录", "Sign in", "サインイン", "로그인")}</button></div></article>`;
+      state.orderSummaries = [];
+      if (el.ordersList) el.ordersList.innerHTML = `<article class="card cx-empty-card"><p>${pickText("请登录后查看订单。", "Sign in to view your orders.", "注文を確認するにはサインインしてください。", "주문을 보려면 로그인하세요.")}</p><div class="actions actions-center"><button data-action="show-login-modal">${pickText("登录", "Sign in", "サインイン", "로그인")}</button></div></article>`;
+      renderConciergeHome();
+      renderPlannerWorkspaceIntro();
+      renderFulfillmentHubIntro();
       return;
     }
-    if (el.ordersList) el.ordersList.innerHTML = `<article class="card"><p style="color:var(--color-error,#e53935)">${pickText("加载订单失败，请稍后重试。", "Failed to load orders. Please try again.", "注文の読み込みに失敗しました。", "주문을 불러오지 못했습니다.")}</p><div class="actions"><button onclick="loadOrders()">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    if (el.ordersList) el.ordersList.innerHTML = `<article class="card"><p class="cx-state-error">${pickText("加载订单失败，请稍后重试。", "Failed to load orders. Please try again.", "注文の読み込みに失敗しました。", "주문을 불러오지 못했습니다.")}</p><div class="actions"><button data-action="load-orders">${pickText("重试", "Retry", "再試行", "재시도")}</button></div></article>`;
+    renderConciergeHome();
+    renderPlannerWorkspaceIntro();
+    renderFulfillmentHubIntro();
     return;
   }
   if (skeleton && el.ordersList) skeleton.clear(el.ordersList);
+  state.orderSummaries = Array.isArray(data.orders) ? data.orders : [];
   if (store) store.dispatch({ type: "SET_ORDERS", orders: data.orders || [] });
   if (!data.orders || !Array.isArray(data.orders) || !data.orders.length) {
-    el.ordersList.innerHTML = `<article class="card"><p>${pickText("暂无订单。", "No orders yet.", "注文はまだありません。", "주문이 아직 없습니다.")}</p><p class="status">${pickText("完成一次行程规划并确认预订后，订单将出现在这里。", "Complete a trip plan and confirm booking to see orders.", "旅程プランを完成させ予約を確定すると、ここに注文が表示されます。", "여행 계획 완료 후 예약을 확인하면 주문이 여기에 표시됩니다.")}</p><div class="actions"><button onclick="switchTab('chat')">${pickText("去规划行程 →", "Plan a trip →", "旅程を計画 →", "여행 계획하기 →")}</button></div></article>`;
+    el.ordersList.innerHTML = `<article class="card"><p>${pickText("暂无订单。", "No orders yet.", "注文はまだありません。", "주문이 아직 없습니다.")}</p><p class="status">${pickText("完成一次行程规划并确认预订后，订单将出现在这里。", "Complete a trip plan and confirm booking to see orders.", "旅程プランを完成させ予約を確定すると、ここに注文が表示されます。", "여행 계획 완료 후 예약을 확인하면 주문이 여기에 표시됩니다.")}</p><div class="actions"><button data-action="go-tab" data-tab="chat">${pickText("去规划行程 →", "Plan a trip →", "旅程を計画 →", "여행 계획하기 →")}</button></div></article>`;
+    renderConciergeHome();
+    renderPlannerWorkspaceIntro();
+    renderFulfillmentHubIntro();
     return;
   }
   el.ordersList.innerHTML = data.orders
     .map(
       (o) => `
       <article class="card">
-        <h3>${escapeHtml(o.provider)}</h3>
+        <h3>${escapeHtml(getOrderTitle(o))}</h3>
         <div>${pickText("时间", "Time","時刻", "시간")}: ${new Date(o.createdAt).toLocaleString()}</div>
-        <div>${pickText("城市", "City","都市", "도시")}: ${escapeHtml(o.city || "Shanghai")}</div>
+        <div>${pickText("城市", "City","都市", "도시")}: ${escapeHtml(_localizeUiCityName(o.city || "Shanghai", state.uiLanguage))}</div>
         <div>${pickText("状态", "Status","状態", "상태")}: <span class="status-badge ${escapeHtml(o.status)}">${escapeHtml(localizeStatus(o.status))}</span></div>
-        <div>${pickText("类型", "Type","タイプ", "유형")}: ${escapeHtml(o.type)}</div>
+        <div>${pickText("类型", "Type","タイプ", "유형")}: ${escapeHtml(_localizeVisibleTravelText(o.type || "-", o.type || "-"))}</div>
         <div>${pickText("金额", "Amount","金額", "금액")}: ${escapeHtml(String(o.price || ""))} ${escapeHtml(o.currency || "")}</div>
-        <div>${pickText("订单号", "Order","注文番号", "주문번호")}: <span class="code">${escapeHtml((o.proof && o.proof.orderNo) || o.outOrderNo || o.id)}</span></div>
+        <div>${pickText("订单号", "Order","注文番号", "주문번호")}: <span class="code">${escapeHtml(o.id)}</span></div>
         <div class="status">${pickText("凭证数量", "Proof count","証憑数", "증빙 수")}: ${Array.isArray(o.proofItems) ? o.proofItems.length : 0} · ${pickText("售后", "After-sales","アフターサポート", "사후지원")}: ${o.refund ? escapeHtml(localizeStatus(o.refund.status || "processing")) : pickText("可用", "available","利用可", "사용 가능")}</div>
         <div class="status">${pickText("生命周期", "Lifecycle","ライフサイクル", "라이프사이클")}: ${(o.lifecycle || []).map((x) => escapeHtml(localizeStatus(x.state))).join(" -> ")}</div>
         <div class="actions">
           <button class="secondary" data-action="open-order-detail" data-order="${o.id}">${pickText("订单详情", "Order Detail","注文詳細", "주문 상세")}</button>
           <button class="secondary" data-action="open-task" data-task="${o.taskId}">${pickText("任务详情", "Task Detail","タスク詳細", "작업 상세")}</button>
           <button class="secondary" data-action="open-proof" data-order="${o.id}">${pickText("凭证", "Proof","証憑", "증빙")}</button>
-          ${["confirmed","delivered","refund_requested","refunded"].includes(o.status) ? `<a class="secondary cx-receipt-btn" href="/api/orders/${escapeHtml(o.id)}/receipt?download=1" target="_blank" rel="noopener">${pickText("下载收据", "Download Receipt","領収書", "영수증 다운로드")}</a>` : ""}
+          ${["confirmed","delivered","refund_requested","refunded"].includes(o.status) ? `<a class="secondary cx-receipt-btn" href="${escapeHtml(buildOrderReceiptUrl(o.id, { download: true }))}" target="_blank" rel="noopener">${pickText("下载收据", "Download Receipt","領収書", "영수증 다운로드")}</a>` : ""}
           <button class="secondary" data-action="cancel-order" data-order="${o.id}">${pickText("取消并退款", "Cancel & Refund","キャンセルと返金", "취소 및 환불")}</button>
         </div>
       </article>
@@ -12873,23 +15213,28 @@ async function loadOrders() {
     )
     .join("");
   if (data.total > data.orders.length) {
-    el.ordersList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" onclick="loadMoreOrders(${data.orders.length})">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
+    el.ordersList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" data-action="load-more-orders" data-offset="${data.orders.length}">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
   }
+  renderConciergeHome();
+  renderPlannerWorkspaceIntro();
+  renderFulfillmentHubIntro();
   motion.bindPressables(el.ordersList);
 }
 
 async function loadMoreOrders(offset) {
   let data;
   try { data = await api(`/api/orders?limit=50&offset=${offset}`); } catch { return; }
+  state.orderSummaries = [...(state.orderSummaries || []), ...(data.orders || [])];
   const lm = el.ordersList && el.ordersList.querySelector(".cx-load-more");
   if (lm) lm.remove();
   (data.orders || []).forEach(o => {
     if (store) store.dispatch({ type: "SET_ORDERS", orders: [...(store.getState().orders || []), o] });
-    el.ordersList.insertAdjacentHTML("beforeend", `<article class="card"><h3>${escapeHtml(o.provider)}</h3><div>${new Date(o.createdAt).toLocaleString()}</div><div><span class="status-badge ${escapeHtml(o.status)}">${escapeHtml(localizeStatus(o.status))}</span></div><div class="actions"><button class="secondary" data-action="open-order-detail" data-order="${o.id}">${pickText("订单详情","Order Detail","注文詳細","주문 상세")}</button>${["confirmed","delivered","refund_requested","refunded"].includes(o.status) ? `<a class="secondary cx-receipt-btn" href="/api/orders/${escapeHtml(o.id)}/receipt?download=1" target="_blank" rel="noopener">${pickText("下载收据","Download Receipt","領収書","영수증")}</a>` : ""}</div></article>`);
+    el.ordersList.insertAdjacentHTML("beforeend", `<article class="card"><h3>${escapeHtml(getOrderTitle(o))}</h3><div>${new Date(o.createdAt).toLocaleString()}</div><div>${pickText("城市", "City","都市", "도시")}: ${escapeHtml(_localizeUiCityName(o.city || "Shanghai", state.uiLanguage))}</div><div><span class="status-badge ${escapeHtml(o.status)}">${escapeHtml(localizeStatus(o.status))}</span></div><div class="actions"><button class="secondary" data-action="open-order-detail" data-order="${o.id}">${pickText("订单详情","Order Detail","注文詳細","주문 상세")}</button>${["confirmed","delivered","refund_requested","refunded"].includes(o.status) ? `<a class="secondary cx-receipt-btn" href="${escapeHtml(buildOrderReceiptUrl(o.id, { download: true }))}" target="_blank" rel="noopener">${pickText("下载收据","Download Receipt","領収書","영수증")}</a>` : ""}</div></article>`);
   });
   if (data.total > offset + (data.orders || []).length) {
-    el.ordersList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" onclick="loadMoreOrders(${offset + (data.orders || []).length})">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
+    el.ordersList.insertAdjacentHTML("beforeend", `<div class="cx-load-more"><button class="secondary" data-action="load-more-orders" data-offset="${offset + (data.orders || []).length}">${pickText(`加载更多（共${data.total}条）`,`Load more (${data.total} total)`,`もっと見る（計${data.total}件）`,`더 보기 (총 ${data.total}개)`)}</button></div>`);
   }
+  renderFulfillmentHubIntro();
   motion.bindPressables(el.ordersList);
 }
 
@@ -12969,7 +15314,7 @@ function _renderFavoritesSection() {
           <div class="status">📍 ${escapeHtml(f.destination || "")} · ${f.dur || 3}${pickText("\u5929","d","\u65e5","\uc77c")} · ${f.pax || 1}${pickText("\u4eba","pax","\u540d","\uba85")}</div>
           <div class="status">${new Date(f.savedAt || 0).toLocaleDateString()}</div>
         </div>
-        <button class="cx-fav-remove secondary" onclick="_toggleFavorite(${JSON.stringify(f.cardId)}, ${JSON.stringify(f.destination || "")}, ${JSON.stringify(f.title || "")}, ${f.dur || 3}, ${f.pax || 1})">\u53d6\u6d88</button>
+        <button class="cx-fav-remove secondary" data-action="toggle-favorite" data-card-id="${escapeHtml(f.cardId || "")}" data-destination="${escapeHtml(f.destination || "")}" data-title="${escapeHtml(f.title || "")}" data-dur="${Number(f.dur || 3)}" data-pax="${Number(f.pax || 1)}">\u53d6\u6d88</button>
       </div>
     </article>
   `).join("");
@@ -12995,8 +15340,8 @@ async function openMyOrdersQuickView(trigger = null) {
     .map(
       (o) => `
       <article class="card">
-        <h3>${escapeHtml(o.provider || "Ctrip Hotel")}</h3>
-        <div class="status">${pickText("订单号", "Order","注文番号", "주문번호")}: <span class="code">${escapeHtml((o.proof && o.proof.orderNo) || o.outOrderNo || o.id)}</span></div>
+        <h3>${escapeHtml(getOrderTitle(o))}</h3>
+        <div class="status">${pickText("订单号", "Order","注文番号", "주문번호")}: <span class="code">${escapeHtml(o.id)}</span></div>
         <div class="status">${pickText("状态", "Status","状態", "상태")}: <span class="status-badge ${escapeHtml(o.status || "")}">${escapeHtml(localizeStatus(o.status || "-"))}</span></div>
         <div class="status">${pickText("金额", "Amount","金額", "금액")}: ${Number(o.price || o.totalPrice || 0)} ${escapeHtml(o.currency || "CNY")}</div>
         <div class="actions">
@@ -13019,16 +15364,16 @@ async function loadOrderDetail(orderId, trigger = null) {
   if (skeleton) skeleton.clear(el.orderDrawerBody);
   const detail = data.detail || {};
   const lifecycle = (detail.lifecycle || [])
-    .map((item) => `<li><strong>${escapeHtml(item.label || item.state)}</strong> <span class="status">${new Date(item.at).toLocaleString()} · ${escapeHtml(item.note || "")}</span></li>`)
+    .map((item) => `<li><strong>${escapeHtml(_localizeVisibleTravelText(item.label || item.state || "", localizeStatus(item.state || "-")))}</strong> <span class="status">${new Date(item.at).toLocaleString()} · ${escapeHtml(_localizeVisibleTravelText(item.note || "", ""))}</span></li>`)
     .join("");
   const proofItems = (detail.proofItems || [])
     .map(
       (item) =>
-        `<li>${escapeHtml(item.title || item.type)} <span class="status">${escapeHtml(item.hash || "-")} · ${new Date(item.generatedAt).toLocaleString()}</span><div class="actions"><button class="secondary" data-action="copy-proof" data-text="${escapeHtml(item.content || item.hash || "")}">${pickText("复制", "Copy","コピー", "복사")}</button><button class="secondary" data-action="share-proof" data-title="${escapeHtml(item.title || item.type)}" data-text="${escapeHtml(item.content || item.hash || "")}">${pickText("分享", "Share","共有", "공유")}</button></div></li>`,
+        `<li>${escapeHtml(_localizeVisibleTravelText(item.title || item.type || "", pickText("凭证", "Proof","証憑", "증빙")))} <span class="status">${escapeHtml(item.hash || "-")} · ${new Date(item.generatedAt).toLocaleString()}</span><div class="actions"><button class="secondary" data-action="copy-proof" data-text="${escapeHtml(item.content || item.hash || "")}">${pickText("复制", "Copy","コピー", "복사")}</button><button class="secondary" data-action="share-proof" data-title="${escapeHtml(_localizeVisibleTravelText(item.title || item.type || "", pickText("凭证", "Proof","証憑", "증빙")))}" data-text="${escapeHtml(item.content || item.hash || "")}">${pickText("分享", "Share","共有", "공유")}</button></div></li>`,
     )
     .join("");
   const support = detail.support
-    ? `<div>${pickText("工单", "Ticket","チケット", "티켓")}: <span class="code">${escapeHtml(detail.support.ticketId)}</span> · <span class="status-badge ${escapeHtml(detail.support.status)}">${escapeHtml(localizeStatus(detail.support.status))}</span> · ${escapeHtml(detail.support.handler)}</div>
+    ? `<div>${pickText("工单", "Ticket","チケット", "티켓")}: <span class="code">${escapeHtml(detail.support.ticketId)}</span> · <span class="status-badge ${escapeHtml(detail.support.status)}">${escapeHtml(localizeStatus(detail.support.status))}</span></div>
        <div class="status eta-live" data-created-at="${escapeHtml(detail.support.createdAt || detail.support.updatedAt || new Date().toISOString())}" data-eta-min="${Number(detail.support.etaMin || 0)}"></div>
        <div class="actions">
          <button class="secondary" data-action="ticket-evidence" data-ticket="${escapeHtml(detail.support.ticketId)}">${pickText("补充材料", "Upload evidence","証拠を追加", "증빙 추가")}</button>
@@ -13061,23 +15406,16 @@ async function loadOrderDetail(orderId, trigger = null) {
       <h3>${pickText("售后支持", "Support","サポート", "지원")}</h3>
       ${support}
     </article>
-    <article class="card" id="invoiceCard_${escapeHtml(orderId)}">
-      <h3>${pickText("申请电子发票", "Apply for E-Invoice", "電子インボイス申請", "전자 영수증 신청")}</h3>
-      <form class="form-col" onsubmit="event.preventDefault();_applyInvoice(event,'${escapeHtml(orderId)}')">
-        <label>${pickText("邮箱", "Email", "メール", "이메일")}
-          <input type="email" name="email" required placeholder="email@example.com" />
-        </label>
-        <label>${pickText("抬头（个人 / 公司名称）", "Invoice title (personal / company)", "宛名（個人 / 会社名）", "발행 대상（개인 / 회사명）")}
-          <input type="text" name="title" placeholder="${pickText("个人 / 公司名称", "Personal / Company name", "個人 / 会社名", "개인 / 회사명")}" />
-        </label>
-        <label>${pickText("纳税人识别号（企业填写）", "Tax ID (companies only)", "法人番号（法人のみ）", "사업자번호（법인만）")}
-          <input type="text" name="taxId" placeholder="${pickText("纳税人识别号", "Tax ID", "法人番号", "사업자번호")}" />
-        </label>
-        <div class="actions">
-          <button type="submit">${pickText("提交发票申请", "Submit Invoice Request", "請求書を申請", "영수증 신청")}</button>
-        </div>
-      </form>
-      <div id="invoiceResult_${escapeHtml(orderId)}" class="status-text"></div>
+    <article class="card" id="receiptCard_${escapeHtml(orderId)}">
+      <h3>${pickText("预订确认与收据", "Booking Confirmation & Receipt", "予約確認と領収書", "예약 확인 및 영수증")}</h3>
+      <div class="status">${pickText("这是旅客侧的主要交付文件，用于确认订单、出示预订结果和下载收据。", "This is the primary traveler document for confirming the order and downloading the receipt.", "これは旅行者向けの主要書類で、予約確認と領収書の取得に使います。", "이 문서는 여행자용 기본 문서로, 예약 확인과 영수증 다운로드에 사용됩니다.")}</div>
+      <div>${pickText("订单号", "Order", "注文番号", "주문 번호")}: <span class="code">${escapeHtml(detail.orderId || orderId)}</span></div>
+      <div>${pickText("当前状态", "Current status", "現在の状態", "현재 상태")}: <span class="status-badge ${escapeHtml(detail.status || "")}">${escapeHtml(localizeStatus(detail.status || "-"))}</span></div>
+      <div class="status">${pickText("如果需要公司报销或特殊税务文件，请联系人工支持，不放在旅客主流程里。", "If you need company reimbursement or special tax documents, contact support instead of using the traveler flow.", "会社精算や特別な税務書類が必要な場合は、旅行者フローではなくサポートへご連絡ください。", "회사 정산이나 별도 세무 문서가 필요하면 여행자 기본 흐름이 아니라 지원팀에 문의하세요.")}</div>
+      <div class="actions">
+        <a class="secondary cx-receipt-btn" href="${escapeHtml(buildOrderReceiptUrl(orderId, { download: true }))}" target="_blank" rel="noopener">${pickText("下载收据", "Download receipt", "領収書をダウンロード", "영수증 다운로드")}</a>
+        <button class="secondary" data-action="open-proof" data-order="${escapeHtml(orderId)}">${pickText("查看确认凭证", "Open confirmation bundle", "確認証憑を見る", "확인 증빙 보기")}</button>
+      </div>
     </article>
   `;
   motion.bindPressables(el.orderDrawerBody);
@@ -13124,8 +15462,17 @@ async function loadAuditLogs() {
   el.languageTag.textContent = state.uiLanguage;
   applyLanguagePack();
   const hasGps = userData.user && userData.user.location && Number.isFinite(Number(userData.user.location.lat)) && Number.isFinite(Number(userData.user.location.lng));
-  el.locationTag.textContent = hasGps ? `${userData.user.city || "Shanghai"} · GPS` : userData.user.city || "Shanghai";
-  state.selectedConstraints.city = userData.user.city || state.selectedConstraints.city || "Shanghai";
+  if (hasGps && userData.user && userData.user.city) {
+    _updateLocationTag(userData.user.city, {
+      cityZh: userData.user.cityZh || userData.user.city,
+      cityEn: userData.user.cityEn || userData.user.city,
+      hasGps: true,
+    });
+  } else if (!state._locationLabelZh && !state._locationLabelEn) {
+    _updateLocationTag("");
+  }
+  state.selectedConstraints.city = userData.user.city || state.selectedConstraints.city || "";
+  _persistConstraints();
   state.viewMode = IS_USER_PORTAL ? "user" : userData.user.viewMode === "admin" ? "admin" : "user";
   state.auditLogs = Array.isArray(logsData.logs) ? logsData.logs : [];
   state.supportTickets = Array.isArray(supportData.tickets) ? supportData.tickets : [];
@@ -13180,16 +15527,20 @@ async function loadAuditLogs() {
     const _authName = _getAuthName ? _getAuthName() : null;
     const _displayName = _authName || _u.displayName || _u.id || pickText("旅行者", "Traveler", "旅行者", "여행자");
     const _initials = _displayName.replace(/\s+/g, "").slice(0, 2).toUpperCase() || "??";
-    const _city = _u.city || pickText("未设定", "Not set", "未設定", "미설정");
+    const _city = _u.city ? _localizeUiCityName(_u.city, state.uiLanguage) : pickText("未设定", "Not set", "未設定", "미설정");
     const _plus = (_plusInfo && _plusInfo.active) || (_u.plusSubscription && _u.plusSubscription.active);
     if (el.meAvatar) el.meAvatar.textContent = _initials;
     if (el.meProfileName) el.meProfileName.textContent = _displayName;
     if (el.meProfileSub) el.meProfileSub.textContent = _city + (_plus ? " · Plus ✦" : "");
     if (el.meTripLabel) el.meTripLabel.textContent = pickText("行程", "Trips", "旅行", "여행");
     if (el.meOrderLabel) el.meOrderLabel.textContent = pickText("订单", "Orders", "注文", "주문");
-    el.meProfileCard.style.display = "";
+    el.meProfileCard.classList.remove("hidden");
     // Async load counts (non-blocking)
-    api("/api/trips").then((d) => { if (el.meTripCount && Array.isArray(d.trips)) el.meTripCount.textContent = d.trips.length; }).catch(() => {});
+    if (_canUsePrivateUserApis()) {
+      api("/api/trips").then((d) => { if (el.meTripCount && Array.isArray(d.trips)) el.meTripCount.textContent = d.trips.length; }).catch(() => {});
+    } else if (el.meTripCount) {
+      el.meTripCount.textContent = "0";
+    }
     api("/api/orders").then((d) => { if (el.meOrderCount && Array.isArray(d.orders)) el.meOrderCount.textContent = d.orders.length; }).catch(() => {});
 
     // ── Profile edit button / form ─────────────────────────────────────────
@@ -13200,16 +15551,16 @@ async function loadAuditLogs() {
         if (el.meEditName)  el.meEditName.value  = _curUser.displayName || "";
         if (el.meEditCity)  el.meEditCity.value  = _curUser.city || "";
         if (el.meEditProfileHeading) el.meEditProfileHeading.textContent = pickText("编辑资料", "Edit Profile", "プロフィール編集", "프로필 편집");
-        if (el.meEditProfileCard) el.meEditProfileCard.style.display = "";
-        if (el.meEditProfileBtn)  el.meEditProfileBtn.style.display  = "none";
+        if (el.meEditProfileCard) el.meEditProfileCard.classList.remove("hidden");
+        if (el.meEditProfileBtn)  el.meEditProfileBtn.classList.add("hidden");
         if (el.meEditName) el.meEditName.focus();
       });
     }
     if (el.meEditProfileCancel && !el.meEditProfileCancel._bound) {
       el.meEditProfileCancel._bound = true;
       el.meEditProfileCancel.addEventListener("click", () => {
-        if (el.meEditProfileCard) el.meEditProfileCard.style.display = "none";
-        if (el.meEditProfileBtn)  el.meEditProfileBtn.style.display  = "";
+        if (el.meEditProfileCard) el.meEditProfileCard.classList.add("hidden");
+        if (el.meEditProfileBtn)  el.meEditProfileBtn.classList.remove("hidden");
       });
     }
     if (el.meEditProfileForm && !el.meEditProfileForm._bound) {
@@ -13224,10 +15575,10 @@ async function loadAuditLogs() {
           const resp = await api("/api/user/profile", { method: "POST", body: JSON.stringify({ displayName: _name, city: _city }) });
           if (resp.ok) {
             if (_name) { try { localStorage.setItem(AUTH_NAME_KEY, _name); } catch {} if (el.meProfileName) el.meProfileName.textContent = _name; }
-            if (_city && el.meProfileSub) el.meProfileSub.textContent = _city + (el.meProfileSub.textContent.includes("Plus") ? " · Plus ✦" : "");
+            if (_city && el.meProfileSub) el.meProfileSub.textContent = _localizeUiCityName(_city, state.uiLanguage) + (el.meProfileSub.textContent.includes("Plus") ? " · Plus ✦" : "");
             notify(pickText("资料已更新", "Profile updated", "プロフィール更新", "프로필 업데이트"), "success");
-            if (el.meEditProfileCard) el.meEditProfileCard.style.display = "none";
-            if (el.meEditProfileBtn)  el.meEditProfileBtn.style.display  = "";
+            if (el.meEditProfileCard) el.meEditProfileCard.classList.add("hidden");
+            if (el.meEditProfileBtn)  el.meEditProfileBtn.classList.remove("hidden");
           } else {
             notify(pickText("保存失败", "Save failed", "保存失敗", "저장 실패"), "error");
           }
@@ -13238,36 +15589,76 @@ async function loadAuditLogs() {
   }
 
   const gaodeLabel = providerData.gaode.enabled ? "Gaode LIVE" : "Gaode mock";
+  const hotelLabel = providerData.hotels
+    ? (providerData.hotels.runtimeVerified ? "Hotels LIVE verified" : "Hotels live lane ready")
+    : "Hotels unknown";
+  const restaurantLabel = providerData.restaurants && providerData.restaurants.enabled ? "Restaurants LIVE" : "Restaurants fallback";
   const partnerLabel = providerData.partnerHub && providerData.partnerHub.enabled ? "PartnerHub external" : "PartnerHub mock";
   const contracts = contractsData.contracts || {};
   const missingProviders = providerData.liveReadiness && Array.isArray(providerData.liveReadiness.missing)
     ? providerData.liveReadiness.missing
     : [];
+  const commerceMissing = providerData.liveReadiness && Array.isArray(providerData.liveReadiness.commerceMissing)
+    ? providerData.liveReadiness.commerceMissing
+    : [];
+  const missingProviderSuffix = missingProviders.length
+    ? pickText(
+      ` · 待补齐数据源 ${missingProviders.length} 项`,
+      ` · ${missingProviders.length} provider(s) need setup`,
+      ` · 未準備のデータソース ${missingProviders.length} 件`,
+      ` · 설정이 필요한 데이터 소스 ${missingProviders.length}개`
+    )
+    : "";
+  const commerceSuffix = commerceMissing.length
+    ? pickText(
+      ` · 商业接入待补齐 ${commerceMissing.length} 项`,
+      ` · commerce setup pending ${commerceMissing.length}`,
+      ` · 商用接続の未設定 ${commerceMissing.length} 件`,
+      ` · 상거래 연동 미설정 ${commerceMissing.length}건`
+    )
+    : pickText(
+      " · 商业接入已就绪",
+      " · commerce ready",
+      " · 商用接続は準備完了",
+      " · 상거래 연동 준비 완료"
+    );
   el.providerStatus.textContent = pickText(
-    `数据源：${gaodeLabel}, ${partnerLabel} · MCP 合同 ${Number(contracts.enforcedContracts || 0)}/${Number(contracts.totalContracts || 0)} 已启用${
-      missingProviders.length ? ` · 缺少环境变量: ${missingProviders.join(", ")}` : ""
-    }`,
-    `Providers: ${gaodeLabel}, ${partnerLabel} · MCP contracts ${Number(contracts.enforcedContracts || 0)}/${Number(contracts.totalContracts || 0)} enforced${
-      missingProviders.length ? ` · Missing env: ${missingProviders.join(", ")}` : ""
-    }`,
-    `データソース: ${gaodeLabel}, ${partnerLabel} · MCP契約 ${Number(contracts.enforcedContracts || 0)}/${Number(contracts.totalContracts || 0)} 有効${
-      missingProviders.length ? ` · 不足環境変数: ${missingProviders.join(", ")}` : ""
-    }`,
-    `데이터 소스: ${gaodeLabel}, ${partnerLabel} · MCP 계약 ${Number(contracts.enforcedContracts || 0)}/${Number(contracts.totalContracts || 0)} 적용${
-      missingProviders.length ? ` · 누락 환경변수: ${missingProviders.join(", ")}` : ""
-    }`,
+    `消费者数据：${gaodeLabel}, ${hotelLabel}, ${restaurantLabel}${missingProviderSuffix}${commerceSuffix} · MCP 合同 ${Number(contracts.enforcedContracts || 0)}/${Number(contracts.totalContracts || 0)} 已启用`,
+    `Consumer data: ${gaodeLabel}, ${hotelLabel}, ${restaurantLabel}${missingProviderSuffix}${commerceSuffix} · MCP contracts ${Number(contracts.enforcedContracts || 0)}/${Number(contracts.totalContracts || 0)} enforced`,
+    `利用者データ: ${gaodeLabel}, ${hotelLabel}, ${restaurantLabel}${missingProviderSuffix}${commerceSuffix} · MCP契約 ${Number(contracts.enforcedContracts || 0)}/${Number(contracts.totalContracts || 0)} 有効`,
+    `사용자 데이터: ${gaodeLabel}, ${hotelLabel}, ${restaurantLabel}${missingProviderSuffix}${commerceSuffix} · MCP 계약 ${Number(contracts.enforcedContracts || 0)}/${Number(contracts.totalContracts || 0)} 적용`,
   );
   if (el.providerProbeSummary) {
     const probes = Array.isArray(probeData.probes) ? probeData.probes : [];
     const lines = probes
       .map(
-        (probe) =>
-          `${probe.provider}: ${probe.mode} · p95 ${Number(probe.p95Ms || 0)}ms · SLA ${(Number(probe.slaMetRate || 0) * 100).toFixed(1)}% · ${pickText("调用", "calls","呼び出し", "호출")} ${Number(probe.sampleCalls || 0)}`,
+        (probe) => {
+          if (probe.provider === "Hotel Catalog") {
+            return `${probe.provider}: ${probe.mode} · ${pickText("已验证", "verified", "検証済み", "검증됨")} ${probe.runtimeVerified ? "yes" : "no"} · ${pickText("缓存", "cache", "キャッシュ", "캐시")} ${Number(probe.cacheEntries || 0)}`;
+          }
+          return `${probe.provider}: ${probe.mode} · p95 ${Number(probe.p95Ms || 0)}ms · SLA ${(Number(probe.slaMetRate || 0) * 100).toFixed(1)}% · ${pickText("调用", "calls","呼び出し", "호출")} ${Number(probe.sampleCalls || 0)}`;
+        },
       )
       .join(" | ");
+    const missingCount = Array.isArray(probeData.missing) ? probeData.missing.length : 0;
+    const commerceMissingCount = Array.isArray(probeData.commerceMissing) ? probeData.commerceMissing.length : 0;
     const health = probeData.ready
-      ? i18n.t(state.uiLanguage, "ui.provider_probe_ready")
-      : `${i18n.t(state.uiLanguage, "ui.provider_probe_missing")}: ${(probeData.missing || []).join(", ") || "-"}`;
+      ? (
+        commerceMissingCount
+          ? pickText(
+            `消费者实时数据就绪，商业接入待补齐 ${commerceMissingCount} 项`,
+            `Consumer live data ready; commerce pending ${commerceMissingCount}`,
+            `利用者向けのライブデータは準備完了、商用接続は ${commerceMissingCount} 件未設定`,
+            `사용자용 실시간 데이터는 준비 완료, 상거래 연동 ${commerceMissingCount}건 미설정`
+          )
+          : i18n.t(state.uiLanguage, "ui.provider_probe_ready")
+      )
+      : pickText(
+        `待补齐数据源 ${missingCount || 1} 项`,
+        `${missingCount || 1} provider(s) need setup`,
+        `未準備のデータソース ${missingCount || 1} 件`,
+        `설정이 필요한 데이터 소스 ${missingCount || 1}개`,
+      );
     el.providerProbeSummary.textContent = `${health} · ${lines || "-"}`;
   }
   if (el.railStatus) {
@@ -13323,12 +15714,12 @@ async function loadAuditLogs() {
   }
 
   el.auditList.innerHTML = !logsData.logs.length
-    ? `<article class="card"><p>${pickText("暂无操作日志。", "No audit logs yet.", "操作ログはありません。", "감사 로그가 없습니다.")}</p><p class="status">${pickText("完成一次行程规划或支付后，操作记录将显示在这里。", "Complete a trip plan or payment to start seeing logs here.", "旅程プランや支払いを完了すると、ここにログが表示されます。", "여행 계획 또는 결제를 완료하면 여기에 로그가 표시됩니다.")}</p><div class="actions"><button class="secondary" onclick="switchTab('chat')">${pickText("去规划行程", "Plan a trip", "旅程を計画する", "여행 계획하기")}</button></div></article>`
+    ? `<article class="card"><p>${pickText("暂无操作日志。", "No audit logs yet.", "操作ログはありません。", "감사 로그가 없습니다.")}</p><p class="status">${pickText("完成一次行程规划或支付后，操作记录将显示在这里。", "Complete a trip plan or payment to start seeing logs here.", "旅程プランや支払いを完了すると、ここにログが表示されます。", "여행 계획 또는 결제를 완료하면 여기에 로그가 표시됩니다.")}</p><div class="actions"><button class="secondary" data-action="go-tab" data-tab="chat">${pickText("去规划行程", "Plan a trip", "旅程を計画する", "여행 계획하기")}</button></div></article>`
     : logsData.logs
         .map(
           (log) => `
       <article class="card">
-        <h3>${escapeHtml(log.what)}</h3>
+        <h3>${escapeHtml(_localizeVisibleTravelText(log.what || "", pickText("审计事件", "Audit event","監査イベント", "감사 이벤트")))}</h3>
         <div class="status">${new Date(log.at).toLocaleString()}</div>
         <div>Hash: <span class="code">${escapeHtml(log.hash)}</span></div>
         <div class="actions">
@@ -13346,10 +15737,10 @@ async function loadAuditLogs() {
         .map(
           (call) => `
       <article class="card">
-        <h3>${escapeHtml(call.op)} · ${escapeHtml(call.toolType)}</h3>
+        <h3>${escapeHtml(_localizeVisibleTravelText(call.op || "", pickText("MCP 调用", "MCP Call","MCP呼び出し", "MCP 호출")))} · ${escapeHtml(_localizeVisibleTravelText(call.toolType || "", call.toolType || "-"))}</h3>
         <div class="status">${new Date(call.at).toLocaleString()} · ${call.response.latency}ms / SLA ${Number(call.response.slaMs || 0)}ms (${call.response.slaMet ? pickText("达标", "met","達成", "충족") : pickText("超时", "breach","違反", "위반")})</div>
-        <div>${pickText("结果", "Result","結果", "결과")}: ${escapeHtml(call.response.status)} | ${pickText("代码", "Code","コード", "코드")}: ${escapeHtml(call.response.code)}</div>
-        <div class="status">${pickText("提供方", "Provider","プロバイダ", "공급자")}: ${escapeHtml((call.response.data && call.response.data.provider) || "-")} · ${pickText("来源", "Source","ソース", "소스")}: ${escapeHtml((call.response.data && call.response.data.source) || "-")}</div>
+        <div>${pickText("结果", "Result","結果", "결과")}: ${escapeHtml(_localizeVisibleTravelText(call.response.status || "", call.response.status || "-"))} | ${pickText("代码", "Code","コード", "코드")}: ${escapeHtml(call.response.code)}</div>
+        <div class="status">${pickText("提供方", "Provider","プロバイダ", "공급자")}: ${escapeHtml(_localizeVisibleTravelText((call.response.data && call.response.data.provider) || "", (call.response.data && call.response.data.provider) || "-"))} · ${pickText("来源", "Source","ソース", "소스")}: ${escapeHtml(_localizeVisibleTravelText((call.response.data && call.response.data.source) || "", (call.response.data && call.response.data.source) || "-"))}</div>
         <div class="status">${pickText("契约", "Contract","契約", "계약")}: ${escapeHtml(call.response.contractId || "-")}</div>
       </article>
     `,
@@ -13364,14 +15755,13 @@ async function loadAuditLogs() {
             (ticket) => `
         <article class="card">
           <h3>${escapeHtml(ticket.id)}</h3>
-          <div>${pickText("状态", "Status","状態", "상태")}: <span class="status-badge ${escapeHtml(ticket.status)}">${escapeHtml(localizeStatus(ticket.status))}</span> · ${pickText("来源", "Source","ソース", "소스")}: ${escapeHtml(ticket.source)} · ${pickText("处理方", "Handler","担当", "담당")}: ${escapeHtml(ticket.handler || "human")}</div>
+          <div>${pickText("状态", "Status","状態", "상태")}: <span class="status-badge ${escapeHtml(ticket.status)}">${escapeHtml(localizeStatus(ticket.status))}</span></div>
           <div class="status">${new Date(ticket.createdAt).toLocaleString()} · <span class="eta-live" data-created-at="${escapeHtml(ticket.createdAt)}" data-eta-min="${Number(ticket.etaMin || 0)}">${pickText("预计", "ETA","目安", "예상")} ${Number(ticket.etaMin || 0)} ${pickText("分钟", "min","分", "분")}</span></div>
-          <div class="status">${pickText("证据数量", "Evidence","証拠数", "증빙 수")}: ${Array.isArray(ticket.evidence) ? ticket.evidence.length : 0}</div>
-          <div class="status">${pickText("实时会话", "Live room","ライブ会話", "실시간 상담")}: ${ticket.liveSession ? `${escapeHtml(ticket.liveSession.status)} · ${pickText("坐席未读", "Ops unread","オペレーター未読", "상담원 미확인")} ${Number((ticket.liveSession.unread && ticket.liveSession.unread.ops) || 0)}` : pickText("未创建", "not started","未開始", "미시작")}</div>
+          <div class="status">${pickText("原因", "Reason","理由", "사유")}: ${escapeHtml(_localizeVisibleTravelText(ticket.reason || "", "-"))}</div>
+          <div class="status">${pickText("证据数量", "Evidence","証拠数", "증빙 수")}: ${Number(ticket.evidenceCount || (Array.isArray(ticket.evidence) ? ticket.evidence.length : 0))}</div>
+          <div class="status">${pickText("实时会话", "Live room","ライブ会話", "실시간 상담")}: ${ticket.liveSession ? escapeHtml(localizeStatus(ticket.liveSession.status || "waiting")) : pickText("未创建", "not started","未開始", "미시작")}</div>
           <div class="actions">
             <button class="secondary" data-action="open-ticket-detail" data-ticket="${escapeHtml(ticket.id)}">${pickText("查看详情", "Open Detail","詳細を見る", "상세 보기")}</button>
-            ${ticket.status === "open" ? `<button class="secondary" data-action="ticket-progress" data-ticket="${escapeHtml(ticket.id)}">${pickText("转处理中", "Mark In Progress","対応中にする", "처리중으로 변경")}</button>` : ""}
-            ${ticket.status === "in_progress" ? `<button class="secondary" data-action="ticket-resolve" data-ticket="${escapeHtml(ticket.id)}">${pickText("标记已解决", "Mark Resolved","解決済みにする", "해결 완료로 변경")}</button>` : ""}
             <button class="secondary" data-action="open-live-support" data-ticket="${escapeHtml(ticket.id)}">${pickText("进入实时会话", "Open Live Room","ライブ会話を開く", "실시간 상담 열기")}</button>
             <button class="secondary" data-action="ticket-evidence" data-ticket="${escapeHtml(ticket.id)}">${pickText("上传凭证", "Upload Evidence","証拠を追加", "증빙 업로드")}</button>
           </div>
@@ -13394,7 +15784,7 @@ async function loadDashboard() {
     api("/api/dashboard/revenue"),
     api("/api/dashboard/mcp-sla"),
     api("/api/system/flags"),
-    api("/api/system/flags/evaluate?userId=demo"),
+    api("/api/system/flags/evaluate"),
     api("/api/system/mcp-policy"),
     api("/api/admin/analytics").catch(() => null),
   ]);
@@ -13504,7 +15894,7 @@ async function loadDashboard() {
         <ul class="steps">
           ${
             remaining.length
-              ? remaining.map((item) => `<li>${escapeHtml(item)}</li>`).join("")
+              ? remaining.map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("")
               : `<li>${pickText("暂无剩余需求。", "No remaining requirements.","残要件はありません。", "남은 요구사항이 없습니다.")}</li>`
           }
         </ul>
@@ -13525,7 +15915,7 @@ async function loadDashboard() {
       </article>
     `,
       )
-    : [`<article class="card">${pickText("未配置灰度标记。", "No feature flags configured.","機能フラグは未設定です。", "기능 플래그가 설정되지 않았습니다.")}</article>`];
+    : [`<article class="card">${pickText("当前无灰度标记。", "No feature flags available right now.","現在利用可能な機能フラグはありません。", "현재 사용 가능한 기능 플래그가 없습니다.")}</article>`];
   flagCards.push(`
     <article class="card">
       <h3>MCP Policy</h3>
@@ -13570,7 +15960,7 @@ async function loadDashboard() {
               ${rows ? `<div class="status">Failed cases:</div><ul class="steps">${rows}</ul>` : ""}
             </article>`;
         } catch (e) {
-          if (el.benchmarkResult) el.benchmarkResult.innerHTML = `<article class="card"><div class="status">Benchmark error: ${escapeHtml(String(e.message || e))}</div></article>`;
+          if (el.benchmarkResult) el.benchmarkResult.innerHTML = `<article class="card"><div class="status">${escapeHtml(formatClientActionError(e, "基准测试失败", "Benchmark failed", "ベンチマーク失敗", "벤치마크 실패"))}</div></article>`;
         } finally { el.runBenchmarkBtn.disabled = false; }
       });
     }
@@ -13614,7 +16004,7 @@ async function loadBuildInfo() {
   if (!el.buildTag) return;
   try {
     const [data, llm] = await Promise.all([api("/api/system/build"), api("/api/system/llm-status").catch(() => null)]);
-    const llmTag = llm && llm.configured ? "ChatGPT:on" : "ChatGPT:off";
+    const llmTag = llm && llm.configured ? "AI:on" : "AI:off";
     el.buildTag.textContent = `build:${data.buildId} · ${llmTag}`;
     document.title = `Cross X | ${data.buildId}`;
   } catch {
@@ -13651,9 +16041,9 @@ function renderLaneCandidates(candidates, compact) {
       <article class="lane-candidate">
         <img class="lane-candidate-image media-photo" src="${escapeHtml(assetUrl(item.imageUrl || "/assets/solution-flow.svg"))}" alt="${escapeHtml(item.name || "candidate")}" />
         <div class="lane-candidate-info">
-          <div><strong>${escapeHtml(item.name || "-")}</strong></div>
-          <div class="status">${escapeHtml(item.category || "-")} · ${pickText("推荐分", "Score","推奨スコア", "추천 점수")} ${Number(item.score || 0)}</div>
-          <div class="status">${escapeHtml(item.reason || "-")}</div>
+          <div><strong>${escapeHtml(_localizeVisibleTravelText(item.name || "-", item.name || "-"))}</strong></div>
+          <div class="status">${escapeHtml(_localizeVisibleTravelText(item.category || "-", item.category || "-"))} · ${pickText("推荐分", "Score","推奨スコア", "추천 점수")} ${Number(item.score || 0)}</div>
+          <div class="status">${escapeHtml(_localizeVisibleTravelText(item.reason || "-", item.reason || "-"))}</div>
         </div>
       </article>
     `,
@@ -13669,12 +16059,12 @@ function renderLaneCandidates(candidates, compact) {
 
 function renderOptionSpecificRows(item) {
   const details = [];
-  if (item && item.placeName) details.push(`${pickText("餐厅/地点", "Place","店舗/地点", "식당/장소")}: ${escapeHtml(item.placeName)}`);
-  if (item && item.hotelName) details.push(`${pickText("酒店", "Hotel","ホテル", "호텔")}: ${escapeHtml(item.hotelName)}`);
-  if (item && item.transportMode) details.push(`${pickText("交通方式", "Transport","移動手段", "교통수단")}: ${escapeHtml(item.transportMode)}`);
+  if (item && item.placeName) details.push(`${pickText("餐厅/地点", "Place","店舗/地点", "식당/장소")}: ${escapeHtml(_localizeVisibleTravelText(item.placeName, item.placeName))}`);
+  if (item && item.hotelName) details.push(`${pickText("酒店", "Hotel","ホテル", "호텔")}: ${escapeHtml(_localizeVisibleTravelText(item.hotelName, item.hotelName))}`);
+  if (item && item.transportMode) details.push(`${pickText("交通方式", "Transport","移動手段", "교통수단")}: ${escapeHtml(_localizeVisibleTravelText(item.transportMode, item.transportMode))}`);
   const detailLine = details.length ? `<div class="status">${details.join(" · ")}</div>` : "";
   const executionRows = item && Array.isArray(item.executionPlan)
-    ? item.executionPlan.slice(0, 4).map((step) => `<li>${escapeHtml(step)}</li>`).join("")
+    ? item.executionPlan.slice(0, 4).map((step) => `<li>${escapeHtml(_localizeVisibleTravelText(step, step))}</li>`).join("")
     : "";
   const executionBlock = executionRows
     ? `<div class="status">${pickText("执行明细", "Execution plan","実行内訳", "실행 내역")}:</div><ul class="steps">${executionRows}</ul>`
@@ -13689,15 +16079,15 @@ function renderSolutionLaneCards(options, recommendedOptionId, compact = false) 
     .map(
       (item) => `
       <article class="card ${item.id === recommendedOptionId ? "lane-recommended" : ""}">
-        <h3>${escapeHtml(item.title || pickText("推荐路线", "Solution lane","推奨ルート", "추천 경로"))}</h3>
+        <h3>${escapeHtml(_localizeVisibleTravelText(item.title || pickText("推荐路线", "Solution lane","推奨ルート", "추천 경로"), item.title || pickText("推荐路线", "Solution lane","推奨ルート", "추천 경로")))}</h3>
         <img class="lane-hero-image media-photo" src="${escapeHtml(assetUrl(item.imagePath || "/assets/solution-flow.svg"))}" alt="${escapeHtml(item.title || "solution lane")}" />
         <div class="status">
           <span class="status-badge lane-grade">${escapeHtml(item.grade || "-")}</span>
-          ${pickText("推荐等级", "Recommendation","推奨レベル", "추천 레벨")}: <strong>${escapeHtml(item.recommendationLevel || "-")}</strong> ·
-          ${pickText("分数", "Score","スコア", "점수")} ${Number(item.score || 0)} / 100 · ${pickText("类型", "Type","タイプ", "유형")} ${escapeHtml(item.type || "-")}
+          ${pickText("推荐等级", "Recommendation","推奨レベル", "추천 레벨")}: <strong>${escapeHtml(_localizeVisibleTravelText(item.recommendationLevel || "-", item.recommendationLevel || "-"))}</strong> ·
+          ${pickText("分数", "Score","スコア", "점수")} ${Number(item.score || 0)} / 100 · ${pickText("类型", "Type","タイプ", "유형")} ${escapeHtml(_localizeVisibleTravelText(item.type || "-", item.type || "-"))}
         </div>
-        <div class="status">ETA ${escapeHtml(item.etaWindow || "-")} · ${pickText("成功率", "Success","成功率", "성공률")} ${(Number(item.successRate7d || 0) * 100).toFixed(0)}% · ${pickText("风险", "Risk","リスク", "리스크")} ${escapeHtml(item.riskLabel || item.riskLevel || "-")}</div>
-        <div class="status">${pickText("费用", "Cost","費用", "비용")} ${escapeHtml(item.costRange || "-")} · ${pickText("前置条件", "Requires","前提条件", "필요 조건")}</div>
+        <div class="status">ETA ${escapeHtml(item.etaWindow || "-")} · ${pickText("成功率", "Success","成功率", "성공률")} ${(Number(item.successRate7d || 0) * 100).toFixed(0)}% · ${pickText("风险", "Risk","リスク", "리스크")} ${escapeHtml(_localizeVisibleTravelText(item.riskLabel || item.riskLevel || "-", item.riskLabel || item.riskLevel || "-"))}</div>
+        <div class="status">${pickText("费用", "Cost","費用", "비용")} ${escapeHtml(_localizeVisibleTravelText(item.costRange || "-", item.costRange || "-"))} · ${pickText("前置条件", "Requires","前提条件", "필요 조건")}</div>
         ${renderOptionSpecificRows(item)}
         <div class="requires-row">${renderRequires(item.requires || [])}</div>
         ${renderLaneCandidates(item.candidates || [], compact)}
@@ -13705,21 +16095,21 @@ function renderSolutionLaneCards(options, recommendedOptionId, compact = false) 
           <button class="secondary" data-action="toggle-lane" data-lane="${escapeHtml(item.id || "")}">${tUi("lane_show_details")}</button>
         </div>
         <div id="lane-tradeoff-${escapeHtml(item.id || "")}" class="lane-tradeoffs collapsed">
-          <div class="status">${tUi("lane_tradeoffs")}: ${escapeHtml((item.tradeoffs || []).join(" | ") || pickText("无", "None","なし", "없음"))}</div>
+          <div class="status">${tUi("lane_tradeoffs")}: ${escapeHtml(_localizeVisibleTravelText((item.tradeoffs || []).join(" | ") || "", (item.tradeoffs || []).join(" | ") || pickText("无", "None","なし", "없음")))}</div>
           ${
             Array.isArray(item.scoring) && item.scoring.length
-              ? `<div class="status">${pickText("评分依据", "Scoring basis","評価基準", "평가 기준")}: ${item.scoring.map((x) => `${escapeHtml(x.k)}=${Number(x.v || 0)}`).join(" · ")}</div>`
+              ? `<div class="status">${pickText("评分依据", "Scoring basis","評価基準", "평가 기준")}: ${item.scoring.map((x) => `${escapeHtml(_localizeVisibleTravelText(x.k, x.k))}=${Number(x.v || 0)}`).join(" · ")}</div>`
               : ""
           }
           ${
             compact
               ? ""
-              : `<h3>${pickText("评论", "Comments","コメント", "코멘트")}</h3><ul class="steps">${(item.comments || []).map((comment) => `<li>${escapeHtml(comment)}</li>`).join("") || `<li>${pickText("暂无评论。", "No comments.","コメントはありません。", "코멘트가 없습니다.")}</li>`}</ul>`
+              : `<h3>${pickText("评论", "Comments","コメント", "코멘트")}</h3><ul class="steps">${(item.comments || []).map((comment) => `<li>${escapeHtml(_localizeVisibleTravelText(comment, comment))}</li>`).join("") || `<li>${pickText("暂无评论。", "No comments.","コメントはありません。", "코멘트가 없습니다.")}</li>`}</ul>`
           }
           ${
             compact
               ? ""
-              : `<h3>${pickText("分析", "Analysis","分析", "분석")}</h3><ul class="steps">${(item.analysis || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("") || `<li>${pickText("暂无分析。", "No analysis.","分析はありません。", "분석이 없습니다.")}</li>`}</ul>`
+              : `<h3>${pickText("分析", "Analysis","分析", "분석")}</h3><ul class="steps">${(item.analysis || []).map((reason) => `<li>${escapeHtml(_localizeVisibleTravelText(reason, reason))}</li>`).join("") || `<li>${pickText("暂无分析。", "No analysis.","分析はありません。", "분석이 없습니다.")}</li>`}</ul>`
           }
         </div>
         <div class="actions">
@@ -13741,36 +16131,35 @@ function updateSpotlightWithAiPlan(cd, spokenText) {
 
   const planRows = plans.map((p) => {
     const bb = p.budget_breakdown || {};
-    const bbTotal = Object.values(bb).reduce((s, v) => s + (v || 0), 0) || 1;
     const isRec = p.is_recommended;
     return `
       <div class="sol-plan-row${isRec ? " sol-plan-row--rec" : ""}">
-        <div class="sol-plan-tag">${isRec ? "⭐ " : ""}${escapeHtml(p.tag || p.id)}</div>
+        <div class="sol-plan-tag">${isRec ? "⭐ " : ""}${escapeHtml(_normalizePlanTag(p) || p.id)}</div>
         <div class="sol-plan-price">¥${Number(p.total_price || 0).toLocaleString()}</div>
         <div class="sol-plan-hotel">${escapeHtml(p.hotel?.name || "")}</div>
-        <div class="sol-bb-bar">
-          ${bb.accommodation ? `<div class="sol-bb-seg" style="width:${Math.round(bb.accommodation/bbTotal*100)}%;background:#2d87f0" title="住宿\u201d></div>` : ""}
-          ${bb.transport ? `<div class="sol-bb-seg" style="width:${Math.round(bb.transport/bbTotal*100)}%;background:#10b981" title="交通\u201d></div>` : ""}
-          ${bb.meals ? `<div class="sol-bb-seg" style="width:${Math.round(bb.meals/bbTotal*100)}%;background:#f59e0b" title="餐饮\u201d></div>` : ""}
-          ${bb.activities ? `<div class="sol-bb-seg" style="width:${Math.round(bb.activities/bbTotal*100)}%;background:#8b5cf6" title="活动\u201d></div>` : ""}
+        <div class="sol-bb-list">
+          ${bb.accommodation ? `<div class="sol-bb-item"><span class="sol-bb-dot sol-bb-dot--accommodation"></span><span>${pickText('住宿','Accommodation','宿泊','숙소')}</span><strong>${fmtCNY(bb.accommodation)}</strong></div>` : ""}
+          ${bb.transport ? `<div class="sol-bb-item"><span class="sol-bb-dot sol-bb-dot--transport"></span><span>${pickText('交通','Transport','交通','교통')}</span><strong>${fmtCNY(bb.transport)}</strong></div>` : ""}
+          ${bb.meals ? `<div class="sol-bb-item"><span class="sol-bb-dot sol-bb-dot--meals"></span><span>${pickText('餐饮','Meals','食事','식사')}</span><strong>${fmtCNY(bb.meals)}</strong></div>` : ""}
+          ${bb.activities ? `<div class="sol-bb-item"><span class="sol-bb-dot sol-bb-dot--activities"></span><span>${pickText('活动','Activities','アクティビティ','활동')}</span><strong>${fmtCNY(bb.activities)}</strong></div>` : ""}
         </div>
       </div>`;
   }).join("");
 
   const highlights = rec ? (rec.highlights || []).slice(0, 3).map(
-    (h) => `<li><span style="color:#2d87f0">✓</span> ${escapeHtml(h)}</li>`
+    (h) => `<li><span class="sol-highlights-check">✓</span> ${escapeHtml(h)}</li>`
   ).join("") : "";
 
   el.chatSolutionStrip.innerHTML = `
-    <div class="sol-ai-header">
-      <span class="sol-ai-badge">AI 方案</span>
+      <div class="sol-ai-header">
+      <span class="sol-ai-badge">${pickText("AI 方案","AI Plan","AI プラン","AI 플랜")}</span>
       ${dest ? `<span class="sol-ai-dest">📍 ${dest}</span>` : ""}
       <span class="sol-ai-dur">${dur}${pickText("天","d","日","일")}</span>
     </div>
     ${spokenText ? `<div class="sol-ai-analysis">${escapeHtml(spokenText)}</div>` : ""}
     <div class="sol-plans-list">${planRows}</div>
     ${highlights ? `<ul class="sol-highlights">${highlights}</ul>` : ""}
-    <button class="sol-scroll-btn" onclick="document.querySelector('.plan-card--v2')?.scrollIntoView({behavior:'smooth',block:'start'})">
+    <button class="sol-scroll-btn" data-action="scroll-to-plan-card">
       ${pickText("查看完整方案对比 ↑", "View Full Plan ↑", "フルプラン ↑", "전체 플랜 ↑")}
     </button>
   `;
@@ -13783,18 +16172,18 @@ async function loadChatSolutionStrip(taskId = null) {
   const data = await api(buildRecommendationPath(taskId));
   const r = data.recommendation || {};
   const selected = (r.options || []).find((item) => item.id === r.recommendedOptionId) || (r.options || [])[0] || null;
-  const shortComments = (r.comments || []).slice(0, 2).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
-  const shortReasons = (r.reasons || []).slice(0, 2).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const shortComments = (r.comments || []).slice(0, 2).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("");
+  const shortReasons = (r.reasons || []).slice(0, 2).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("");
   const laneCards = renderSolutionLaneCards((r.options || []).slice(0, 3), r.recommendedOptionId, true);
   el.chatSolutionStrip.innerHTML = `
     <article class="card">
-      <h3>${escapeHtml(r.title || pickText("Cross X 推荐方案", "Cross X Recommended Solution", "Cross X 推奨ソリューション", "Cross X 추천 솔루션"))}</h3>
-      <div class="status">${escapeHtml(r.subtitle || pickText("全局组合级推荐", "Portfolio-level recommendation","ポートフォリオ推奨", "포트폴리오 추천"))}</div>
+      <h3>${escapeHtml(_localizeVisibleTravelText(r.title || pickText("Cross X 推荐方案", "Cross X Recommended Solution", "Cross X 推奨ソリューション", "Cross X 추천 솔루션"), r.title || pickText("Cross X 推荐方案", "Cross X Recommended Solution", "Cross X 推奨ソリューション", "Cross X 추천 솔루션")))}</h3>
+      <div class="status">${escapeHtml(_localizeVisibleTravelText(r.subtitle || pickText("全局组合级推荐", "Portfolio-level recommendation","ポートフォリオ推奨", "포트폴리오 추천"), r.subtitle || pickText("全局组合级推荐", "Portfolio-level recommendation","ポートフォリオ推奨", "포트폴리오 추천")))}</div>
       <img class="solution-overview-image media-photo" src="${escapeHtml(assetUrl(r.imagePath || "/assets/solution-flow.svg"))}" alt="${pickText("方案总览", "Solution overview","ソリューション概要", "솔루션 개요")}" />
-      <div class="status">${pickText("推荐路线", "Recommended lane","推奨ルート", "추천 경로")}: <strong>${escapeHtml(r.recommendedOptionId || "-")}</strong> · ${pickText("等级", "Grade","グレード", "등급")} <strong>${escapeHtml(r.recommendedGrade || "-")}</strong> · ${pickText("推荐级别", "Level","レベル", "레벨")} <strong>${escapeHtml(r.recommendedLevel || "-")}</strong></div>
+      <div class="status">${pickText("推荐路线", "Recommended lane","推奨ルート", "추천 경로")}: <strong>${escapeHtml(r.recommendedOptionId || "-")}</strong> · ${pickText("等级", "Grade","グレード", "등급")} <strong>${escapeHtml(r.recommendedGrade || "-")}</strong> · ${pickText("推荐级别", "Level","レベル", "레벨")} <strong>${escapeHtml(_localizeVisibleTravelText(r.recommendedLevel || "-", r.recommendedLevel || "-"))}</strong></div>
       ${
         selected
-          ? `<div class="status">${pickText("餐厅/地点", "Place","店舗/地点", "식당/장소")}: ${escapeHtml(selected.placeName || "-")} · ${pickText("酒店", "Hotel","ホテル", "호텔")}: ${escapeHtml(selected.hotelName || "-")} · ${pickText("交通", "Transport","交通", "교통")}: ${escapeHtml(selected.transportMode || "-")}</div>`
+          ? `<div class="status">${pickText("餐厅/地点", "Place","店舗/地点", "식당/장소")}: ${escapeHtml(_localizeVisibleTravelText(selected.placeName || "-", selected.placeName || "-"))} · ${pickText("酒店", "Hotel","ホテル", "호텔")}: ${escapeHtml(_localizeVisibleTravelText(selected.hotelName || "-", selected.hotelName || "-"))} · ${pickText("交通", "Transport","交通", "교통")}: ${escapeHtml(_localizeVisibleTravelText(selected.transportMode || "-", selected.transportMode || "-"))}</div>`
           : ""
       }
       <div class="actions">
@@ -13817,23 +16206,23 @@ async function loadSolutionBoard(taskId = null) {
   const data = await api(buildRecommendationPath(taskId));
   const r = data.recommendation || {};
   const selected = (r.options || []).find((item) => item.id === r.recommendedOptionId) || (r.options || [])[0] || null;
-  const comments = (r.comments || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
-  const reasons = (r.reasons || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const comments = (r.comments || []).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("");
+  const reasons = (r.reasons || []).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("");
   const options = renderSolutionLaneCards(r.options || [], r.recommendedOptionId, false);
 
   el.solutionBoard.innerHTML = `
     <article class="card">
-      <h3>${escapeHtml(r.title || pickText("Cross X 推荐方案", "Cross X Recommended Solution", "Cross X 推奨ソリューション", "Cross X 추천 솔루션"))}</h3>
-      <div class="status">${escapeHtml(r.subtitle || pickText("全局组合级推荐", "Portfolio-level recommendation","ポートフォリオ推奨", "포트폴리오 추천"))}</div>
+      <h3>${escapeHtml(_localizeVisibleTravelText(r.title || pickText("Cross X 推荐方案", "Cross X Recommended Solution", "Cross X 推奨ソリューション", "Cross X 추천 솔루션"), r.title || pickText("Cross X 推荐方案", "Cross X Recommended Solution", "Cross X 推奨ソリューション", "Cross X 추천 솔루션")))}</h3>
+      <div class="status">${escapeHtml(_localizeVisibleTravelText(r.subtitle || pickText("全局组合级推荐", "Portfolio-level recommendation","ポートフォリオ推奨", "포트폴리오 추천"), r.subtitle || pickText("全局组合级推荐", "Portfolio-level recommendation","ポートフォリオ推奨", "포트폴리오 추천")))}</div>
       <img class="solution-overview-image media-photo" src="${escapeHtml(assetUrl(r.imagePath || "/assets/solution-flow.svg"))}" alt="${pickText("Cross X 方案流程", "Cross X solution flow", "Cross X ソリューションフロー", "Cross X 솔루션 플로우")}" />
-      <div class="status">${pickText("推荐等级", "Recommended grade","推奨グレード", "추천 등급")}: <strong>${escapeHtml(r.recommendedGrade || "-")}</strong> · ${escapeHtml(r.recommendedLevel || "-")}</div>
+      <div class="status">${pickText("推荐等级", "Recommended grade","推奨グレード", "추천 등급")}: <strong>${escapeHtml(r.recommendedGrade || "-")}</strong> · ${escapeHtml(_localizeVisibleTravelText(r.recommendedLevel || "-", r.recommendedLevel || "-"))}</div>
       <div class="status">${pickText("闭环率", "Closed-loop","クローズドループ率", "클로즈 루프율")} ${(Number((r.metrics && r.metrics.closedLoopRate) || 0) * 100).toFixed(1)}% · ${pickText("人工接管中", "Open handoffs","有人対応中", "상담 진행")} ${Number((r.metrics && r.metrics.openHandoffs) || 0)}</div>
       <div class="status">MCP SLA ${(Number((r.metrics && r.metrics.mcpSlaRate) || 0) * 100).toFixed(1)}% · ${pickText("毛利率", "Markup","マークアップ率", "마진율")} ${(Number((r.metrics && r.metrics.markupRateRealized) || 0) * 100).toFixed(1)}%</div>
       <div class="status">${pickText("对账匹配", "Reconciliation","照合一致率", "정산 일치율")} ${(Number((r.metrics && r.metrics.reconciliationMatchRate) || 0) * 100).toFixed(1)}% · ${pickText("不一致", "mismatches","不一致", "불일치")} ${Number((r.metrics && r.metrics.reconciliationMismatched) || 0)}</div>
       <div class="status">${pickText("合同覆盖", "Contract coverage","契約カバレッジ", "계약 커버리지")} ${(Number((r.metrics && r.metrics.mcpContractCoverage) || 0) * 100).toFixed(1)}% · ${pickText("通道认证", "Rail certification","レール認証", "레일 인증")} ${(Number((r.metrics && r.metrics.railCertificationRate) || 0) * 100).toFixed(1)}%</div>
       ${
         selected
-          ? `<div class="status">${pickText("推荐明细", "Recommended detail","推奨詳細", "추천 상세")}: ${escapeHtml(selected.placeName || "-")} · ${escapeHtml(selected.hotelName || "-")} · ${escapeHtml(selected.transportMode || "-")}</div>`
+          ? `<div class="status">${pickText("推荐明细", "Recommended detail","推奨詳細", "추천 상세")}: ${escapeHtml(_localizeVisibleTravelText(selected.placeName || "-", selected.placeName || "-"))} · ${escapeHtml(_localizeVisibleTravelText(selected.hotelName || "-", selected.hotelName || "-"))} · ${escapeHtml(_localizeVisibleTravelText(selected.transportMode || "-", selected.transportMode || "-"))}</div>`
           : ""
       }
     </article>
@@ -13860,8 +16249,8 @@ async function loadMiniPackage() {
   el.miniPackageSummary.innerHTML = `
     <article class="card">
       <div>${pickText("版本", "Version","バージョン", "버전")}: <strong>${escapeHtml(pkg.version || "0.1.0")}</strong></div>
-      <div class="status">Alipay: ${escapeHtml(alipay.status || "ready")} ${alipay.lastReleaseAt ? `· ${new Date(alipay.lastReleaseAt).toLocaleString()}` : ""}</div>
-      <div class="status">WeChat: ${escapeHtml(wechat.status || "ready")} ${wechat.lastReleaseAt ? `· ${new Date(wechat.lastReleaseAt).toLocaleString()}` : ""}</div>
+      <div class="status">Alipay: ${escapeHtml(_localizeVisibleTravelText(alipay.status || "ready", alipay.status || "ready"))} ${alipay.lastReleaseAt ? `· ${new Date(alipay.lastReleaseAt).toLocaleString()}` : ""}</div>
+      <div class="status">WeChat: ${escapeHtml(_localizeVisibleTravelText(wechat.status || "ready", wechat.status || "ready"))} ${wechat.lastReleaseAt ? `· ${new Date(wechat.lastReleaseAt).toLocaleString()}` : ""}</div>
       <div class="status">${pickText("页面", "Pages","ページ", "페이지")}: ${(pkg.pages || []).join(", ")}</div>
     </article>
     <article class="card">
@@ -13870,7 +16259,7 @@ async function loadMiniPackage() {
         ${
           releases.length
             ? releases
-                .map((r) => `<li>${escapeHtml(r.channel)} · v${escapeHtml(r.version)} · ${new Date(r.at).toLocaleString()} <span class="status">${escapeHtml(r.note || "")}</span></li>`)
+                .map((r) => `<li>${escapeHtml(_localizeVisibleTravelText(r.channel || "", r.channel || "-"))} · v${escapeHtml(r.version)} · ${new Date(r.at).toLocaleString()} <span class="status">${escapeHtml(_localizeVisibleTravelText(r.note || "", ""))}</span></li>`)
                 .join("")
             : `<li>${pickText("暂无发布记录。", "No releases yet.","リリースはまだありません。", "릴리즈 기록이 없습니다.")}</li>`
         }
@@ -13881,11 +16270,39 @@ async function loadMiniPackage() {
 
 function bindActions() {
   document.body.addEventListener("click", async (event) => {
-    const target = event.target;
+    // Walk up the DOM to find the actual actionable element (handles clicks on child spans/icons)
+    const target =
+      (event.target instanceof HTMLElement &&
+        (event.target.closest("[data-action]") ||
+          event.target.closest(".tab") ||
+          event.target.closest(".subtab") ||
+          event.target.closest("[data-simulate-pay]"))) ||
+      event.target;
     if (!(target instanceof HTMLElement)) return;
 
     if (target.classList.contains("tab")) {
       switchTab(target.dataset.tab);
+      return;
+    }
+
+    if (target.dataset.action === "travel-confirm") {
+      const key = target.dataset.key;
+      if (key) {
+        target.disabled = true;
+        await openTravelPlanPayment(key, target);
+      }
+      return;
+    }
+
+    if (target.dataset.action === "travel-dismiss") {
+      const card = target.closest(".card");
+      if (card) card.classList.add("hidden");
+      return;
+    }
+
+    if (target.dataset.action === "replan-dest") {
+      const dest = target.dataset.dest || "";
+      createTaskFromText(pickText(`重新规划${dest}`, `Replan${dest ? ` for ${dest}` : ""}`, `再計画${dest ? ` (${dest})` : ""}`, `다시 계획${dest ? ` - ${dest}` : ""}`));
       return;
     }
 
@@ -13918,10 +16335,383 @@ function bindActions() {
     const action = target.dataset.action;
     if (!action) return;
 
+    if (action === "go-tab") {
+      const tab = String(target.dataset.tab || "").trim();
+      if (tab === "chat") {
+        setConsumerSurface("workspace");
+        switchTab("chat", { force: true });
+        return;
+      }
+      if (tab === "trips") {
+        setConsumerSurface("workspace", { focusComposer: false });
+        switchTab("trips", { force: true });
+        await Promise.allSettled([loadTrips(), loadOrders()]);
+        return;
+      }
+      if (tab) switchTab(tab);
+      return;
+    }
+
+    if (action === "show-login-modal") {
+      _showLoginModal();
+      return;
+    }
+
+    if (action === "go-concierge-home") {
+      setConsumerSurface("workspace", { focusComposer: true });
+      switchTab("chat", { force: true });
+      return;
+    }
+
+    if (action === "go-workspace-chat") {
+      setConsumerSurface("workspace", { focusComposer: false });
+      switchTab("chat", { force: true });
+      return;
+    }
+
+    if (action === "enter-concierge-workspace") {
+      setConsumerSurface("workspace");
+      switchTab("chat", { force: true });
+      return;
+    }
+
+    if (action === "open-home-orders") {
+      if (shouldPreferConciergeHome()) {
+        setConsumerSurface("workspace", { focusComposer: false });
+        switchTab("trips", { force: true });
+        await Promise.allSettled([loadTrips(), loadOrders()]);
+        return;
+      }
+      try {
+        await withButtonLoading(
+          target,
+          pickText("加载中...", "Loading...", "読み込み中...", "로딩 중..."),
+          async () => openMyOrdersQuickView(target),
+        );
+      } catch (err) {
+        notify(formatClientActionError(err, "订单加载失败", "Failed to load orders", "注文の読み込み失敗", "주문 로드 실패"), "error");
+      }
+      return;
+    }
+
+    if (action === "open-home-order-detail") {
+      try {
+        await withButtonLoading(
+          target,
+          pickText("加载中...", "Loading...", "読み込み中...", "로딩 중..."),
+          async () => loadOrderDetail(String(target.dataset.order || ""), target),
+        );
+      } catch (err) {
+        notify(formatClientActionError(err, "订单详情加载失败", "Order detail failed", "注文詳細の読み込み失敗", "주문 상세 로드 실패"), "error");
+      }
+      return;
+    }
+
+    if (action === "home-run-prompt") {
+      const message = String(target.dataset.message || "").trim();
+      setConsumerSurface("workspace", { focusComposer: false });
+      switchTab("chat", { force: true });
+      if (!message) return;
+      try {
+        await withButtonLoading(
+          target,
+          pickText("执行中...", "Running...", "実行中...", "실행 중..."),
+          async () => {
+            if (el.chatInput) {
+              el.chatInput.value = message;
+              autoResizeChatInput();
+              updateChatSendState();
+            }
+            if (isLocalAgentChatEnabled()) await handleAgentConversationInput(message);
+            else await createTaskFromText(message);
+          },
+        );
+      } catch (err) {
+        notify(formatClientActionError(err, "执行失败", "Run failed", "実行失敗", "실행 실패"), "error");
+      }
+      return;
+    }
+
+    if (action === "restore-plan-version") {
+      restorePlanVersion(String(target.dataset.cardId || ""), Number.parseInt(target.dataset.versionIdx || "-1", 10));
+      return;
+    }
+
+    if (action === "invite-act-based-on") {
+      _inviteActBasedOn();
+      return;
+    }
+
+    if (action === "invite-act-fresh") {
+      _inviteActFresh();
+      return;
+    }
+
+    if (action === "dismiss-invite-landing") {
+      document.getElementById("cx-invite-landing")?.remove();
+      return;
+    }
+
+    if (action === "close-holiday-banner") {
+      target.closest(".cx-holiday-banner")?.remove();
+      return;
+    }
+
+    if (action === "open-plan-detail") {
+      openPlanDetail(String(target.dataset.cardId || ""), Number.parseInt(target.dataset.planIdx || "-1", 10));
+      return;
+    }
+
+    if (action === "plan-option-select") {
+      _planOptionSelect(String(target.dataset.cardId || ""), Number.parseInt(target.dataset.planIdx || "-1", 10));
+      return;
+    }
+
+    if (action === "switch-plan-day") {
+      const rawDay = String(target.dataset.day || "");
+      switchPlanDay(String(target.dataset.cardId || ""), rawDay === "map" ? "map" : Number.parseInt(rawDay, 10));
+      return;
+    }
+
+    if (action === "fetch-local-nav") {
+      await fetchLocalNav(target);
+      return;
+    }
+
+    if (action === "delete-activity") {
+      deleteActivity(target);
+      return;
+    }
+
+    if (action === "toggle-day-edit") {
+      toggleDayEdit(target);
+      return;
+    }
+
+    if (action === "detail-open-itinerary") {
+      cxDetailOpenItinerary(target);
+      return;
+    }
+
+    if (action === "detail-go-to-checkout") {
+      cxGoToCheckout(target);
+      return;
+    }
+
+    if (action === "confirm-itinerary") {
+      cxConfirmItinerary(target);
+      return;
+    }
+
+    if (action === "dismiss-exec-tip") {
+      trackEvent("exec_tip_dismissed", { lang: state.uiLanguage || "EN" }).catch(() => {});
+      target.closest(".cx-onboarding-overlay")?.remove();
+      return;
+    }
+
+    if (action === "load-trips") {
+      await loadTrips();
+      return;
+    }
+
+    if (action === "load-orders") {
+      await loadOrders();
+      return;
+    }
+
+    if (action === "open-share-card") {
+      await openShareCard(String(target.dataset.cardId || ""));
+      return;
+    }
+
+    if (action === "open-plan-history") {
+      openPlanHistory(String(target.dataset.cardId || ""));
+      return;
+    }
+
+    if (action === "share-plan-invite") {
+      sharePlanInvite(String(target.dataset.cardId || ""));
+      return;
+    }
+
+    if (action === "save-itinerary-to-trips") {
+      await _saveItineraryToTrips(String(target.dataset.cardId || ""));
+      return;
+    }
+
+    if (action === "scroll-to-plan-card") {
+      document.querySelector(".plan-card--v2")?.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+
+    if (action === "load-more-trips") {
+      const offset = Number.parseInt(target.dataset.offset || "0", 10);
+      if (Number.isFinite(offset) && offset >= 0) await loadMoreTrips(offset);
+      return;
+    }
+
+    if (action === "load-more-orders") {
+      const offset = Number.parseInt(target.dataset.offset || "0", 10);
+      if (Number.isFinite(offset) && offset >= 0) await loadMoreOrders(offset);
+      return;
+    }
+
+    if (action === "load-near-suggestions") {
+      await loadNearSuggestions();
+      return;
+    }
+
+    if (action === "card-payment-confirm") {
+      handleCardPaymentConfirm(target);
+      return;
+    }
+
+    if (action === "checkout-confirm-booking") {
+      crossXConfirmBooking(
+        target,
+        String(target.dataset.hotelName || ""),
+        String(target.dataset.destination || ""),
+        Number.parseFloat(target.dataset.totalPrice || "0") || 0,
+      );
+      return;
+    }
+
+    if (action === "checkout-quick-task") {
+      const message = String(target.dataset.message || "").trim();
+      const taskText = String(target.dataset.taskText || "").trim();
+      if (message) addMessage(message, "user");
+      if (taskText) createTaskFromText(taskText);
+      return;
+    }
+
+    if (action === "report-recommendation") {
+      await _reportRecommendation(target);
+      return;
+    }
+
+    if (action === "checkout-select-pay-method") {
+      cxSelectPayMethod(target);
+      return;
+    }
+
+    if (action === "checkout-go-to-payment") {
+      cxGoToPayment(target);
+      return;
+    }
+
+    if (action === "checkout-process-payment") {
+      await cxProcessPayment(target);
+      return;
+    }
+
+    if (action === "clear-near-filters") {
+      _clearNearFilters();
+      return;
+    }
+
+    if (action === "toggle-favorite") {
+      _toggleFavorite(
+        String(target.dataset.cardId || ""),
+        String(target.dataset.destination || ""),
+        String(target.dataset.title || ""),
+        Number.parseInt(target.dataset.dur || "3", 10) || 3,
+        Number.parseInt(target.dataset.pax || "1", 10) || 1,
+      );
+      return;
+    }
+
+    if (action === "clear-session") {
+      clearSession();
+      return;
+    }
+
+    if (action === "book-item") {
+      _handleBooking(String(target.dataset.name || ""), String(target.dataset.externalId || ""));
+      return;
+    }
+
+    if (action === "agent-payment-confirm") {
+      handleAgentPaymentConfirm(target);
+      return;
+    }
+
+    if (action === "quick-action-track") {
+      quickActionTrack(String(target.dataset.platformId || ""));
+      return;
+    }
+
+    if (action === "quick-action-speak") {
+      quickActionSpeak(String(target.dataset.text || ""));
+      return;
+    }
+
+    if (action === "clarify-chip-fill") {
+      _clarifyChipFill(target, String(target.dataset.value || ""));
+      return;
+    }
+
+    if (action === "clarify-send") {
+      _clarifySend(target.closest(".clarify-card"));
+      return;
+    }
+
+    if (action === "submit-plan-rating") {
+      await submitPlanRating(
+        String(target.dataset.cardId || ""),
+        Number.parseInt(target.dataset.rating || "0", 10) || 0,
+        String(target.dataset.destination || ""),
+        Number.parseInt(target.dataset.durationDays || "0", 10) || 0,
+        target,
+      );
+      return;
+    }
+
+    if (action === "go-back") {
+      cxGoBack();
+      return;
+    }
+
+    if (action === "toggle-thinking-panel") {
+      target.closest(".thinking-panel")?.classList.toggle("collapsed");
+      return;
+    }
+
+    if (action === "focus-chat-reset") {
+      const input = document.getElementById("chatInput");
+      if (input) {
+        input.focus();
+        input.value = "";
+      }
+      return;
+    }
+
+    if (action === "plan-refine-preset") {
+      _sendPlanRefine(String(target.dataset.text || ""));
+      return;
+    }
+
+    if (action === "plan-refine-send") {
+      const row = target.closest(".cx-pr-input-row");
+      const input = row ? row.querySelector(".cx-pr-input") : null;
+      _sendPlanRefine(input && "value" in input ? input.value : "", input);
+      return;
+    }
+
+    if (action === "apply-sensitivity-patch") {
+      let patch = null;
+      try {
+        patch = JSON.parse(String(target.dataset.patch || "{}"));
+      } catch {}
+      if (patch && typeof patch === "object") {
+        await _applySensitivityPatch(patch, String(target.dataset.barId || ""));
+      }
+      return;
+    }
+
     if (action === "open-openai-login") {
       window.open("https://platform.openai.com/settings/organization/api-keys", "_blank", "noopener");
       notify(
-        pickText("已打开 OpenAI 登录页。", "Opened OpenAI login page.", "OpenAI ログインページを開きました。", "OpenAI 로그인 페이지를 열었습니다."),
+        pickText("已打开 AI 服务设置页面。", "Opened AI service settings.", "AI サービス設定ページを開きました。", "AI 서비스 설정 페이지를 열었습니다."),
         "info",
       );
       return;
@@ -13937,14 +16727,11 @@ function bindActions() {
         const llm = await getLlmStatus();
         renderLlmRuntimeStatus(llm);
         notify(
-          pickText("已清除运行时 OpenAI Key。", "Runtime OpenAI key cleared.","実行時 OpenAI キーを削除しました。", "런타임 OpenAI 키를 삭제했습니다."),
+          pickText("已清除运行时 AI 凭据。", "Runtime AI credentials cleared.","実行時 AI 資格情報を削除しました。", "런타임 AI 자격 증명을 삭제했습니다."),
           "success",
         );
       } catch (err) {
-        notify(
-          pickText(`清除失败：${err.message}`, `Clear failed: ${err.message}`, `削除失敗: ${err.message}`, `삭제 실패: ${err.message}`),
-          "error",
-        );
+        notify(formatClientActionError(err, "清除失败", "Clear failed", "削除失敗", "삭제 실패"), "error");
       }
       return;
     }
@@ -14053,7 +16840,7 @@ function bindActions() {
           headers: { "Content-Type": "application/json", ..._authHeaders() },
           body: JSON.stringify({ railId: state.agentConversation.paymentRail || "alipay_cn" }),
         });
-      } catch (railErr) { console.warn("[agent/pay-rail] rail select failed (non-blocking):", railErr.message); }
+      } catch (railErr) { console.warn("[agent/pay-rail] rail select failed (non-blocking):", getClientErrorCode(railErr, "payment_rail_select_failed")); }
       await runAgentExecution(optionKey, forceFail);
       return;
     }
@@ -14274,10 +17061,7 @@ function bindActions() {
       try {
         await toggleSupportRoomVoiceRecording();
       } catch (err) {
-        notify(
-          pickText(`语音发送失败：${err.message}`, `Voice failed: ${err.message}`, `音声送信失敗: ${err.message}`, `음성 전송 실패: ${err.message}`),
-          "error",
-        );
+        notify(formatClientActionError(err, "语音发送失败", "Voice failed", "音声送信失敗", "음성 전송 실패"), "error");
       }
       return;
     }
@@ -14311,8 +17095,8 @@ function bindActions() {
         renderReplanPreview(data.preview || null);
         if (el.replanHint) el.replanHint.textContent = pickText("预览已生成，可保存。", "Preview generated. You can now save.","プレビューを生成しました。保存できます。", "미리보기가 생성되었습니다. 저장할 수 있습니다.");
       } catch (err) {
-        if (el.replanHint) el.replanHint.textContent = pickText(`预览失败：${err.message}`, `Preview failed: ${err.message}`, `プレビュー失敗: ${err.message}`, `미리보기 실패: ${err.message}`);
-        addMessage(pickText(`预览改写失败：${err.message}`, `Preview replan failed: ${err.message}`, `再計画プレビューに失敗: ${err.message}`, `재계획 미리보기 실패: ${err.message}`));
+        if (el.replanHint) el.replanHint.textContent = formatClientActionError(err, "预览失败", "Preview failed", "プレビュー失敗", "미리보기 실패");
+        addMessage(formatClientActionError(err, "预览改写失败", "Preview replan failed", "再計画プレビューに失敗", "재계획 미리보기 실패"));
       }
       return;
     }
@@ -14322,7 +17106,7 @@ function bindActions() {
         await Promise.all([loadSolutionBoard(), loadChatSolutionStrip()]);
         addMessage(pickText("方案分析已刷新。", "Solution analysis refreshed.","提案分析を更新しました。", "솔루션 분석을 새로고침했습니다."));
       } catch (err) {
-        addMessage(pickText(`刷新失败：${err.message}`, `Refresh failed: ${err.message}`, `更新失敗: ${err.message}`, `새로고침 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "刷新失败", "Refresh failed", "更新失敗", "새로고침 실패"));
       }
       return;
     }
@@ -14332,7 +17116,7 @@ function bindActions() {
         await loadMiniPackage();
         addMessage(pickText("小程序发布状态已刷新。", "Mini package status refreshed.","ミニプログラム状態を更新しました。", "미니 프로그램 상태를 새로고침했습니다."));
       } catch (err) {
-        addMessage(pickText(`小程序状态刷新失败：${err.message}`, `Mini package refresh failed: ${err.message}`, `ミニプログラム更新失敗: ${err.message}`, `미니 프로그램 새로고침 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "小程序状态刷新失败", "Mini package refresh failed", "ミニプログラム更新失敗", "미니 프로그램 새로고침 실패"));
       }
       return;
     }
@@ -14355,7 +17139,7 @@ function bindActions() {
         );
         await Promise.all([loadMiniPackage(), loadDashboard(), loadAuditLogs()]);
       } catch (err) {
-        addMessage(pickText(`小程序发布失败：${err.message}`, `Mini program release failed: ${err.message}`, `ミニプログラム公開失敗: ${err.message}`, `미니 프로그램 릴리즈 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "小程序发布失败", "Mini program release failed", "ミニプログラム公開失敗", "미니 프로그램 릴리즈 실패"));
       }
       return;
     }
@@ -14370,7 +17154,7 @@ function bindActions() {
           else await createTaskFromText(intent);
           await trackEvent("quick_intent_clicked", { intent });
         } catch (err) {
-          addMessage(pickText(`快捷意图执行失败：${err.message}`, `Failed to run quick intent: ${err.message}`, `クイック意図の実行失敗: ${err.message}`, `빠른 의도 실행 실패: ${err.message}`));
+          addMessage(formatClientActionError(err, "快捷意图执行失败", "Failed to run quick intent", "クイック意図の実行失敗", "빠른 의도 실행 실패"));
         }
       }
       return;
@@ -14414,7 +17198,7 @@ function bindActions() {
           },
         );
       } catch (err) {
-        addMessage(pickText(`人工监督请求失败：${err.message}`, `Human supervision failed: ${err.message}`, `有人監督の依頼失敗: ${err.message}`, `사람 감독 요청 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "人工监督请求失败", "Human supervision failed", "有人監督の依頼失敗", "사람 감독 요청 실패"));
       }
       return;
     }
@@ -14453,10 +17237,7 @@ function bindActions() {
           await openSupportRoomBySession(data.session.id, target);
         }
       } catch (err) {
-        notify(
-          pickText(`打开人工会话失败：${err.message}`, `Open live support room failed: ${err.message}`, `有人会話の開始失敗: ${err.message}`, `실시간 상담 룸 열기 실패: ${err.message}`),
-          "error",
-        );
+        notify(formatClientActionError(err, "打开人工会话失败", "Open live support room failed", "有人会話の開始失敗", "실시간 상담 룸 열기 실패"), "error");
       }
       return;
     }
@@ -14475,7 +17256,7 @@ function bindActions() {
           "success",
         );
       } catch (err) {
-        addMessage(pickText(`监督状态刷新失败：${err.message}`, `Assist refresh failed: ${err.message}`, `監督状態の更新失敗: ${err.message}`, `감독 상태 새로고침 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "监督状态刷新失败", "Assist refresh failed", "監督状態の更新失敗", "감독 상태 새로고침 실패"));
       }
       return;
     }
@@ -14486,7 +17267,7 @@ function bindActions() {
       try {
         await renderSupportTicketDrawer(ticketId, target);
       } catch (err) {
-        addMessage(pickText(`工单详情加载失败：${err.message}`, `Ticket detail failed: ${err.message}`, `チケット詳細の読み込み失敗: ${err.message}`, `티켓 상세 로드 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "工单详情加载失败", "Ticket detail failed", "チケット詳細の読み込み失敗", "티켓 상세 로드 실패"));
       }
       return;
     }
@@ -14497,10 +17278,7 @@ function bindActions() {
       try {
         await openSupportRoomByTicket(ticketId, target, { reason: "ticket_detail_live_open" });
       } catch (err) {
-        notify(
-          pickText(`打开人工会话失败：${err.message}`, `Open live support room failed: ${err.message}`, `有人会話の開始失敗: ${err.message}`, `실시간 상담 룸 열기 실패: ${err.message}`),
-          "error",
-        );
+        notify(formatClientActionError(err, "打开人工会话失败", "Open live support room failed", "有人会話の開始失敗", "실시간 상담 룸 열기 실패"), "error");
       }
       return;
     }
@@ -14516,7 +17294,7 @@ function bindActions() {
           "success",
         );
       } catch (err) {
-        addMessage(pickText(`工单刷新失败：${err.message}`, `Ticket refresh failed: ${err.message}`, `チケット更新失敗: ${err.message}`, `티켓 새로고침 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "工单刷新失败", "Ticket refresh failed", "チケット更新失敗", "티켓 새로고침 실패"));
       }
       return;
     }
@@ -14543,7 +17321,7 @@ function bindActions() {
         });
       } catch (err) {
         notify(
-          pickText(`行程详情加载失败：${err.message}`, `Trip detail failed: ${err.message}`, `旅程詳細の読み込み失敗: ${err.message}`, `트립 상세 로드 실패: ${err.message}`),
+          formatClientActionError(err, "行程详情加载失败", "Trip detail failed", "旅程詳細の読み込み失敗", "트립 상세 로드 실패"),
           "error",
         );
       }
@@ -14574,7 +17352,7 @@ function bindActions() {
         );
       } catch (err) {
         notify(
-          pickText(`挂载失败：${err.message}`, `Attach failed: ${err.message}`, `紐付け失敗: ${err.message}`, `연결 실패: ${err.message}`),
+          formatClientActionError(err, "挂载失败", "Attach failed", "紐付け失敗", "연결 실패"),
           "error",
         );
       }
@@ -14595,7 +17373,7 @@ function bindActions() {
         });
       } catch (err) {
         notify(
-          pickText(`行程状态更新失败：${err.message}`, `Trip status update failed: ${err.message}`, `旅程状態更新に失敗: ${err.message}`, `트립 상태 업데이트 실패: ${err.message}`),
+          formatClientActionError(err, "行程状态更新失败", "Trip status update failed", "旅程状態更新に失敗", "트립 상태 업데이트 실패"),
           "error",
         );
       }
@@ -14643,21 +17421,22 @@ function bindActions() {
           await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
         });
       } catch (err) {
-        notify(
-          pickText(
-            `补全失败：${err.message}`,
-            `Fill failed: ${err.message}`,
-            `補完に失敗: ${err.message}`,
-            `보완 실패: ${err.message}`,
-          ),
-          "error",
-        );
+        notify(formatClientActionError(err, "补全失败", "Fill failed", "補完に失敗", "보완 실패"), "error");
       }
       return;
     }
 
     if (action === "run-smart-option") {
       const intent = target.dataset.intent;
+      // Show payment modal if button has data-show-payment (Book Now button)
+      if (target.dataset.showPayment === "1" && window.crossxShowPayment) {
+        window.crossxShowPayment({
+          title: target.dataset.paymentTitle || intent || "",
+          costRange: target.dataset.paymentCost || "",
+          price: target.dataset.paymentCost || "",
+        });
+        return;
+      }
       switchTab("chat");
       if (!intent) {
         notify(pickText("该方案缺少执行语句。", "This option is missing execution prompt.","この案に実行文がありません。", "이 옵션에 실행 문구가 없습니다."), "warning");
@@ -14677,14 +17456,7 @@ function bindActions() {
           }
         });
       } catch (err) {
-        addMessage(
-          pickText(
-            `执行方案失败：${err.message}`,
-            `Run option failed: ${err.message}`,
-            `案の実行に失敗しました: ${err.message}`,
-            `옵션 실행 실패: ${err.message}`,
-          ),
-        );
+        addMessage(formatClientActionError(err, "执行方案失败", "Run option failed", "案の実行に失敗しました", "옵션 실행 실패"));
       }
       return;
     }
@@ -14724,10 +17496,7 @@ function bindActions() {
         } catch (err) {
           addMessage(
             pickText(
-              `酒店下单失败：${err.message}`,
-              `Hotel booking failed: ${err.message}`,
-              `ホテル予約に失敗しました: ${err.message}`,
-              `호텔 예약 실패: ${err.message}`,
+              formatClientActionError(err, "酒店下单失败", "Hotel booking failed", "ホテル予約に失敗しました", "호텔 예약 실패"),
             ),
           );
         }
@@ -14757,10 +17526,7 @@ function bindActions() {
       } catch (err) {
         addMessage(
           pickText(
-            `执行动作失败：${err.message}`,
-            `Action failed: ${err.message}`,
-            `アクション実行失敗: ${err.message}`,
-            `작업 실행 실패: ${err.message}`,
+            formatClientActionError(err, "执行动作失败", "Action failed", "アクション実行失敗", "작업 실행 실패"),
           ),
         );
       }
@@ -14775,7 +17541,7 @@ function bindActions() {
       try {
         await handleAgentConversationInput(msg);
       } catch (err) {
-        addMessage(pickText(`发送失败：${err.message}`, `Send failed: ${err.message}`, `送信失敗: ${err.message}`, `전송 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "发送失败", "Send failed", "送信失敗", "전송 실패"));
       }
       return;
     }
@@ -14785,7 +17551,7 @@ function bindActions() {
       try {
         await loadNearSuggestions();
       } catch (err) {
-        addMessage(pickText(`附近预览加载失败：${err.message}`, `Near Me preview failed: ${err.message}`, `近くのプレビュー読込失敗: ${err.message}`, `근처 미리보기 로드 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "附近预览加载失败", "Near Me preview failed", "近くのプレビュー読込失敗", "근처 미리보기 로드 실패"));
       }
       return;
     }
@@ -14799,7 +17565,7 @@ function bindActions() {
         );
         switchTab("trips");
       } catch (err) {
-        addMessage(pickText(`订单详情加载失败：${err.message}`, `Order detail failed: ${err.message}`, `注文詳細の読み込み失敗: ${err.message}`, `주문 상세 로드 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "订单详情加载失败", "Order detail failed", "注文詳細の読み込み失敗", "주문 상세 로드 실패"));
       }
       return;
     }
@@ -14833,7 +17599,7 @@ function bindActions() {
           }
         });
       } catch (err) {
-        addMessage(pickText(`步骤重试失败：${err.message}`, `Retry step failed: ${err.message}`, `ステップ再試行失敗: ${err.message}`, `단계 재시도 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "步骤重试失败", "Retry step failed", "ステップ再試行失敗", "단계 재시도 실패"));
       }
       return;
     }
@@ -14844,7 +17610,7 @@ function bindActions() {
       try {
         await confirmAndExecute(taskId);
       } catch (err) {
-        notify(`Retry failed: ${err.message}`, "error");
+        notify(formatClientActionError(err, "重试失败", "Retry failed", "再試行失敗", "재시도 실패"), "error");
       }
       return;
     }
@@ -14864,7 +17630,7 @@ function bindActions() {
           );
         }
       } catch (err) {
-        addMessage(pickText(`路线切换失败：${err.message}`, `Switch lane failed: ${err.message}`, `ルート切替失敗: ${err.message}`, `경로 전환 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "路线切换失败", "Switch lane failed", "ルート切替失敗", "경로 전환 실패"));
       }
       return;
     }
@@ -14885,7 +17651,7 @@ function bindActions() {
           </article>
         `);
       } catch (err) {
-        addMessage(pickText(`退款规则加载失败：${err.message}`, `Refund policy unavailable: ${err.message}`, `返金規約の取得失敗: ${err.message}`, `환불 정책 로드 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "退款规则加载失败", "Refund policy unavailable", "返金規約の取得失敗", "환불 정책 로드 실패"));
       }
       return;
     }
@@ -14934,15 +17700,15 @@ function bindActions() {
         const relatedProof = related
           .map(
             (item) =>
-              `<li>${escapeHtml(item.title || item.type)} <span class="status">${escapeHtml(item.hash || "-")}</span></li>`,
+              `<li>${escapeHtml(_localizeVisibleTravelText(item.title || item.type || "", pickText("凭证", "Proof","証憑", "증빙")))} <span class="status">${escapeHtml(item.hash || "-")}</span></li>`,
           )
           .join("");
         if (el.proofDrawerTitle) el.proofDrawerTitle.textContent = `${pickText("操作追踪事件", "Operation Event","操作トラッキングイベント", "작업 추적 이벤트")} · ${escapeHtml(eventDetail.id || auditId)}`;
         if (el.proofDrawerBody) {
           el.proofDrawerBody.innerHTML = `
             <article class="card">
-              <h3>${escapeHtml(eventDetail.what || "-")}</h3>
-              <div class="status">${new Date(eventDetail.at || Date.now()).toLocaleString()} · ${escapeHtml(eventDetail.kind || "-")}</div>
+              <h3>${escapeHtml(_localizeVisibleTravelText(eventDetail.what || "", "-"))}</h3>
+              <div class="status">${new Date(eventDetail.at || Date.now()).toLocaleString()} · ${escapeHtml(_localizeVisibleTravelText(eventDetail.kind || "", eventDetail.kind || "-"))}</div>
               <div>${pickText("参与者", "Actor","主体", "수행자")}: ${escapeHtml(eventDetail.who || "-")}</div>
               <div>${pickText("关联任务", "Task","関連タスク", "연관 작업")}: <span class="code">${escapeHtml(eventDetail.taskId || "-")}</span></div>
               <div class="status">Hash: <span class="code">${escapeHtml(eventDetail.hash || "-")}</span></div>
@@ -14961,7 +17727,7 @@ function bindActions() {
         }
         if (drawerController) drawerController.open(el.proofDrawer, { trigger: target });
       } catch (err) {
-        notify(`Failed to open event: ${err.message}`, "error");
+        notify(formatClientActionError(err, "打开事件失败", "Failed to open event", "イベントを開けませんでした", "이벤트 열기 실패"), "error");
       }
       return;
     }
@@ -14986,7 +17752,7 @@ function bindActions() {
         }
         await loadAuditLogs();
       } catch (err) {
-        addMessage(pickText(`上传证据失败：${err.message}`, `Upload evidence failed: ${err.message}`, `証拠アップロード失敗: ${err.message}`, `증빙 업로드 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "上传证据失败", "Upload evidence failed", "証拠アップロード失敗", "증빙 업로드 실패"));
       }
       return;
     }
@@ -15010,7 +17776,7 @@ function bindActions() {
         target.textContent = pickText("已启动", "Started","起動済み", "시작됨");
       } catch (err) {
         target.textContent = prevLabel || tUi("run_lane");
-        addMessage(pickText(`执行推荐路线失败：${err.message}`, `Failed to execute recommended lane: ${err.message}`, `推奨ルート実行失敗: ${err.message}`, `추천 경로 실행 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "执行推荐路线失败", "Failed to execute recommended lane", "推奨ルート実行失敗", "추천 경로 실행 실패"));
       } finally {
         setTimeout(() => {
           target.removeAttribute("disabled");
@@ -15027,7 +17793,7 @@ function bindActions() {
         const current = await api(`/api/tasks/${taskId}`);
         openReplanDrawer(current.task || null);
       } catch (err) {
-        addMessage(pickText(`打开计划编辑器失败：${err.message}`, `Open plan editor failed: ${err.message}`, `プラン編集の表示失敗: ${err.message}`, `계획 편집기 열기 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "打开计划编辑器失败", "Open plan editor failed", "プラン編集の表示失敗", "계획 편집기 열기 실패"));
       }
       return;
     }
@@ -15040,7 +17806,7 @@ function bindActions() {
           async () => confirmAndExecute(target.dataset.task),
         );
       } catch (err) {
-        addMessage(pickText(`执行失败：${err.message}`, `Execution failed: ${err.message}`, `実行失敗: ${err.message}`, `실행 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "执行失败", "Execution failed", "実行失敗", "실행 실패"));
       }
       return;
     }
@@ -15067,7 +17833,7 @@ function bindActions() {
         );
         await loadAuditLogs();
       } catch (err) {
-        notify(pickText(`保存偏好失败：${err.message}`, `Save preference failed: ${err.message}`, `設定保存失敗: ${err.message}`, `선호 저장 실패: ${err.message}`), "error");
+        notify(formatClientActionError(err, "保存偏好失败", "Save preference failed", "設定保存失敗", "선호 저장 실패"), "error");
       }
       return;
     }
@@ -15076,7 +17842,7 @@ function bindActions() {
       try {
         await openTaskDetail(target.dataset.task);
       } catch (err) {
-        addMessage(pickText(`任务详情加载失败：${err.message}`, `Failed to load task detail: ${err.message}`, `タスク詳細の読み込み失敗: ${err.message}`, `작업 상세 로드 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "任务详情加载失败", "Failed to load task detail", "タスク詳細の読み込み失敗", "작업 상세 로드 실패"));
       }
       return;
     }
@@ -15086,26 +17852,27 @@ function bindActions() {
         const proofPath = `/api/orders/${target.dataset.order}/proof?language=${encodeURIComponent(state.uiLanguage || "EN")}`;
         const data = await api(proofPath);
         const proof = data.proof || null;
+        const proofOrderDisplay = data.orderId || (data.order && data.order.id) || "-";
         const insights = data.insights || {};
         const proofItems = (data.proofItems || [])
           .map(
             (item) =>
-              `<li>${escapeHtml(item.title || item.type)} <span class="status">${escapeHtml(item.hash || "-")} · ${new Date(item.generatedAt).toLocaleString()}</span><div class="actions"><button class="secondary" data-action="copy-proof" data-text="${escapeHtml(item.content || item.hash || "")}">${pickText("复制", "Copy","コピー", "복사")}</button><button class="secondary" data-action="share-proof" data-title="${escapeHtml(item.title || item.type)}" data-text="${escapeHtml(item.content || item.hash || "")}">${pickText("分享", "Share","共有", "공유")}</button></div></li>`,
+              `<li>${escapeHtml(_localizeVisibleTravelText(item.title || item.type || "", pickText("凭证", "Proof","証憑", "증빙")))} <span class="status">${escapeHtml(item.hash || "-")} · ${new Date(item.generatedAt).toLocaleString()}</span><div class="actions"><button class="secondary" data-action="copy-proof" data-text="${escapeHtml(item.content || item.hash || "")}">${pickText("复制", "Copy","コピー", "복사")}</button><button class="secondary" data-action="share-proof" data-title="${escapeHtml(_localizeVisibleTravelText(item.title || item.type || "", pickText("凭证", "Proof","証憑", "증빙")))}" data-text="${escapeHtml(item.content || item.hash || "")}">${pickText("分享", "Share","共有", "공유")}</button></div></li>`,
           )
           .join("");
-        const comments = (insights.comments || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
-        const reasons = (insights.reasons || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+        const comments = (insights.comments || []).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("");
+        const reasons = (insights.reasons || []).map((item) => `<li>${escapeHtml(_localizeVisibleTravelText(item || "", "-"))}</li>`).join("");
         const moments = (insights.keyMoments || [])
-          .map((m) => `<li>${escapeHtml(m.kind)} · ${new Date(m.at).toLocaleString()} <span class="status">${escapeHtml(m.note || "")}</span></li>`)
+          .map((m) => `<li>${escapeHtml(_localizeVisibleTravelText(m.kind || "", pickText("节点", "Moment","時点", "시점")))} · ${new Date(m.at).toLocaleString()} <span class="status">${escapeHtml(_localizeVisibleTravelText(m.note || "", ""))}</span></li>`)
           .join("");
         if (el.proofDrawerBody) {
           el.proofDrawerBody.innerHTML = `
             <article class="card">
               <h3>${pickText("凭证快照", "Proof Snapshot","証憑スナップショット", "증빙 스냅샷")}</h3>
-              <div>${pickText("订单号", "Order","注文番号", "주문 번호")}: <span class="code">${escapeHtml((proof && proof.orderNo) || "-")}</span></div>
-              <div>${pickText("地址", "Address","住所", "주소")}: ${escapeHtml((proof && proof.bilingualAddress) || "")}</div>
+              <div>${pickText("订单号", "Order","注文番号", "주문 번호")}: <span class="code">${escapeHtml(proofOrderDisplay)}</span></div>
+              <div>${pickText("地址", "Address","住所", "주소")}: ${escapeHtml(_localizeVisibleTravelText((proof && proof.bilingualAddress) || "", (proof && proof.bilingualAddress) || ""))}</div>
               <div class="status">QR: ${escapeHtml((proof && proof.qrText) || "")}</div>
-              ${proof && (proof.navLink || proof.meituanLink || proof.didiLink) ? `<div class="actions" style="flex-wrap:wrap;gap:6px;margin:8px 0">
+              ${proof && (proof.navLink || proof.meituanLink || proof.didiLink) ? `<div class="actions cx-proof-link-row">
                 ${proof && proof.navLink ? `<a class="secondary" href="${escapeHtml(proof.navLink)}" target="_blank" rel="noopener">${pickText("高德导航", "Amap Nav", "Amapナビ", "Amap 내비")}</a>` : ""}
                 ${proof && proof.meituanLink ? `<a class="secondary" href="${escapeHtml(proof.meituanLink)}" target="_blank" rel="noopener">${pickText("美团预订", "Meituan Book", "美団予約", "메이퇀 예약")}</a>` : ""}
                 ${proof && proof.didiLink ? `<a class="secondary" href="${escapeHtml(proof.didiLink)}" target="_blank" rel="noopener">${pickText("滴滴出行", "Didi Ride", "DiDi乗車", "디디 탑승")}</a>` : ""}
@@ -15124,15 +17891,15 @@ function bindActions() {
         }
         if (el.proofDrawerTitle) {
           el.proofDrawerTitle.dataset.lockedTitle = "true";
-          el.proofDrawerTitle.textContent = proof ? `${tTerm("proof")} · ${proof.orderNo || "-"}` : tTerm("proof");
+          el.proofDrawerTitle.textContent = proof ? `${tTerm("proof")} · ${proofOrderDisplay}` : tTerm("proof");
         }
         if (el.proofDrawer) {
           delete el.proofDrawer.dataset.ticketId;
         }
         if (drawerController) drawerController.open(el.proofDrawer, { trigger: target });
-        if (proof) notify(`${tUi("proof_ready")}: ${proof.orderNo || ""}`, "success");
+        if (proof) notify(`${tUi("proof_ready")}: ${proofOrderDisplay}`, "success");
       } catch (err) {
-        notify(pickText(`凭证加载失败：${err.message}`, `Failed to load proof: ${err.message}`, `証憑の読み込み失敗: ${err.message}`, `증빙 로드 실패: ${err.message}`), "error");
+        notify(formatClientActionError(err, "凭证加载失败", "Failed to load proof", "証憑の読み込み失敗", "증빙 로드 실패"), "error");
       }
       return;
     }
@@ -15165,7 +17932,7 @@ function bindActions() {
         }
         await loadAuditLogs();
       } catch (err) {
-        addMessage(pickText(`人工接管请求失败：${err.message}`, `Handoff failed: ${err.message}`, `有人対応依頼に失敗: ${err.message}`, `사람 상담 요청 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "人工接管请求失败", "Handoff failed", "有人対応依頼に失敗", "사람 상담 요청 실패"));
       }
       return;
     }
@@ -15204,7 +17971,7 @@ function bindActions() {
           },
         );
       } catch (err) {
-        addMessage(pickText(`工单更新失败：${err.message}`, `Ticket update failed: ${err.message}`, `チケット更新失敗: ${err.message}`, `티켓 업데이트 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "工单更新失败", "Ticket update failed", "チケット更新失敗", "티켓 업데이트 실패"));
       }
       return;
     }
@@ -15246,7 +18013,7 @@ function bindActions() {
         );
         await Promise.all([loadDashboard(), loadAuditLogs()]);
       } catch (err) {
-        addMessage(pickText(`结算执行失败：${err.message}`, `Settlement run failed: ${err.message}`, `精算実行失敗: ${err.message}`, `정산 실행 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "结算执行失败", "Settlement run failed", "精算実行失敗", "정산 실행 실패"));
       }
       return;
     }
@@ -15271,7 +18038,7 @@ function bindActions() {
         );
         await Promise.all([loadDashboard(), loadAuditLogs()]);
       } catch (err) {
-        addMessage(pickText(`对账失败：${err.message}`, `Reconciliation failed: ${err.message}`, `照合失敗: ${err.message}`, `정산 대조 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "对账失败", "Reconciliation failed", "照合失敗", "정산 대조 실패"));
       }
       return;
     }
@@ -15288,7 +18055,7 @@ function bindActions() {
         );
         notify(pickText("数据源探测已刷新。", "Provider probe refreshed.","データソース診断を更新しました。", "공급자 점검을 갱신했습니다."), "success");
       } catch (err) {
-        notify(pickText(`数据源探测失败：${err.message}`, `Provider probe failed: ${err.message}`, `データソース診断失敗: ${err.message}`, `공급자 점검 실패: ${err.message}`), "error");
+        notify(formatClientActionError(err, "数据源探测失败", "Provider probe failed", "データソース診断失敗", "공급자 점검 실패"), "error");
       }
       return;
     }
@@ -15317,8 +18084,7 @@ function bindActions() {
               body: JSON.stringify({ reason: String(reason || "user_request").slice(0, 120) }),
             });
             await trackEvent("order_canceled_by_user", { orderId: target.dataset.order, reason });
-            // Warn user if real gateway refund failed and mock was used
-            if (data.refund && data.refund.gatewayWarning) {
+            if (data.refund && data.refund.attentionRequired) {
               notify(pickText("退款已记录，但真实退款通道出错，请联系客服确认到账。", "Refund recorded but real gateway failed — contact support to confirm.", "返金を記録しましたが、ゲートウェイエラーが発生しました。サポートにご連絡ください。", "환불이 기록되었지만 실제 결제 게이트웨이 오류가 발생했습니다. 고객 서비스에 문의하세요."), "warning");
             }
             const _refundInfo = data.order && data.order.refund;
@@ -15336,7 +18102,7 @@ function bindActions() {
           },
         );
       } catch (err) {
-        addMessage(pickText(`取消失败：${err.message}`, `Cancel failed: ${err.message}`, `キャンセル失敗: ${err.message}`, `취소 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "取消失败", "Cancel failed", "キャンセル失敗", "취소 실패"));
       }
       return;
     }
@@ -15352,7 +18118,7 @@ function bindActions() {
         addMessage(pickText("计划已暂停。", "Plan paused.","プランを一時停止しました。", "계획을 일시중지했습니다."));
         await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
       } catch (err) {
-        addMessage(pickText(`暂停失败：${err.message}`, `Pause failed: ${err.message}`, `一時停止に失敗: ${err.message}`, `일시중지 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "暂停失败", "Pause failed", "一時停止に失敗", "일시중지 실패"));
       }
       return;
     }
@@ -15368,7 +18134,7 @@ function bindActions() {
         addMessage(pickText("计划已恢复。", "Plan resumed.","プランを再開しました。", "계획을 재개했습니다."));
         await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
       } catch (err) {
-        addMessage(pickText(`恢复失败：${err.message}`, `Resume failed: ${err.message}`, `再開に失敗: ${err.message}`, `재개 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "恢复失败", "Resume failed", "再開に失敗", "재개 실패"));
       }
       return;
     }
@@ -15386,7 +18152,7 @@ function bindActions() {
         addMessage(pickText("任务已取消。", "Task canceled.","タスクをキャンセルしました。", "작업이 취소되었습니다."));
         await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
       } catch (err) {
-        addMessage(pickText(`取消任务失败：${err.message}`, `Cancel task failed: ${err.message}`, `タスクキャンセル失敗: ${err.message}`, `작업 취소 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "取消任务失败", "Cancel task failed", "タスクキャンセル失敗", "작업 취소 실패"));
       }
       return;
     }
@@ -15401,7 +18167,7 @@ function bindActions() {
         const current = await api(`/api/tasks/${taskId}`);
         openReplanDrawer(current.task || null);
       } catch (err) {
-        addMessage(pickText(`打开改写面板失败：${err.message}`, `Open modify panel failed: ${err.message}`, `編集パネルを開けませんでした: ${err.message}`, `수정 패널 열기 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "打开改写面板失败", "Open modify panel failed", "編集パネルを開けませんでした", "수정 패널 열기 실패"));
       }
       return;
     }
@@ -15421,7 +18187,7 @@ function bindActions() {
           "5회 계획 크레딧 추가 완료(¥9.9). 언제든지 더 구매하거나 Plus로 업그레이드할 수 있습니다.",
         ));
       } catch (err) {
-        notify(pickText(`购买失败：${err.message}`, `Purchase failed: ${err.message}`, `購入失敗: ${err.message}`, `구매 실패: ${err.message}`), "error");
+        notify(formatClientActionError(err, "购买失败", "Purchase failed", "購入失敗", "구매 실패"), "error");
       }
       return;
     }
@@ -15437,7 +18203,7 @@ function bindActions() {
         addMessage(pickText("Cross X Plus 已开通，享有 7×24 人工兜底、实时翻译、稀缺资源礼宾服务。", "Cross X Plus activated. Enjoy 24/7 human fallback, live translation, and scarce resource concierge.", "Cross X Plus が有効になりました。24/7 人的フォールバック、リアルタイム翻訳、希少リソースコンシェルジュをご利用ください。", "Cross X Plus가 활성화되었습니다. 24/7 인적 폴백, 실시간 번역, 희귀 자원 컨시어지를 즐기세요."));
         await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
       } catch (err) {
-        addMessage(pickText(`Plus 开通失败：${err.message}`, `Plus activation failed: ${err.message}`, `Plus 有効化失敗: ${err.message}`, `Plus 활성화 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "Plus 开通失败", "Plus activation failed", "Plus 有効化失敗", "Plus 활성화 실패"));
       }
       return;
     }
@@ -15452,23 +18218,50 @@ function bindActions() {
         addMessage(pickText("Cross X Plus 已暂停。", "Cross X Plus paused.", "Cross X Plus を停止しました。", "Cross X Plus가 일시중지되었습니다."));
         await Promise.all([loadTrips(), loadAuditLogs(), loadDashboard()]);
       } catch (err) {
-        addMessage(pickText(`Plus 暂停失败：${err.message}`, `Plus pause failed: ${err.message}`, `Plus 停止失敗: ${err.message}`, `Plus 일시중지 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "Plus 暂停失败", "Plus pause failed", "Plus 停止失敗", "Plus 일시중지 실패"));
       }
       return;
     }
 
     if (action === "export-data") {
       try {
-        const data = await api("/api/user/export");
+        const deviceId = typeof getDeviceId === "function" ? getDeviceId() : "";
+        const res = await fetch("/api/user/export", {
+          headers: {
+            ..._authHeaders(),
+            ...(deviceId ? { "X-Device-Id": deviceId } : {}),
+          },
+        });
+        if (!res.ok) {
+          let errMsg = `HTTP ${res.status}`;
+          try {
+            const errData = await _readJsonResponseSafe(res, {});
+            errMsg = errData.error || errMsg;
+          } catch {}
+          throw new Error(errMsg);
+        }
+        const text = await res.text();
+        const data = JSON.parse(text || "{}");
+        const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+        const dlUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement("a");
+        anchor.href = dlUrl;
+        anchor.download = `crossx-data-export-${Date.now()}.json`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(dlUrl), 1000);
         await trackEvent("data_exported");
+        const tripCount = Array.isArray(data.trips) ? data.trips.length : 0;
+        const orderCount = Array.isArray(data.orders) ? data.orders.length : 0;
         el.privacyResult.textContent = pickText(
-          `导出已就绪：${new Date(data.exportedAt).toLocaleString()}（${data.tasks.length} 个任务，${data.orders.length} 个订单）`,
-          `Export ready: ${new Date(data.exportedAt).toLocaleString()} (${data.tasks.length} tasks, ${data.orders.length} orders)`,
-          `エクスポート準備完了: ${new Date(data.exportedAt).toLocaleString()} (${data.tasks.length} tasks, ${data.orders.length} orders)`,
-          `내보내기 준비 완료: ${new Date(data.exportedAt).toLocaleString()} (${data.tasks.length} tasks, ${data.orders.length} orders)`,
+          `导出已下载：${new Date(data.exportedAt).toLocaleString()}（${tripCount} 个任务，${orderCount} 个订单）`,
+          `Export downloaded: ${new Date(data.exportedAt).toLocaleString()} (${tripCount} tasks, ${orderCount} orders)`,
+          `エクスポートをダウンロードしました: ${new Date(data.exportedAt).toLocaleString()} (${tripCount} tasks, ${orderCount} orders)`,
+          `내보내기를 다운로드했습니다: ${new Date(data.exportedAt).toLocaleString()} (${tripCount} tasks, ${orderCount} orders)`,
         );
       } catch (err) {
-        el.privacyResult.textContent = pickText(`导出失败：${err.message}`, `Export failed: ${err.message}`, `エクスポート失敗: ${err.message}`, `내보내기 실패: ${err.message}`);
+        el.privacyResult.textContent = pickText(`导出失败：${describeClientError(err)}`, `Export failed: ${describeClientError(err)}`, `エクスポート失敗: ${describeClientError(err)}`, `내보내기 실패: ${describeClientError(err)}`);
       }
       return;
     }
@@ -15476,29 +18269,77 @@ function bindActions() {
     if (action === "delete-data") {
       const ok = window.confirm(
         pickText(
-          "确认删除本地任务/订单/审计数据？",
-          "Delete all local task/order/audit data?",
-          "ローカルのタスク/注文/監査データを削除しますか？",
-          "로컬 작업/주문/감사 데이터를 모두 삭제할까요?",
+          "确认提交删除请求，并清除当前设备上的本地缓存？",
+          "Submit a deletion request and clear local data on this device?",
+          "削除リクエストを送信し、この端末のローカルデータを消去しますか？",
+          "삭제 요청을 제출하고 이 기기의 로컬 데이터를 지울까요?",
         ),
       );
       if (!ok) return;
       try {
-        await api("/api/user/delete-data", { method: "POST", body: JSON.stringify({ reason: "user_request" }) });
+        const result = await api("/api/user/delete-data", { method: "POST", body: JSON.stringify({ reason: "user_request" }) });
         await trackEvent("data_deleted");
         // Clear all user data from localStorage (preserve auth token, device ID, GDPR consent)
         [CONV_STORAGE_KEY, _NEAR_FILTER_KEY, _FAV_KEY, CX_PLAN_SESSION_KEY, "cx_onboarded"].forEach(k => {
           try { localStorage.removeItem(k); } catch {}
         });
         state.favorites = [];
-        el.privacyResult.textContent = pickText("本地数据已删除。", "Local data deleted.","ローカルデータを削除しました。", "로컬 데이터를 삭제했습니다.");
-        addMessage(pickText("你的本地数据已删除。", "Your local data has been deleted.","ローカルデータを削除しました。", "로컬 데이터가 삭제되었습니다."));
+        const scheduledAt = result && result.scheduledAt ? new Date(result.scheduledAt).toLocaleString() : "";
+        const deadline = result && result.deadline ? new Date(result.deadline).toLocaleString() : "";
+        el.privacyResult.textContent = pickText(
+          `删除请求已提交；当前设备缓存已清除。${scheduledAt ? `计划执行时间：${scheduledAt}。` : ""}${deadline ? `最晚完成时间：${deadline}。` : ""}`,
+          `Deletion request submitted; local data on this device was cleared.${scheduledAt ? ` Scheduled for ${scheduledAt}.` : ""}${deadline ? ` Deadline ${deadline}.` : ""}`,
+          `削除リクエストを送信し、この端末のローカルデータを消去しました。${scheduledAt ? `実行予定: ${scheduledAt}。` : ""}${deadline ? `完了期限: ${deadline}。` : ""}`,
+          `삭제 요청이 제출되었고 이 기기의 로컬 데이터가 정리되었습니다.${scheduledAt ? ` 예정 시각: ${scheduledAt}.` : ""}${deadline ? ` 완료 기한: ${deadline}.` : ""}`,
+        );
+        addMessage(
+          pickText(
+            `已提交数据删除请求，当前设备缓存已清除。${scheduledAt ? `计划执行时间：${scheduledAt}。` : ""}`,
+            `Your deletion request was submitted and local device data was cleared.${scheduledAt ? ` Scheduled for ${scheduledAt}.` : ""}`,
+            `データ削除リクエストを送信し、この端末のローカルデータを消去しました。${scheduledAt ? `実行予定: ${scheduledAt}。` : ""}`,
+            `데이터 삭제 요청이 제출되었고 이 기기의 로컬 데이터가 정리되었습니다.${scheduledAt ? ` 예정 시각: ${scheduledAt}.` : ""}`,
+          ),
+        );
         await Promise.all([loadTrips(), loadOrders(), loadAuditLogs(), loadDashboard()]);
       } catch (err) {
-        el.privacyResult.textContent = pickText(`删除失败：${err.message}`, `Delete failed: ${err.message}`, `削除失敗: ${err.message}`, `삭제 실패: ${err.message}`);
+        el.privacyResult.textContent = pickText(`删除失败：${describeClientError(err)}`, `Delete failed: ${describeClientError(err)}`, `削除失敗: ${describeClientError(err)}`, `삭제 실패: ${describeClientError(err)}`);
       }
     }
   });
+
+  document.body.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.isComposing) return;
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    const refineInput = target ? target.closest(".cx-pr-input") : null;
+    if (refineInput instanceof HTMLInputElement) {
+      event.preventDefault();
+      _sendPlanRefine(refineInput.value, refineInput);
+      return;
+    }
+    const clarifyInput = target ? target.closest(".b2-clarify-input") : null;
+    if (clarifyInput instanceof HTMLInputElement) {
+      event.preventDefault();
+      _clarifySend(clarifyInput.closest(".clarify-card"));
+    }
+  });
+
+  document.body.addEventListener("error", (event) => {
+    const img = event.target instanceof HTMLImageElement ? event.target : null;
+    if (!img) return;
+
+    const fallbackSrc = String(img.dataset.fallbackSrc || "").trim();
+    if (fallbackSrc && img.dataset.fallbackApplied !== "1") {
+      img.dataset.fallbackApplied = "1";
+      img.src = fallbackSrc;
+      return;
+    }
+
+    if (img.dataset.errorOpacityZero === "1") img.classList.add("img-error-zero");
+    if (img.dataset.errorHide === "1") img.classList.add("hidden");
+    if (img.dataset.errorShowNext === "1" && img.nextElementSibling instanceof HTMLElement) {
+      img.nextElementSibling.classList.remove("hidden");
+    }
+  }, true);
 }
 
 // ── Cold-start starter prompts ─────────────────────────────────────────────
@@ -15506,82 +18347,267 @@ function _initStarterPrompts() {
   const container = document.getElementById("cxStarterPrompts");
   const chipsEl   = document.getElementById("cxStarterChips");
   const labelEl   = document.getElementById("cxStarterLabel");
-  if (!container || !chipsEl) return;
+  const sectionCopyEl = document.getElementById("cxStarterSectionCopy");
+  const heroEl    = document.getElementById("cxStarterHero");
+  const heroBadgeEl = document.getElementById("cxStarterHeroBadge");
+  const heroTitleEl = document.getElementById("cxStarterHeroTitle");
+  const heroDescEl  = document.getElementById("cxStarterHeroDesc");
+  if (!container || !chipsEl) {
+    _syncColdStartLayout();
+    return;
+  }
 
   // Hide if conversation already exists
   if ((state.agentConversation?.messages || []).length > 0) {
-    container.style.display = "none";
+    container.classList.add("hidden");
+    _syncColdStartLayout();
     return;
+  }
+
+  // Render hero section with product intro
+  if (heroEl && heroTitleEl && heroDescEl) {
+    const lang = state.uiLanguage || "ZH";
+    const heroContent = {
+      ZH: {
+        title: "告诉 CrossX 你的需求",
+        desc: "输入目的地、时间和预算，先给你推荐方案，再给 2 个可比较备选。",
+        features: {
+          map: "地图导航",
+          hotel: "酒店比价",
+          food: "餐厅推荐",
+          transport: "交通方案"
+        }
+      },
+      "ZH-TW": {
+        title: "告訴 CrossX 你的需求",
+        desc: "輸入目的地、時間和預算，先給你推薦方案，再給 2 個可直接比較的備選。",
+        features: {
+          map: "地圖導航",
+          hotel: "酒店比價",
+          food: "餐廳推薦",
+          transport: "交通方案"
+        }
+      },
+      EN: {
+        title: "Tell CrossX what you need",
+        desc: "Enter destination, timing, and budget. Get one recommended plan plus 2 alternatives to compare.",
+        features: {
+          map: "Route",
+          hotel: "Hotels",
+          food: "Food",
+          transport: "Transport"
+        }
+      },
+      JA: {
+        title: "CrossX に必要なことを伝える",
+        desc: "目的地・日程・予算を入力すると、おすすめ案と比較用の2案を先に出します。",
+        features: {
+          map: "地図ナビ",
+          hotel: "ホテル比較",
+          food: "レストラン推薦",
+          transport: "交通オプション"
+        }
+      },
+      KO: {
+        title: "CrossX에 원하는 내용을 입력하세요",
+        desc: "목적지, 일정, 예산을 입력하면 추천안 1개와 비교용 대안 2개를 먼저 보여줍니다.",
+        features: {
+          map: "지도 내비게이션",
+          hotel: "호텔 비교",
+          food: "레스토랑 추천",
+          transport: "교통 옵션"
+        }
+      },
+      ID: {
+        title: "Ceritakan kebutuhan Anda ke CrossX",
+        desc: "Masukkan tujuan, waktu, dan budget. Dapatkan 1 rencana utama plus 2 alternatif untuk dibandingkan.",
+        features: {
+          map: "Navigasi Peta",
+          hotel: "Perbandingan Hotel",
+          food: "Rekomendasi Restoran",
+          transport: "Opsi Transportasi"
+        }
+      },
+      AR: {
+        title: "أخبر CrossX بما تحتاجه",
+        desc: "أدخل الوجهة والوقت والميزانية لتحصل أولاً على خطة موصى بها وخيارين للمقارنة.",
+        features: {
+          map: "الملاحة",
+          hotel: "مقارنة الفنادق",
+          food: "توصيات المطاعم",
+          transport: "خيارات النقل"
+        }
+      }
+    };
+
+    const content = heroContent[lang] || heroContent.EN;
+    if (heroBadgeEl) {
+      heroBadgeEl.textContent = pickText(
+        "CrossX Concierge",
+        "CrossX Concierge",
+        "CrossX Concierge",
+        "CrossX Concierge",
+        "CrossX Concierge",
+        "CrossX Concierge",
+      );
+    }
+    heroTitleEl.textContent = content.title;
+    heroDescEl.textContent = content.desc;
+
+    // feature queries per language (one per tag: map / hotel / food / transport)
+    const FEATURE_QUERIES = {
+      ZH:      ["帮我规划北京3天行程，包含故宫和长城，需要地图导航", "上海明天晚上住一晚，帮我比较3家酒店，预算600元以内", "成都美食推荐，找5家本地人常去的餐厅，有川菜优先", "杭州2天自由行，帮我规划地铁和公交的出行方案"],
+      "ZH-TW": ["幫我規劃北京3天行程，包含故宮和長城，需要地圖導航", "上海明天晚上住一晚，幫我比較3家酒店，預算600元以內", "成都美食推薦，找5家本地人常去的餐廳，有川菜優先", "杭州2天自由行，幫我規劃地鐵和公交的出行方案"],
+      EN:      ["Plan a 3-day trip to Beijing: Forbidden City + Great Wall, need map navigation", "Hotel in Shanghai tonight, compare 3 options, budget under $100", "Chengdu food guide: 5 local restaurants, Sichuan cuisine preferred", "2-day Hangzhou trip: plan metro and bus routes"],
+      JA:      ["北京3日間プラン、故宮と万里の長城を含む、地図ナビが必要", "明日の上海ホテル、3つ比較、予算12,000円以内", "成都グルメ推薦、地元レストラン5店、四川料理優先", "杭州2日間フリープラン、地下鉄とバスルート作成"],
+      KO:      ["베이징 3일 일정: 자금성+만리장성, 지도 내비게이션 필요", "오늘 밤 상하이 호텔 3곳 비교, 예산 12만원 이하", "청두 맛집 추천 5곳, 사천 요리 우선", "항저우 2일 자유여행, 지하철·버스 이동 계획"],
+      ID:      ["Rencana 3 hari di Beijing: Kota Terlarang + Tembok Besar, butuh navigasi peta", "Hotel di Shanghai malam ini, bandingkan 3 pilihan, budget Rp1,5 juta", "Kuliner Chengdu: 5 restoran lokal, masakan Sichuan diprioritaskan", "Perjalanan mandiri 2 hari di Hangzhou, rute metro dan bus"],
+      AR:      ["خطط لرحلة 3 أيام إلى بكين: المدينة المحظورة + سور الصين، أحتاج الملاحة", "فندق في شنغهاي الليلة، قارن 3 خيارات، ميزانية 150 دولار", "توصيات مطاعم تشنغدو: 5 محلية، مطبخ سيتشوان", "رحلة يومين في هانغتشو، خطط مسارات المترو والحافلات"],
+    };
+    const featureQueriesForLang = FEATURE_QUERIES[lang] || FEATURE_QUERIES.EN;
+    const featureKeys = ["map", "hotel", "food", "transport"];
+
+    // Apply label text + click handler to each tag
+    const featureTagButtons = heroEl.querySelectorAll(".cx-starter-feature-tag");
+    featureTagButtons.forEach((btn, i) => {
+      if (i >= featureKeys.length) return;
+
+      // Update inner span label text from i18n content
+      const innerSpan = btn.querySelector("span");
+      if (innerSpan) innerSpan.textContent = content.features[featureKeys[i]];
+
+      // Add clickable class for hover/active styles (button element already has native click)
+      btn.classList.add("cx-starter-feature-tag--clickable");
+
+      const query = featureQueriesForLang[i];
+
+      btn.addEventListener("click", () => {
+        const inp = document.getElementById("chatInput");
+        const frm = document.getElementById("chatForm");
+        if (!inp || !frm) return;
+        inp.value = query;
+        if (typeof autoResizeChatInput === "function") autoResizeChatInput();
+        if (typeof updateChatSendState === "function") updateChatSendState();
+        inp.focus();
+        if (typeof frm.requestSubmit === "function") frm.requestSubmit();
+        else frm.dispatchEvent(new Event("submit", { bubbles: true }));
+      });
+    });
   }
 
   const STARTERS = {
     ZH: [
-      "帮我规划成都5天4夜，2人，预算5000元",
-      "上海明晚住一晚，预算500元以内",
-      "三亚亲子游4天，带两个小孩",
-      "云南大理+丽江7天深度游，不喜欢跟团",
+      "成都5天4夜亲子游，2大1小，预算8000元，求完整行程",
+      "北京故宫+长城2天，不喜欢跟团，帮我排最优路线",
+      "上海明晚住一晚，中心位置，预算500以内",
+      "三亚蜜月4天，有海景房，帮我挑餐厅和水上活动",
     ],
     "ZH-TW": [
-      "幫我規劃成都5天4夜，2人，預算5000元",
-      "上海明晚住一晚，預算500元以內",
-      "三亞親子遊4天，帶兩個小孩",
-      "雲南大理+麗江7天深度遊，不喜歡跟團",
+      "成都5天4夜親子遊，2大1小，預算8000元，求完整行程",
+      "北京故宮+長城2天，不喜歡跟團，幫我排最優路線",
+      "上海明晚住一晚，市中心，預算500以內",
+      "三亞蜜月4天，有海景房，幫我挑餐廳和水上活動",
     ],
     EN: [
-      "Plan a 5-day trip to Kyoto for 2, budget $1500",
-      "Hotel in Tokyo for tomorrow night, under $150",
-      "3-day family trip to Bali with kids",
-      "Backpacker route: Bangkok → Chiang Mai 7 days",
+      "5-day family trip to Chengdu — 2 adults 1 child, budget $1200, full itinerary please",
+      "2 days in Beijing: Forbidden City + Great Wall, no tour groups, best route?",
+      "Hotel in Shanghai tonight, central location, under $100",
+      "4-day honeymoon in Sanya — sea view room, recommend restaurants & water sports",
     ],
     JA: [
-      "2人で京都・奈良5日間旅行を計画して",
-      "明日のホテルを東京で予算15000円以内で",
-      "子連れ家族旅行 沖縄3泊4日",
+      "成都5泊6日の家族旅行、大人2人子供1人、予算120,000円、完全プランお願い",
+      "北京故宮+万里の長城 2日間、ツアーなしで最適ルートは？",
+      "明日の上海ホテル、中心部、予算12,000円以内",
+      "三亜4日間ハネムーン、オーシャンビュー、レストラン＆マリンスポート推薦",
     ],
     KO: [
-      "2인 도쿄 5박6일 여행 계획해줘, 예산 200만원",
-      "내일 서울 호텔 예약, 15만원 이하",
-      "가족여행 제주도 3박4일 아이 2명",
+      "청두 5박6일 가족여행 — 성인 2명, 아이 1명, 예산 150만원, 전체 일정 부탁해요",
+      "베이징 자금성+만리장성 2일, 단체여행 싫어요, 최적 루트 짜줘",
+      "오늘 밤 상하이 호텔, 중심가, 10만원 이하",
+      "싼야 신혼여행 4일 — 오션뷰 포함, 레스토랑 & 수상스포츠 추천",
     ],
     ID: [
-      "Rencanakan perjalanan 5 hari ke Shanghai untuk 2 orang, budget Rp8 juta",
-      "Hotel di Beijing besok malam, di bawah Rp1 juta",
-      "Wisata keluarga 4 hari ke Chengdu dengan 2 anak",
-      "Rute backpacker: Shanghai → Hangzhou 3 hari",
+      "Liburan keluarga 5 hari di Chengdu — 2 dewasa 1 anak, budget Rp12 juta, buat itinerary lengkap",
+      "2 hari di Beijing: Kota Terlarang + Tembok Besar, tanpa tur, rute terbaik?",
+      "Hotel di Shanghai malam ini, lokasi sentral, di bawah Rp1,5 juta",
+      "Bulan madu 4 hari di Sanya — kamar ocean view, rekomendasikan restoran & olahraga air",
     ],
     AR: [
-      "خطط لرحلة 5 أيام إلى شنغهاي لشخصين، ميزانية 2000 دولار",
-      "فندق في بكين غداً، أقل من 150 دولار",
-      "رحلة عائلية 4 أيام إلى تشنغدو مع طعام حلال",
-      "مطاعم حلال قريبة في شنغهاي",
+      "رحلة عائلية 5 أيام في تشنغدو — شخصان وطفل، ميزانية 2000 دولار، خطة كاملة",
+      "يومان في بكين: المدينة المحظورة + سور الصين، بدون جولات منظمة، أفضل مسار؟",
+      "فندق في شنغهاي الليلة، موقع مركزي، أقل من 150 دولار",
+      "شهر عسل 4 أيام في سانيا — غرفة مطلة على البحر، مطاعم ورياضات مائية",
     ],
   };
 
   const lang = state.uiLanguage || "ZH";
   const prompts = STARTERS[lang] || STARTERS.EN;
-  if (labelEl) labelEl.textContent = pickText("✦ 试试这些", "✦ Try these", "✦ 試してみて", "✦ 이런 건 어떠세요", "✦ Coba ini", "✦ جرب هذه");
+  if (labelEl) labelEl.textContent = pickText("✦ 直接输入，或点一个例子", "✦ Type directly, or tap an example", "✦ そのまま入力するか、例を選んでください", "✦ 바로 입력하거나 예시를 누르세요", "✦ Ketik langsung, atau pilih contoh", "✦ اكتب مباشرة أو اختر مثالاً");
+  if (sectionCopyEl) {
+    sectionCopyEl.textContent = pickText(
+      "先说需求，再看方案。",
+      "State the need first, then compare plans.",
+      "先に要望を伝えて、その後に案を比べます。",
+      "먼저 요구를 말하고, 그다음 안을 비교하세요.",
+      "Sampaikan kebutuhan dulu, lalu bandingkan rencananya.",
+      "ابدأ بطلبك أولاً ثم قارن الخطط.",
+    );
+  }
+  const starterCardMeta = [
+    {
+      eyebrow: pickText("完整行程", "Full itinerary", "完全旅程", "전체 일정", "Itinerary lengkap", "رحلة كاملة"),
+      note: pickText("适合从完整中国行程开局。", "Best for a full China trip plan.", "中国旅行を丸ごと作りたい時に向いています。", "중국 여행 전체 일정을 한 번에 만들고 싶을 때 적합합니다.", "Cocok saat Anda ingin rencana perjalanan China yang lengkap.", "مناسب عندما تريد خطة رحلة كاملة إلى الصين."),
+    },
+    {
+      eyebrow: pickText("路线优化", "Route optimization", "ルート最適化", "동선 최적화", "Optimasi rute", "تحسين المسار"),
+      note: pickText("适合景点组合与顺路安排。", "Good for combining landmarks and tightening routes.", "観光地の組み合わせと動線整理に向いています。", "랜드마크 조합과 동선 정리에 적합합니다.", "Bagus untuk menggabungkan landmark dan merapikan rute.", "مناسب لدمج المعالم وشد المسار."),
+    },
+    {
+      eyebrow: pickText("今晚入住", "Tonight stay", "今夜の宿泊", "오늘 밤 숙박", "Malam ini menginap", "إقامة الليلة"),
+      note: pickText("适合立刻给出可订酒店方案。", "Use this when you need bookable hotel options fast.", "すぐ予約できるホテル案が欲しい時に使います。", "바로 실행 가능한 호텔 옵션이 필요할 때 적합합니다.", "Gunakan saat Anda butuh opsi hotel yang bisa langsung dipesan.", "استخدمه عندما تحتاج إلى خيارات فندقية قابلة للحجز بسرعة."),
+    },
+    {
+      eyebrow: pickText("体验组合", "Experience bundle", "体験セット", "경험 조합", "Paket pengalaman", "حزمة تجارب"),
+      note: pickText("适合酒店、餐厅和活动一起规划。", "Useful when hotel, dining, and activities need to land together.", "ホテル・食事・体験を一緒に組む時に向いています。", "호텔, 식사, 활동을 함께 잡아야 할 때 유용합니다.", "Berguna saat hotel, makan, dan aktivitas harus direncanakan bersama.", "مفيد عندما تحتاج إلى جمع الفندق والطعام والأنشطة معاً."),
+    },
+  ];
 
   // Prepend recent destinations as "继续上次" chips
   const recentDests = _getRecentDests ? _getRecentDests() : [];
-  const recentChips = recentDests.slice(0, 2).map(d => {
+  const recentChips = recentDests.slice(0, 1).map(d => {
+    const localizedDest = _localizeUiCityName(d.dest);
     const label = pickText(
-      `\u7ee7\u7eed\u89c4\u5212 ${d.dest}`,
-      `Continue: ${d.dest}`,
-      `${d.dest}\u306e\u65c5\u884c\u3092\u7d9a\u3051\u308b`,
-      `${d.dest} \uc5ec\ud589 \uacc4\uc18d`
+      `\u7ee7\u7eed\u89c4\u5212 ${localizedDest}`,
+      `Continue: ${localizedDest}`,
+      `${localizedDest}\u306e\u65c5\u884c\u3092\u7d9a\u3051\u308b`,
+      `${localizedDest} \uc5ec\ud589 \uacc4\uc18d`
     );
     const query = pickText(
-      `\u5e2e\u6211\u91cd\u65b0\u89c4\u5212 ${d.dest} ${d.days}\u5929\u7684\u884c\u7a0b`,
-      `Re-plan my ${d.days}-day trip to ${d.dest}`,
-      `${d.dest}\u306e${d.days}\u65e5\u9593\u65c5\u884c\u3092\u518d\u8a08\u753b\u3057\u3066`,
-      `${d.dest} ${d.days}\uc77c \uc5ec\ud589 \uc7ac\uacc4\ud68d`
+      `\u5e2e\u6211\u91cd\u65b0\u89c4\u5212 ${localizedDest} ${d.days}\u5929\u7684\u884c\u7a0b`,
+      `Re-plan my ${d.days}-day trip to ${localizedDest}`,
+      `${localizedDest}\u306e${d.days}\u65e5\u9593\u65c5\u884c\u3092\u518d\u8a08\u753b\u3057\u3066`,
+      `${localizedDest} ${d.days}\uc77c \uc5ec\ud589 \uc7ac\uacc4\ud68d`
     );
-    return `<button class="cx-starter-chip cx-starter-chip--recent" type="button" data-query="${escapeHtml(query)}">\ud83d\udd01 ${escapeHtml(label)}</button>`;
+    return `
+      <button class="cx-starter-chip cx-starter-chip--recent" type="button" data-query="${escapeHtml(query)}">
+        <span class="cx-starter-chip-eyebrow">${pickText("继续上次", "Continue last trip", "前回の続き", "지난 여행 이어서")}</span>
+        <strong>${escapeHtml(label)}</strong>
+        <small>${pickText(`${localizedDest} ${d.days} 天行程继续推进`, `Resume your ${d.days}-day plan in ${localizedDest}`, `${localizedDest} ${d.days}日間の旅程を再開`, `${localizedDest} ${d.days}일 일정 이어가기`)}</small>
+      </button>
+    `;
   }).join("");
 
-  chipsEl.innerHTML = recentChips + prompts.map(p =>
-    `<button class="cx-starter-chip" type="button">${escapeHtml(p)}</button>`
-  ).join("");
+  const visiblePrompts = prompts.slice(0, 3);
+  chipsEl.innerHTML = recentChips + visiblePrompts.map((prompt, index) => {
+    const meta = starterCardMeta[index] || starterCardMeta[starterCardMeta.length - 1];
+    return `
+      <button class="cx-starter-chip" type="button" data-query="${escapeHtml(prompt)}">
+        <span class="cx-starter-chip-eyebrow">${escapeHtml(meta.eyebrow)}</span>
+        <strong>${escapeHtml(prompt)}</strong>
+        <small>${escapeHtml(meta.note)}</small>
+      </button>
+    `;
+  }).join("");
 
   chipsEl.querySelectorAll(".cx-starter-chip").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -15595,26 +18621,85 @@ function _initStarterPrompts() {
       }
     });
   });
+
+  _syncColdStartLayout();
 }
 
 function _hideStarterPrompts() {
   const el2 = document.getElementById("cxStarterPrompts");
-  if (el2 && el2.style.display !== "none") {
-    el2.style.opacity = "0";
-    el2.style.transform = "translateY(-6px)";
-    setTimeout(() => { el2.style.display = "none"; }, 250);
+  if (el2 && !el2.classList.contains("hidden") && !el2.classList.contains("cx-starter-prompts--closing")) {
+    el2.classList.add("cx-starter-prompts--closing");
+    _syncColdStartLayout();
+    setTimeout(() => {
+      el2.classList.add("hidden");
+      el2.classList.remove("cx-starter-prompts--closing");
+      _syncColdStartLayout();
+    }, 250);
+    return;
   }
+  _syncColdStartLayout();
+}
+
+function _isStarterPromptsVisible() {
+  const starter = document.getElementById("cxStarterPrompts");
+  if (!starter) return false;
+  return !starter.hidden
+    && !starter.classList.contains("hidden")
+    && !starter.classList.contains("cx-starter-prompts--closing")
+    && window.getComputedStyle(starter).display !== "none";
+}
+
+function _syncColdStartLayout() {
+  const body = document.body;
+  if (!body) return;
+  const isConsumerSingleDialog =
+    body.classList.contains("consumer-app") &&
+    body.classList.contains("single-dialog-mode");
+  const feed = document.getElementById("chatFeed");
+  const starter = document.getElementById("cxStarterPrompts");
+  const hasActiveConversation = !!(
+    feed && (
+      feed.querySelector(".msg.user")
+      || feed.querySelector('.msg.agent:not([data-i18n-key="welcome_intro"])')
+      || feed.querySelector(".task-skeleton-wrap")
+      || feed.querySelector(".cx-plan-skeleton")
+      || feed.querySelector(".thinking-panel")
+      || feed.querySelector(".cx-typing-bubble-row")
+    )
+  );
+  if (hasActiveConversation && starter && !starter.classList.contains("hidden")) {
+    starter.classList.add("hidden");
+    starter.classList.remove("cx-starter-prompts--closing");
+  }
+  const starterVisible = _isStarterPromptsVisible();
+  body.classList.toggle("cx-cold-start", isConsumerSingleDialog && starterVisible);
+
+  if (isConsumerSingleDialog && starterVisible) {
+    document.getElementById("cx-pwa-banner")?.remove();
+  }
+
+  const auxiliarySections = [
+    document.querySelector(".quick-goals-card"),
+    document.querySelector(".spotlight-card"),
+    document.querySelector(".constraints-toolbar"),
+    document.getElementById("constraintChips"),
+    ...document.querySelectorAll(".cx-taw-row"),
+  ];
+  auxiliarySections.forEach((node) => {
+    if (!(node instanceof HTMLElement)) return;
+    node.classList.toggle("hidden", isConsumerSingleDialog && starterVisible);
+  });
 }
 
 // ── P1: Modal overflow management — prevents scroll conflicts when multiple modals open ──
 let _modalCount = 0;
 function _incrementModalCount() {
   _modalCount++;
-  if (_modalCount === 1) document.body.style.overflow = "hidden";
+  if (_modalCount === 1) document.body.classList.add("cx-modal-open");
 }
 function _decrementModalCount() {
   _modalCount = Math.max(0, _modalCount - 1);
-  if (_modalCount === 0) document.body.style.overflow = "";
+  if (_modalCount === 0) document.body.classList.remove("cx-modal-open");
 }
 
 function bindInput() {
@@ -15628,8 +18713,10 @@ function bindInput() {
       return;
     }
     state._planStreamActive = true; // Set immediately to prevent double-submit
+    setConsumerSurface("workspace", { focusComposer: false });
     _hideStarterPrompts();
     el.chatInput.value = "";
+    _updateCharCounter();
     autoResizeChatInput();
     updateChatSendState();
     _hideTypingHint();
@@ -15653,12 +18740,11 @@ function bindInput() {
     } catch (err) {
       const _retryId = `retry_${Date.now()}`;
       const _retryLabel = pickText("重试", "Retry", "再試行", "재시도", "Coba Lagi", "إعادة المحاولة");
-      const _errRow = addMessage(pickText(`创建任务失败：${err.message}`, `Failed to create task: ${err.message}`, `タスク作成失敗: ${err.message}`, `작업 생성 실패: ${err.message}`));
+      const _errRow = addMessage(formatClientActionError(err, "创建任务失败", "Failed to create task", "タスク作成失敗", "작업 생성 실패"));
       if (_errRow) {
         const _retryBtn = document.createElement("button");
-        _retryBtn.className = "secondary";
+        _retryBtn.className = "secondary cx-inline-retry-btn";
         _retryBtn.id = _retryId;
-        _retryBtn.style.cssText = "margin-top:8px;font-size:0.8rem";
         _retryBtn.textContent = _retryLabel;
         _retryBtn.addEventListener("click", () => {
           if (el.chatInput) el.chatInput.value = state._lastChatInput || "";
@@ -15670,6 +18756,7 @@ function bindInput() {
     } finally {
       state._planStreamActive = false;
       updateChatSendState();
+      _focusComposerAfterReply();
     }
   });
 
@@ -15693,6 +18780,12 @@ function bindInput() {
 
   if (el.myOrdersBtn) {
     el.myOrdersBtn.addEventListener("click", async () => {
+      if (shouldPreferConciergeHome()) {
+        setConsumerSurface("workspace", { focusComposer: false });
+        switchTab("trips", { force: true });
+        await Promise.allSettled([loadTrips(), loadOrders()]);
+        return;
+      }
       try {
         await withButtonLoading(
           el.myOrdersBtn,
@@ -15700,15 +18793,7 @@ function bindInput() {
           async () => openMyOrdersQuickView(el.myOrdersBtn),
         );
       } catch (err) {
-        notify(
-          pickText(
-            `订单加载失败：${err.message}`,
-            `Failed to load orders: ${err.message}`,
-            `注文の読み込み失敗: ${err.message}`,
-            `주문 로드 실패: ${err.message}`,
-          ),
-          "error",
-        );
+        notify(formatClientActionError(err, "订单加载失败", "Failed to load orders", "注文の読み込み失敗", "주문 로드 실패"), "error");
       }
     });
   }
@@ -15728,15 +18813,7 @@ function bindInput() {
   if (el.voiceInputBtn) {
     el.voiceInputBtn.addEventListener("click", () => {
       toggleVoiceListening().catch((err) => {
-        notify(
-          pickText(
-            `语音模式启动失败：${err.message}`,
-            `Failed to start voice mode: ${err.message}`,
-            `音声モード起動失敗: ${err.message}`,
-            `음성 모드 시작 실패: ${err.message}`,
-          ),
-          "error",
-        );
+        notify(formatClientActionError(err, "语音模式启动失败", "Failed to start voice mode", "音声モード起動失敗", "음성 모드 시작 실패"), "error");
       });
     });
   }
@@ -15744,7 +18821,7 @@ function bindInput() {
   // ── Payment Modal ──────────────────────────────────────────────────────
   function showPaymentModal(option) {
     if (!el.paymentModal) return;
-    const title = (option && option.title) || (option && option.name) || "服务方案";
+    const title = paymentDisplayTitle(option);
     const priceRaw = (option && (option.costRange || option.price || option.cost || option.estimatedCost)) || "";
     const numericPrice = priceRaw ? Number(String(priceRaw).replace(/[^\d.]/g, "")) : 0;
     const priceLabel = numericPrice > 0 ? formatCNY(numericPrice) : (priceRaw ? String(priceRaw) : pickText("价格面议", "Price TBD", "価格要相談", "가격 협의", "Harga TBD", "السعر غير محدد"));
@@ -15756,6 +18833,9 @@ function bindInput() {
     if (el.payQrSection) el.payQrSection.classList.add("hidden");
     // Store orderId for Stripe checkout linking
     el.paymentModal.dataset.orderId = (option && option.orderId) || "";
+    el.paymentModal.dataset.amount = numericPrice > 0 ? String(numericPrice) : "";
+    el.paymentModal.dataset.paymentAttempted = "";
+    el.paymentModal.dataset.provider = "";
     el.paymentModal.classList.remove("hidden");
     _incrementModalCount();
     // For international users: put Credit/Debit Card first in the method list (only once)
@@ -15771,12 +18851,85 @@ function bindInput() {
     el.paymentModal.classList.add("hidden");
     _decrementModalCount();
     if (el.payQrSection) el.payQrSection.classList.add("hidden");
-    if (el.paymentModal) el.paymentModal.dataset.provider = "";
+    if (el.paymentModal) {
+      el.paymentModal.dataset.amount = "";
+      el.paymentModal.dataset.provider = "";
+      el.paymentModal.dataset.paymentAttempted = "";
+    }
+  }
+
+  async function processManagedOrderPayment(provider) {
+    const orderId = el.paymentModal?.dataset?.orderId || "";
+    if (!orderId) return false;
+    const railMap = { wechat: "wechat_cn", alipay: "alipay_cn", card: "card_delegate" };
+    const railId = railMap[provider] || "alipay_cn";
+    try {
+      const result = await api("/api/booking/pay", {
+        method: "POST",
+        body: JSON.stringify({ orderId, railId }),
+      });
+      if (!result || result.ok !== true) {
+        throw new Error(result?.reason || result?.errorCode || "payment_unavailable");
+      }
+      el.paymentModal.dataset.paymentAttempted = "1";
+      el.paymentModal.dataset.provider = provider;
+      if (el.payQrLabel) {
+        el.payQrLabel.textContent = provider === "wechat"
+          ? pickText("微信扫码支付", "WeChat Pay — Scan QR", "WeChat Pay — QRスキャン", "WeChat Pay — QR 스캔")
+          : provider === "alipay"
+            ? pickText("支付宝扫码支付", "Alipay — Scan QR", "Alipay — QRスキャン", "Alipay — QR 스캔")
+            : pickText("卡支付确认", "Card payment ready", "カード決済の確認", "카드 결제 확인");
+      }
+      if (el.payQrAmount) {
+        const baseAmount = Number(result.amount || 0) > 0
+          ? Number(result.amount || 0)
+          : Number(el.paymentModal?.dataset?.amount || 0);
+        const cnyBaseLabel = `¥${baseAmount.toLocaleString()} CNY`;
+        const display = Number(result.fx?.settledAmount || 0) > 0 && result.fx?.settlementCurrency
+          ? `${cnyBaseLabel} (~${result.fx.settledAmount} ${result.fx.settlementCurrency})`
+          : formatCNY(baseAmount);
+        el.payQrAmount.textContent = display;
+      }
+      if (provider === "card") {
+        if (el.payQrImg) {
+          el.payQrImg.removeAttribute("src");
+          el.payQrImg.classList.add("hidden");
+        }
+        if (el.payQrHint) {
+          el.payQrHint.textContent = pickText(
+            `卡支付已在 CrossX 内锁定。支付编号：${result.paymentId || orderId}`,
+            `Card payment is prepared inside CrossX. Payment ID: ${result.paymentId || orderId}`,
+            `CrossX 内でカード決済を準備しました。支払い番号: ${result.paymentId || orderId}`,
+            `CrossX 내부에서 카드 결제를 준비했습니다. 결제 번호: ${result.paymentId || orderId}`,
+          );
+        }
+      } else {
+        if (el.payQrImg) {
+          el.payQrImg.alt = provider === "wechat" ? "WeChat Pay QR" : "Alipay QR";
+          el.payQrImg.classList.remove("hidden");
+          if (result.qrCode) el.payQrImg.src = result.qrCode;
+        }
+        if (el.payQrHint) {
+          el.payQrHint.textContent = provider === "wechat"
+            ? pickText("请打开微信 → 扫一扫", "Open WeChat → Scan", "WeChatを開く → スキャン", "WeChat 열기 → 스캔")
+            : pickText("请打开支付宝 → 扫一扫", "Open Alipay → Scan", "Alipayを開く → スキャン", "Alipay 열기 → 스캔");
+        }
+      }
+      if (el.payQrSection) el.payQrSection.classList.remove("hidden");
+      return true;
+    } catch (err) {
+      notify(formatClientActionError(err, "支付通道暂不可用", "Payment rail unavailable", "決済チャネルを利用できません", "결제 수단을 사용할 수 없습니다"), "error");
+      return false;
+    }
   }
 
   function showPaymentQR(provider) {
     if (!el.payQrSection) return;
     const priceText = (el.payQrAmount && el.payTotal && el.payTotal.textContent) ? el.payTotal.textContent : "";
+    if (el.paymentModal?.dataset?.orderId) {
+      processManagedOrderPayment(provider);
+      return;
+    }
 
     // International card (Stripe checkout) — redirect to hosted checkout
     if (provider === "card") {
@@ -15790,8 +18943,10 @@ function bindInput() {
       const _ordId   = el.paymentModal?.dataset?.orderId || "";
       const _locale  = { EN: "en", JA: "ja", KO: "ko", ID: "en" }[state.uiLanguage] || "auto";
       const _amt     = encodeURIComponent(el.payTotal?.textContent || "");
+      const _deviceId = typeof getDeviceId === "function" ? getDeviceId() : "";
       const checkoutUrl = `/api/payment/checkout?ref=${Date.now()}&amount=${_amt}`
         + (_ordId  ? `&orderId=${encodeURIComponent(_ordId)}` : "")
+        + (_ordId && _deviceId ? `&deviceId=${encodeURIComponent(_deviceId)}` : "")
         + `&locale=${_locale}`;
       notify(
         pickText("正在跳转到安全支付页...", "Redirecting to secure card payment...", "安全なカード決済ページへ移動中...", "안전한 카드 결제 페이지로 이동 중...", "Mengarahkan ke halaman pembayaran kartu...", "جارٍ التحويل إلى صفحة الدفع الآمنة..."),
@@ -15807,16 +18962,15 @@ function bindInput() {
       : `alipays://platformapi/startapp?appId=20000067&url=${encodeURIComponent("https://crossx.ai/pay?ref=" + Date.now())}`;
     if (el.payQrImg) {
       el.payQrImg.alt = isWeChat ? "WeChat Pay QR" : "Alipay QR";
-      el.payQrImg.style.display = "";
+      el.payQrImg.classList.remove("hidden");
       // Clear any existing fallback error message before attempting new QR generation
       const existingErr = el.payQrSection.querySelector(".cx-qr-fallback");
       if (existingErr) existingErr.remove();
 
       el.payQrImg.onerror = () => {
-        el.payQrImg.style.display = "none";
+        el.payQrImg.classList.add("hidden");
         const errDiv = document.createElement("div");
         errDiv.className = "cx-qr-fallback";
-        errDiv.style.cssText = "padding:16px;text-align:center;color:var(--color-error,#e53935);font-size:13px;";
         el.payQrSection.insertBefore(errDiv, el.payQrImg.nextSibling);
         errDiv.textContent = pickText("二维码生成失败，请刷新重试", "QR code generation failed, please refresh", "QRコードの生成に失敗しました", "QR 코드 생성 실패, 새로고침 해주세요");
       };
@@ -15846,7 +19000,31 @@ function bindInput() {
   const _payCardBtn = document.getElementById("payCard");
   if (_payCardBtn) _payCardBtn.addEventListener("click", () => showPaymentQR("card"));
   if (el.payDoneBtn) {
-    el.payDoneBtn.addEventListener("click", () => {
+    el.payDoneBtn.addEventListener("click", async () => {
+      const orderId = el.paymentModal?.dataset?.orderId || "";
+      if (orderId) {
+        if (el.paymentModal.dataset.paymentAttempted !== "1") {
+          notify(
+            pickText("请先选择支付方式。", "Choose a payment method first.", "先に支払い方法を選択してください。", "먼저 결제 수단을 선택해 주세요."),
+            "warning",
+          );
+          return;
+        }
+        try {
+          const result = await api("/api/booking/confirm", {
+            method: "POST",
+            body: JSON.stringify({ orderId }),
+          });
+          hidePaymentModal();
+          if (result && result.status === "success") {
+            renderPaymentSuccessCard(result);
+            return;
+          }
+        } catch (err) {
+          notify(formatClientActionError(err, "确认支付失败", "Payment confirmation failed", "支払い確認に失敗しました", "결제 확인에 실패했습니다"), "error");
+          return;
+        }
+      }
       hidePaymentModal();
       notify(pickText("支付已提交，凭证生成中…", "Payment submitted, generating proof…", "お支払い完了、証憑を生成中…", "결제 완료, 영수증 생성 중…"), "success");
     });
@@ -15969,7 +19147,7 @@ function bindInput() {
         el.supportRoomInput.value = "";
       } catch (err) {
         notify(
-          pickText(`发送失败：${err.message}`, `Send failed: ${err.message}`, `送信失敗: ${err.message}`, `전송 실패: ${err.message}`),
+          formatClientActionError(err, "发送失败", "Send failed", "送信失敗", "전송 실패"),
           "error",
         );
       } finally {
@@ -15998,6 +19176,7 @@ function bindInput() {
         state.selectedConstraints[key] = value;
         markAgentEvidenceFromConstraint(key, value, true);
       }
+      _persistConstraints();
       syncChipSelectionFromConstraints();
       updateContextSummary();
       syncAgentSlotsFromSelectedConstraints();
@@ -16017,7 +19196,7 @@ function bindInput() {
       // Show brief "Filtering..." banner so user knows action is processing
       if (el.nearList) {
         const _filterBanner = document.createElement("div");
-        _filterBanner.style.cssText = "text-align:center;padding:8px;font-size:13px;color:var(--color-primary,#1a56db);opacity:0.8";
+        _filterBanner.className = "cx-filter-banner";
         _filterBanner.textContent = pickText("筛选中...", "Filtering...", "フィルタリング中...", "필터링 중...");
         el.nearList.prepend(_filterBanner);
       }
@@ -16039,14 +19218,26 @@ function bindInput() {
       try { localStorage.setItem("cx_ui_lang", next); } catch { /* quota */ }
       applyLanguagePack();
 
-      // ── Step 2: Re-translate any rendered plan cards in the new language.
-      // This is safe regardless of busy state — it only re-renders DOM nodes
-      // that are already fully loaded. Never sends a network request.
-      refreshPlanCardLanguage();
+      // ── Step 2: If AI is currently thinking/streaming, defer all DOM mutations
+      // that touch the chat feed. The ongoing SSE / slot-fill / chat-reply must
+      // not be disrupted — even a .remove() on a sibling node can cause token
+      // appends to mis-target the DOM while the stream is live.
+      if (isAiBusy()) {
+        state._pendingLanguageRefresh = true;
+        return;
+      }
 
-      // ── Step 3: If AI is currently thinking/streaming, stop here.
-      // The ongoing SSE / slot-fill / chat-reply must not be disrupted.
-      if (isAiBusy()) return;
+      // ── Step 3: AI is idle — safe to mutate the session context banner now.
+      const sessionBanner = document.querySelector(".cx-scb-row");
+      if (sessionBanner) {
+        sessionBanner.remove();
+        _renderSessionContextBanner();
+      }
+
+      // ── Step 2: Re-translate rendered plan cards once the UI is stable.
+      refreshPlanCardLanguage();
+      normalizeWelcomeMessageRow();
+      _initStarterPrompts();
 
       // ── Step 4: Persist preference to backend (fire-and-forget, never awaited).
       api("/api/user/preferences", {
@@ -16054,14 +19245,14 @@ function bindInput() {
         body: JSON.stringify({ language: next }),
       }).catch(() => {});
 
-      // ── Step 5: Refresh secondary data panels (all fire-and-forget).
+      // ── Step 5 (removed): Secondary panel refreshes (loadNearSuggestions/loadTrips/
+      // loadOrders/loadAuditLogs) were fired here on every language switch.
+      // Removed: they triggered re-renders that overwrote plan card content and added
+      // network latency that slowed the AI response pipeline. Each panel self-refreshes
+      // when the user navigates to it via its own load-on-demand pattern.
       // loadChatSolutionStrip / loadSolutionBoard intentionally NOT called here —
       // they serve as legacy fallback panels and never contain plan cards.
       // Calling them here would risk replacing their content with empty data.
-      loadNearSuggestions().catch(() => {});
-      loadTrips().catch(() => {});
-      loadOrders().catch(() => {});
-      loadAuditLogs().catch(() => {});
 
       // ── Step 5: Refresh open task drawer label (if any).
       if (state.currentTaskDetail?.overview?.taskId) {
@@ -16078,10 +19269,13 @@ function bindInput() {
 
       // ── Step 6: Brief success toast.
       notify(
-        { ZH:"语言已切换。", JA:"言語を切り替えました。", KO: "언어를 변경했습니다.", MY: "Bahasa ditukar." }[next]
+        { ZH:"语言已切换。", JA:"言語を切り替えました。", KO: "언어를 변경했습니다.", ID: "Bahasa diubah.", AR: "تم تغيير اللغة." }[next]
           || "Language switched.",
         "success",
       );
+
+      const fallbackNotice = getUiFallbackNotice(next);
+      if (fallbackNotice) notify(fallbackNotice, "info");
 
       // NOTE: refineAgentPlanWithSmartReply and /api/chat/reply are intentionally
       // NOT called here. Triggering a new LLM request on language switch would race
@@ -16122,7 +19316,7 @@ function bindForms() {
         );
       } catch (err) {
         notify(
-          pickText(`创建行程失败：${err.message}`, `Create trip failed: ${err.message}`, `旅程作成に失敗: ${err.message}`, `트립 생성 실패: ${err.message}`),
+          formatClientActionError(err, "创建行程失败", "Create trip failed", "旅程作成に失敗", "트립 생성 실패"),
           "error",
         );
       }
@@ -16188,8 +19382,8 @@ function bindForms() {
           await openTaskDetail(payload.taskId);
         }
       } catch (err) {
-        if (el.replanHint) el.replanHint.textContent = pickText(`保存失败：${err.message}`, `Save failed: ${err.message}`, `保存失敗: ${err.message}`, `저장 실패: ${err.message}`);
-        addMessage(pickText(`保存改写失败：${err.message}`, `Save replan failed: ${err.message}`, `再計画保存に失敗: ${err.message}`, `재계획 저장 실패: ${err.message}`));
+        if (el.replanHint) el.replanHint.textContent = formatClientActionError(err, "保存失败", "Save failed", "保存失敗", "저장 실패");
+        addMessage(formatClientActionError(err, "保存改写失败", "Save replan failed", "再計画保存に失敗", "재계획 저장 실패"));
       }
     });
   }
@@ -16259,7 +19453,7 @@ function bindForms() {
       addMessage(pickText("授权域已更新。", "Authorization domain updated.","委任設定を更新しました。", "권한 위임 영역을 업데이트했습니다."));
       await loadAuditLogs();
     } catch (err) {
-      addMessage(pickText(`授权域更新失败：${err.message}`, `Failed to update authorization: ${err.message}`, `委任設定更新に失敗: ${err.message}`, `권한 위임 업데이트 실패: ${err.message}`));
+      addMessage(formatClientActionError(err, "授权域更新失败", "Failed to update authorization", "委任設定更新に失敗", "권한 위임 업데이트 실패"));
     }
   });
 
@@ -16283,7 +19477,7 @@ function bindForms() {
         );
         await loadAuditLogs();
       } catch (err) {
-        addMessage(pickText(`支付通道更新失败：${err.message}`, `Failed to update payment rail: ${err.message}`, `決済レール更新失敗: ${err.message}`, `결제 레일 업데이트 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "支付通道更新失败", "Failed to update payment rail", "決済レール更新失敗", "결제 레일 업데이트 실패"));
       }
     });
   }
@@ -16330,7 +19524,7 @@ function bindForms() {
         );
         await loadAuditLogs();
       } catch (err) {
-        addMessage(pickText(`合规更新失败：${err.message}`, `Failed to update compliance: ${err.message}`, `コンプライアンス更新失敗: ${err.message}`, `컴플라이언스 업데이트 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "合规更新失败", "Failed to update compliance", "コンプライアンス更新失敗", "컴플라이언스 업데이트 실패"));
       }
     });
   }
@@ -16353,7 +19547,7 @@ function bindForms() {
         addMessage(pickText("支付合规策略已更新。", "Payment compliance policy updated.","決済コンプライアンスポリシーを更新しました。", "결제 컴플라이언스 정책을 업데이트했습니다."));
         await loadAuditLogs();
       } catch (err) {
-        addMessage(pickText(`支付策略更新失败：${err.message}`, `Failed to update payment policy: ${err.message}`, `決済ポリシー更新失敗: ${err.message}`, `결제 정책 업데이트 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "支付策略更新失败", "Failed to update payment policy", "決済ポリシー更新失敗", "결제 정책 업데이트 실패"));
       }
     });
   }
@@ -16408,7 +19602,7 @@ function bindForms() {
       notify(pickText("\u504f\u597d\u8bbe\u7f6e\u5df2\u4fdd\u5b58\u3002", "Preferences saved.", "\u8a2d\u5b9a\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f\u3002", "\ud658\uacbd\uc124\uc815\uc744 \uc800\uc7a5\ud588\uc2b5\ub2c8\ub2e4."), "success");
       await loadAuditLogs();
     } catch (err) {
-      addMessage(pickText(`偏好保存失败：${err.message}`, `Failed to save preferences: ${err.message}`, `設定保存に失敗: ${err.message}`, `환경설정 저장 실패: ${err.message}`));
+      addMessage(formatClientActionError(err, "偏好保存失败", "Failed to save preferences", "設定保存に失敗", "환경설정 저장 실패"));
     }
   });
 
@@ -16420,7 +19614,7 @@ function bindForms() {
       const model = String(form.get("model") || "").trim();
       if (!apiKey) {
         notify(
-          pickText("请先粘贴 OpenAI API Key。", "Paste OpenAI API key first.","先に OpenAI API キーを入力してください。", "먼저 OpenAI API 키를 입력하세요."),
+          pickText("请先填写 AI 服务凭据。", "Enter AI service credentials first.","先に AI サービス資格情報を入力してください。", "먼저 AI 서비스 자격 증명을 입력하세요."),
           "warning",
         );
         return;
@@ -16443,17 +19637,17 @@ function bindForms() {
         renderLlmRuntimeStatus(llm);
         const ok = probe && probe.source === "openai";
         if (!ok && probe && probe.fallbackReason) {
-          el.llmLastErrorText.textContent = `${pickText("最近诊断", "Last diagnose","最近の診断", "최근 진단")}: ${localizeLlmIssue(probe.fallbackReason)}`;
+          el.llmLastErrorText.textContent = `${pickText("最近诊断", "Last diagnosis","最近の診断", "최근 진단")}: ${localizeLlmIssue(probe.fallbackReason)}`;
         }
         notify(
           ok
-            ? pickText("OpenAI 连接成功，已启用 ChatGPT。", "OpenAI connected. ChatGPT enabled.", "OpenAI 接続成功。ChatGPT を有効化しました。", "OpenAI 연결 성공. ChatGPT 활성화됨.")
+            ? pickText("AI 连接成功，已启用智能回复。", "AI connected. Smart replies enabled.", "AI 接続成功。スマート応答を有効化しました。", "AI 연결 성공. 스마트 응답 활성화됨.")
             : pickText("Key 已保存，但探测未通过，请看下方诊断。", "Key saved but probe failed. Check diagnostics below.","キーは保存されましたが、プローブ失敗。下の診断を確認してください。", "키는 저장됐지만 프로브 실패. 아래 진단을 확인하세요."),
           ok ? "success" : "warning",
         );
       } catch (err) {
         notify(
-          pickText(`连接失败：${err.message}`, `Connect failed: ${err.message}`, `接続失敗: ${err.message}`, `연결 실패: ${err.message}`),
+          formatClientActionError(err, "连接失败", "Connect failed", "接続失敗", "연결 실패"),
           "error",
         );
       } finally {
@@ -16498,7 +19692,7 @@ function bindForms() {
         );
         await loadAuditLogs();
       } catch (err) {
-        addMessage(pickText(`模式切换失败：${err.message}`, `Switch mode failed: ${err.message}`, `モード切替失敗: ${err.message}`, `모드 전환 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "模式切换失败", "Switch mode failed", "モード切替失敗", "모드 전환 실패"));
       }
     });
   }
@@ -16520,7 +19714,7 @@ function bindForms() {
       );
       await loadAuditLogs();
     } catch (err) {
-      el.privacyResult.textContent = pickText(`隐私设置更新失败：${err.message}`, `Privacy update failed: ${err.message}`, `プライバシー更新失敗: ${err.message}`, `개인정보 설정 업데이트 실패: ${err.message}`);
+      el.privacyResult.textContent = pickText(`隐私设置更新失败：${describeClientError(err)}`, `Privacy update failed: ${describeClientError(err)}`, `プライバシー更新失敗: ${describeClientError(err)}`, `개인정보 설정 업데이트 실패: ${describeClientError(err)}`);
     }
   });
 
@@ -16541,7 +19735,7 @@ function bindForms() {
         addMessage(pickText("灰度发布已更新。", "Gray rollout updated.","ロールアウト設定を更新しました。", "롤아웃 설정을 업데이트했습니다."));
         await loadDashboard();
       } catch (err) {
-        addMessage(pickText(`灰度更新失败：${err.message}`, `Failed to update rollout: ${err.message}`, `ロールアウト更新失敗: ${err.message}`, `롤아웃 업데이트 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "灰度更新失败", "Failed to update rollout", "ロールアウト更新失敗", "롤아웃 업데이트 실패"));
       }
     });
   }
@@ -16565,7 +19759,7 @@ function bindForms() {
         addMessage(pickText("MCP 策略已更新。", "MCP policy updated.", "MCP ポリシーを更新しました。", "MCP 정책을 업데이트했습니다."));
         await loadDashboard();
       } catch (err) {
-        addMessage(pickText(`MCP 策略更新失败：${err.message}`, `Failed to update MCP policy: ${err.message}`, `MCP ポリシー更新失敗: ${err.message}`, `MCP 정책 업데이트 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "MCP 策略更新失败", "Failed to update MCP policy", "MCP ポリシー更新失敗", "MCP 정책 업데이트 실패"));
       }
     });
   }
@@ -16597,12 +19791,16 @@ function exposeAgentDebugInterface() {
     localStorage.setItem("cx_visits", String(visits));
     if (visits >= 3 && !localStorage.getItem("cx_pwa_dismissed")) {
       setTimeout(() => {
+        if (document.getElementById("cx-login-modal")) return;
+        if (document.getElementById("cx-gdpr-banner")) return;
+        if (_isStarterPromptsVisible()) return;
+        if (document.body.classList.contains("cx-cold-start")) return;
+        document.getElementById("cx-pwa-banner")?.remove();
         const banner = document.createElement("div");
         banner.id = "cx-pwa-banner";
-        banner.style.cssText = "position:fixed;bottom:72px;left:50%;transform:translateX(-50%);background:#1a56db;color:#fff;padding:10px 16px;border-radius:12px;display:flex;align-items:center;gap:12px;z-index:8888;box-shadow:0 4px 16px rgba(0,0,0,0.2);max-width:90vw;font-size:0.85rem";
-        banner.innerHTML = `<span>${pickText("添加 Cross X 到主屏幕", "Add Cross X to Home Screen", "Cross X をホーム画面に追加", "Cross X를 홈 화면에 추가")}</span>
-          <button style="background:#fff;color:#1a56db;border:none;padding:5px 12px;border-radius:8px;cursor:pointer;font-weight:600" id="cx-pwa-install">${pickText("安装", "Install", "インストール", "설치")}</button>
-          <button style="background:transparent;color:#fff;border:none;cursor:pointer;font-size:1.1rem" id="cx-pwa-dismiss">✕</button>`;
+        banner.innerHTML = `<span class="cx-pwa-banner-text">${pickText("添加 Cross X 到主屏幕", "Add Cross X to Home Screen", "Cross X をホーム画面に追加", "Cross X를 홈 화면에 추가")}</span>
+          <button class="cx-pwa-install-btn" id="cx-pwa-install">${pickText("安装", "Install", "インストール", "설치")}</button>
+          <button class="cx-pwa-dismiss-btn" id="cx-pwa-dismiss" aria-label="${pickText("关闭安装提示", "Dismiss install prompt", "インストール案内を閉じる", "설치 안내 닫기")}">✕</button>`;
         document.body.appendChild(banner);
         document.getElementById("cx-pwa-install")?.addEventListener("click", () => {
           _deferredInstall?.prompt();
@@ -16637,7 +19835,7 @@ function _checkWeChatBrowser() {
 
 async function init() {
   // GDPR: show consent banner before any tracking (Art. 7)
-  _checkGdprConsent();
+  _checkGdprConsent({ deferForLoginGate: true });
   // WeChat browser compatibility warning (CX-P1-14)
   _checkWeChatBrowser();
   // Restore conversation history and slots from previous session (up to 4h)
@@ -16654,6 +19852,8 @@ async function init() {
     document.body.classList.add("consumer-app");
     state.viewMode = "user";
     state.singleDialogMode = true;
+    state.surfaceMode = "workspace";
+    _applyCompactTopbarContract();
   }
 
   // Mobile keyboard: when virtual keyboard opens, scroll chatForm into view.
@@ -16667,15 +19867,14 @@ async function init() {
       const form = document.getElementById("chatForm");
       if (!form) return;
       if (keyboardOpen) {
-        // Keyboard just opened — scroll chat to bottom and nudge form into view
+        // Keyboard just opened — keep the live chat viewport anchored to the latest content.
         setTimeout(() => {
-          form.scrollIntoView({ block: "end", behavior: "smooth" });
-          const feed = document.getElementById("chatFeed");
-          if (feed) feed.scrollTop = feed.scrollHeight;
+          _smartScrollToBottom(document.getElementById("chatFeed"), { force: true });
         }, 100);
       }
     });
   }
+  window.addEventListener("resize", _applyCompactTopbarContract, { passive: true });
   // Show language fallback notice once per browser session (not per page load)
   try {
     const _fallbackLang = sessionStorage.getItem("cx_lang_fallback");
@@ -16740,6 +19939,8 @@ async function init() {
   } catch { /* ignore */ }
 
   addMessage(getSystemMessageByKey("welcome_intro"), "agent", { i18nKey: "welcome_intro" });
+  _syncColdStartLayout();
+  document.body.classList.remove("cx-preboot");
   // AI session context banner (restored sessions) or time-aware suggestions (fresh sessions)
   if (state._sessionRestored) {
     setTimeout(() => _renderSessionContextBanner(), 300);
@@ -16750,14 +19951,11 @@ async function init() {
   setTimeout(() => _loadProfileGreeting().catch(() => {}), 800);
   // Phase 2: show recent trip history chips on fresh sessions
   setTimeout(() => _loadTripHistoryChip().catch(() => {}), 1000);
-  // Silently detect location in background to personalize the welcome message
-  setTimeout(() => silentAutoDetectLocation().catch(() => {}), 600);
   // P6: prefetch live FX rates from API gateway
   setTimeout(() => fetchGatewayFx().catch(() => {}), 1200);
   // Feature flags: evaluate for current user and store in state
   setTimeout(() => {
-    const _fuid = _getAuthUserId ? (_getAuthUserId() || getDeviceId()) : getDeviceId();
-    api(`/api/system/flags/evaluate?userId=${encodeURIComponent(_fuid || "guest")}`)
+    api("/api/system/flags/evaluate")
       .then((d) => { if (d && typeof d === "object") { state.featureFlags = d; } })
       .catch(() => {});
   }, 1500);
@@ -16779,28 +19977,48 @@ async function init() {
     }).catch(() => {});
   }, 2000);
 
-  // AP-01/P2-07: Register CrossX Service Worker for offline caching.
-  // Replaces the previous "unregister all" approach — sw.js now properly
-  // handles cache versioning and cleanup of old caches in its activate handler.
+  // Keep local dev and temporary public tunnels free of stale offline shells so the UI
+  // always reflects the currently deployed files.
+  const _swDisabledHosts = new Set(["localhost", "127.0.0.1"]);
+  const _swDisabled =
+    _swDisabledHosts.has(window.location.hostname)
+    || /\.trycloudflare\.com$/i.test(window.location.hostname)
+    || window.location.search.includes("sw=off");
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("/sw.js", { scope: "/" })
-      .then((reg) => {
-        console.log("[SW] Registered, scope:", reg.scope);
-        // Tell any waiting SW to activate immediately
-        if (reg.waiting) reg.waiting.postMessage("SKIP_WAITING");
-        reg.addEventListener("updatefound", () => {
-          const newWorker = reg.installing;
-          if (newWorker) {
-            newWorker.addEventListener("statechange", () => {
-              if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
-                // New SW installed — page reload picks up updates on next navigation
-                console.log("[SW] Update available");
-              }
-            });
+    if (_swDisabled) {
+      navigator.serviceWorker.getRegistrations()
+        .then((regs) => Promise.all(regs.map((reg) => reg.unregister())))
+        .then(async () => {
+          if (window.caches && typeof window.caches.keys === "function") {
+            const keys = await window.caches.keys();
+            await Promise.all(keys.filter((key) => key.startsWith("crossx-")).map((key) => window.caches.delete(key)));
           }
-        });
-      })
-      .catch((err) => console.warn("[SW] Registration failed:", err.message));
+          console.log("[SW] Disabled on this host and cleared CrossX caches");
+        })
+        .catch((err) => console.warn("[SW] Cleanup failed:", getClientErrorCode(err, "service_worker_cleanup_failed")));
+    } else {
+      // AP-01/P2-07: Register CrossX Service Worker for offline caching.
+      // Replaces the previous "unregister all" approach — sw.js now properly
+      // handles cache versioning and cleanup of old caches in its activate handler.
+      navigator.serviceWorker.register("/sw.js", { scope: "/" })
+        .then((reg) => {
+          console.log("[SW] Registered, scope:", reg.scope);
+          // Tell any waiting SW to activate immediately
+          if (reg.waiting) reg.waiting.postMessage("SKIP_WAITING");
+          reg.addEventListener("updatefound", () => {
+            const newWorker = reg.installing;
+            if (newWorker) {
+              newWorker.addEventListener("statechange", () => {
+                if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
+                  // New SW installed — page reload picks up updates on next navigation
+                  console.log("[SW] Update available");
+                }
+              });
+            }
+          });
+        })
+        .catch((err) => console.warn("[SW] Registration failed:", getClientErrorCode(err, "service_worker_registration_failed")));
+    }
   }
 
   bindActions();
@@ -16818,6 +20036,24 @@ async function init() {
   startSupportEtaTicker();
   startChatNotificationTicker();
   updateChatSendState();
+  setConsumerSurface("workspace", { focusComposer: false });
+
+  if (el.brandWrap) {
+    const openHome = () => {
+      if (shouldPreferConciergeHome()) {
+        setConsumerSurface("home", { focusComposer: false });
+      } else {
+        setConsumerSurface("workspace", { focusComposer: false });
+        switchTab("chat", { force: true });
+      }
+    };
+    el.brandWrap.addEventListener("click", openHome);
+    el.brandWrap.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      openHome();
+    });
+  }
 
   if (el.emergencyBtn) {
     el.emergencyBtn.addEventListener("click", async () => {
@@ -16842,7 +20078,7 @@ async function init() {
           await openSupportRoomByTicket(data.ticketId, el.emergencyBtn, { urgent: true, reason: "emergency_fallback_open" });
         }
       } catch (err) {
-        addMessage(pickText(`紧急支持失败：${err.message}`, `Emergency support failed: ${err.message}`, `緊急サポート失敗: ${err.message}`, `긴급 지원 실패: ${err.message}`));
+        addMessage(formatClientActionError(err, "紧急支持失败", "Emergency support failed", "緊急サポート失敗", "긴급 지원 실패"));
       }
     });
   }
@@ -16877,12 +20113,7 @@ async function init() {
     setTimeout(() => {
       runAgentDemoPath(bootDemo).catch((err) => {
         addMessage(
-          pickText(
-            `演示路径启动失败：${err.message}`,
-            `Failed to start demo path: ${err.message}`,
-            `デモパス開始に失敗: ${err.message}`,
-            `데모 경로 시작 실패: ${err.message}`,
-          ),
+          formatClientActionError(err, "演示路径启动失败", "Failed to start demo path", "デモパス開始に失敗", "데모 경로 시작 실패"),
           "agent",
           { speak: false },
         );
@@ -16900,6 +20131,7 @@ async function init() {
       stopSupportRoomRecorder(false).catch(() => {});
       api(`/api/support/sessions/${encodeURIComponent(sid)}/presence`, {
         method: "POST",
+        headers: _supportAccessHeaders(sid),
         body: JSON.stringify({ actor: "user", online: false }),
       }).catch(() => {});
       state.supportRoom.activeSessionId = "";
@@ -16930,10 +20162,18 @@ async function init() {
       state.supportRoom.stream = null;
     }
     const sid = state.supportRoom.activeSessionId;
-    if (sid && navigator.sendBeacon) {
+    if (sid) {
       try {
-        const payload = new Blob([JSON.stringify({ actor: "user", online: false })], { type: "application/json" });
-        navigator.sendBeacon(`/api/support/sessions/${encodeURIComponent(sid)}/presence`, payload);
+        fetch(`/api/support/sessions/${encodeURIComponent(sid)}/presence`, {
+          method: "POST",
+          keepalive: true,
+          headers: {
+            "Content-Type": "application/json",
+            ..._authHeaders(),
+            ..._supportAccessHeaders(sid),
+          },
+          body: JSON.stringify({ actor: "user", online: false }),
+        }).catch(() => {});
       } catch {
         // ignore unload beacon failure
       }
@@ -16986,7 +20226,7 @@ function formatCNY(amountCNY, opts = {}) {
 async function fetchGatewayFx() {
   try {
     const res  = await fetch("/api/gateway/fx");
-    const json = await res.json();
+    const json = await _readJsonResponseSafe(res, {});
     if (json.ok && json.rates) _fxLive.rates = json.rates;
   } catch { /* fallback constants stay in effect */ }
 }
@@ -16999,7 +20239,7 @@ async function fetchCouponBar(destination, barEl) {
   }
   try {
     const res    = await fetch(`/api/gateway/coupons?keyword=${encodeURIComponent(destination)}`);
-    const json   = await res.json();
+    const json   = await _readJsonResponseSafe(res, {});
     const coupon = (json.coupons || [])[0] || null;
     _couponCache.set(destination, coupon);
     _applyCouponBar(barEl, coupon);
@@ -17009,6 +20249,36 @@ async function fetchCouponBar(destination, barEl) {
 function _applyCouponBar(barEl, coupon) {
   if (!barEl) return;
   const lang = state.uiLanguage || "ZH";
+  barEl.classList.remove("cx-status-bar--clickable");
+  barEl.onclick = null;
+
+  const normalizeCouponShopName = (name) => {
+    const raw = String(name || "").trim();
+    if (!raw) return "";
+    if (state.uiLanguage !== "ZH" && /[\u4e00-\u9fff]/.test(raw)) {
+      return pickText(raw, "CrossX Dining Picks", "CrossX グルメセレクション", "CrossX 맛집 셀렉션");
+    }
+    if (/CrossX\s+.+精选美食/.test(raw)) {
+      const city = raw.replace(/^CrossX\s+/, "").replace(/\s*精选美食$/, "").trim();
+      return pickText(
+        `CrossX ${city} 精选美食`,
+        `CrossX ${city} Dining Picks`,
+        `CrossX ${city} グルメセレクション`,
+        `CrossX ${city} 맛집 셀렉션`
+      );
+    }
+    return raw;
+  };
+  const normalizeCouponSalesLabel = (sales) => {
+    const raw = String(sales || "").trim();
+    if (!raw) return "";
+    const m = raw.match(/月售\s*([0-9+万wWkK]+)/);
+    if (m) {
+      const qty = m[1];
+      return pickText(`月售${qty}`, `${qty} sold this month`, `今月${qty}件`, `이번 달 ${qty}건`);
+    }
+    return raw;
+  };
 
   if (!coupon) {
     barEl.innerHTML = `<span class="cx-sb-icon">✈️</span><span class="cx-sb-text">${
@@ -17019,8 +20289,8 @@ function _applyCouponBar(barEl, coupon) {
 
   // ── Restaurant/store format (from fetchJutuiRestaurants via ele/store_list) ──
   if ("monthly_sales" in coupon || "biz_type" in coupon) {
-    const name  = coupon.shop_name || "";
-    const sales = coupon.monthly_sales || "";
+    const name  = normalizeCouponShopName(coupon.shop_name || "");
+    const sales = normalizeCouponSalesLabel(coupon.monthly_sales || "");
     const label = name
       ? { ZH: `附近美食: ${name}${sales ? " · " + sales : ""}`, EN: `Nearby: ${name}${sales ? " · " + sales : ""}`, JA: `近く: ${name}${sales ? " · " + sales : ""}`, KO: `근처: ${name}${sales ? " · " + sales : ""}`, MY: `Berdekatan: ${name}` }[lang] || name
       : { ZH:"已接入本地美食数据", EN: "Local dining data active", JA:"ローカルグルメ接続済み", KO: "로컬 맛집 연결됨", MY: "Data makanan lokal aktif" }[lang] || "Local dining data active";
@@ -17040,7 +20310,7 @@ function _applyCouponBar(barEl, coupon) {
   const label = { ZH: `专属优惠券 ¥${price}`, EN: `¥${price} Voucher`, JA: `クーポン ¥${price}`, KO: `쿠폰 ¥${price}`, MY: `Baucar ¥${price}` }[lang] || `¥${price} Off`;
   barEl.innerHTML = `<span class="cx-sb-icon">🎫</span><span class="cx-sb-text">${escapeHtml(label)}</span>`;
   if (h5url && h5url !== "#cx-book") {
-    barEl.style.cursor = "pointer";
+    barEl.classList.add("cx-status-bar--clickable");
     barEl.onclick = () => window.open(h5url, "_blank", "noopener");
   }
 }
@@ -17085,8 +20355,8 @@ function buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, cozeData) {
   // P10: real photo or explicit "暂无实拍图" placeholder — zero fake stock images
   const heroHtml = finalHero
     ? `<img class="cx-detail-hero" src="${finalHero}" alt="${restName}" loading="lazy"
-         onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`
-      + `<div class="cx-rest-no-photo" style="display:none">📷 ${pickText("暂无实拍图","No photo yet","実写なし","실사 없음")}</div>`
+         data-error-hide="1" data-error-show-next="1">`
+      + `<div class="cx-rest-no-photo hidden">📷 ${pickText("暂无实拍图","No photo yet","実写なし","실사 없음")}</div>`
     : `<div class="cx-rest-no-photo">📷 ${pickText("暂无实拍图","No photo yet","実写なし","실사 없음")}</div>`;
 
   const el = document.createElement("div");
@@ -17095,7 +20365,7 @@ function buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, cozeData) {
     ${heroHtml}
     <div class="cx-detail-body">
       <div class="cx-detail-rest-name">${restName}</div>
-      <div class="cx-detail-meta" style="gap:10px;flex-wrap:wrap">
+      <div class="cx-detail-meta cx-detail-meta--wide">
         ${rating     ? `<span class="cx-rest-score">★ ${rating} <span class="cx-rest-score-label">${pickText("大众评分","Rating","評点","평점")}</span></span>` : ""}
         ${finalPrice ? `<span class="cx-rest-avgprice">${pickText("人均","Avg","人均","인당")} ¥${finalPrice}</span>` : ""}
         ${queueMin   ? `<span class="cx-rest-queue">⏳ ${pickText("排队约","Wait ~","待ち約","대기 약")}${queueMin}${pickText("分钟","min","分","분")}</span>` : ""}
@@ -17116,12 +20386,12 @@ function buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, cozeData) {
       <div class="cx-detail-actions">
         <button class="cx-detail-itin-btn"
           data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
-          onclick="cxDetailOpenItinerary(this)">
+          data-action="detail-open-itinerary">
           ${pickText("查看完整美食路线 ↓","View Full Food Trail ↓","グルメルートを見る ↓","맛집 코스 보기 ↓")}
         </button>
         <button class="cx-detail-book-btn"
           data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
-          onclick="cxGoToCheckout(this)">
+          data-action="detail-go-to-checkout">
           ${pickText("预订此方案 →","Book This Plan →","このプランを予約 →","이 플랜 예약 →")}
         </button>
       </div>
@@ -17129,7 +20399,42 @@ function buildRestaurantDetailHTML(p, cardId, planIdx, spokenText, cozeData) {
   return el;
 }
 
-function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
+function _isGenericPlanHero(url) {
+  const raw = String(url || "").trim().toLowerCase();
+  if (!raw) return true;
+  return raw.includes("/api/city-photo") || raw.includes("/api/placeholder");
+}
+
+function _truncatePlanDetailLabel(value, max = 26) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  return raw.length > max ? `${raw.slice(0, max - 1)}…` : raw;
+}
+
+function _buildPlanDetailHeroMarkup({ heroUrl, hotelName, cityLabel, hotelRating, hotelRevCount, ppn, hotelTags }) {
+  if (heroUrl && !_isGenericPlanHero(heroUrl)) {
+    return `<img class="cx-detail-hero" src="${heroUrl}" alt="${escapeHtml(hotelName || cityLabel || "Plan cover")}" loading="lazy" data-error-hide="1">`;
+  }
+  const initials = escapeHtml((hotelName || cityLabel || "CX").split(/\s+/).slice(0, 2).map((part) => part.slice(0, 1).toUpperCase()).join("") || "CX");
+  const factRows = [];
+  if (hotelRating) factRows.push(`★ ${escapeHtml(String(hotelRating))}`);
+  if (hotelRevCount) factRows.push(escapeHtml(hotelRevCount));
+  if (ppn) factRows.push(`¥${escapeHtml(String(ppn))}${pickText("/晚", "/night", "/泊", "/박")}`);
+  hotelTags.slice(0, 2).forEach((tag) => factRows.push(escapeHtml(tag)));
+  if (!factRows.length && cityLabel) factRows.push(escapeHtml(cityLabel));
+  return `
+    <div class="cx-detail-hero-cover">
+      <div class="cx-detail-hero-cover__eyebrow">${pickText("行程封面", "Plan Cover", "プラン概要", "플랜 개요")}</div>
+      <div class="cx-detail-hero-cover__monogram">${initials}</div>
+      <div class="cx-detail-hero-cover__title">${escapeHtml(hotelName || cityLabel || pickText("精选行程", "Curated stay", "厳選プラン", "큐레이션 숙소"))}</div>
+      <div class="cx-detail-hero-cover__meta">${escapeHtml(cityLabel || pickText("中国旅行", "China travel", "中国旅行", "중국 여행"))}</div>
+      <div class="cx-detail-hero-cover__facts">${factRows.map((item) => `<span class="cx-detail-hero-cover__fact">${item}</span>`).join("")}</div>
+      <div class="cx-detail-hero-cover__note">${pickText("当前暂无核验过的酒店实拍图，先展示关键信息摘要。", "No verified property photo yet. Showing a contextual summary instead.", "確認済みの宿泊写真がないため、要点サマリーを表示しています。", "검증된 숙소 사진이 없어 핵심 정보 요약을 먼저 보여줍니다.")}</div>
+    </div>
+  `;
+}
+
+function buildPlanDetailHtml(p, cardId, planIdx, spokenText, days) {
   // P9: Polymorphic template — food_only → buildRestaurantDetailHTML, travel → hotel UI
   const layoutType = state._layoutType || "travel_full";
   const isFoodDetail = layoutType === "food_only";
@@ -17142,11 +20447,38 @@ function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
   el.className = "cx-plan-detail";
 
   // ── Travel / stay mode: hotel detail (original template) ───────────────────
-  const heroUrl       = p.hotel?.hero_image || "";
-  const ppn           = p.hotel?.price_per_night || 0;
-  const hotelRating   = p.hotel?.rating || 0;
-  const hotelRevCount = p.hotel?.review_count || "";
-  const hotelGuestRev = p.hotel?.guest_review || "";
+  const hotel = p.hotel || {};
+  const heroUrl       = hotel.hero_image || "";
+  const hotelNameText = paymentDisplayTitle({
+    hotelDisplay: p.hotelDisplay || hotel.name || "",
+    hotelName: p.hotel_name || hotel.name || "",
+    title: p.title || "",
+  }) || "";
+  const ppn           = hotel.price_per_night || p.hotel_price_per_night || 0;
+  const hotelRating   = hotel.rating || p.hotel_rating || p.hotel_ctrip_score || 0;
+  const hotelRevCount = _normalizeReviewCountText(hotel.review_count || p.hotel_review_count || p.hotel_ctrip_review_count || "");
+  const hotelGuestRev = _derivePlanReviewText(p);
+  const hotelTags     = _derivePlanHighlights(p);
+  const hotelShortName = _truncatePlanDetailLabel(hotelNameText || hotel.name || p.hotelDisplay || p.hotel_name || p.title || "");
+  const cityLabel = _localizeUiCityName(p.destination || p.city || getCurrentCity() || "China", state.uiLanguage);
+  const heroMarkup = _buildPlanDetailHeroMarkup({
+    heroUrl,
+    hotelName: hotelNameText,
+    cityLabel,
+    hotelRating,
+    hotelRevCount,
+    ppn,
+    hotelTags,
+  });
+  const ctripHotelLinkLabel = hotelShortName
+    ? pickText(`携程查看「${hotelShortName}」`, `Open "${hotelShortName}" on Ctrip`, `Ctripで「${hotelShortName}」を見る`, `Ctrip에서 "${hotelShortName}" 보기`)
+    : pickText("携程订酒店", "Open on Ctrip", "Ctripで見る", "Ctrip에서 보기");
+  const bookingHotelLinkLabel = hotelShortName
+    ? pickText(`Booking.com · ${hotelShortName}`, `Booking.com · ${hotelShortName}`, `Booking.com · ${hotelShortName}`, `Booking.com · ${hotelShortName}`)
+    : "Booking.com";
+  const agodaHotelLinkLabel = hotelShortName
+    ? pickText(`Agoda · ${hotelShortName}`, `Agoda · ${hotelShortName}`, `Agoda · ${hotelShortName}`, `Agoda · ${hotelShortName}`)
+    : "Agoda";
 
   const highlights = (p.highlights || []).slice(0, 5).map((h) =>
     `<li><span class="opt-check">✓</span>${escapeHtml(h)}</li>`
@@ -17163,54 +20495,182 @@ function buildPlanDetailHtml(p, cardId, planIdx, spokenText) {
     { label: pickText("活动","Activities","アクティビティ","활동"), key: "activities",    color: "#8b5cf6" },
     { label: pickText("杂项","Misc.","その他","기타"),             key: "misc",          color: "#94a3b8" },
   ].filter((e) => (p.budget_breakdown || {})[e.key] > 0);
-  const bbTotal = bbEntries.reduce((s, e) => s + ((p.budget_breakdown || {})[e.key] || 0), 0) || 1;
-  const bbBar = bbEntries.map((e) => {
-    const pct = Math.max(4, Math.round(((p.budget_breakdown || {})[e.key] || 0) / bbTotal * 100));
-    return `<div class="opt-bb-seg" style="width:${pct}%;background:${e.color}"></div>`;
-  }).join("");
   const bbLegend = bbEntries.map((e) =>
-    `<span class="opt-bb-item"><span style="background:${e.color}"></span>${e.label} ¥${Number((p.budget_breakdown || {})[e.key] || 0).toLocaleString()} CNY</span>`
+    `<span class="opt-bb-item"><span class="opt-bb-item-dot opt-bb-item-dot--${escapeHtml(e.key)}"></span>${e.label} ¥${Number((p.budget_breakdown || {})[e.key] || 0).toLocaleString()} CNY</span>`
   ).join("");
 
   el.innerHTML = `
-    ${heroUrl ? `<img class="cx-detail-hero" src="${heroUrl}" alt="" loading="lazy" onerror="this.style.display='none'">` : ""}
+    ${heroMarkup}
     <div class="cx-detail-body">
-      <div class="cx-detail-hotel-name">${escapeHtml(p.hotel?.name || "")}</div>
+      <div class="cx-detail-hotel-name">${escapeHtml(hotelNameText)}</div>
       <div class="cx-detail-meta">
         ${hotelRating   ? `<span class="opt-hotel-stars">★ ${hotelRating}</span>` : ""}
         ${hotelRevCount ? `<span class="opt-hotel-revcount">${escapeHtml(hotelRevCount)}</span>` : ""}
         ${ppn           ? `<span class="opt-hotel-ppn">¥${ppn}${pickText("/晚","/night","/泊","/박")}</span>` : ""}
       </div>
-      ${hotelGuestRev ? `<div class="opt-hotel-guestrev">"${escapeHtml(hotelGuestRev)}"</div>` : ""}
+      ${hotelTags.length ? `<div class="cx-lc-hotel-tags cx-lc-hotel-tags--tight">${hotelTags.slice(0,3).map(t=>`<span class="cx-ctrip-tag">${escapeHtml(t)}</span>`).join("")}</div>` : ""}
       ${whyText ? `
       <div class="cx-detail-why">
         <div class="cx-detail-why-label">${pickText("为何推荐","Why We Recommend This","おすすめの理由","추천 이유")}</div>
         ${whyText}
       </div>` : ""}
       <div class="cx-detail-divider"></div>
+      ${(() => {
+        // Build a scrollable list of review cards from all available review sources
+        const reviewItems = [];
+        // Determine data source for accurate provenance labeling
+        const hotelSrc = p.hotel_source || p.source || "";
+        const isLiveScrape = hotelSrc === "ctrip_live" || hotelSrc === "trip_live";
+        const isCurated   = hotelSrc === "ctrip_curated" || hotelSrc === "ctrip_list_live";
+        const liveLabel   = pickText("携程·实时评价","Ctrip · Live Review","Ctrip · リアル口コミ","씨트립 · 실시간 리뷰");
+        const curatedLabel= pickText("携程·精选","Ctrip · Curated","Ctrip · 厳選","씨트립 · 큐레이션");
+        const defaultLabel= pickText("用户评价","Guest Review","口コミ","이용 후기");
+        const primarySourceLabel = isLiveScrape ? liveLabel : isCurated ? curatedLabel : defaultLabel;
+        // 1. Primary guest_review (from plan or hotel)
+        const primary = (p.guest_review || p.hotel?.guest_review || p.hotel_guest_review || "").trim();
+        if (primary) reviewItems.push({ text: primary, source: primarySourceLabel, live: isLiveScrape });
+        // 2. Ctrip review array
+        if (Array.isArray(p.hotel_ctrip_reviews)) {
+          p.hotel_ctrip_reviews.slice(0, 3).forEach((r) => {
+            const t = String(r || "").trim();
+            if (t && t !== primary) reviewItems.push({ text: t, source: primarySourceLabel, live: isLiveScrape });
+          });
+        }
+        // 3. Other review fields
+        [p.review, p.user_review].forEach((r) => {
+          const t = String(r || "").trim();
+          if (t && !reviewItems.some(x => x.text === t)) reviewItems.push({ text: t, source: defaultLabel, live: false });
+        });
+        if (!reviewItems.length) return "";
+        const cards = reviewItems.map(r => `
+          <div class="cx-review-card">
+            <div class="cx-review-quote">"${escapeHtml(r.text)}"</div>
+            <div class="cx-review-meta">
+              <span class="cx-review-stars">★★★★★</span>
+              <span class="cx-review-source${r.live ? " cx-review-source--live" : ""}">${r.live ? "✅ " : ""}${escapeHtml(_localizeVisibleTravelText(r.source || "", r.source || ""))}</span>
+            </div>
+          </div>`).join("");
+        const sectionLabel = isLiveScrape
+          ? pickText("真实用户评价（实时爬取）","Real Guest Reviews (Live)","リアル口コミ（ライブ取得）","실제 이용 후기 (실시간)")
+          : pickText("用户评价","Guest Reviews","口コミ","이용 후기");
+        return `
+          <div class="cx-detail-section-label">${sectionLabel}</div>
+          <div class="cx-review-list">${cards}</div>`;
+      })()}
       <div class="cx-detail-section-label">${pickText("交通方案","Transport","交通","교통")}</div>
-      <div class="cx-detail-transport">${escapeHtml(p.transport_plan || "")}</div>
+      ${(() => {
+        const opts = Array.isArray(p.transport_options) && p.transport_options.length ? p.transport_options : null;
+        if (opts) {
+          const rows = opts.map(o => {
+            const costStr = o.cost > 0 ? `¥${o.cost}` : pickText("免费","Free","無料","무료");
+            return `<div class="cx-transport-opt">
+              <span class="cx-transport-icon">${escapeHtml(o.icon||"🚌")}</span>
+              <div class="cx-transport-info">
+                <span class="cx-transport-label">${escapeHtml(_localizeVisibleTravelText(o.label || "", o.label || ""))}</span>
+                <span class="cx-transport-meta">${escapeHtml(_localizeVisibleTravelText(o.duration || "", o.duration || ""))} · ${costStr}</span>
+                ${o.note ? `<span class="cx-transport-note">${escapeHtml(_localizeVisibleTravelText(o.note, o.note))}</span>` : ""}
+                ${o.url ? `<a class="secondary cx-transport-link" href="${escapeHtml(o.url)}" target="_blank" rel="noopener">${pickText("打开","Open","開く","열기")}</a>` : ""}
+              </div>
+            </div>`;
+          }).join("");
+          return `<div class="cx-transport-grid">${rows}</div>`;
+        }
+        return `<div class="cx-detail-transport">${escapeHtml(p.transport_plan || "")}</div>`;
+      })()}
       <div class="cx-detail-section-label">${pickText("亮点","Highlights","ハイライト","하이라이트")}</div>
       <ul class="opt-highlights">${highlights}</ul>
-      ${bbBar ? `
+      ${bbLegend ? `
       <div class="cx-detail-section-label">${pickText("预算分配","Budget Breakdown","予算内訳","예산 배분")}</div>
-      <div class="opt-bb-bar" style="height:6px;margin:0 0 6px">${bbBar}</div>
       <div class="opt-bb-legend">${bbLegend}</div>` : ""}
+      ${(() => {
+        // ── Per-day itinerary embedded in detail panel (multi-day plans) ──────
+        const daysArr = Array.isArray(days) ? days : [];
+        if (daysArr.length < 2) return "";
+        const ACT_ICONS = {
+          food: "🍜", restaurant: "🍜", meal: "🍽️", breakfast: "☕",
+          lunch: "🥢", dinner: "🍷",
+          sightseeing: "🏛️", attraction: "🏛️", museum: "🖼️",
+          temple: "⛩️", park: "🌳", activity: "🎯",
+          hotel: "🏨", transport: "🚄", city_change: "🚌",
+          shopping: "🛍️", nightlife: "🌙",
+          default: "📍",
+        };
+        const dayCards = daysArr.map((d, di) => {
+          const dayLabel = pickText(`第${d.day || di+1}天`, `Day ${d.day || di+1}`, `${d.day || di+1}日目`, `${d.day || di+1}일차`);
+          const dayCity  = d.city ? escapeHtml(_localizeUiCityName(d.city)) : "";
+          const acts = Array.isArray(d.activities) ? d.activities : [];
+          // Pick up to 4 highlights; prefer non-transport types for the preview
+          const previewActs = acts.slice(0, 5).filter(a => !/^(transport|city_change)$/i.test(a.type||"")).slice(0, 4);
+          const fallbackActs = previewActs.length ? previewActs : acts.slice(0, 3);
+          const actRows = fallbackActs.map(act => {
+            const icon = ACT_ICONS[act.type] || ACT_ICONS.default;
+            const imgSrc = act.image_url || act.real_photo_url || "";
+            const actName = escapeHtml(_localizeVisibleTravelText(act.name || "", ""));
+            const actNote = escapeHtml(_localizeVisibleTravelText(act.desc || act.note || "", ""));
+            const timeBadge = act.time ? `<span class="cx-dact-time">${escapeHtml(act.time)}</span>` : "";
+            const costRaw = act.cost_cny || act.cost || 0;
+            const costStr = costRaw > 0 ? `<span class="cx-dact-cost">¥${Number(costRaw).toLocaleString()}</span>` : "";
+            // Real user review / vibe text for this activity
+            const vibe = _localizeVisibleTravelText(act.real_vibe || act.real_vibes || act.insider_tip || act.insider_tips || "", "");
+            const vibeHtml = vibe ? `<div class="cx-dact-vibe">"${escapeHtml(vibe)}"</div>` : "";
+            return `<div class="cx-dact-row">
+              ${imgSrc ? `<img class="cx-dact-img" src="${imgSrc}" alt="${actName}" loading="lazy" data-error-hide="1">` : `<span class="cx-dact-icon">${icon}</span>`}
+              <div class="cx-dact-body">
+                <div class="cx-dact-name">${timeBadge}${actName}${costStr}</div>
+                ${actNote ? `<div class="cx-dact-note">${actNote}</div>` : ""}
+                ${vibeHtml}
+              </div>
+            </div>`;
+          }).join("");
+          // Hotel for the night
+          const nightHotel = d.hotel?.name || "";
+          const nightHotelReview = d.hotel ? (d.hotel.tip || _derivePlanReviewText({ hotel: d.hotel }) || "") : "";
+          const hotelHtml = nightHotel ? `
+            <div class="cx-dact-hotel-row">
+              <span class="cx-dact-hotel-icon">🏨</span>
+              <div class="cx-dact-hotel-info">
+                <span class="cx-dact-hotel-name">${escapeHtml(nightHotel)}</span>
+                ${nightHotelReview ? `<div class="cx-dact-hotel-review">"${escapeHtml(nightHotelReview)}"</div>` : ""}
+              </div>
+            </div>` : "";
+          // Day budget
+          const dayBudget = (d.budget_cny || d.day_budget_cny || 0);
+          const budgetHtml = dayBudget > 0 ? `<div class="cx-dact-day-budget">${pickText("当日预算","Day Budget","当日予算","당일 예산")} ¥${Number(dayBudget).toLocaleString()}</div>` : "";
+          return `<div class="cx-detail-day-card">
+            <div class="cx-detail-day-head">
+              <span class="cx-detail-day-label">${dayLabel}</span>
+              ${dayCity ? `<span class="cx-detail-day-city">📍 ${dayCity}</span>` : ""}
+              ${budgetHtml}
+            </div>
+            <div class="cx-dact-list">${actRows || `<div class="cx-dact-empty">${pickText("暂无活动详情","No activities yet","アクティビティ未定","활동 미정")}</div>`}</div>
+            ${hotelHtml}
+          </div>`;
+        }).join("");
+        return `
+          <div class="cx-detail-divider"></div>
+          <div class="cx-detail-section-label">${pickText("逐日行程安排","Day-by-Day Itinerary","日程の詳細","일별 일정")}</div>
+          <div class="cx-detail-days-wrap">${dayCards}</div>`;
+      })()}
       <div class="cx-detail-actions">
+        <button class="cx-detail-confirm-btn"
+          data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
+          data-action="confirm-itinerary">
+          ✅ ${pickText("确认此行程","Confirm Itinerary","この行程を確定","일정 확정")}
+        </button>
         <button class="cx-detail-itin-btn"
           data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
-          onclick="cxDetailOpenItinerary(this)">
+          data-action="detail-open-itinerary">
           ${pickText("查看逐日行程 ↓","View Itinerary ↓","日程を見る ↓","일정 보기 ↓")}
         </button>
         ${p.hotel?.name ? (
           (state.uiLanguage === "ZH")
-            ? `<a class="cx-detail-hotel-link" href="https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏨 携程订酒店</a>`
-            : `<a class="cx-detail-hotel-link" href="${PLATFORM_DEEPLINKS.booking.url(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏨 Book on Booking.com</a>
-               <a class="cx-detail-hotel-link" href="${PLATFORM_DEEPLINKS.agoda.url(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏩 Agoda</a>`
+            ? `<a class="cx-detail-hotel-link" href="https://m.ctrip.com/webapp/hotel/search/?keyword=${encodeURIComponent(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏨 ${escapeHtml(ctripHotelLinkLabel)}</a>`
+            : `<a class="cx-detail-hotel-link" href="${PLATFORM_DEEPLINKS.booking.url(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏨 ${escapeHtml(bookingHotelLinkLabel)}</a>
+               <a class="cx-detail-hotel-link" href="${PLATFORM_DEEPLINKS.agoda.url(p.hotel.name)}" target="_blank" rel="noopener noreferrer">🏩 ${escapeHtml(agodaHotelLinkLabel)}</a>`
         ) : ""}
         <button class="cx-detail-book-btn"
           data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
-          onclick="cxGoToCheckout(this)">
+          data-action="detail-go-to-checkout">
           ${pickText("预订此方案 →","Book This Plan →","このプランを予約 →","이 플랜 예약 →")}
         </button>
       </div>
@@ -17247,7 +20707,7 @@ function buildCheckoutHtml(p, cardId, planIdx) {
     { icon: "💚", label: "CrossX Pay (WeChat)",  method: "wxpay"  },
     { icon: "💙", label: "CrossX Pay (Alipay)",  method: "alipay" },
   ].map((pm, i) =>
-    `<div class="cx-pm-row${i === 0 ? " cx-pm-selected" : ""}" onclick="cxSelectPayMethod(this)" data-method="${pm.method}">
+    `<div class="cx-pm-row${i === 0 ? " cx-pm-selected" : ""}" data-action="checkout-select-pay-method" data-method="${pm.method}">
       <span class="cx-pm-icon">${pm.icon}</span>
       <span class="cx-pm-label">${pm.label}</span>
       <span class="cx-pm-radio"></span>
@@ -17280,7 +20740,7 @@ function buildCheckoutHtml(p, cardId, planIdx) {
       <div class="cx-co-divider"></div>
       <button class="cx-pay-btn"
         data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
-        onclick="cxGoToPayment(this)">
+        data-action="checkout-go-to-payment">
         <span class="cx-pay-lock">🔒</span>
         <span class="cx-pay-label">${pickText("确认预订","Confirm Booking","予約を確認","예약 확인")}</span>
         <span class="cx-pay-arrow">→</span>
@@ -17294,7 +20754,7 @@ function buildCheckoutHtml(p, cardId, planIdx) {
     </div>
 
     <!-- Step 2: Payment method selection -->
-    <div class="cx-pay-step" style="display:none">
+    <div class="cx-pay-step hidden">
       <div class="cx-co-summary">
         <div class="cx-co-hotel">${pickText("选择支付方式","Select Payment","支払い方法","결제 방법 선택")}</div>
         <div class="cx-co-meta">${pickText("应付","Due","支払金額","결제 금액")}: ¥${Number(total).toLocaleString()}${totalFxInline}</div>
@@ -17302,7 +20762,7 @@ function buildCheckoutHtml(p, cardId, planIdx) {
       <div class="cx-payment-methods">${pmMethods}</div>
       <button class="cx-pay-btn"
         data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id || "")}" data-idx="${planIdx}"
-        onclick="cxProcessPayment(this)">
+        data-action="checkout-process-payment">
         <span class="cx-pay-lock">🔒</span>
         <span class="cx-pay-label">${pickText("立即支付","Pay Now","今すぐ支払う","지금 결제")} ¥${Number(total).toLocaleString()}${totalFxInline}</span>
         <span class="cx-pay-arrow">→</span>
@@ -17310,7 +20770,7 @@ function buildCheckoutHtml(p, cardId, planIdx) {
     </div>
 
     <!-- Step 3: Syncing animation -->
-    <div class="cx-pay-step cx-pay-syncing" style="display:none">
+    <div class="cx-pay-step cx-pay-syncing hidden">
       <div class="cx-pay-spinner"></div>
       <div class="cx-pay-sync-text">${pickText("正在与航司同步状态...","Syncing with airline...","航空会社と同期中...","항공사와 동기화 중...")}</div>
       <div class="cx-pay-sync-sub">${pickText("通常约15秒","Usually ~15s","通常約15秒","보통 ~15초")}</div>
@@ -17322,8 +20782,8 @@ function buildCheckoutHtml(p, cardId, planIdx) {
 function cxGoToPayment(btn) {
   const steps = btn.closest(".cx-checkout")?.querySelectorAll(".cx-pay-step");
   if (!steps) return;
-  steps[0].style.display = "none";
-  steps[1].style.display = "flex";
+  steps[0].classList.add("hidden");
+  steps[1].classList.remove("hidden");
 }
 
 // Toggle payment method highlight
@@ -17346,8 +20806,8 @@ async function cxProcessPayment(btn) {
   const method = checkout.querySelector(".cx-pm-selected")?.dataset.method || "card";
 
   // Show syncing step
-  if (steps[1]) steps[1].style.display = "none";
-  if (steps[2]) steps[2].style.display = "flex";
+  if (steps[1]) steps[1].classList.add("hidden");
+  if (steps[2]) steps[2].classList.remove("hidden");
 
   // Resolve plan data for order creation
   const card = document.getElementById(cardId);
@@ -17385,12 +20845,12 @@ async function cxProcessPayment(btn) {
         total: Number(chosenPlan.total_price || 0),
       }),
     });
-    const json = await resp.json();
+    const json = await _readJsonResponseSafe(resp, {});
     if (json.ok) orderRef = json.ref;
-  } catch (orderErr) { console.warn("[booking] order/create failed → using client-side ref:", orderErr.message); }
+  } catch (orderErr) { console.warn("[booking] order/create failed → using client-side ref:", getClientErrorCode(orderErr, "order_create_failed")); }
 
   // Client-side fallback ref if backend unreachable
-  if (!orderRef) orderRef = "CXS-" + Date.now().toString(36).slice(-5).toUpperCase();
+  if (!orderRef) orderRef = `xord_${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
 
   // Mobile wallets: open H5 pay URL
   const coupon = _couponCache.get(destination);
@@ -17402,17 +20862,20 @@ async function cxProcessPayment(btn) {
   for (let i = 0; i < 4; i++) {
     await new Promise((r) => setTimeout(r, 800));
     try {
-      const sr = await fetch(`/api/order/status?ref=${encodeURIComponent(orderRef)}`);
-      const sj = await sr.json();
+      const deviceId = typeof getDeviceId === "function" ? getDeviceId() : "";
+      const statusQuery = new URLSearchParams({ ref: orderRef });
+      if (deviceId) statusQuery.set("deviceId", deviceId);
+      const sr = await fetch(`/api/order/status?${statusQuery.toString()}`, { headers: _authHeaders() });
+      const sj = await _readJsonResponseSafe(sr, {});
       if (sj.status === "confirmed") break;
-    } catch (pollErr) { console.warn("[booking] order/status poll failed:", pollErr.message); }
+    } catch (pollErr) { console.warn("[booking] order/status poll failed:", getClientErrorCode(pollErr, "order_status_poll_failed")); }
   }
   clearInterval(ticker);
 
   // Replace syncing UI with booking voucher
   if (steps[2]) {
     steps[2].classList.remove("cx-pay-syncing");
-    steps[2].style.display = "block";
+    steps[2].classList.remove("hidden");
     steps[2].innerHTML = buildVoucherHtml(orderRef, chosenPlan, destination, method);
   }
 
@@ -17455,6 +20918,133 @@ function buildVoucherHtml(ref, plan, destination, method) {
 }
 
 // ── P5: slide-to-checkout / slide-back ────────────────────────────────────
+// ── Confirm Itinerary — one-click confirmed itinerary card ─────────────────
+/**
+ * cxConfirmItinerary: generates a clean confirmed itinerary snapshot card
+ * showing the selected plan's hotel, transport options, and daily schedule.
+ * Different from cxGoToCheckout (payment flow) — this is a sharable view.
+ */
+function cxConfirmItinerary(btn) {
+  const cardId  = btn.dataset.card;
+  const planId  = btn.dataset.plan;
+  const planIdx = parseInt(btn.dataset.idx, 10);
+
+  const card = document.getElementById(cardId);
+  if (!card) return;
+  let plans = [];
+  try { plans = JSON.parse(card.dataset.plans || "[]"); } catch {}
+  const cd = _planCardData.get(cardId) || state.lastAiPlan?.cd;
+  const p = plans[planIdx];
+  if (!p) return;
+
+  // Build confirmed itinerary card HTML
+  const dest = escapeHtml(_localizeUiCityName(cd?.destination || "") || "");
+  const dur = cd?.duration_days || (cd?.days || []).length || "";
+  const pax = cd?.pax || 1;
+  const hotel = p.hotel || {};
+  const hotelName = escapeHtml(paymentDisplayTitle({
+    hotelDisplay: p.hotelDisplay || hotel.name || "",
+    hotelName: p.hotel_name || hotel.name || "",
+    title: p.title || "",
+  }) || "");
+  const tag = escapeHtml(p.tag || "");
+  const totalPrice = Number(p.total_price || 0);
+  const guestReview = _derivePlanReviewText(p);
+  const review = guestReview ? `<div class="cx-confirmed-review"><span class="cx-confirmed-review-icon">💬</span>${escapeHtml(guestReview)}</div>` : "";
+
+  // Transport options list
+  const transportHtml = (() => {
+    const opts = Array.isArray(p.transport_options) && p.transport_options.length ? p.transport_options : null;
+    if (opts) {
+      return opts.map(o => {
+        const cost = o.cost > 0 ? ` · ¥${o.cost}` : "";
+        return `<div class="cx-confirmed-transport-row">
+          <span>${escapeHtml(o.icon||"🚌")}</span>
+          <span class="cx-confirmed-transport-name">${escapeHtml(_localizeVisibleTravelText(o.label || "", o.label || ""))}</span>
+          <span class="cx-confirmed-transport-meta">${escapeHtml(_localizeVisibleTravelText(o.duration || "", o.duration || ""))}${cost}</span>
+          ${o.url ? `<a class="secondary cx-confirmed-transport-link" href="${escapeHtml(o.url)}" target="_blank" rel="noopener">${pickText("打开","Open","開く","열기")}</a>` : ""}
+        </div>`;
+      }).join("");
+    }
+    return `<div class="cx-confirmed-transport-fallback">${escapeHtml(p.transport_plan || "")}</div>`;
+  })();
+
+  // Day highlights
+  const dayItems = (cd?.days || []).slice(0, 5).map(d => {
+    const acts = (d.activities || []).slice(0, 3).map(a => `<span class="cx-confirmed-act">${escapeHtml(a.name || "")}</span>`).join("");
+    return `<div class="cx-confirmed-day">
+      <div class="cx-confirmed-day-label">${escapeHtml(d.label || `Day ${d.day}`)}</div>
+      <div class="cx-confirmed-act-row">${acts}</div>
+    </div>`;
+  }).join("");
+
+  const confirmedEl = document.createElement("div");
+  confirmedEl.className = "cx-confirmed-itin";
+  confirmedEl.innerHTML = `
+    <div class="cx-confirmed-header">
+      <div class="cx-confirmed-dest">${dest}</div>
+      <div class="cx-confirmed-meta">
+        <span>✅ ${pickText("已确认方案","Plan Confirmed","プラン確定","플랜 확정")}</span>
+        <span class="cx-confirmed-tag">${tag}</span>
+      </div>
+      <div class="cx-confirmed-chips">
+        ${dur ? `<span class="cx-confirmed-chip">🗓 ${dur}${pickText("天","d","日","일")}</span>` : ""}
+        ${pax > 1 ? `<span class="cx-confirmed-chip">👥 ${pax}${pickText("人","pax","名","명")}</span>` : ""}
+        ${totalPrice ? `<span class="cx-confirmed-chip">💰 ¥${totalPrice.toLocaleString()}</span>` : ""}
+      </div>
+    </div>
+    ${hotelName ? `<div class="cx-confirmed-section-label">${pickText("入住酒店","Hotel","ホテル","숙소")}</div>
+    <div class="cx-confirmed-hotel">🏨 ${hotelName}</div>` : ""}
+    ${review}
+    <div class="cx-confirmed-section-label">${pickText("交通方案","Transport","交通","교통")}</div>
+    <div class="cx-confirmed-transport">${transportHtml}</div>
+    ${dayItems ? `<div class="cx-confirmed-section-label">${pickText("行程亮点","Itinerary","日程","일정")}</div>
+    <div class="cx-confirmed-days">${dayItems}</div>` : ""}
+    <div class="cx-confirmed-actions">
+      <button class="cx-detail-confirm-btn" data-action="open-share-card" data-card-id="${escapeHtml(cardId)}">
+        📤 ${pickText("分享行程","Share","共有","공유")}
+      </button>
+      <button class="cx-detail-book-btn"
+        data-card="${escapeHtml(cardId)}" data-plan="${escapeHtml(p.id||"")}" data-idx="${planIdx}"
+        data-action="detail-go-to-checkout">
+        ${pickText("立即预订 →","Book Now →","今すぐ予約 →","지금 예약 →")}
+      </button>
+    </div>
+  `;
+
+  const title = pickText("我的行程","My Itinerary","マイ旅程","내 일정");
+  if (window.innerWidth > 768 && _cxModal) {
+    const slidesEl = _cxModal.querySelector(".cx-modal-slides");
+    const slideOut = _cxModal.querySelector(".cx-slide-checkout");
+    const backBtn  = _cxModal.querySelector(".cx-modal-back");
+    const titleEl  = _cxModal.querySelector(".cx-modal-title");
+    if (!slidesEl || !slideOut) return;
+    slideOut.innerHTML = "";
+    slideOut.appendChild(confirmedEl);
+    requestAnimationFrame(() => slidesEl.classList.add("slide-checkout"));
+    if (backBtn) { backBtn._prevTitle = titleEl?.textContent || ""; backBtn.classList.remove("hidden"); }
+    if (titleEl) titleEl.textContent = title;
+  } else if (_cxBottomSheet) {
+    const body    = _cxBottomSheet.querySelector(".cx-sheet-body");
+    const titleEl = _cxBottomSheet.querySelector(".cx-sheet-title");
+    _cxBottomSheet._prevContent = body.firstElementChild ? body.firstElementChild.cloneNode(true) : null;
+    _cxBottomSheet._prevTitle   = titleEl?.textContent || "";
+    body.innerHTML = "";
+    body.appendChild(confirmedEl);
+    if (titleEl) titleEl.textContent = title;
+    let backBtn = _cxBottomSheet.querySelector(".cx-sheet-back-btn");
+    if (!backBtn) {
+      backBtn = document.createElement("button");
+      backBtn.className = "cx-modal-back cx-sheet-back-btn";
+      backBtn.innerHTML = "←";
+      backBtn.addEventListener("click", cxGoBack);
+      const hdr = _cxBottomSheet.querySelector(".cx-sheet-header");
+      if (hdr) hdr.insertBefore(backBtn, hdr.firstChild);
+    }
+    backBtn.classList.remove("hidden");
+  }
+}
+
 function cxGoToCheckout(btn) {
   const cardId  = btn.dataset.card;
   const planId  = btn.dataset.plan;
@@ -17480,7 +21070,7 @@ function cxGoToCheckout(btn) {
     slideOut.innerHTML = "";
     slideOut.appendChild(checkoutEl);
     requestAnimationFrame(() => slidesEl.classList.add("slide-checkout"));
-    if (backBtn) { backBtn._prevTitle = titleEl?.textContent || ""; backBtn.style.display = "flex"; }
+    if (backBtn) { backBtn._prevTitle = titleEl?.textContent || ""; backBtn.classList.remove("hidden"); }
     if (titleEl) titleEl.textContent = checkoutTitle;
   } else if (_cxBottomSheet) {
     // Mobile: replace sheet body with checkout
@@ -17500,7 +21090,7 @@ function cxGoToCheckout(btn) {
       const hdr = _cxBottomSheet.querySelector(".cx-sheet-header");
       if (hdr) hdr.insertBefore(backBtn, hdr.firstChild);
     }
-    backBtn.style.display = "flex";
+    backBtn.classList.remove("hidden");
   }
 }
 
@@ -17510,14 +21100,14 @@ function cxGoBack() {
     const backBtn  = _cxModal.querySelector(".cx-modal-back");
     const titleEl  = _cxModal.querySelector(".cx-modal-title");
     if (slidesEl) slidesEl.classList.remove("slide-checkout");
-    if (backBtn)  { if (titleEl) titleEl.textContent = backBtn._prevTitle || ""; backBtn.style.display = "none"; }
+    if (backBtn)  { if (titleEl) titleEl.textContent = backBtn._prevTitle || ""; backBtn.classList.add("hidden"); }
   } else if (_cxBottomSheet) {
     const body    = _cxBottomSheet.querySelector(".cx-sheet-body");
     const titleEl = _cxBottomSheet.querySelector(".cx-sheet-title");
     const backBtn = _cxBottomSheet.querySelector(".cx-sheet-back-btn");
     if (_cxBottomSheet._prevContent) { body.innerHTML = ""; body.appendChild(_cxBottomSheet._prevContent); }
     if (titleEl) titleEl.textContent = _cxBottomSheet._prevTitle || "";
-    if (backBtn) backBtn.style.display = "none";
+    if (backBtn) backBtn.classList.add("hidden");
   }
 }
 
@@ -17534,12 +21124,14 @@ function openPlanDetail(cardId, planIdx) {
   const card = document.getElementById(cardId);
   if (!card) return;
   let plans = [];
+  let days = [];
   try { plans = JSON.parse(card.dataset.plans || "[]"); } catch {}
+  try { days = JSON.parse(card.dataset.days || "[]"); } catch {}
   const p = plans[planIdx];
   if (!p) return;
   const spokenText = card.dataset.spoken || "";
-  const title      = p.tag || pickText("方案详情","Plan Details","プラン詳細","플랜 상세");
-  const contentEl  = buildPlanDetailHtml(p, cardId, planIdx, spokenText);
+  const title      = _normalizePlanTag(p) || pickText("方案详情","Plan Details","プラン詳細","플랜 상세");
+  const contentEl  = buildPlanDetailHtml(p, cardId, planIdx, spokenText, days);
   if (window.innerWidth <= 768) {
     openSheet(title, contentEl);
   } else {
@@ -17562,7 +21154,7 @@ function initModal() {
   _cxModal.innerHTML = `
     <div class="cx-modal-header">
       <div class="cx-modal-hleft">
-        <button class="cx-modal-back" style="display:none" onclick="cxGoBack()">←</button>
+        <button class="cx-modal-back hidden" data-action="go-back">←</button>
         <span class="cx-modal-title"></span>
       </div>
       <button class="cx-sheet-close" aria-label="Close">✕</button>
@@ -17590,7 +21182,7 @@ function openModal(title, contentEl) {
   // Reset to detail panel
   _cxModal.querySelector(".cx-modal-slides")?.classList.remove("slide-checkout");
   const backBtn = _cxModal.querySelector(".cx-modal-back");
-  if (backBtn) backBtn.style.display = "none";
+  if (backBtn) backBtn.classList.add("hidden");
   requestAnimationFrame(() => {
     _cxModalBackdrop.classList.add("cx-modal-open");
     _cxModal.classList.add("cx-modal-open");
@@ -17708,11 +21300,18 @@ function renderSessionBadge(show) {
       "AIが行程を記憶中 — 追加質問できます",
       "AI가 일정을 기억 중 — 추가 질문 가능",
     );
-    badge.innerHTML = `<span class="cx-session-dot"></span><span class="cx-session-label">${pickText("记忆中", "Active","記憶中", "기억 중")}</span>`;
+    badge.innerHTML = `<span class="cx-session-dot"></span><span class="cx-session-label">${pickText("记忆中", "Remembered","記憶中", "기억 중")}</span>`;
     const submitBtn = form.querySelector('[type="submit"]');
     if (submitBtn) submitBtn.insertAdjacentElement("beforebegin", badge);
     else form.appendChild(badge);
   }
+  badge.title = pickText(
+    "AI 已记住本次行程，可直接追问修改",
+    "AI remembers your plan — ask follow-up questions",
+    "AIが行程を記憶中 — 追加質問できます",
+    "AI가 일정을 기억 중 — 추가 질문 가능",
+  );
+  badge.innerHTML = `<span class="cx-session-dot"></span><span class="cx-session-label">${pickText("记忆中", "Remembered","記憶中", "기억 중")}</span>`;
   badge.classList.toggle("hidden", !show);
 }
 
@@ -17731,12 +21330,12 @@ function renderBoundaryRejectionCard(text) {
         "申し訳ありません、旅行専門 AI のため対応できません。",
         "죄송합니다. 저는 여행 전문 AI로 이 요청을 처리할 수 없습니다.",
       ))}</p>
-      <button class="cx-boundary-reset" onclick="(function(){var i=document.getElementById('chatInput');if(i){i.focus();i.value='';}})()">
+      <button class="cx-boundary-reset" data-action="focus-chat-reset">
         ${pickText("返回旅行规划 ↩", "Back to Travel Planning ↩", "旅行計画に戻る ↩", "여행 계획으로 돌아가기 ↩")}
       </button>
     </div>`;
   feed.appendChild(card);
-  feed.scrollTop = feed.scrollHeight;
+  _smartScrollToBottom(feed, { force: true });
 }
 
 // ── SSE Plan Stream Client ────────────────────────────────────────────────
@@ -17800,7 +21399,7 @@ async function consumePlanStream({
   } finally {
     reader.releaseLock();
   }
-  return finalEvent || { type: "error", msg: "No response" };
+  return finalEvent || { type: "error", msg: pickText("无响应", "No response", "応答なし", "응답 없음") };
 }
 
 // ── P2: Thinking Stream + Plan Skeleton ──────────────────────────────────
@@ -17813,6 +21412,244 @@ const PLAN_STEPS = [
   { id: "T_CALC",   icon: "🚗" },
   { id: "B_CHECK",  icon: "💰" },
 ];
+
+const UI_CITY_LABELS = {
+  Shanghai:  { ZH: "上海", EN: "Shanghai", JA: "上海", KO: "상하이", ID: "Shanghai", AR: "شنغهاي", "ZH-TW": "上海" },
+  Beijing:   { ZH: "北京", EN: "Beijing", JA: "北京", KO: "베이징", ID: "Beijing", AR: "بكين", "ZH-TW": "北京" },
+  Shenzhen:  { ZH: "深圳", EN: "Shenzhen", JA: "深圳", KO: "선전", ID: "Shenzhen", AR: "شنتشن", "ZH-TW": "深圳" },
+  Guangzhou: { ZH: "广州", EN: "Guangzhou", JA: "広州", KO: "광저우", ID: "Guangzhou", AR: "قوانغتشو", "ZH-TW": "廣州" },
+  Hangzhou:  { ZH: "杭州", EN: "Hangzhou", JA: "杭州", KO: "항저우", ID: "Hangzhou", AR: "هانغتشو", "ZH-TW": "杭州" },
+  Chengdu:   { ZH: "成都", EN: "Chengdu", JA: "成都", KO: "청두", ID: "Chengdu", AR: "تشنغدو", "ZH-TW": "成都" },
+  Xian:      { ZH: "西安", EN: "Xi'an", JA: "西安", KO: "시안", ID: "Xi'an", AR: "شيآن", "ZH-TW": "西安" },
+  Chongqing: { ZH: "重庆", EN: "Chongqing", JA: "重慶", KO: "충칭", ID: "Chongqing", AR: "تشونغتشينغ", "ZH-TW": "重慶" },
+  Wuhan:     { ZH: "武汉", EN: "Wuhan", JA: "武漢", KO: "우한", ID: "Wuhan", AR: "ووهان", "ZH-TW": "武漢" },
+  Nanjing:   { ZH: "南京", EN: "Nanjing", JA: "南京", KO: "난징", ID: "Nanjing", AR: "نانجينغ", "ZH-TW": "南京" },
+  Xiamen:    { ZH: "厦门", EN: "Xiamen", JA: "厦門", KO: "샤먼", ID: "Xiamen", AR: "شيامن", "ZH-TW": "廈門" },
+  Sanya:     { ZH: "三亚", EN: "Sanya", JA: "三亜", KO: "싼야", ID: "Sanya", AR: "سانيا", "ZH-TW": "三亞" },
+};
+
+function _canonicalUiCityKey(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw) return "";
+  if (raw.includes("上海") || raw.includes("shanghai")) return "Shanghai";
+  if (raw.includes("北京") || raw.includes("beijing")) return "Beijing";
+  if (raw.includes("深圳") || raw.includes("shenzhen")) return "Shenzhen";
+  if (raw.includes("广州") || raw.includes("guangzhou")) return "Guangzhou";
+  if (raw.includes("杭州") || raw.includes("hangzhou")) return "Hangzhou";
+  if (raw.includes("成都") || raw.includes("chengdu")) return "Chengdu";
+  if (raw.includes("西安") || raw.includes("xi'an") || raw.includes("xian")) return "Xian";
+  if (raw.includes("重庆") || raw.includes("chongqing")) return "Chongqing";
+  if (raw.includes("武汉") || raw.includes("wuhan")) return "Wuhan";
+  if (raw.includes("南京") || raw.includes("nanjing")) return "Nanjing";
+  if (raw.includes("厦门") || raw.includes("xiamen")) return "Xiamen";
+  if (raw.includes("三亚") || raw.includes("sanya")) return "Sanya";
+  return "";
+}
+
+function _localizeUiCityName(value, language = state.uiLanguage) {
+  const key = _canonicalUiCityKey(value);
+  const lang = String(language || state.uiLanguage || "EN").toUpperCase();
+  if (key && UI_CITY_LABELS[key]) {
+    return UI_CITY_LABELS[key][lang] || UI_CITY_LABELS[key].EN || String(value || "");
+  }
+  return String(value || "");
+}
+
+function _replaceKnownUiPlaces(value, language = state.uiLanguage) {
+  let text = String(value || "");
+  const labels = {
+    "深圳": _localizeUiCityName("Shenzhen", language),
+    "上海": _localizeUiCityName("Shanghai", language),
+    "北京": _localizeUiCityName("Beijing", language),
+    "广州": _localizeUiCityName("Guangzhou", language),
+    "成都": _localizeUiCityName("Chengdu", language),
+    "杭州": _localizeUiCityName("Hangzhou", language),
+    "西安": _localizeUiCityName("Xi'an", language),
+    "南京": _localizeUiCityName("Nanjing", language),
+    "南山区": "Nanshan District",
+    "宝安区": "Bao'an District",
+    "福田区": "Futian District",
+    "罗湖区": "Luohu District",
+    "龙岗区": "Longgang District",
+    "龙华区": "Longhua District",
+    "盐田区": "Yantian District",
+    "珠江新城": "Zhujiang New Town",
+    "天河CBD": "Tianhe CBD",
+    "天河": "Tianhe",
+    "越秀": "Yuexiu",
+    "海珠": "Haizhu",
+    "番禺": "Panyu",
+    "国贸CBD": "Guomao CBD",
+    "王府井": "Wangfujing",
+    "三里屯": "Sanlitun",
+    "望京": "Wangjing",
+    "朝阳": "Chaoyang",
+    "科技园": "Tech Park",
+    "前海": "Qianhai",
+    "后海湾": "Houhai Bay",
+    "福田中心": "Futian Center",
+    "西湖": "West Lake",
+    "武林广场": "Wulin Square",
+    "春熙路": "Chunxi Road",
+    "天府广场": "Tianfu Square",
+    "海棠湾": "Haitang Bay",
+    "广州白云国际机场": "Guangzhou Baiyun International Airport",
+    "北京首都国际机场": "Beijing Capital International Airport",
+    "深圳宝安国际机场": "Shenzhen Bao'an International Airport",
+    "浦东国际机场": "Shanghai Pudong International Airport",
+  };
+  Object.entries(labels).forEach(([from, to]) => {
+    text = text.replace(new RegExp(from, "g"), to);
+  });
+  return text;
+}
+
+function _localizeVisibleTravelText(value, fallback = "", language = state.uiLanguage) {
+  const lang = String(language || state.uiLanguage || "ZH").toUpperCase();
+  const raw = String(value || "").trim();
+  if (!raw) return fallback || "";
+  if (lang === "ZH") return raw;
+  let text = _replaceKnownUiPlaces(raw, lang);
+  const regexRules = [
+    [/^(.+?)到(.+?)暂未拿到实时城际交通结果，当前先展示本地估算\/回退交通。?$/g, "Live intercity transport from $1 to $2 is not available yet. Showing a local estimate / fallback transport for now."],
+    [/^(.+?)落地到酒店的实时接驳路线暂未返回，当前先展示本地估算。?$/g, "Live arrival-to-hotel transfer in $1 is not available yet. Showing a local estimate for now."],
+    [/^订单已锁定，请在(\d+)分钟内完成支付$/g, "Order locked. Complete payment within $1 minutes."],
+    [/^建议打开12306自行核验余票并至少提前(\d+)-(\d+)分钟到站。?$/g, "Open 12306 to verify live seat inventory and arrive at least $1-$2 minutes before departure."],
+    [/^抵达(.+?)后从车站继续接驳酒店，建议打开12306自行核验余票并至少提前(\d+)-(\d+)分钟到站。?$/g, "After arriving at $1 station, continue to the hotel and use 12306 to verify live seat inventory. Arrive at least $2-$3 minutes before departure."],
+  ];
+  regexRules.forEach(([pattern, replacement]) => {
+    text = text.replace(pattern, replacement);
+  });
+  const visibleMap = {
+    "待处理": pickText("待处理", "Pending", "未対応", "대기"),
+    "处理中": pickText("处理中", "In progress", "対応中", "처리 중"),
+    "已解决": pickText("已解决", "Resolved", "解決済み", "해결됨"),
+    "已完成": pickText("已完成", "Completed", "完了", "완료"),
+    "已取消": pickText("已取消", "Canceled", "キャンセル済み", "취소됨"),
+    "已确认": pickText("已确认", "Confirmed", "確認済み", "확인됨"),
+    "待确认": pickText("待确认", "Pending", "未確定", "확인 대기"),
+    "执行中": pickText("执行中", "Running", "実行中", "실행 중"),
+    "失败": pickText("失败", "Failed", "失敗", "실패"),
+    "成功": pickText("成功", "Success", "成功", "성공"),
+    "人工处理中": pickText("人工处理中", "Human Active", "有人対応中", "사람 처리중"),
+    "转人工": pickText("转人工", "Human handoff", "有人対応へ", "사람 상담 전환"),
+    "证据": pickText("证据", "Evidence", "証拠", "증빙"),
+    "原因": pickText("原因", "Reason", "理由", "사유"),
+    "节点": pickText("节点", "Moment", "時点", "시점"),
+    "备注": pickText("备注", "Note", "メモ", "메모"),
+    "操作": pickText("操作", "Operation", "操作", "작업"),
+    "凭证": pickText("凭证", "Proof", "証憑", "증빙"),
+    "订单": pickText("订单", "Order", "注文", "주문"),
+    "支持单": pickText("支持单", "Support ticket", "サポートチケット", "지원 티켓"),
+    "酒店": pickText("酒店", "Hotel", "ホテル", "호텔"),
+    "餐厅": pickText("餐厅", "Restaurant", "レストラン", "식당"),
+    "景点": pickText("景点", "Attraction", "観光", "관광지"),
+    "交通": pickText("交通", "Transport", "交通", "교통"),
+    "当前状态": pickText("当前状态", "Current status", "現在の状態", "현재 상태"),
+    "当前备注": pickText("当前备注", "Current note", "現在のメモ", "현재 메모"),
+    "当前没有活动任务": pickText("当前没有活动任务", "No live task right now", "現在アクティブなタスクはありません", "현재 활성 작업이 없습니다"),
+    "当前开放工单": pickText("当前开放工单", "Open tickets", "現在オープン中のチケット", "현재 열린 티켓"),
+    "暂无人工工单记录": pickText("暂无人工工单记录", "No human assist ticket yet.", "有人チケットはまだありません。", "사람 지원 티켓이 아직 없습니다."),
+    "当前为单对话模式": pickText("当前为单对话模式", "Single-dialog mode enabled", "シングル会話モード有効", "단일 대화 모드 활성"),
+    "当前为工作台模式": pickText("当前为工作台模式", "Workspace mode enabled", "ワークスペースモード有効", "워크스페이스 모드 활성"),
+    "本地估算": pickText("本地估算", "local estimate", "ローカル見積り", "로컬 추정"),
+    "回退交通": pickText("回退交通", "fallback transport", "代替交通", "대체 교통"),
+    "当前为回退/估算交通结果": pickText("当前为回退/估算交通结果", "Currently showing fallback / estimated transport", "現在は代替 / 推定交通を表示しています", "현재는 대체 / 추정 교통을 표시합니다"),
+    "打开12306自行核验余票": pickText("打开12306自行核验余票", "open 12306 to check current seat availability yourself", "12306 を開いて空席を自分で確認", "12306을 열어 현재 잔여 좌석을 직접 확인"),
+    "北京": "Beijing",
+    "上海": "Shanghai",
+    "广州": "Guangzhou",
+    "深圳": "Shenzhen",
+    "杭州": "Hangzhou",
+    "成都": "Chengdu",
+    "重庆": "Chongqing",
+    "西安": "Xi'an",
+    "苏州": "Suzhou",
+    "南京": "Nanjing",
+    "武汉": "Wuhan",
+    "天津": "Tianjin",
+    "长沙": "Changsha",
+    "厦门": "Xiamen",
+    "青岛": "Qingdao",
+    "珠海": "Zhuhai",
+    "香港": "Hong Kong",
+    "澳门": "Macau",
+    "待响应": pickText("待响应", "Awaiting response", "応答待ち", "응답 대기"),
+    "退款申请已提交": pickText("退款申请已提交", "Refund request submitted", "返金申請を送信済み", "환불 요청 제출됨"),
+    "退款处理中": pickText("退款处理中", "Refund in progress", "返金処理中", "환불 처리 중"),
+    "订单已创建": pickText("订单已创建", "Order created", "注文作成済み", "주문 생성됨"),
+    "订单已确认": pickText("订单已确认", "Order confirmed", "注文確認済み", "주문 확인됨"),
+    "订单已取消": pickText("订单已取消", "Order canceled", "注文キャンセル済み", "주문 취소됨"),
+    "支持团队已回复": pickText("支持团队已回复", "Support team replied", "サポートチームが返信済み", "지원팀이 답변함"),
+    "支持团队已加入会话": pickText("支持团队已加入会话", "Support team joined the conversation", "サポートチームが会話に参加しました", "지원팀이 대화에 참여했습니다"),
+    "工单状态已更新": pickText("工单状态已更新", "Ticket status updated", "チケット状態を更新しました", "티켓 상태가 업데이트되었습니다"),
+    "异常已提交到支持协同": pickText("异常已提交到支持协同", "Issue submitted to support coordination", "問題をサポート連携へ送信しました", "이슈를 지원 협업으로 전달했습니다"),
+    "备注已发送给支持团队": pickText("备注已发送给支持团队", "Note sent to the support team", "メモをサポートチームへ送信しました", "메모를 지원팀에 전송했습니다"),
+    "平台推荐/资料申请已提交，等待内部审核": pickText("平台推荐/资料申请已提交，等待内部审核", "Platform request submitted and awaiting internal review", "プラットフォーム申請を送信し、内部審査待ちです", "플랫폼 요청이 제출되었고 내부 검토를 기다리는 중입니다"),
+    "当前没有符合条件且可订的酒店，建议放宽预算或星级。": pickText("当前没有符合条件且可订的酒店，建议放宽预算或星级。", "No bookable hotel matches the current filters. Try widening the budget or star level.", "条件に合う予約可能ホテルがありません。予算または星級を広げてください。", "현재 조건에 맞는 예약 가능 호텔이 없습니다. 예산이나 등급을 넓혀 보세요."),
+    "当前没有符合你条件且可直接执行的酒店方案。建议放宽每晚预算、调整区域，或让我重新搜索一批可订酒店。": pickText("当前没有符合你条件且可直接执行的酒店方案。建议放宽每晚预算、调整区域，或让我重新搜索一批可订酒店。", "No directly bookable hotel option matches your filters. Try widening the nightly budget, changing area, or asking me to search another batch.", "直接予約できるホテル案が条件に合いません。1泊予算やエリアを広げるか、別の候補を再検索してください。", "바로 예약 가능한 호텔 옵션이 조건에 맞지 않습니다. 1박 예산이나 지역을 넓히거나 새 후보를 다시 검색해 보세요."),
+    "当前没有符合条件且可订的酒店": pickText("当前没有符合条件且可订的酒店", "No bookable hotel matches current filters", "条件に合う予約可能ホテルなし", "조건에 맞는 예약 가능 호텔 없음"),
+    "订单已确认，酒店已为你保留房间。": pickText("订单已确认，酒店已为你保留房间。", "Order confirmed. The hotel is holding your room.", "注文確認済み。ホテルが客室を確保しています。", "주문이 확인되었고 호텔이 객실을 확보했습니다."),
+    "订单已创建，正在等待酒店确认。": pickText("订单已创建，正在等待酒店确认。", "Order created. Waiting for hotel confirmation.", "注文を作成しました。ホテルの確認待ちです。", "주문이 생성되었고 호텔 확인을 기다리는 중입니다."),
+    "订单已取消，退款处理中。": pickText("订单已取消，退款处理中。", "Order canceled. Refund is in progress.", "注文をキャンセルしました。返金処理中です。", "주문이 취소되었고 환불이 진행 중입니다."),
+    "退款已完成，资金将按银行时效到账。": pickText("退款已完成，资金将按银行时效到账。", "Refund completed. Funds will arrive based on your bank processing window.", "返金が完了しました。着金は銀行処理時間に従います。", "환불이 완료되었습니다. 입금 시점은 은행 처리 시간에 따라 달라집니다."),
+    "退款处理中，请查看售后支持": pickText("退款处理中，请查看售后支持", "Refund is in progress. Check after-sales support for updates.", "返金処理中です。更新はアフターサポートをご確認ください。", "환불이 진행 중입니다. 업데이트는 사후 지원에서 확인해 주세요."),
+    "已为你保留房间": pickText("已为你保留房间", "room is being held for you", "客室を確保しています", "객실을 확보해 두었습니다")
+  };
+  Object.entries(visibleMap).forEach(([from, to]) => {
+    text = text.replace(new RegExp(from, "g"), to);
+  });
+  text = text
+    .replace(/^欢迎来到(.+?)[!！。]*$/, (_m, city) => pickText(`欢迎来到${city}!`, `Welcome to ${_replaceKnownUiPlaces(city, lang)}!`, `${_replaceKnownUiPlaces(city, lang)}へようこそ！`, `${_replaceKnownUiPlaces(city, lang)}에 오신 것을 환영합니다!`))
+    .replace(/^(?:到达|抵达)(.+?)$/, (_m, city) => pickText(`抵达${city}`, `Arrive in ${_replaceKnownUiPlaces(city, lang)}`, `${_replaceKnownUiPlaces(city, lang)}に到着`, `${_replaceKnownUiPlaces(city, lang)} 도착`))
+    .replace(/^(.+?)美食与住宿计划$/, (_m, city) => pickText(`${city}美食与住宿计划`, `${_replaceKnownUiPlaces(city, lang)} Dining & Stay Plan`, `${_replaceKnownUiPlaces(city, lang)} グルメ＆宿泊プラン`, `${_replaceKnownUiPlaces(city, lang)} 미식·숙박 플랜`))
+    .replace(/^(.+?)美食探索之旅$/, (_m, city) => pickText(`${city}美食探索之旅`, `${_replaceKnownUiPlaces(city, lang)} Food Journey`, `${_replaceKnownUiPlaces(city, lang)} グルメ旅`, `${_replaceKnownUiPlaces(city, lang)} 미식 여행`))
+    .replace(/^(.+?)(\d+)日美食之旅$/, (_m, city, days) => `${_replaceKnownUiPlaces(city, lang)} ${days}-day food journey`)
+    .replace(/^准备好享受(.+?)的美食之旅吧[!！。]*$/, (_m, city) => pickText(`准备好享受${city}的美食之旅吧！`, `Get ready for a food journey in ${_replaceKnownUiPlaces(city, lang)}!`, `${_replaceKnownUiPlaces(city, lang)}でグルメ旅を楽しみましょう！`, `${_replaceKnownUiPlaces(city, lang)}에서 미식 여행을 즐겨보세요!`))
+    .replace(/^准备好在(.+?)享受美食与文化的旅程吧[!！。]*$/, (_m, city) => `Get ready for a food and culture journey in ${_replaceKnownUiPlaces(city, lang)}!`)
+    .replace(/^让我们一起享受(.+?)的美食与文化之旅吧[!！。]*$/, (_m, city) => `Let's enjoy a food and culture journey in ${_replaceKnownUiPlaces(city, lang)}!`)
+    .replace(/^让我们一起探索(.+?)的美食与文化(?:之旅)?吧[!！。]*$/, (_m, city) => `Let's explore the food and culture of ${_replaceKnownUiPlaces(city, lang)} together!`)
+    .replace(/^让我们一起探索(.+?)的美食与文化[，,]\s*体验难忘的(\d+)天吧[!！。]*$/, (_m, city, days) => `Let's explore the food and culture of ${_replaceKnownUiPlaces(city, lang)} over ${days} unforgettable days!`)
+    .replace(/^让我们一起探索(.+?)的美食与文化[，,].*[!！。]*$/, (_m, city) => `Let's explore the food and culture of ${_replaceKnownUiPlaces(city, lang)} together!`)
+    .replace(/^餐厅定位[:：]\s*(.+)$/, (_m, area) => `Restaurant area: ${_replaceKnownUiPlaces(area, lang)}`)
+    .replace(/^Restaurant area:\s*(.+)$/, (_m, area) => `Restaurant area: ${_replaceKnownUiPlaces(area, lang)}`)
+    .replace(/^酒店位置[:：]\s*(.+)$/, (_m, area) => `Hotel location: ${_replaceKnownUiPlaces(area, lang)}`);
+  if (lang !== "ZH" && /[·|]\s*~?¥\d+\/person/i.test(text)) {
+    text = text.replace(/^[\u4e00-\u9fffA-Za-z0-9()（）·\-\s]+(?=\s·\s~?¥\d+\/person)/, (name) => {
+      return /[\u4e00-\u9fff]/.test(name) ? pickText("精选餐厅", "Selected dining stop", "おすすめ店", "추천 식당") : name;
+    });
+  }
+  if (lang !== "ZH" && /^Nearby:\s*.+sold this month$/i.test(text) && /[\u4e00-\u9fff]/.test(text)) {
+    const qty = (text.match(/(\d[\d,+]*)\s*sold this month/i) || [])[1] || "";
+    text = `Nearby: CrossX Dining Picks${qty ? ` · ${qty} sold this month` : ""}`;
+  }
+  if (_isMostlyChineseText(text)) return fallback || "";
+  return text;
+}
+
+function _fallbackPlanTitle(dest, layoutType = state._layoutType || "travel_full") {
+  const city = _localizeUiCityName(dest || getCurrentCity() || "China", state.uiLanguage);
+  if (layoutType === "food_only") return `${city} ${pickText("美食清单", "Dining Guide", "グルメガイド", "다이닝 가이드")}`;
+  if (layoutType === "stay_focus") return `${city} ${pickText("住宿方案", "Stay Options", "宿泊プラン", "숙박 플랜")}`;
+  return `${city} ${pickText("行程方案", "Trip Plan", "旅行プラン", "여행 플랜")}`;
+}
+
+function _detectThinkingIntent(text) {
+  const raw = String(text || "");
+  const lower = raw.toLowerCase();
+  const hasFood = /餐厅|美食|好吃|推荐.*吃|吃什么|小吃|eat|restaurant|food|dining|meal|cuisine/i.test(raw);
+  const hasStay = /酒店|住宿|宾馆|民宿|hotel|hostel|stay|accommodation/i.test(raw);
+  const hasSight = /景点|游览|门票|博物馆|景区|打卡|scenic|attraction|museum|sightseeing/i.test(raw);
+  const hasTransport = /机票|航班|飞机|高铁|火车|机场|地铁|打车|交通|接送|flight|airport|plane|rail|train|taxi|metro|transfer|pickup|drop-?off/i.test(raw);
+  const hasDuration = /(?:\d+\s*(?:天|日|晚|days?|nights?))|(?:一|二|三|四|五|六|七|八|九|十|两)\s*(?:天|日|晚)/i.test(raw);
+  const hasBudget = /(?:预算|人均|总价|花费)|(?:\d{2,6}\s*(?:元|块|rmb|cny|usd|\$|¥|eur|gbp))/i.test(raw);
+  const hasTravelScope = hasTransport || hasStay || hasSight || hasDuration || hasBudget;
+  if (hasTravelScope && (hasFood || hasSight || hasStay || hasTransport)) return "travel";
+  if (hasStay) return "stay";
+  if (hasFood) return "food";
+  if (hasSight) return "activity";
+  return "travel";
+}
 
 // P8.7 Unified real-time thinking map — handles BOTH SSE tool_call events AND
 // backend status codes. Values are thunks: (dest, foodKw) => string.
@@ -17831,7 +21668,7 @@ const REALTIME_THINKING_MAP = {
     : pickText("正在核算交通费用...",          "Calculating transport...",                  "交通費を計算中...",               "교통비 계산 중..."),
   B_CHECK:  (d, f) => f
     ? pickText(`精算${d}人均餐饮消费`,         `Budgeting ${d} per-person dining`,          `${d}の一人あたり飲食費を計算中`,  `${d} 1인 식비 계산 중`)
-    : pickText("正在锁定最优预算...",          "Locking best budget...",                    "最適予算を確定中...",             "최적 예산 확정 ���..."),
+    : pickText("正在锁定最优预算...",          "Locking best budget...",                    "最適予算を確定中...",             "최적 예산 확정 중..."),
   // ── Coze tool_call names ─────────────────────────────────────────────────
   search_restaurants:          (d) => pickText(`搜寻${d}本地必吃老字号`,    `Hunting ${d} must-eat spots`,       `${d}の必食店を探索中`,     `${d} 필수 맛집 탐색 중`),
   check_restaurant_queue:      (d) => pickText(`实时探测${d}餐厅排队强度`, `Checking ${d} restaurant queues`,   `${d}の待ち時間を確認中`,   `${d} 대기 시간 확인 중`),
@@ -17851,8 +21688,23 @@ const REALTIME_THINKING_MAP = {
 
 // Helper: extract destination city from user message (inline, no regex import needed)
 function _extractDestFromText(msg) {
-  const CITIES = ["北京","上海","广州","深圳","成都","西安","杭州","南京","武汉","重庆","厦门","三亚","丽江","桂林","拉萨","乌鲁木齐","苏州","青岛","大理","张家界","黄山","敦煌"];
-  return CITIES.find((c) => msg.includes(c)) || getCurrentCity() || "";
+  const CITY_PATTERNS = [
+    ["Beijing", /北京|beijing/i],
+    ["Shanghai", /上海|shanghai/i],
+    ["Guangzhou", /广州|guangzhou/i],
+    ["Shenzhen", /深圳|shenzhen/i],
+    ["Chengdu", /成都|chengdu/i],
+    ["Xian", /西安|xi'?an/i],
+    ["Hangzhou", /杭州|hangzhou/i],
+    ["Nanjing", /南京|nanjing/i],
+    ["Wuhan", /武汉|wuhan/i],
+    ["Chongqing", /重庆|chongqing/i],
+    ["Xiamen", /厦门|xiamen/i],
+    ["Sanya", /三亚|sanya/i],
+  ];
+  const found = CITY_PATTERNS.find(([, pattern]) => pattern.test(String(msg || "")));
+  const raw = found ? found[0] : (getCurrentCity() || "");
+  return _localizeUiCityName(raw, state.uiLanguage);
 }
 
 // Helper: extract specific food keyword from message (e.g. "肉夹馍" from "想吃肉夹馍")
@@ -17881,13 +21733,14 @@ function _renderIntentPreview(ev, streamEl) {
   if (!ev || (!ev.dest && !ev.days)) return;
   const axisIcon = ev.axis === "eat" ? "\u{1F374}" : ev.axis === "hotel" ? "\u{1F3E8}" : "\u2708\uFE0F";
   const parts = [];
-  if (ev.dest) parts.push(`\u{1F4CD} ${ev.dest}`);
-  if (ev.days) parts.push(`\u23F1 ${ev.days}\u5929`);
-  if (ev.pax)  parts.push(`\u{1F465} ${ev.pax}\u4EBA`);
+  const destLabel = ev.dest ? _localizeUiCityName(ev.dest, state.uiLanguage) : "";
+  if (destLabel) parts.push(`\u{1F4CD} ${destLabel}`);
+  if (ev.days) parts.push(`\u23F1 ${ev.days}${pickText("\u5929", " days", "\u65E5", "\uC77C")}`);
+  if (ev.pax)  parts.push(`\u{1F465} ${ev.pax}${pickText("\u4EBA", " pax", "\u540D", "\uBA85")}`);
 
   const row = document.createElement("div");
   row.className = "cx-ip-row";
-  row.innerHTML = `<span class="cx-ip-label">${axisIcon} AI \u7406\u89E3\u5230</span>${
+  row.innerHTML = `<span class="cx-ip-label">${axisIcon} ${pickText("AI \u7406\u89E3\u5230", "AI understands", "AI \u304C\u7406\u89E3\u3057\u305F\u5185\u5BB9", "AI\uAC00 \uC774\uD574\uD55C \uB0B4\uC6A9")}</span>${
     parts.map(p => `<span class="cx-ip-tag">${p}</span>`).join("")
   }`;
 
@@ -17896,8 +21749,8 @@ function _renderIntentPreview(ev, streamEl) {
     const title = streamEl.querySelector(".cx-ts-title");
     if (title) {
       // Also update the title text to show destination for ambient awareness
-      if (ev.dest) {
-        title.innerHTML = `<span class="cx-ts-ping"></span>\u{1F4CD} ${escapeHtml(ev.dest)} \u2014 AI \u7CBE\u7B97\u4E2D...`;
+      if (destLabel) {
+        title.innerHTML = `<span class="cx-ts-ping"></span>\u{1F4CD} ${escapeHtml(destLabel)} \u2014 ${pickText("AI \u7CBE\u7B97\u4E2D...", "AI calculating...", "AI \u8A08\u7B97\u4E2D...", "AI \uACC4\uC0B0 \uC911...", "AI sedang menghitung...", "\u0627\u0644\u0630\u0643\u0627\u0621 \u0627\u0644\u0627\u0635\u0637\u0646\u0627\u0639\u064A \u064A\u062D\u0633\u0628 \u0627\u0644\u0622\u0646...")}`;
       }
       title.after(row);
     } else {
@@ -17906,13 +21759,16 @@ function _renderIntentPreview(ev, streamEl) {
   } else {
     // Fallback: inject into chat feed directly
     const feed = document.getElementById("chatFeed");
-    if (feed) { feed.appendChild(row); feed.scrollTop = feed.scrollHeight; }
+    if (feed) {
+      feed.appendChild(row);
+      _smartScrollToBottom(feed, { force: true });
+    }
   }
 
   // Also surface the destination in the global thinking indicator text
-  if (ev.dest) {
+  if (destLabel) {
     applyThinkingIndicatorState(true,
-      `\u{1F4CD} ${ev.dest} \u2014 ${pickText("\u6B63\u5728\u751F\u6210\u65B9\u6848...", "Generating plan...", "\u30D7\u30E9\u30F3\u3092\u751F\u6210\u4E2D...", "\uD50C\uB79C \uC0DD\uC131 \uC911...")}`
+      `\u{1F4CD} ${destLabel} \u2014 ${pickText("\u6B63\u5728\u751F\u6210\u65B9\u6848...", "Generating plan...", "\u30D7\u30E9\u30F3\u3092\u751F\u6210\u4E2D...", "\uD50C\uB79C \uC0DD\uC131 \uC911...")}`
     );
   }
 }
@@ -17927,7 +21783,7 @@ function renderThinkingStream() {
 
   const title = document.createElement("div");
   title.className = "cx-ts-title";
-  title.innerHTML = `<span class="cx-ts-ping"></span>${pickText("CrossX AI 精算中...", "CrossX AI calculating...", "CrossX AI 精算中...", "CrossX AI 정산 중...")}`;
+  title.innerHTML = `<span class="cx-ts-ping"></span>${pickText("CrossX AI 精算中...", "CrossX AI calculating...", "CrossX AI が計算中...", "CrossX AI 계산 중...", "CrossX AI sedang menghitung...", "CrossX AI يحسب الآن...")}`;
   wrap.appendChild(title);
 
   const list = document.createElement("div");
@@ -17950,7 +21806,7 @@ function renderThinkingStream() {
   wrap.appendChild(list);
 
   feed.appendChild(wrap);
-  feed.scrollTop = feed.scrollHeight;
+  _smartScrollToBottom(feed, { force: true });
   return wrap;
 }
 
@@ -17981,7 +21837,7 @@ function appendThinkingStep(stream, code, label) {
       if (stateEl) stateEl.textContent = "✓";
     } else if (i === idx) {
       row.className = "cx-ts-step active";
-      if (lblEl) _typewrite(lblEl, label || code, 14);
+      if (lblEl) lblEl.textContent = label || code;
       if (stateEl) stateEl.innerHTML = `<span class="cx-ts-pulse"></span>`;
     }
   });
@@ -18028,10 +21884,12 @@ function createThinkingPanel() {
   const panel = document.createElement("div");
   panel.className = "thinking-panel";
   panel.dataset.thinkingPanel = "1";
+  panel.dataset.state = "running";
+  panel.dataset.rawCount = "0";
   panel.innerHTML = `
-    <div class="thinking-panel-header" onclick="this.closest('.thinking-panel').classList.toggle('collapsed')">
+    <div class="thinking-panel-header" data-action="toggle-thinking-panel">
       <div class="thinking-panel-icon"></div>
-      <span class="thinking-panel-label">${pickText("深度推理中...", "Deep Reasoning...", "深層推論中...", "심층 추론 중...")}</span>
+      <span class="thinking-panel-label">${pickText("深度推理中...", "Deep Reasoning...", "深層推論中...", "심층 추론 중...", "Penalaran mendalam...", "جارٍ الاستدلال المتعمق...")}</span>
       <span class="thinking-panel-chars"></span>
       <span class="thinking-panel-toggle">▾</span>
     </div>
@@ -18045,23 +21903,145 @@ function appendThinkingText(panel, text) {
   if (!panel) return;
   const textEl = panel.querySelector(".thinking-text");
   if (!textEl) return;
-  textEl.textContent += text;
-  // Update char count
+  const nextRaw = `${panel.dataset.rawThinking || ""}${text || ""}`;
+  panel.dataset.rawThinking = nextRaw;
+  if (shouldSummarizeThinkingForCurrentLanguage(nextRaw)) {
+    textEl.textContent = _summarizeThinkingText(nextRaw);
+  } else {
+    const visibleChunk = state.uiLanguage === "ZH"
+      ? String(text || "")
+      : _localizeVisibleTravelText(text, "");
+    if (!visibleChunk && _isMostlyChineseText(text)) {
+      textEl.textContent = _summarizeThinkingText(nextRaw);
+    } else {
+      textEl.textContent += visibleChunk || text;
+    }
+  }
+  panel.dataset.rawCount = String(textEl.textContent.length);
   const chars = panel.querySelector(".thinking-panel-chars");
-  if (chars) chars.textContent = `${textEl.textContent.length} chars`;
+  if (chars) chars.textContent = formatThinkingCharCount(textEl.textContent.length);
   const body = panel.querySelector(".thinking-panel-body");
   if (body) body.scrollTop = body.scrollHeight;
 }
 
+function _cleanThinkingText(raw) {
+  if (!raw) return "";
+  // Remove markdown code blocks
+  let text = raw.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]+`/g, "");
+  // Process line-by-line: strip JSON structure, keep natural language
+  const lines = text.split("\n");
+  const out = [];
+  let depth = 0;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t) continue;
+    const opens = (t.match(/[{[]/g) || []).length;
+    const closes = (t.match(/[}\]]/g) || []).length;
+    if (depth > 0) {
+      depth = Math.max(0, depth + opens - closes);
+      continue; // inside JSON block, skip
+    }
+    // Detect start of JSON block
+    if (t.startsWith("{") || t.startsWith("[")) {
+      depth = Math.max(0, opens - closes);
+      continue;
+    }
+    // Skip lines that are pure JSON properties or closing punctuation
+    if (/^"[^"]+"\s*:/.test(t) || /^[}\],]+\s*$/.test(t)) continue;
+    out.push(line);
+  }
+  return out.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function _looksLikeInternalThinking(text) {
+  const value = String(text || "").trim();
+  if (!value) return true;
+  if (/抱歉，我是专注于旅行规划的 AI 助手|travel-planning AI assistant|旅行計画に特化した AI アシスタント|여행 계획 전용 AI 도우미/i.test(value)) return true;
+  const lines = value.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (!lines.length) return true;
+  const noisyCount = lines.filter((line) =>
+    /^[_A-Z][A-Z0-9_:-]{2,}$/.test(line)
+    || /[{[\]}]/.test(line)
+    || /^"[^"]+"\s*:/.test(line)
+    || /(^|\s)(const|let|var|function|return)\s/.test(line)
+  ).length;
+  return noisyCount >= Math.max(2, Math.ceil(lines.length * 0.4));
+}
+
+function _summarizeThinkingText(raw) {
+  const text = String(raw || "");
+  const signals = [];
+  if (/酒店|hotel|stay|accommodation/i.test(text)) signals.push(pickText("住宿资源", "stays", "宿泊先", "숙소"));
+  if (/交通|route|flight|transport|pickup/i.test(text)) signals.push(pickText("交通方案", "transport", "交通", "교통"));
+  if (/预算|budget|price|cost/i.test(text)) signals.push(pickText("预算约束", "budget", "予算", "예산"));
+  if (/餐厅|food|restaurant|dining/i.test(text)) signals.push(pickText("餐饮偏好", "food options", "食事候補", "식사 옵션"));
+  if (/景点|attraction|sight|museum|activity/i.test(text)) signals.push(pickText("游玩内容", "activities", "観光内容", "관광 일정"));
+  if (!signals.length) {
+    return pickText(
+      "已整理目的地、预算、交通和资源可用性，并生成可执行方案。",
+      "Checked destination, budget, transport, and live availability before generating the plan.",
+      "目的地・予算・交通・空き状況を確認してから実行可能なプランを組み立てました。",
+      "목적지, 예산, 교통, 실시간 가능 여부를 확인한 뒤 실행 가능한 플랜을 정리했습니다."
+    );
+  }
+  const joined = signals.join(pickText("、", ", ", "・", ", "));
+  return pickText(
+    `已完成${joined}的核对，并整理出可执行方案。`,
+    `Checked ${joined} and assembled an executable plan.`,
+    `${joined}を確認し、実行可能なプランに整理しました。`,
+    `${joined} 확인을 마치고 실행 가능한 플랜으로 정리했습니다.`
+  );
+}
+
 function collapseThinkingPanel(panel) {
   if (!panel) return;
+  panel.dataset.state = "done";
   panel.classList.add("done", "collapsed");
   const label = panel.querySelector(".thinking-panel-label");
-  if (label) label.textContent = pickText("推理完成", "Reasoning done","推論完了", "추론 완료");
+  if (label) label.textContent = pickText("推理完成", "Reasoning done","推論完了", "추론 완료", "Penalaran selesai", "اكتمل الاستدلال");
   const chars = panel.querySelector(".thinking-panel-chars");
   const textEl = panel.querySelector(".thinking-text");
-  if (chars && textEl) chars.textContent = `${textEl.textContent.length} chars`;
+  // Clean up code/JSON blocks from reasoning text
+  if (textEl && textEl.textContent) {
+    const rawText = panel.dataset.rawThinking || textEl.textContent;
+    const cleaned = _cleanThinkingText(rawText);
+    const localizedCleaned = state.uiLanguage === "ZH" ? cleaned : _localizeVisibleTravelText(cleaned, "");
+    textEl.textContent = (_looksLikeInternalThinking(cleaned) || shouldSummarizeThinkingForCurrentLanguage(cleaned) || (!localizedCleaned && _isMostlyChineseText(cleaned)))
+      ? _summarizeThinkingText(rawText)
+      : (localizedCleaned || cleaned);
+    panel.dataset.rawCount = String(textEl.textContent.length);
+  }
+  if (chars && textEl) chars.textContent = formatThinkingCharCount(textEl.textContent.length);
   else if (chars) chars.textContent = "";
+}
+
+function syncThinkingPanelsLanguage() {
+  document.querySelectorAll(".thinking-panel").forEach((panel) => {
+    const label = panel.querySelector(".thinking-panel-label");
+    const chars = panel.querySelector(".thinking-panel-chars");
+    const textEl = panel.querySelector(".thinking-text");
+    const rawThinking = panel.dataset.rawThinking || textEl?.textContent || "";
+    const isDone = panel.dataset.state === "done" || panel.classList.contains("done");
+    if (label) {
+      label.textContent = isDone
+        ? pickText("推理完成", "Reasoning done", "推論完了", "추론 완료", "Penalaran selesai", "اكتمل الاستدلال")
+        : pickText("深度推理中...", "Deep Reasoning...", "深層推論中...", "심층 추론 중...", "Penalaran mendalam...", "جارٍ الاستدلال المتعمق...");
+    }
+    if (textEl && shouldSummarizeThinkingForCurrentLanguage(rawThinking)) {
+      textEl.textContent = _summarizeThinkingText(rawThinking);
+      panel.dataset.rawCount = String(textEl.textContent.length);
+    } else if (textEl && state.uiLanguage !== "ZH") {
+      const localized = _localizeVisibleTravelText(rawThinking, "");
+      if (!localized && _isMostlyChineseText(rawThinking)) {
+        textEl.textContent = _summarizeThinkingText(rawThinking);
+      } else if (localized) {
+        textEl.textContent = localized;
+      }
+      panel.dataset.rawCount = String(textEl.textContent.length);
+    }
+    const count = Number(panel.dataset.rawCount || textEl?.textContent.length || 0);
+    if (chars) chars.textContent = formatThinkingCharCount(count);
+  });
 }
 
 // ── Booking Handlers ──────────────────────────────────────────────────────
@@ -18091,9 +22071,9 @@ function showBookingPaymentModal(orderData) {
   const modal = document.getElementById("paymentModal");
   if (!modal) return;
   const setText = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
-  setText("payModalTitle","确认订单");
-  setText("payModalSubtitle", `订单号: ${orderData.orderId}`);
-  setText("payItemName","定制行程方案");
+  setText("payModalTitle", pickText("确认订单", "Confirm Order", "注文を確認", "주문 확인", "Konfirmasi Pesanan", "تأكيد الطلب"));
+  setText("payModalSubtitle", `${pickText("订单号", "Order ID", "注文番号", "주문 번호", "ID pesanan", "رقم الطلب")}: ${orderData.orderId}`);
+  setText("payItemName", pickText("定制行程方案", "Custom trip plan", "カスタム旅程プラン", "맞춤 여행 플랜", "Rencana perjalanan khusus", "خطة رحلة مخصصة"));
   setText("payItemPrice",     `¥${Number(orderData.totalCost).toLocaleString()}`);
   setText("payTotal",         `¥${Number(orderData.totalCost).toLocaleString()}`);
 
@@ -18108,9 +22088,9 @@ function showBookingPaymentModal(orderData) {
       const label = document.getElementById("payQrLabel");
       const amount = document.getElementById("payQrAmount");
       const hint = document.getElementById("payQrHint");
-      if (label) label.textContent = btnId === "payWechat" ? "微信支付扫码" :"支付宝扫码";
+      if (label) label.textContent = btnId === "payWechat" ? pickText("微信支付扫码","WeChat Pay QR","WeChat Pay QR","WeChat Pay QR","QR WeChat Pay","رمز WeChat Pay") : pickText("支付宝扫码","Alipay QR","Alipay QR","Alipay QR","QR Alipay","رمز Alipay");
       if (amount) amount.textContent = `¥${Number(orderData.totalCost).toLocaleString()}`;
-      if (hint)   hint.textContent   = btnId === "payWechat" ? "请用微信扫描二维码" :"请用支付宝扫描二维码";
+      if (hint)   hint.textContent   = btnId === "payWechat" ? pickText("请用微信扫描二维码","Scan with WeChat","WeChatでスキャン","WeChat으로 스캔","Pindai dengan WeChat","امسح باستخدام WeChat") : pickText("请用支付宝扫描二维码","Scan with Alipay","Alipayでスキャン","Alipay로 스캔","Pindai dengan Alipay","امسح باستخدام Alipay");
       if (qrSection) qrSection.classList.remove("hidden");
     };
   });
@@ -18147,12 +22127,15 @@ function showBookingPaymentModal(orderData) {
 
 function renderPaymentSuccessCard(result) {
   const { orderId = "", itineraryId = "", msg = "" } = result;
+  const localizedMsg = (state.uiLanguage || "ZH") !== "ZH" && /[\u4e00-\u9fff]/.test(String(msg || ""))
+    ? pickText("您的行程已成功预订。", "Your itinerary is confirmed.","旅程が確定しました。", "일정이 확정되었습니다.")
+    : (msg || pickText("您的行程已成功预订。", "Your itinerary is confirmed.","旅程が確定しました。", "일정이 확정되었습니다."));
   clearChatCards({ keepDeliverable: true, keepSmartReply: false });
   addCard(`
     <article class="card booking-success-card">
       <div class="booking-success-icon">✓</div>
       <h3 class="booking-success-title">${pickText("支付成功！行程已确认", "Payment Successful!","支払い完了！旅程確定", "결제 완료! 일정 확정")}</h3>
-      <p class="booking-success-msg">${escapeHtml(msg || pickText("您的行程已成功预订。", "Your itinerary is confirmed.","旅程が確定しました。", "일정이 확정되었습니다."))}</p>
+      <p class="booking-success-msg">${escapeHtml(localizedMsg)}</p>
       <div class="booking-success-code">
         <span class="booking-code-label">${pickText("电子确认码", "Confirmation Code","確認コード", "확인 코드")}</span>
         <span class="booking-code-value">${escapeHtml(itineraryId || orderId)}</span>
@@ -18182,11 +22165,25 @@ async function _loadProfileGreeting() {
   try { data = await api(`/api/session/profile?deviceId=${encodeURIComponent(deviceId)}`); } catch { return; }
   const profile = data?.profile;
   if (!profile || !profile.tripCount || profile.tripCount < 1) return;
-  const cities = (profile.cities || []).slice(-2).join("\u3001");
+  const cities = (profile.cities || [])
+    .slice(-2)
+    .map((city) => _localizeUiCityName(city, state.uiLanguage))
+    .filter(Boolean)
+    .join(pickText("\u3001", ", ", "\u30FB", ", "));
   const tc = profile.tripCount;
   const greeting = tc >= 3
-    ? `\u6b22\u8fce\u56de\u6765\uff01\u4e0a\u6b21\u60a8\u7ecf\u5386\u4e86 ${tc} \u6b21\u884c\u7a0b${cities ? "\uff08" + cities + "\uff09" : ""}\uff0c\u6b64\u6b21\u60f3\u53bb\u54ea\u91cc\uff1f`
-    : `\u6b22\u8fce\u56de\u6765\uff01${cities ? "\u60a8\u4e4b\u524d\u53bb\u8fc7 " + cities + "\uff0c" : ""}\u8fd9\u6b21\u60f3\u53bb\u54ea\u91cc\uff1f`;
+    ? pickText(
+        `欢迎回来！你已经有 ${tc} 次行程${cities ? `（${cities}）` : ""}，这次想去哪里？`,
+        `Welcome back. You already have ${tc} past trips${cities ? ` (${cities})` : ""}. Where do you want to go this time?`,
+        `お帰りなさい。これまでに ${tc} 回の旅程${cities ? `（${cities}）` : ""}があります。今回はどこへ行きますか？`,
+        `다시 오셨네요. 지금까지 ${tc}번의 여행${cities ? ` (${cities})` : ""}이 있습니다. 이번에는 어디로 가시겠어요?`,
+      )
+    : pickText(
+        `欢迎回来！${cities ? `你之前去过 ${cities}，` : ""}这次想去哪里？`,
+        `Welcome back${cities ? `. You previously explored ${cities}` : ""}. Where do you want to go this time?`,
+        `お帰りなさい。${cities ? `以前訪れた場所は ${cities} です。` : ""}今回はどこへ行きますか？`,
+        `다시 오셨네요.${cities ? ` 이전에 다녀온 곳은 ${cities}입니다.` : ""} 이번에는 어디로 가시겠어요?`,
+      );
   addMessage(greeting, "agent");
 }
 
@@ -18198,7 +22195,8 @@ async function _renderPostBookingFollowUp(plan, cardData) {
   // Fetch personalized suggestions from /api/proactive
   let suggestions = [];
   try {
-    const data = await fetch(`/api/proactive?deviceId=${encodeURIComponent(deviceId)}`, { headers: _authHeaders() }).then(r => r.json());
+    const proactiveRes = await fetch(`/api/proactive?deviceId=${encodeURIComponent(deviceId)}`, { headers: _authHeaders() });
+    const data = await _readJsonResponseSafe(proactiveRes, {});
     if (data.ok && Array.isArray(data.suggestions) && data.suggestions.length >= 2) {
       suggestions = data.suggestions.slice(0, 4).map(s => ({
         icon:  s.icon  || "\u{1F4A1}",
@@ -18219,7 +22217,7 @@ async function _renderPostBookingFollowUp(plan, cardData) {
   }
 
   const chipsHtml = suggestions.map(s =>
-    `<button class="cx-pb-chip" onclick="createTaskFromText(${JSON.stringify(s.query)})">${s.icon} ${escapeHtml(s.text)}</button>`
+    `<button class="cx-pb-chip" data-action="run-intent" data-intent="${escapeHtml(s.query)}">${s.icon} ${escapeHtml(s.text)}</button>`
   ).join("");
   addCard(`
     <article class="card cx-pb-card">
@@ -18315,36 +22313,47 @@ function _updateCharCounter() {
  * Tells the user the AI still has their context so they can continue naturally.
  */
 function _renderSessionContextBanner() {
-  const msgs = state.agentConversation.messages || [];
+  const msgs = (state._restoredConversation && state._restoredConversation.messages) || state.agentConversation.messages || [];
   const slots = state.agentConversation.slots || {};
   const savedAt = state._restoredAt;
 
   // Build context summary from slots
   const contextParts = [];
-  if (slots.city)                        contextParts.push(`\uD83D\uDCCD ${[slots.area, slots.city].filter(Boolean).join(" \u00B7 ")}`);
+  if (slots.city) {
+    const localizedArea = slots.area ? _localizeUiCityName(slots.area, state.uiLanguage) : "";
+    const localizedCity = _localizeUiCityName(slots.city, state.uiLanguage);
+    contextParts.push(`\uD83D\uDCCD ${[localizedArea, localizedCity].filter(Boolean).join(" \u00B7 ")}`);
+  }
   if (slots.time_constraint)             contextParts.push(`\u23F1 ${slots.time_constraint}`);
-  if (slots.party_size > 1)             contextParts.push(`\uD83D\uDC65 ${slots.party_size}\u4EBA`);
+  if (slots.party_size > 1)             contextParts.push(`\uD83D\uDC65 ${slots.party_size}${pickText("\u4EBA", " pax", "\u540D", "\uBA85")}`);
 
   // Time since saved
   let timeHint = "";
   if (savedAt) {
     const minAgo = Math.round((Date.now() - savedAt) / 60000);
-    timeHint = minAgo < 2 ? "\u521A\u624D" : minAgo < 60 ? `${minAgo}\u5206\u949F\u524D` : "\u4E4B\u524D";
+    timeHint = minAgo < 2
+      ? pickText("\u521A\u624D", "just now", "\u305F\u3063\u305F\u4ECA", "\uBC29\uAE08")
+      : minAgo < 60
+        ? pickText(`${minAgo}\u5206\u949F\u524D`, `${minAgo} min ago`, `${minAgo}\u5206\u524D`, `${minAgo}\uBD84 \uC804`)
+        : pickText("\u66F4\u65E9\u4E4B\u524D", "earlier", "\u5C11\u3057\u524D", "\uC870\uAE08 \uC804");
   }
 
   const userMsgCount = msgs.filter(m => m.role === "user").length;
   if (userMsgCount === 0) return; // nothing meaningful to recap
 
-  const contextStr = contextParts.length ? contextParts.join(" \u00B7 ") : `${userMsgCount}\u6761\u5BF9\u8BDD`;
+  const contextStr = contextParts.length ? contextParts.join(" \u00B7 ") : `${userMsgCount}${pickText("\u6761\u5BF9\u8BDD", " turns", "\u4EF6\u306E\u5BFE\u8A71", "\uAC1C \uB300\uD654")}`;
+  const labelText = timeHint
+    ? pickText(`AI \u8BB0\u5F97\u4F60${timeHint}\u7684\u5BF9\u8BDD`, `AI remembers your conversation from ${timeHint}`, `${timeHint}\u306E\u4F1A\u8A71\u3092\u899A\u3048\u3066\u3044\u307E\u3059`, `${timeHint} \uB300\uD654\uB97C \uAE30\uC5B5\uD558\uACE0 \uC788\uC5B4\uC694`)
+    : pickText("AI \u8BB0\u5F97\u4F60\u521A\u624D\u7684\u5BF9\u8BDD", "AI remembers your recent conversation", "\u76F4\u524D\u306E\u4F1A\u8A71\u3092\u899A\u3048\u3066\u3044\u307E\u3059", "\uBC29\uAE08 \uB300\uD654\uB97C \uAE30\uC5B5\uD558\uACE0 \uC788\uC5B4\uC694");
 
   addCard(`
-    <div class="cx-scb-row">
+    <div class="cx-scb-row" id="sessionContextBanner">
       <span class="cx-scb-icon">\u{1F9E0}</span>
       <div class="cx-scb-text">
-        <span class="cx-scb-label">AI \u8BB0\u5F97\u4F60${timeHint}\u7684\u5BF9\u8BDD</span>
+        <span class="cx-scb-label">${escapeHtml(labelText)}</span>
         <span class="cx-scb-ctx">${escapeHtml(contextStr)}</span>
       </div>
-      <button class="cx-scb-clear" onclick="clearSession()" title="\u6E05\u9664\u8BB0\u5F55">\u00D7</button>
+      <button class="cx-scb-clear" data-action="clear-session" title="${escapeHtml(pickText("\u6E05\u9664\u8BB0\u5F55", "Clear session", "\u5C65\u6B74\u3092\u6D88\u53BB", "\uC138\uC158 \uC0AD\uC81C"))}">\u00D7</button>
     </div>
   `);
 }
@@ -18355,6 +22364,9 @@ function clearSession() {
 
   // Clear conversation state
   state.agentConversation = { mode: "idle", slots: {}, preferences: [], messages: [] };
+  state._restoredConversation = null;
+  state._sessionRestored = false;
+  state._restoredAt = 0;
   state.currentTask = null;
   state._lastSessionId = null;
   state._lastCardData = null;
@@ -18369,10 +22381,9 @@ function clearSession() {
 
   // Clear storage
   try {
-    const tabId = sessionStorage.getItem("cx_tab_id") || "";
-    const key = tabId ? `cx_conv_${tabId}` : "cx_conv";
-    sessionStorage.removeItem(key);
-  } catch {}
+    localStorage.removeItem(CONV_STORAGE_KEY);
+    localStorage.removeItem(CONV_STORAGE_KEY_SHARED);
+  } catch { /* ignore */ }
 
   notify(pickText("会话已清除", "Session cleared", "セッションをクリアしました", "세션이 지워졌습니다"), "success");
 
@@ -18388,57 +22399,61 @@ function clearSession() {
 function _renderTimeAwareSuggestions() {
   // Only show on a fresh session (no prior conversation restored)
   if (state.agentConversation.messages.length > 0) return;
-  const city = getCurrentCity() || "\u5f53\u524d\u57ce\u5e02"; // 当前城市
+  const city = _localizeUiCityName(
+    getCurrentCity() || pickText("\u5f53\u524d\u57ce\u5e02", "current city", "\u73FE\u5728\u306E\u90FD\u5E02", "\uD604\uC7AC \uB3C4\uC2DC"),
+    state.uiLanguage,
+  );
   const h = new Date().getHours();
 
   let scenarios;
   if (h >= 6 && h < 10) {
     // Morning
     scenarios = [
-      { icon: "\u2615", label: "\u65e9\u9910\u4e0d\u6392\u961f", query: `\u5e2e\u6211\u5728${city}\u627e\u4e0d\u7528\u6392\u961f\u7684\u65e9\u9910\u5e97` },
-      { icon: "\u{1F30A}", label: "\u4eca\u65e5\u51fa\u884c\u8ba1\u5212", query: `\u5e2e\u6211\u89c4\u5212${city}\u4e00\u65e5\u6e38` },
-      { icon: "\u2708\uFE0F", label: "\u5468\u672b\u77ed\u9014\u65c5\u884c", query: `\u5929\u6d25\u51fa\u53d1\u5468\u672b2\u65e5\u6e38` },
+      { icon: "\u2615", label: pickText("\u65e9\u9910\u4e0d\u6392\u961f", "Breakfast without waiting", "\u5F85\u3061\u306A\u3057\u306E\u671D\u98DF", "\uC870\uC2DD \uB300\uAE30 \uC5C6\uC774"), query: pickText(`\u5e2e\u6211\u5728${city}\u627e\u4e0d\u7528\u6392\u961f\u7684\u65e9\u9910\u5e97`, `Find me a breakfast place in ${city} without a wait.`, `${city}\u3067\u5F85\u3061\u6642\u9593\u306E\u5C11\u306A\u3044\u671D\u98DF\u5E97\u3092\u63A2\u3057\u3066\u3002`, `${city}\uC5D0\uC11C \uB300\uAE30 \uC5C6\uB294 \uC870\uC2DD \uACF3\uC744 \uCC3E\uC544\uC918.`) },
+      { icon: "\u{1F30A}", label: pickText("\u4eca\u65e5\u51fa\u884c\u8ba1\u5212", "Today's outing", "\u4ECA\u65E5\u306E\u304A\u51FA\u304B\u3051", "\uC624\uB298 \uC678\uCD9C \uACC4\uD68D"), query: pickText(`\u5e2e\u6211\u89c4\u5212${city}\u4e00\u65e5\u6e38`, `Plan a one-day trip in ${city}.`, `${city}\u3067\u65E5\u5E30\u308A\u30D7\u30E9\u30F3\u3092\u7D44\u3093\u3067\u3002`, `${city}\uC5D0\uC11C \uD558\uB8E8 \uC5EC\uD589 \uACC4\uD68D\uC744 \uC9DC\uC918.`) },
+      { icon: "\u2708\uFE0F", label: pickText("\u5468\u672b\u77ed\u9014\u65c5\u884c", "Weekend getaway", "\u9031\u672B\u306E\u5C0F\u65C5\u884C", "\uC8FC\uB9D0 \uC9E7\uC740 \uC5EC\uD589"), query: pickText(`\u5929\u6d25\u51fa\u53d1\u5468\u672b2\u65e5\u6e38`, `Plan a 2-day weekend getaway from Tianjin.`, `\u5929\u6D25\u51FA\u767A\u306E2\u65E5\u9593\u9031\u672B\u65C5\u884C\u3092\u8A08\u753B\u3057\u3066\u3002`, `\uCC9C\uC9C4 \uCD9C\uBC1C 2\uC77C \uC8FC\uB9D0 \uC5EC\uD589\uC744 \uACC4\uD68D\uD574\uC918.`) },
     ];
   } else if (h >= 10 && h < 14) {
     // Lunch
     scenarios = [
-      { icon: "\u{1F35c}", label: "\u5348\u9910\u60a8\u770b", query: `\u5e2e\u6211\u5728${city}\u627e\u5348\u9910\uff0c\u4e0d\u6392\u961f\u3001\u5473\u9053\u597d` },
-      { icon: "\u{1F1e8}\u{1F1f3}", label: "\u5468\u672b\u53bb\u54ea\u73a9", query: `\u63a8\u8350\u4e00\u4e2a\u5468\u672b2\u65e5\u6e38\u76ee\u7684\u5730` },
-      { icon: "\u{1F3e8}", label: "\u8ba2\u9152\u5e97\u6700\u4f18\u60e0", query: `\u5e2e\u6211\u5728${city}\u627e\u6027\u4ef7\u6bd4\u9ad8\u7684\u9152\u5e97` },
+      { icon: "\u{1F35c}", label: pickText("\u5348\u9910\u60a8\u770b", "Lunch ideas", "\u30E9\u30F3\u30C1\u6848", "\uC810\uC2EC \uC81C\uC548"), query: pickText(`\u5e2e\u6211\u5728${city}\u627e\u5348\u9910\uff0c\u4e0d\u6392\u961f\u3001\u5473\u9053\u597d`, `Find lunch in ${city} with short wait and good taste.`, `${city}\u3067\u5F85\u3061\u6642\u9593\u304C\u77ED\u304F\u3066\u7F8E\u5473\u3057\u3044\u30E9\u30F3\u30C1\u3092\u63A2\u3057\u3066\u3002`, `${city}\uC5D0\uC11C \uB300\uAE30 \uC9E7\uACE0 \uB9DB\uC788\uB294 \uC810\uC2EC\uC744 \uCC3E\uC544\uC918.`) },
+      { icon: "\u{1F1e8}\u{1F1f3}", label: pickText("\u5468\u672b\u53bb\u54ea\u73a9", "Weekend destination", "\u9031\u672B\u306E\u884C\u304D\u5148", "\uC8FC\uB9D0 \uD589\uC120\uC9C0"), query: pickText(`\u63a8\u8350\u4e00\u4e2a\u5468\u672b2\u65e5\u6e38\u76ee\u7684\u5730`, `Recommend a 2-day weekend destination.`, `2\u65E5\u9593\u306E\u9031\u672B\u65C5\u884C\u5148\u3092\u63A8\u8350\u3057\u3066\u3002`, `2\uC77C \uC8FC\uB9D0 \uC5EC\uD589 \uBAA9\uC801\uC9C0\uB97C \uCD94\uCC9C\uD574\uC918.`) },
+      { icon: "\u{1F3e8}", label: pickText("\u8ba2\u9152\u5e97\u6700\u4f18\u60e0", "Best hotel deal", "\u304A\u5F97\u306A\u30DB\u30C6\u30EB", "\uD638\uD154 \uCD5C\uC800\uAC00"), query: pickText(`\u5e2e\u6211\u5728${city}\u627e\u6027\u4ef7\u6bd4\u9ad8\u7684\u9152\u5e97`, `Find me a good-value hotel in ${city}.`, `${city}\u3067\u30B3\u30B9\u30D1\u306E\u826F\u3044\u30DB\u30C6\u30EB\u3092\u63A2\u3057\u3066\u3002`, `${city}\uC5D0\uC11C \uAC00\uC131\uBE44 \uC88B\uC740 \uD638\uD154\uC744 \uCC3E\uC544\uC918.`) },
     ];
   } else if (h >= 14 && h < 18) {
     // Afternoon
     scenarios = [
-      { icon: "\u{1F3de}\uFE0F", label: "\u4e0b\u5348\u51fa\u6e38", query: `${city}\u4e0b\u5348\u9002\u5408\u53bb\u54ea\u91cc\u73a9` },
-      { icon: "\u{1F374}", label: "\u665a\u9910\u9884\u8ba2", query: `\u5e2e\u6211\u9884\u8ba2${city}\u4eca\u665a\u6b63\u9910` },
-      { icon: "\u{1F6eb}", label: "\u660e\u5929\u98de\u673a\u884c\u7a0b", query: `\u5e2e\u6211\u89c4\u5212\u4e00\u4e2a3\u65e5\u5c0f\u957f\u5047\u65c5\u884c` },
+      { icon: "\u{1F3de}\uFE0F", label: pickText("\u4e0b\u5348\u51fa\u6e38", "Afternoon outing", "\u5348\u5F8C\u306E\u304A\u51FA\u304B\u3051", "\uC624\uD6C4 \uC678\uCD9C"), query: pickText(`${city}\u4e0b\u5348\u9002\u5408\u53bb\u54ea\u91cc\u73a9`, `Where should I go this afternoon in ${city}?`, `${city}\u3067\u4ECA\u65E5\u306E\u5348\u5F8C\u306B\u884C\u304F\u306E\u306B\u304A\u3059\u3059\u3081\u306F\uFF1F`, `${city}\uC5D0\uC11C \uC624\uD6C4\uC5D0 \uAC00\uAE30 \uC88B\uC740 \uACF3\uC740?`) },
+      { icon: "\u{1F374}", label: pickText("\u665A\u9910\u9884\u8BA2", "Dinner booking", "\u5915\u98DF\u306E\u4E88\u7D04", "\uC800\uB141 \uC608\uC57D"), query: pickText(`\u5e2e\u6211\u9884\u8ba2${city}\u4eca\u665a\u6b63\u9910`, `Book dinner for me in ${city} tonight.`, `${city}\u3067\u4ECA\u591C\u306E\u30C7\u30A3\u30CA\u30FC\u3092\u4E88\u7D04\u3057\u3066\u3002`, `${city}\uC5D0\uC11C \uC624\uB298 \uC800\uB141 \uC2DD\uB2F9\uC744 \uC608\uC57D\uD574\uC918.`) },
+      { icon: "\u{1F6eb}", label: pickText("\u660e\u5929\u98de\u673a\u884c\u7a0b", "Tomorrow's flight plan", "\u660E\u65E5\u306E\u30D5\u30E9\u30A4\u30C8", "\uB0B4\uC77C \uD56D\uACF5 \uC77C\uC815"), query: pickText(`\u5e2e\u6211\u89c4\u5212\u4e00\u4e2a3\u65e5\u5c0f\u957f\u5047\u65c5\u884c`, `Plan a 3-day short holiday for me.`, `3\u65E5\u9593\u306E\u30B7\u30E7\u30FC\u30C8\u30C8\u30EA\u30C3\u30D7\u3092\u8A08\u753B\u3057\u3066\u3002`, `3\uC77C \uC9E7\uC740 \uD734\uAC00 \uC5EC\uD589\uC744 \uACC4\uD68D\uD574\uC918.`) },
     ];
   } else if (h >= 18 && h < 23) {
     // Evening
     scenarios = [
-      { icon: "\u{1F962}", label: "\u4eca\u665a\u5403\u4ec0\u4e48", query: `\u5e2e\u6211\u5728${city}\u627e\u4eca\u665a\u6b63\u9910\uff0c\u4e0d\u6392\u961f` },
-      { icon: "\u{1F319}", label: "\u591c\u6e38\u597d\u53bb\u5904", query: `${city}\u591c\u665a\u9002\u5408\u53bb\u54ea\u91cc` },
-      { icon: "\u{1F5fa}\uFE0F", label: "\u89c4\u5212\u660e\u65e5\u884c\u7a0b", query: `\u5e2e\u6211\u89c4\u5212\u660e\u5929\u5728${city}\u7684\u884c\u7a0b` },
+      { icon: "\u{1F962}", label: pickText("\u4eca\u665a\u5403\u4ec0\u4e48", "Dinner tonight", "\u4ECA\u591C\u306E\u98DF\u4E8B", "\uC624\uB298 \uC800\uB141"), query: pickText(`\u5e2e\u6211\u5728${city}\u627e\u4eca\u665a\u6b63\u9910\uff0c\u4e0d\u6392\u961f`, `Find dinner in ${city} tonight with no long queue.`, `${city}\u3067\u4ECA\u591C\u306E\u5915\u98DF\u3092\u63A2\u3057\u3066\u3002\u9577\u3044\u5F85\u3061\u306F\u907F\u3051\u305F\u3044\u3002`, `${city}\uC5D0\uC11C \uC624\uB298 \uC800\uB141 \uC2DD\uB2F9\uC744 \uCC3E\uC544\uC918. \uAE34 \uB300\uAE30\uB294 \uD53C\uD558\uACE0 \uC2F6\uC5B4.`) },
+      { icon: "\u{1F319}", label: pickText("\u591C\u6E38\u597D\u53BB\u5904", "Night outing", "\u591C\u306E\u304A\u51FA\u304B\u3051", "\uC57C\uAC04 \uC678\uCD9C"), query: pickText(`${city}\u591c\u665a\u9002\u5408\u53bb\u54ea\u91cc`, `Where should I go tonight in ${city}?`, `${city}\u3067\u4ECA\u591C\u884C\u304F\u306E\u306B\u304A\u3059\u3059\u3081\u306F\uFF1F`, `${city}\uC5D0\uC11C \uC624\uB298 \uBC24 \uAC00\uAE30 \uC88B\uC740 \uACF3\uC740?`) },
+      { icon: "\u{1F5fa}\uFE0F", label: pickText("\u89c4\u5212\u660e\u65e5\u884c\u7a0b", "Plan tomorrow", "\u660E\u65E5\u306E\u8A08\u753B", "\uB0B4\uC77C \uACC4\uD68D"), query: pickText(`\u5e2e\u6211\u89c4\u5212\u660e\u5929\u5728${city}\u7684\u884c\u7a0b`, `Plan my itinerary in ${city} for tomorrow.`, `${city}\u3067\u660E\u65E5\u306E\u65E5\u7A0B\u3092\u7D44\u3093\u3067\u3002`, `${city}\uC5D0\uC11C \uB0B4\uC77C \uC77C\uC815\uC744 \uACC4\uD68D\uD574\uC918.`) },
     ];
   } else {
     // Late night
     scenarios = [
-      { icon: "\u{1F319}", label: "\u5c0f\u591c\u664b\u5440", query: `${city}\u6df1\u591c\u5403\u5565` },
-      { icon: "\u{1F4c5}", label: "\u660e\u5929\u65e9\u9910\u5b89\u6392", query: `\u5e2e\u6211\u5b89\u6392\u660e\u5929\u65e9\u9910` },
-      { icon: "\u2708\uFE0F", label: "\u8ba1\u5212\u4e0b\u6b21\u65c5\u884c", query: `\u63a8\u8350\u4e00\u4e2a\u5468\u672b\u51fa\u884c\u76ee\u7684\u5730` },
+      { icon: "\u{1F319}", label: pickText("\u5C0F\u591C\u5BB5", "Late-night bite", "\u591C\u98DF", "\uC57C\uC2DD"), query: pickText(`${city}\u6df1\u591c\u5403\u5565`, `What can I eat late at night in ${city}?`, `${city}\u3067\u6DF1\u591C\u306B\u98DF\u3079\u3089\u308C\u308B\u3082\u306E\u306F\uFF1F`, `${city}\uC5D0\uC11C \uBC24\uB2E4\uB978 \uBA39\uC744 \uAC70 \uCD94\uCC9C\uD574\uC918.`) },
+      { icon: "\u{1F4c5}", label: pickText("\u660e\u5929\u65e9\u9910\u5b89\u6392", "Tomorrow's breakfast", "\u660E\u65E5\u306E\u671D\u98DF", "\uB0B4\uC77C \uC544\uCE68"), query: pickText(`\u5e2e\u6211\u5b89\u6392\u660e\u5929\u65e9\u9910`, "Arrange breakfast for tomorrow morning.", "\u660E\u65E5\u306E\u671D\u98DF\u3092\u624B\u914D\u3057\u3066\u3002", "\uB0B4\uC77C \uC544\uCE68 \uC2DD\uC0AC\uB97C \uC900\uBE44\uD574\uC918.") },
+      { icon: "\u2708\uFE0F", label: pickText("\u8ba1\u5212\u4e0b\u6b21\u65c5\u884c", "Next trip idea", "\u6B21\u306E\u65C5\u884C", "\uB2E4\uC74C \uC5EC\uD589"), query: pickText(`\u63a8\u8350\u4e00\u4e2a\u5468\u672b\u51fa\u884c\u76ee\u7684\u5730`, "Recommend a weekend destination for my next trip.", "\u6B21\u306E\u9031\u672B\u65C5\u884C\u5148\u3092\u63A8\u8350\u3057\u3066\u3002", "\uB2E4\uC74C \uC8FC\uB9D0 \uC5EC\uD589\uC9C0\uB97C \uCD94\uCC9C\uD574\uC918.") },
     ];
   }
 
   const chipsHtml = scenarios.map(s =>
-    `<button class="cx-taw-chip" onclick="createTaskFromText(${JSON.stringify(s.query)})">${s.icon} ${escapeHtml(s.label)}</button>`
+    `<button class="cx-taw-chip" data-action="run-intent" data-intent="${escapeHtml(s.query)}">${s.icon} ${escapeHtml(s.label)}</button>`
   ).join("");
 
   addCard(`
     <div class="cx-taw-row">
-      <span class="cx-taw-label">\u{1F4a1} \u5feb\u901f\u5f00\u59cb</span>
+      <span class="cx-taw-label">\u{1F4a1} ${pickText("\u5FEB\u901F\u5F00\u59CB", "Quick Start", "\u3059\u3050\u59CB\u3081\u308B", "\uBE60\uB978 \uC2DC\uC791")}</span>
       ${chipsHtml}
     </div>
   `);
+  _syncColdStartLayout();
 }
 
 /**
@@ -18447,25 +22462,36 @@ function _renderTimeAwareSuggestions() {
  */
 async function _loadTripHistoryChip() {
   if (state.agentConversation.messages.length > 0) return; // skip on restored sessions
+  if (!_canUsePrivateUserApis()) return;
   try {
     const deviceId = getDeviceId ? getDeviceId() : "demo";
     const r = await fetch(`/api/trips/recent?deviceId=${encodeURIComponent(deviceId)}&limit=3`, { headers: _authHeaders() });
-    const data = await r.json();
+    const data = await _readJsonResponseSafe(r, {});
     const trips = (data.ok && Array.isArray(data.trips)) ? data.trips : [];
     if (!trips.length) return;
     const chipsHtml = trips.map((t) => {
-      const label = t.place ? escapeHtml(t.place) : pickText("上次行程", "Previous trip", "前回", "이전 여행");
+      const label = t.place
+        ? escapeHtml(_localizeUiCityName(t.place))
+        : pickText("上次行程", "Previous trip", "前回", "이전 여행");
       const query = t.place && t.city
-        ? `${t.intent === "eat" ? "在" : "去"}${t.city}${t.area ? t.area : ""}${t.place}`
+        ? pickText(
+            `${t.intent === "eat" ? "在" : "去"}${t.city}${t.area ? t.area : ""}${t.place}`,
+            t.intent === "eat"
+              ? `Find something near ${_localizeUiCityName(t.city)} ${t.place}`
+              : `Plan a trip to ${_localizeUiCityName(t.city)} ${t.place}`,
+            `${_localizeUiCityName(t.city)} ${t.place} を再表示`,
+            `${_localizeUiCityName(t.city)} ${t.place} 다시 보기`
+          )
         : "";
-      return `<button class="cx-taw-chip" ${query ? `onclick="createTaskFromText(${JSON.stringify(query)})"` : ""}>\u{1F4CC} ${label}</button>`;
+      return `<button class="cx-taw-chip" ${query ? `data-action="run-intent" data-intent="${escapeHtml(query)}"` : "disabled"}>\u{1F4CC} ${label}</button>`;
     }).join("");
     addCard(`
       <div class="cx-taw-row">
-        <span class="cx-taw-label">\u{1F551} \u4e0a\u6b21\u53bb\u8fc7</span>
+        <span class="cx-taw-label">\u{1F551} ${escapeHtml(pickText("上次去过", "Recent trips", "最近の旅", "최근 여행"))}</span>
         ${chipsHtml}
       </div>
     `);
+    _syncColdStartLayout();
   } catch (_) { /* non-critical */ }
 }
 
@@ -18473,11 +22499,62 @@ async function _loadTripHistoryChip() {
 
 const CX_GDPR_KEY = "cx_gdpr_v1";
 
+function _setGdprBannerVisibility(visible) {
+  document.body.classList.toggle("cx-gdpr-banner-visible", !!visible);
+}
+
+function _syncGdprOffset() {
+  const banner = document.getElementById("cx-gdpr-banner");
+  const nextOffset = banner ? `${Math.ceil(banner.getBoundingClientRect().height || 0)}px` : "0px";
+  document.documentElement.style.setProperty("--cx-gdpr-offset", nextOffset);
+}
+
+function _hasRecordedGdprConsent() {
+  try {
+    return Boolean(localStorage.getItem(CX_GDPR_KEY));
+  } catch {
+    return false;
+  }
+}
+
+function _getStoredGdprConsentChoice() {
+  try {
+    const raw = localStorage.getItem(CX_GDPR_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    const purposes = Array.isArray(parsed?.purposes) ? parsed.purposes : [];
+    if (purposes.includes("analytics") || purposes.includes("personalization")) return "all";
+    if (purposes.includes("essential")) return "essential";
+  } catch {
+    // ignore parse errors
+  }
+  return "";
+}
+
+function _removeGdprBanner() {
+  const banner = document.getElementById("cx-gdpr-banner");
+  if (banner) banner.remove();
+  _setGdprBannerVisibility(false);
+  _syncGdprOffset();
+}
+
+function _recordGdprConsent(purposes) {
+  try {
+    localStorage.setItem(CX_GDPR_KEY, JSON.stringify({ v: "1.0", t: Date.now(), purposes }));
+  } catch (_) { /* ignore */ }
+  _postConsent(purposes, true).catch(() => {});
+  _removeGdprBanner();
+}
+
 /**
  * Check if GDPR consent has been recorded. If not, inject a bottom banner.
  * Called early in init() before any analytics/personalization is enabled.
  */
-function _checkGdprConsent() {
+function _checkGdprConsent(options = {}) {
+  const deferForLoginGate = options.deferForLoginGate === true;
+  _setGdprBannerVisibility(false);
+  if (document.getElementById("cx-gdpr-banner")) return;
+  if (document.getElementById("cx-login-modal") || document.body.classList.contains("auth-gated")) return;
+  if (deferForLoginGate && IS_USER_PORTAL && !_authBootstrapResolved) return;
   try {
     if (localStorage.getItem(CX_GDPR_KEY)) return; // already consented
   } catch (_) {
@@ -18489,24 +22566,32 @@ function _checkGdprConsent() {
   banner.innerHTML = `
     <div class="cx-gdpr-box">
       <div class="cx-gdpr-text">
-        <strong>隐私提示 / Privacy Notice</strong>
-        CrossX 使用设备偏好数据为您提供个性化旅行规划服务。
-        <a href="/privacy" target="_blank" rel="noopener">查看隐私政策 / Privacy Policy</a>
+        <strong>${pickText("隐私提示", "Privacy Notice", "プライバシー通知", "개인정보 안내")}</strong>
+        ${pickText(
+          "CrossX 使用设备偏好数据为您提供个性化旅行规划服务。",
+          "CrossX uses device preferences to personalize your travel planning experience.",
+          "CrossX は端末設定を使って旅行計画をパーソナライズします。",
+          "CrossX는 기기 선호 정보를 사용해 여행 계획을 개인화합니다."
+        )}
+        <a href="${escapeHtml(getLocalizedPrivacyUrl())}" target="_blank" rel="noopener" data-privacy-link="1">${pickText("查看隐私政策", "Read Privacy Policy", "プライバシーポリシーを見る", "개인정보 처리방침 보기")}</a>
       </div>
       <div class="cx-gdpr-actions">
-        <button id="cx-gdpr-min" class="cx-gdpr-btn cx-gdpr-btn-min">仅必要 / Essential only</button>
-        <button id="cx-gdpr-all" class="cx-gdpr-btn cx-gdpr-btn-all">接受全部 / Accept all</button>
+        <button id="cx-gdpr-min" class="cx-gdpr-btn cx-gdpr-btn-min">${pickText("仅必要", "Essential only", "必須のみ", "필수만")}</button>
+        <button id="cx-gdpr-all" class="cx-gdpr-btn cx-gdpr-btn-all">${pickText("接受全部", "Accept all", "すべて許可", "모두 허용")}</button>
       </div>
     </div>
   `;
   document.body.appendChild(banner);
+  _setGdprBannerVisibility(true);
+
+  const cleanupConsentUi = () => {
+    _setGdprBannerVisibility(false);
+  };
 
   const accept = (purposes) => {
-    try {
-      localStorage.setItem(CX_GDPR_KEY, JSON.stringify({ v: "1.0", t: Date.now(), purposes }));
-    } catch (_) {}
-    _postConsent(purposes, true).catch(() => {});
-    banner.remove();
+    _recordGdprConsent(purposes);
+    cleanupConsentUi();
+    setTimeout(() => _initOnboarding(), 140);
   };
 
   const btnAll = document.getElementById("cx-gdpr-all");
@@ -18532,78 +22617,107 @@ async function _postConsent(purposes, granted) {
 const AUTH_TOKEN_KEY   = "cx_user_token";
 const AUTH_USERID_KEY  = "cx_user_id";
 const AUTH_NAME_KEY    = "cx_user_name";
+const AUTH_SESSION_HINT_KEY = "cx_user_session_hint";
 
-// SEC-03: Token now primarily stored in HttpOnly cookie (server sets cx_token cookie on login).
-// localStorage fallback kept for backwards compat with existing sessions and cookie-blocked envs.
-function _getAuthToken() {
-  try {
-    // If the server set a cx_token cookie we still need the value for Authorization header injection.
-    // Cookies are not readable from JS when HttpOnly, so fall back to localStorage for the header.
-    // The server will accept EITHER the cookie OR the Authorization header.
-    return localStorage.getItem(AUTH_TOKEN_KEY) || null;
-  } catch { return null; }
+function _authStorage() {
+  try { return window.sessionStorage; } catch { return null; }
 }
-function _getAuthUserId()  { try { return localStorage.getItem(AUTH_USERID_KEY) || null; } catch { return null; } }
-function _getAuthName()    { try { return localStorage.getItem(AUTH_NAME_KEY) || null; } catch { return null; } }
+
+function _legacyAuthStorage() {
+  try { return window.localStorage; } catch { return null; }
+}
+
+function _getAuthToken() {
+  return null;
+}
+function _getAuthUserId()  { try { return _authStorage()?.getItem(AUTH_USERID_KEY) || null; } catch { return null; } }
+function _getAuthName()    { try { return _authStorage()?.getItem(AUTH_NAME_KEY) || null; } catch { return null; } }
 
 function _saveAuthState(token, userId, displayName) {
   try {
-    // Still save token in localStorage for Authorization header injection (HttpOnly cookie handles security)
-    localStorage.setItem(AUTH_TOKEN_KEY,  token);
-    localStorage.setItem(AUTH_USERID_KEY, userId);
-    localStorage.setItem(AUTH_NAME_KEY,   displayName);
-    // Note: HttpOnly cx_token cookie is set by the server on login — no JS needed here
+    const store = _authStorage();
+    const legacy = _legacyAuthStorage();
+    if (store) {
+      if (userId) store.setItem(AUTH_USERID_KEY, userId);
+      else store.removeItem(AUTH_USERID_KEY);
+      if (displayName) store.setItem(AUTH_NAME_KEY, displayName);
+      else store.removeItem(AUTH_NAME_KEY);
+      store.setItem(AUTH_SESSION_HINT_KEY, String(Date.now()));
+    }
+    if (legacy) {
+      legacy.removeItem(AUTH_TOKEN_KEY);
+      legacy.removeItem(AUTH_USERID_KEY);
+      legacy.removeItem(AUTH_NAME_KEY);
+      legacy.removeItem(AUTH_SESSION_HINT_KEY);
+    }
   } catch { /* storage disabled */ }
 }
 
 function _clearAuthState() {
   try {
-    localStorage.removeItem(AUTH_TOKEN_KEY);
-    localStorage.removeItem(AUTH_USERID_KEY);
-    localStorage.removeItem(AUTH_NAME_KEY);
+    const store = _authStorage();
+    const legacy = _legacyAuthStorage();
+    store?.removeItem(AUTH_USERID_KEY);
+    store?.removeItem(AUTH_NAME_KEY);
+    store?.removeItem(AUTH_SESSION_HINT_KEY);
+    legacy?.removeItem(AUTH_TOKEN_KEY);
+    legacy?.removeItem(AUTH_USERID_KEY);
+    legacy?.removeItem(AUTH_NAME_KEY);
+    legacy?.removeItem(AUTH_SESSION_HINT_KEY);
     // Note: HttpOnly cx_token cookie is cleared by the server on logout (Set-Cookie: Max-Age=0)
   } catch { /* storage disabled */ }
 }
 
 function _applyAuthUi(loggedIn, displayName) {
   const loginBtn    = document.getElementById("loginBtn");
+  const myOrdersBtn = document.getElementById("myOrdersBtn");
   const logoutBtn   = document.getElementById("logoutBtn");
   const userNameTag = document.getElementById("userNameTag");
   if (!loginBtn) return;
   if (loggedIn) {
     loginBtn.classList.add("hidden");
+    if (myOrdersBtn) myOrdersBtn.classList.remove("hidden");
     userNameTag.textContent = displayName || pickText("旅行者", "Traveler", "旅人", "여행자");
     userNameTag.classList.remove("hidden");
     logoutBtn.classList.remove("hidden");
   } else {
     loginBtn.classList.remove("hidden");
+    if (myOrdersBtn) myOrdersBtn.classList.add("hidden");
     userNameTag.classList.add("hidden");
     logoutBtn.classList.add("hidden");
+  }
+  _applyCompactTopbarContract();
+}
+
+function _maybeShowRequiredLoginModal() {
+  if (_bootLoginPromptShown || !IS_USER_PORTAL || state.viewMode === "admin") return;
+  if (_authBootstrapAuthenticated) return;
+  if (document.getElementById("cx-login-modal")) return;
+  _bootLoginPromptShown = true;
+  window.setTimeout(() => {
+    if (_authBootstrapAuthenticated || document.getElementById("cx-login-modal")) return;
+    _showLoginModal({ required: true });
+  }, 60);
+}
+
+async function _refreshAuthIdentityFromServer() {
+  try {
+    const r = await fetch("/api/auth/me", { headers: _authHeaders() });
+    if (!r.ok) return null;
+    const data = await _readJsonResponseSafe(r, {});
+    if (!data || !data.ok) return null;
+    _saveAuthState(null, data.userId, data.displayName);
+    return data;
+  } catch {
+    return null;
   }
 }
 
 async function _initAuthState() {
-  // Handle WeChat OAuth callback: ?wx_token=...&wx_name=...
   const _urlP = new URLSearchParams(window.location.search);
-  const _wxToken = _urlP.get("wx_token");
-  const _wxName  = _urlP.get("wx_name");
+  const _authSuccess = _urlP.get("auth_success");
+  const _authName = _urlP.get("auth_name");
   const _authErr = _urlP.get("auth_error");
-  if (_wxToken) {
-    // Verify the token with server, then log in
-    try {
-      const _r = await fetch("/api/auth/me", { headers: { Authorization: `Bearer ${_wxToken}` } });
-      if (_r.ok) {
-        const _d = await _r.json();
-        if (_d.ok) {
-          _onLoginSuccess(_wxToken, _d.userId, _d.displayName || _wxName || "微信用户");
-        }
-      }
-    } catch { /* ignore */ }
-    // Clean URL
-    const _clean = window.location.pathname;
-    history.replaceState({}, "", _clean);
-    return;
-  }
   if (_authErr) {
     const _authErrMap = {
       denied:                pickText("登录已取消。", "Sign-in was cancelled.", "サインインがキャンセルされました。", "로그인이 취소되었습니다."),
@@ -18635,7 +22749,7 @@ async function _initAuthState() {
           await new Promise(r => setTimeout(r, 3000));
           try {
             const _ps = await api(`/api/orders/${encodeURIComponent(_payOrderId)}/status`);
-            if (_ps && _ps.paymentStatus === "paid") { await loadOrders(); break; }
+            if (_ps && (_ps.status === "paid" || _ps.paymentStatus === "paid")) { await loadOrders(); break; }
           } catch { break; }
         }
       }
@@ -18660,20 +22774,60 @@ async function _initAuthState() {
     history.replaceState({}, "", window.location.pathname);
   }
 
-  const token = _getAuthToken();
-  if (!token) { _applyAuthUi(false); return; }
+  const _shouldForceAuthProbe = Boolean(_authSuccess);
+  const _shouldForcePaymentProbe = Boolean(_payOk || _payCancel || _payErr);
+  if (!_shouldForceAuthProbe && !_shouldForcePaymentProbe && _hasLegacyStoredAuthState() && !_hasStoredAuthIdentity()) {
+    _clearAuthState();
+  }
+  const _hasStoredIdentity = _hasStoredAuthIdentity();
+  const _shouldProbeAuth = Boolean(IS_USER_PORTAL || _hasStoredIdentity || _shouldForceAuthProbe || _shouldForcePaymentProbe);
+  if (_hasStoredIdentity) {
+    _applyAuthUi(true, _getAuthName ? _getAuthName() : "");
+  }
+  if (!_shouldProbeAuth) {
+    _setAuthBootstrapState(true, false);
+    _applyAuthUi(false);
+    setConsumerSurface("workspace", { focusComposer: false });
+    _maybeShowRequiredLoginModal();
+    return;
+  }
+
   try {
-    const r = await fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } });
-    if (!r.ok) { _clearAuthState(); _applyAuthUi(false); return; }
-    const data = await r.json();
-    if (data.ok) {
-      _saveAuthState(token, data.userId, data.displayName);
-      _applyAuthUi(true, data.displayName);
-      _loadServerFavorites().catch(() => {});
-    } else {
-      _clearAuthState(); _applyAuthUi(false);
+    const r = await fetch("/api/auth/me", { headers: _authHeaders() });
+    if (!r.ok) {
+      _clearAuthState();
+      _setAuthBootstrapState(true, false);
+      _applyAuthUi(false);
+      setConsumerSurface("workspace", { focusComposer: false });
+      _maybeShowRequiredLoginModal();
+      return;
     }
-  } catch { _applyAuthUi(false); }
+    const data = await _readJsonResponseSafe(r, {});
+    if (data.ok) {
+      _setAuthBootstrapState(true, true);
+      _saveAuthState(null, data.userId, data.displayName);
+      _applyAuthUi(true, data.displayName);
+      if (_authSuccess) {
+        notify(pickText(`欢迎回来，${data.displayName || _authName || "旅行者"}！`, `Welcome, ${data.displayName || _authName || "Traveler"}!`, `ようこそ、${data.displayName || _authName || "旅行者"}！`, `환영합니다, ${data.displayName || _authName || "여행자"}!`), "success");
+        history.replaceState({}, "", window.location.pathname);
+      }
+      _loadServerFavorites().catch(() => {});
+      await hydrateConsumerHome({ preferHome: false, focusComposer: true });
+      _checkGdprConsent();
+    } else {
+      _setAuthBootstrapState(true, false);
+      _clearAuthState();
+      _applyAuthUi(false);
+      setConsumerSurface("workspace", { focusComposer: false });
+      _maybeShowRequiredLoginModal();
+    }
+  } catch {
+    // Network error — keep stored token for next attempt but do not hard-block homepage usage.
+    _setAuthBootstrapState(true, false);
+    _applyAuthUi(false);
+    setConsumerSurface("workspace", { focusComposer: false });
+    _maybeShowRequiredLoginModal();
+  }
 }
 
 // ── Onboarding (first-visit 3-step guide) ─────────────────────────────────
@@ -18681,6 +22835,12 @@ function _initOnboarding() {
   try {
     if (localStorage.getItem("cx_onboarded")) return;
   } catch { return; }
+  if (!_hasRecordedGdprConsent()) return;
+  if (window.innerWidth <= 768) {
+    try { localStorage.setItem("cx_onboarded", "1"); } catch { /* ignore */ }
+    return;
+  }
+  if (document.body.classList.contains("auth-gated") || document.getElementById("cx-login-modal")) return;
   const overlay = document.getElementById("onboardingOverlay");
   if (!overlay) return;
   overlay.classList.remove("hidden");
@@ -18763,32 +22923,34 @@ function _initOnboarding() {
   dots.forEach((d) => d.addEventListener("click", () => _goStep(+d.dataset.step)));
 }
 
-function _onLoginSuccess(token, userId, displayName) {
-  _saveAuthState(token, userId, displayName);
-  _applyAuthUi(true, displayName);
-  notify(pickText(`欢迎回来，${displayName}！`, `Welcome, ${displayName}!`, `ようこそ、${displayName}！`, `환영합니다, ${displayName}!`), "success");
-  _syncFavoritesToAccount(token).catch(() => {});
+async function _onLoginSuccess(token, userId, displayName) {
+  void userId;
+  _bootLoginPromptShown = false;
+  _closeLoginModal();
+  _setAuthBootstrapState(true, true);
+  _saveAuthState(token || null, null, displayName);
+  const authIdentity = await _refreshAuthIdentityFromServer();
+  const safeDisplayName = (authIdentity && authIdentity.displayName) || displayName;
+  _applyAuthUi(true, safeDisplayName);
+  notify(pickText(`欢迎回来，${safeDisplayName}！`, `Welcome, ${safeDisplayName}!`, `ようこそ、${safeDisplayName}！`, `환영합니다, ${safeDisplayName}!`), "success");
+  _syncFavoritesToAccount().catch(() => {});
+  await hydrateConsumerHome({ preferHome: false, focusComposer: true });
 }
 
-async function _syncFavoritesToAccount(token) {
+async function _syncFavoritesToAccount() {
   try {
     const local = JSON.parse(localStorage.getItem(_FAV_KEY) || "[]");
     if (!local.length) return;
-    await fetch("/api/user/favorites", {
+    await api("/api/user/favorites", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({ items: local }),
     });
   } catch { /* sync failure is non-fatal */ }
 }
 
 async function _loadServerFavorites() {
-  const token = _getAuthToken();
-  if (!token) return;
   try {
-    const r = await fetch("/api/user/favorites", { headers: { Authorization: `Bearer ${token}` } });
-    if (!r.ok) return;
-    const data = await r.json();
+    const data = await api("/api/user/favorites");
     if (!data.ok || !Array.isArray(data.items) || !data.items.length) return;
     // Merge server favorites into local state (deduplicate by name)
     const existing = new Set((state.favorites || []).map(f => f.title || f.destination));
@@ -18811,16 +22973,46 @@ async function _loadServerFavorites() {
 
 function _onLogout() {
   if (!window.confirm(pickText("确认退出登录？", "Confirm logout?", "\u30ed\u30b0\u30a2\u30a6\u30c8\u3057\u307e\u3059\u304b\uff1f", "\ub85c\uadf8\uc544\uc6c3\ud558\uc2dc\uac00\uc694?"))) return;
+  _bootLoginPromptShown = false;
+  _setAuthBootstrapState(true, false);
   _clearAuthState();
   _applyAuthUi(false);
+  state.tripPlans = [];
+  state.orderSummaries = [];
+  state.activeTripId = "";
+  renderConciergeHome();
+  setConsumerSurface("workspace", { focusComposer: false });
   fetch("/api/auth/logout", { method: "POST" }).catch(() => {});
   notify(pickText("已退出登录", "Signed out successfully", "サインアウトしました", "로그아웃 완료"), "info");
+  _maybeShowRequiredLoginModal();
 }
 
 // ── Login Modal ───────────────────────────────────────────────────────────────
-function _showLoginModal() {
-  const existing = document.getElementById("cx-login-modal");
-  if (existing) existing.remove();
+function _closeLoginModal() {
+  const modal = document.getElementById("cx-login-modal");
+  document.body.classList.remove("auth-gated");
+  if (!modal) {
+    if (_modalCount === 0) document.body.classList.remove("cx-modal-open");
+    return;
+  }
+  if (typeof modal._cxClose === "function") {
+    modal._cxClose();
+    return;
+  }
+  modal.remove();
+  if (_modalCount > 0) _decrementModalCount();
+  else document.body.classList.remove("cx-modal-open");
+}
+
+function _showLoginModal(opts) {
+  const _loginRequired = opts && opts.required === true;
+  _closeLoginModal();
+  document.getElementById("cx-pwa-banner")?.remove();
+  document.body.classList.toggle("auth-gated", _loginRequired);
+  if (_loginRequired) {
+    const onboarding = document.getElementById("onboardingOverlay");
+    if (onboarding) onboarding.classList.add("hidden");
+  }
 
   const t = (zh, en, ja, ko) => pickText(zh, en, ja, ko);
 
@@ -18831,41 +23023,138 @@ function _showLoginModal() {
     <div class="cx-modal-panel" role="dialog" aria-modal="true" aria-label="Sign in to CrossX">
       <button class="cx-modal-close" id="cxLoginClose" aria-label="Close">&times;</button>
       <div class="cx-modal-logo-row">
-        <img src="/assets/logo-crossx.jpg" alt="CrossX" class="cx-modal-logo" onerror="this.style.display='none'" />
+        <img src="/assets/logo-crossx.svg" alt="CrossX" class="cx-modal-logo" data-fallback-src="/assets/logo-crossx.png" />
         <h2 class="cx-modal-title">${t("登录 CrossX", "Sign in to CrossX", "CrossX にサインイン", "CrossX 로그인")}</h2>
       </div>
-      <p class="cx-modal-sub">${t("AI 中国旅行助手", "Your AI travel companion for China", "AIによる中国旅行コンシェルジュ", "AI 중국 여행 어시스턴트")}</p>
+      <p class="cx-modal-sub">${_loginRequired ? t("请登录后使用 CrossX", "Please sign in to use CrossX", "CrossX をご利用にはサインインが必要です", "CrossX 사용을 위해 로그인하세요") : t("AI 中国旅行助手", "Your AI travel companion for China", "AIによる中国旅行コンシェルジュ", "AI 중국 여행 어시스턴트")}</p>
+      ${_loginRequired ? `<div class="cx-login-required-banner"><span class="cx-login-required-icon">⚠️</span><span>${t("根据合规要求，使用本服务需要登录", "Login required for compliance", "コンプライアンスのためログインが必要です", "규정 준수를 위해 로그인이 필요합니다")}</span></div>` : ""}
+      <section class="cx-login-consent-gate" id="cxLoginConsentGate">
+        <div class="cx-login-consent-badge" id="cxLoginConsentBadge"></div>
+        <div class="cx-login-consent-copy">
+          <strong id="cxLoginPrivacyTitle"></strong>
+          <p id="cxLoginPrivacyCopy"></p>
+          <div class="cx-login-consent-helper" id="cxLoginPrivacyHelper"></div>
+        </div>
+        <label class="cx-login-consent-check" for="cxLoginPrivacyAccept">
+          <input type="checkbox" id="cxLoginPrivacyAccept" />
+          <span id="cxLoginPrivacyLabel"></span>
+        </label>
+        <div class="cx-login-cookie-gate hidden" id="cxLoginCookieGate">
+          <div class="cx-login-cookie-copy">
+            <strong id="cxLoginCookieTitle"></strong>
+            <p id="cxLoginCookieCopy"></p>
+          </div>
+          <div class="cx-login-cookie-actions">
+            <button type="button" class="cx-gdpr-btn cx-gdpr-btn-min" id="cxLoginCookieEssential"></button>
+            <button type="button" class="cx-gdpr-btn cx-gdpr-btn-all" id="cxLoginCookieAll"></button>
+          </div>
+          <div class="cx-login-cookie-status hidden" id="cxLoginCookieStatus"></div>
+        </div>
+        <div class="cx-modal-error hidden" id="cxLoginConsentErr"></div>
+      </section>
 
+      <div class="cx-login-intro">
+        <div class="cx-login-intro-row">
+          <strong class="cx-login-intro-title">${t("快捷登录", "Quick sign-in", "クイックサインイン", "빠른 로그인")}</strong>
+          <span class="cx-login-intro-copy">${t("支持常用账号一键进入", "Use a common account to enter in one tap", "よく使うアカウントでワンタップ", "자주 쓰는 계정으로 원탭 로그인")}</span>
+        </div>
+        <div id="cxLoginOauthHint" class="cx-login-oauth-hint">
+          ${t("国际用户优先推荐 Google / Apple / X，中国内地用户可用微信；Facebook 和支付宝账号登录将陆续开放。", "Google, Apple and X are best for international users, WeChat for mainland China. Facebook and Alipay account sign-in are rolling out next.", "海外ユーザーは Google / Apple / X、中国本土ユーザーは WeChat を推奨。Facebook と Alipay は順次対応します。", "해외 사용자는 Google / Apple / X, 중국 본토 사용자는 WeChat을 권장합니다. Facebook과 Alipay는 순차 지원됩니다.")}
+        </div>
+      </div>
+
+      <div class="cx-login-provider-grid">
       <!-- Google OAuth — primary for foreign users -->
-      <button class="cx-modal-btn cx-modal-btn-google" id="cxLoginGoogle">
-        <svg width="18" height="18" viewBox="0 0 24 24" style="vertical-align:middle;margin-right:8px" aria-hidden="true">
+      <button class="cx-modal-btn cx-modal-btn-google cx-login-provider" id="cxLoginGoogle">
+        <span class="cx-login-provider-icon" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24">
           <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
           <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
           <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
           <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
         </svg>
-        ${t("使用 Google 登录", "Continue with Google", "Google でサインイン", "Google로 로그인")}
+        </span>
+        <span class="cx-login-provider-copy">
+          <strong>${t("使用 Google 登录", "Continue with Google", "Google でサインイン", "Google로 로그인")}</strong>
+          <span>${t("适合国际游客", "Best for international travelers", "海外旅行者向け", "해외 여행자에게 권장")}</span>
+        </span>
+        <span data-oauth-badge="google" class="cx-login-provider-badge">${t("一键进入", "1-tap", "ワンタップ", "원탭")}</span>
+      </button>
+
+      <!-- Apple OAuth -->
+      <button class="cx-modal-btn cx-modal-btn-apple cx-login-provider" id="cxLoginApple">
+        <span class="cx-login-provider-icon cx-login-provider-icon-apple" aria-hidden="true"></span>
+        <span class="cx-login-provider-copy">
+          <strong>${t("使用 Apple 登录", "Continue with Apple", "Apple でサインイン", "Apple로 로그인")}</strong>
+          <span>${t("适合常见国际账号", "Best for mainstream global accounts", "一般的な海外アカウント向け", "주요 글로벌 계정에 적합")}</span>
+        </span>
+        <span data-oauth-badge="apple" class="cx-login-provider-badge">${t("即将支持", "Coming soon", "近日対応", "곧 지원")}</span>
+      </button>
+
+      <!-- X OAuth -->
+      <button class="cx-modal-btn cx-modal-btn-x cx-login-provider" id="cxLoginX">
+        <span class="cx-login-provider-icon cx-login-provider-icon-x" aria-hidden="true">X</span>
+        <span class="cx-login-provider-copy">
+          <strong>${t("使用 X 登录", "Continue with X", "X でサインイン", "X로 로그인")}</strong>
+          <span>${t("适合国际社交账号", "Best for global social accounts", "海外向けソーシャルアカウント", "글로벌 소셜 계정에 적합")}</span>
+        </span>
+        <span data-oauth-badge="x" class="cx-login-provider-badge">${t("即将支持", "Coming soon", "近日対応", "곧 지원")}</span>
+      </button>
+
+      <!-- Facebook OAuth -->
+      <button class="cx-modal-btn cx-modal-btn-facebook cx-login-provider" id="cxLoginFacebook">
+        <span class="cx-login-provider-icon" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="#fff">
+          <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z"/>
+        </svg>
+        </span>
+        <span class="cx-login-provider-copy">
+          <strong>${t("使用 Facebook 登录", "Continue with Facebook", "Facebook でサインイン", "Facebook로 로그인")}</strong>
+          <span>${t("适合常见社交账号", "Best for common social accounts", "一般的なSNSアカウント向け", "일반 소셜 계정에 적합")}</span>
+        </span>
+        <span data-oauth-badge="facebook" class="cx-login-provider-badge">${t("即将支持", "Coming soon", "近日対応", "곧 지원")}</span>
       </button>
 
       <!-- WeChat OAuth — conditional, shown when configured -->
-      <button class="cx-modal-btn cx-modal-btn-wechat hidden" id="cxLoginWechat">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:middle;margin-right:8px" aria-hidden="true"><path d="M8.69 11.52c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm4.62 0c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm2.71 5.13c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zm3.14 0c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zM12 2C6.48 2 2 6.04 2 11c0 2.96 1.54 5.6 3.96 7.36L5.1 21l3.06-1.53C9.34 19.81 10.64 20 12 20c5.52 0 10-4.04 10-9s-4.48-9-10-9z"/></svg>
-        ${t("微信登录", "WeChat Login", "WeChat でログイン", "WeChat 로그인")}
+      <button class="cx-modal-btn cx-modal-btn-wechat cx-login-provider" id="cxLoginWechat">
+        <span class="cx-login-provider-icon" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M8.69 11.52c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm4.62 0c-.56 0-1.01-.46-1.01-1.02s.45-1.02 1.01-1.02c.56 0 1.01.46 1.01 1.02s-.45 1.02-1.01 1.02zm2.71 5.13c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zm3.14 0c-.42 0-.76-.35-.76-.77s.34-.77.76-.77.76.35.76.77-.34.77-.76.77zM12 2C6.48 2 2 6.04 2 11c0 2.96 1.54 5.6 3.96 7.36L5.1 21l3.06-1.53C9.34 19.81 10.64 20 12 20c5.52 0 10-4.04 10-9s-4.48-9-10-9z"/></svg>
+        </span>
+        <span class="cx-login-provider-copy">
+          <strong>${t("微信登录", "Continue with WeChat", "WeChat でログイン", "WeChat로 로그인")}</strong>
+          <span>${t("适合中国本地账号", "Best for mainland China accounts", "中国本土アカウント向け", "중국 본토 계정에 적합")}</span>
+        </span>
+        <span data-oauth-badge="wechat" class="cx-login-provider-badge">${t("可用时一键", "1-tap when available", "利用可能ならワンタップ", "사용 가능 시 원탭")}</span>
       </button>
+
+      <!-- Alipay OAuth -->
+      <button class="cx-modal-btn cx-modal-btn-alipay cx-login-provider" id="cxLoginAlipay">
+        <span class="cx-login-provider-icon" aria-hidden="true">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="#fff">
+          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm5.5 14.5c-1.5.5-3.5 1-5.5 1-3 0-5.5-1.5-6.5-3.5 1.5 1 3.5 1.5 5.5 1.5 2.5 0 4.5-.5 6.5-1.5v2.5zm0-4c-1.5.5-3.5 1-5.5 1-2 0-4-.5-5.5-1.5V10c1.5 1 3.5 1.5 5.5 1.5s4-.5 5.5-1.5v2.5zm0-4c-1.5.5-3.5 1-5.5 1s-4-.5-5.5-1.5V6c1.5 1 3.5 1.5 5.5 1.5s4-.5 5.5-1.5v2.5z"/>
+        </svg>
+        </span>
+        <span class="cx-login-provider-copy">
+          <strong>${t("支付宝账号登录", "Continue with Alipay", "Alipay アカウントでログイン", "Alipay 계정으로 로그인")}</strong>
+          <span>${t("常用中国支付账号", "Common payment account in China", "中国で一般的な決済アカウント", "중국에서 자주 쓰는 결제 계정")}</span>
+        </span>
+        <span data-oauth-badge="alipay" class="cx-login-provider-badge">${t("即将支持", "Coming soon", "近日対応", "곧 지원")}</span>
+      </button>
+      </div>
 
       <div class="cx-modal-divider"><span>${t("或用手机/邮箱登录", "or sign in with phone / email", "電話またはメールでサインイン", "전화 또는 이메일로 로그인")}</span></div>
 
       <!-- Method tabs: Phone | Email -->
-      <div class="cx-modal-tabs" style="display:flex;gap:0;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:12px">
-        <button class="cx-modal-tab cx-modal-tab-active" id="cxTabPhone" style="flex:1;padding:8px;background:#eff6ff;font-size:13px;border:none;cursor:pointer;font-weight:600;color:#1a56db">${t("手机号", "Phone", "電話番号", "전화번호")}</button>
-        <button class="cx-modal-tab" id="cxTabEmail" style="flex:1;padding:8px;background:#fff;font-size:13px;border:none;cursor:pointer;font-weight:500;color:#6b7280">${t("邮箱", "Email", "メール", "이메일")}</button>
+      <div class="cx-modal-tabs">
+        <button class="cx-modal-tab cx-modal-tab-active" id="cxTabPhone">${t("手机号", "Phone", "電話番号", "전화번호")}</button>
+        <button class="cx-modal-tab" id="cxTabEmail">${t("邮箱", "Email", "メール", "이메일")}</button>
       </div>
 
       <!-- Phone OTP — international prefix support -->
       <div id="cxLoginPhoneSection">
       <div id="cxLoginStep1">
-        <div style="display:flex;gap:6px;align-items:center">
-          <select id="cxLoginCountry" class="cx-modal-select" style="width:90px;flex-shrink:0">
+        <div class="cx-login-phone-row">
+          <select id="cxLoginCountry" class="cx-modal-select cx-login-country-select">
             <option value="+1">🇺🇸 +1</option>
             <option value="+44">🇬🇧 +44</option>
             <option value="+61">🇦🇺 +61</option>
@@ -18889,7 +23178,7 @@ function _showLoginModal() {
             <option value="+962">🇯🇴 +962</option>
             <option value="+86">🇨🇳 +86</option>
           </select>
-          <input class="cx-modal-input" type="tel" id="cxLoginPhone" placeholder="${t("手机号", "Phone number", "電話番号", "전화번호")}" maxlength="15" autocomplete="tel" style="flex:1" />
+          <input class="cx-modal-input cx-login-phone-input" type="tel" id="cxLoginPhone" placeholder="${t("手机号", "Phone number", "電話番号", "전화번호")}" maxlength="15" autocomplete="tel" />
         </div>
         <button class="cx-modal-btn cx-modal-btn-outline" id="cxLoginSendOtp">${t("发送验证码", "Send verification code", "認証コードを送信", "인증 코드 전송")}</button>
         <div class="cx-modal-error hidden" id="cxLoginErr1"></div>
@@ -18897,12 +23186,12 @@ function _showLoginModal() {
       <div id="cxLoginStep2" class="hidden">
         <label class="cx-modal-label">${t("验证码（6位）", "6-digit code", "6桁の認証コード", "6자리 코드")}</label>
         <input class="cx-modal-input cx-otp-input" type="text" id="cxLoginCode" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
-        <label class="cx-modal-label" style="margin-top:10px">${t("昵称（可选）", "Name (optional)", "ニックネーム（任意）", "닉네임 (선택)")}</label>
+        <label class="cx-modal-label cx-modal-label-spaced">${t("昵称（可选）", "Name (optional)", "ニックネーム（任意）", "닉네임 (선택)")}</label>
         <input class="cx-modal-input" type="text" id="cxLoginName" placeholder="${t("旅行者", "Traveler", "旅人", "여행자")}" maxlength="20" />
         <button class="cx-modal-btn" id="cxLoginVerify">${t("确认登录", "Confirm", "確認", "확인")}</button>
         <button class="cx-modal-link" id="cxLoginResend">${t("重新发送", "Resend code", "再送信", "재전송")}</button>
         <div class="cx-modal-error hidden" id="cxLoginErr2"></div>
-        <div class="cx-modal-dev-hint hidden" id="cxLoginDevHint" style="font-size:11px;color:#6366f1;margin-top:6px;font-family:monospace;text-align:center;"></div>
+        <div class="cx-modal-dev-hint hidden" id="cxLoginDevHint"></div>
       </div>
       </div><!-- end cxLoginPhoneSection -->
 
@@ -18916,30 +23205,162 @@ function _showLoginModal() {
         <div id="cxLoginEmailStep2" class="hidden">
           <label class="cx-modal-label">${t("验证码（6位）", "6-digit code", "6桁の認証コード", "6자리 코드")}</label>
           <input class="cx-modal-input cx-otp-input" type="text" id="cxLoginEmailCode" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
-          <label class="cx-modal-label" style="margin-top:10px">${t("昵称（可选）", "Name (optional)", "ニックネーム（任意）", "닉네임 (선택)")}</label>
+          <label class="cx-modal-label cx-modal-label-spaced">${t("昵称（可选）", "Name (optional)", "ニックネーム（任意）", "닉네임 (선택)")}</label>
           <input class="cx-modal-input" type="text" id="cxLoginEmailName" placeholder="${t("旅行者", "Traveler", "旅人", "여행자")}" maxlength="20" />
           <button class="cx-modal-btn" id="cxLoginEmailVerify">${t("确认登录", "Confirm", "確認", "확인")}</button>
           <button class="cx-modal-link" id="cxLoginEmailResend">${t("重新发送", "Resend code", "再送信", "재전송")}</button>
           <div class="cx-modal-error hidden" id="cxLoginEmailErr2"></div>
-          <div class="cx-modal-dev-hint hidden" id="cxLoginEmailDevHint" style="font-size:11px;color:#6366f1;margin-top:6px;font-family:monospace;text-align:center;"></div>
+          <div class="cx-modal-dev-hint hidden" id="cxLoginEmailDevHint"></div>
         </div>
       </div>
 
-      <!-- Guest mode — no account needed -->
-      <div class="cx-modal-divider"><span>${t("不想注册？", "No account?", "登録不要？", "계정 없이")}</span></div>
-      <button class="cx-modal-link cx-modal-guest-btn" id="cxLoginGuest">
+      <!-- Guest mode — no account needed (hidden when login is required) -->
+      <div class="cx-modal-divider cx-modal-guest-section${_loginRequired ? ' hidden' : ''}"><span>${t("不想注册？", "No account?", "登録不要？", "계정 없이")}</span></div>
+      <button class="cx-modal-link cx-modal-guest-btn${_loginRequired ? ' hidden' : ''}" id="cxLoginGuest">
         ${t("以访客身份继续（功能受限）", "Continue as guest (limited features)", "ゲストとして続ける（機能制限あり）", "게스트로 계속 (기능 제한)")}
       </button>
     </div>`;
   document.body.appendChild(modal);
+  _incrementModalCount();
+  _removeGdprBanner();
+  syncLoginConsentLanguage();
+
+  const _consentErr = document.getElementById("cxLoginConsentErr");
+  const _privacyAccept = document.getElementById("cxLoginPrivacyAccept");
+  const _cookieGate = document.getElementById("cxLoginCookieGate");
+  const _cookieStatus = document.getElementById("cxLoginCookieStatus");
+  const _cookieEssentialBtn = document.getElementById("cxLoginCookieEssential");
+  const _cookieAllBtn = document.getElementById("cxLoginCookieAll");
+  const _loginGateTargets = [
+    "cxLoginGoogle",
+    "cxLoginApple",
+    "cxLoginX",
+    "cxLoginFacebook",
+    "cxLoginWechat",
+    "cxLoginAlipay",
+    "cxTabPhone",
+    "cxTabEmail",
+    "cxLoginSendOtp",
+    "cxLoginVerify",
+    "cxLoginResend",
+    "cxLoginSendEmail",
+    "cxLoginEmailVerify",
+    "cxLoginEmailResend",
+  ];
+
+  const _setConsentErr = (message) => {
+    if (!_consentErr) return;
+    if (!message) {
+      _consentErr.textContent = "";
+      _consentErr.classList.add("hidden");
+      return;
+    }
+    _consentErr.textContent = message;
+    _consentErr.classList.remove("hidden");
+  };
+
+  const _hasCookieChoice = () => _hasRecordedGdprConsent() || modal.dataset.cookieChoice === "essential" || modal.dataset.cookieChoice === "all";
+
+  const _refreshLoginConsentUi = () => {
+    const copy = _getLoginConsentCopy();
+    const _privacyOk = _privacyAccept?.checked === true;
+    const _cookieOk = _hasCookieChoice();
+    if (_cookieGate) _cookieGate.classList.toggle("hidden", !_privacyOk || _cookieOk);
+    if (_cookieStatus) {
+      if (_cookieOk) {
+        const _choice = modal.dataset.cookieChoice || "essential";
+        _cookieStatus.textContent = _choice === "all" ? copy.cookieSavedAll : copy.cookieSavedEssential;
+        _cookieStatus.classList.remove("hidden");
+      } else {
+        _cookieStatus.textContent = "";
+        _cookieStatus.classList.add("hidden");
+      }
+    }
+    for (const id of _loginGateTargets) {
+      const node = document.getElementById(id);
+      if (!node) continue;
+      node.disabled = !(_privacyOk && _cookieOk);
+      node.classList.toggle("cx-login-gated-disabled", !(_privacyOk && _cookieOk));
+    }
+  };
+
+  const _ensureLoginConsentReady = () => {
+    const copy = _getLoginConsentCopy();
+    if (_privacyAccept?.checked !== true) {
+      _setConsentErr(copy.privacyRequiredError);
+      _privacyAccept?.focus();
+      return false;
+    }
+    if (!_hasCookieChoice()) {
+      _setConsentErr(copy.cookieRequiredError);
+      _cookieGate?.classList.remove("hidden");
+      _cookieEssentialBtn?.focus();
+      return false;
+    }
+    _setConsentErr("");
+    return true;
+  };
+
+  const _chooseCookieConsent = (purposes, choice) => {
+    modal.dataset.cookieChoice = choice;
+    _recordGdprConsent(purposes);
+    _setConsentErr("");
+    _refreshLoginConsentUi();
+  };
+
+  if (_privacyAccept) {
+    _privacyAccept.addEventListener("change", () => {
+      if (_privacyAccept.checked) _setConsentErr("");
+      _refreshLoginConsentUi();
+    });
+  }
+  if (_cookieEssentialBtn) {
+    _cookieEssentialBtn.addEventListener("click", () => _chooseCookieConsent(["essential"], "essential"));
+  }
+  if (_cookieAllBtn) {
+    _cookieAllBtn.addEventListener("click", () => _chooseCookieConsent(["essential", "personalization", "analytics"], "all"));
+  }
+  if (_hasRecordedGdprConsent() && !modal.dataset.cookieChoice) {
+    modal.dataset.cookieChoice = _getStoredGdprConsentChoice() || "essential";
+  }
+  _refreshLoginConsentUi();
+
+  // Apply required-mode restrictions AFTER modal is in DOM
+  const _closeBtn = document.getElementById("cxLoginClose");
+  const _backdrop = document.getElementById("cxLoginBackdrop");
+  let _isClosed = false;
+
+  const close = () => {
+    if (_isClosed) return;
+    _isClosed = true;
+    if (typeof _otpCooldownTimer !== "undefined" && _otpCooldownTimer) { clearInterval(_otpCooldownTimer); _otpCooldownTimer = null; }
+    if (typeof _emailCooldownTimer !== "undefined" && _emailCooldownTimer) { clearInterval(_emailCooldownTimer); _emailCooldownTimer = null; }
+    document.body.classList.remove("auth-gated");
+    modal.remove();
+    _decrementModalCount();
+  };
+  modal._cxClose = close;
+
+  if (_loginRequired) {
+    // Mandatory gate — cannot be dismissed without authenticating
+    if (_closeBtn) _closeBtn.classList.add("hidden");
+    // Backdrop click does nothing (no onclick handler)
+  } else {
+    if (_closeBtn) _closeBtn.onclick = close;
+    if (_backdrop) _backdrop.onclick = close;
+  }
 
   // Auto-select country code based on detected UI language / browser locale
   const _countrySelect = document.getElementById("cxLoginCountry");
   if (_countrySelect) {
+    const _supportedPrefixes = new Set(Array.from(_countrySelect.options || []).map((opt) => opt.value));
+    const _geoPrefix = _inferDialPrefixFromContext();
+    const _geoPrefixSafe = _supportedPrefixes.has(_geoPrefix) ? _geoPrefix : "";
     const _ulang = (state.uiLanguage || "").toUpperCase();
     const _nav   = (navigator.language || "").toLowerCase();
     const _code  =
-      _ulang === "ZH"             ? "+86"
+      _geoPrefixSafe               ? _geoPrefixSafe
+      : _ulang === "ZH"             ? "+86"
       : _ulang === "JA"           ? "+81"
       : _ulang === "KO"           ? "+82"
       : _ulang === "ID"           ? "+62"
@@ -18957,35 +23378,195 @@ function _showLoginModal() {
     _countrySelect.value = _code;
   }
 
-  const close = () => {
-    if (typeof _otpCooldownTimer !== "undefined" && _otpCooldownTimer) { clearInterval(_otpCooldownTimer); _otpCooldownTimer = null; }
-    if (typeof _emailCooldownTimer !== "undefined" && _emailCooldownTimer) { clearInterval(_emailCooldownTimer); _emailCooldownTimer = null; }
-    modal.remove();
-  };
-  document.getElementById("cxLoginClose").onclick    = close;
-  document.getElementById("cxLoginBackdrop").onclick = close;
-
-  // Google OAuth — primary login for international users
+  // OAuth providers — check availability and wire up click handlers
   const _googleBtn = document.getElementById("cxLoginGoogle");
-  if (_googleBtn) {
-    fetch("/api/system/providers").then(r => r.json()).then(d => {
-      const _googleAvail = d && d.google_oauth;
-      const _wxAvail     = d && d.wechat_oauth;
-      if (!_googleAvail) {
-        _googleBtn.classList.add("hidden");
-      }
-      const _wxBtn2 = document.getElementById("cxLoginWechat");
-      if (_wxBtn2 && _wxAvail) _wxBtn2.classList.remove("hidden");
-    }).catch(() => {
-      _googleBtn.classList.add("hidden");
-    });
-    _googleBtn.onclick = () => { window.location.href = "/api/auth/google"; };
+  const _appleBtn = document.getElementById("cxLoginApple");
+  const _xBtn = document.getElementById("cxLoginX");
+  const _facebookBtn = document.getElementById("cxLoginFacebook");
+  const _wxBtn = document.getElementById("cxLoginWechat");
+  const _alipayBtn = document.getElementById("cxLoginAlipay");
+  const _oauthHint = document.getElementById("cxLoginOauthHint");
+
+  function _setOauthButtonState(btn, cfg) {
+    if (!btn) return;
+    const available = cfg && cfg.available === true;
+    const badge = btn.querySelector(`[data-oauth-badge="${cfg.badge}"]`);
+    btn.classList.remove("hidden");
+    btn.dataset.oauthState = available ? "available" : "inactive";
+    btn.title = available ? "" : cfg.inactiveTooltip;
+    if (badge) {
+      badge.textContent = available ? cfg.activeBadge : cfg.inactiveBadge;
+      badge.dataset.oauthState = available ? "available" : "inactive";
+    }
   }
 
-  // WeChat OAuth button
-  const _wxBtn = document.getElementById("cxLoginWechat");
-  if (_wxBtn) {
-    _wxBtn.onclick = () => { window.location.href = "/api/auth/wechat"; };
+  function _focusPhoneLogin(prefix) {
+    const phoneTab = document.getElementById("cxTabPhone");
+    const country = document.getElementById("cxLoginCountry");
+    const phone = document.getElementById("cxLoginPhone");
+    if (phoneTab) phoneTab.click();
+    if (country && prefix) country.value = prefix;
+    if (phone) phone.focus();
+  }
+
+  if (_googleBtn || _appleBtn || _xBtn || _facebookBtn || _wxBtn || _alipayBtn) {
+    fetch("/api/system/providers").then(r => _readJsonResponseSafe(r, {})).then(d => {
+      const _googleAvail = d && d.google_oauth;
+      const _appleAvail = d && d.apple_oauth;
+      const _xAvail = d && d.x_oauth;
+      const _facebookAvail = d && d.facebook_oauth;
+      const _wxAvail = d && d.wechat_oauth;
+      const _alipayAvail = d && d.alipay_oauth;
+
+      if (_googleBtn) {
+        _setOauthButtonState(_googleBtn, {
+          available: _googleAvail,
+          badge: "google",
+          activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+          inactiveBadge: t("暂不可用", "Unavailable", "一時利用不可", "일시 사용 불가"),
+          inactiveTooltip: t("Google 登录暂不可用。", "Google sign-in is temporarily unavailable.", "Google サインインは一時的に利用できません。", "Google 로그인은 일시적으로 사용할 수 없습니다."),
+        });
+        _googleBtn.onclick = () => {
+          if (!_ensureLoginConsentReady()) return;
+          if (!_googleAvail) return notify(t("暂不支持 Google 登录。", "Google sign-in is not available.", "Google サインインはご利用いただけません。", "Google 로그인을 사용할 수 없습니다."), "warn");
+          window.location.href = "/api/auth/google";
+        };
+      }
+      if (_appleBtn) {
+        _setOauthButtonState(_appleBtn, {
+          available: _appleAvail,
+          badge: "apple",
+          activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+          inactiveBadge: t("即将支持", "Coming soon", "近日対応", "곧 지원"),
+          inactiveTooltip: t("Apple 登录即将支持。", "Apple sign-in is coming soon.", "Apple ログインは近日対応です。", "Apple 로그인은 곧 지원됩니다."),
+        });
+        _appleBtn.onclick = () => {
+          if (!_ensureLoginConsentReady()) return;
+          if (!_appleAvail) {
+            _focusPhoneLogin(_inferDialPrefixFromContext() || "+1");
+            notify(t("Apple 快捷登录即将支持，当前可先用手机号或邮箱登录。", "Apple quick sign-in is coming soon. For now, use phone or email login.", "Apple クイックログインは近日対応です。今は電話番号またはメールをご利用ください。", "Apple 빠른 로그인은 곧 지원됩니다. 지금은 휴대폰 또는 이메일 로그인을 이용하세요."), "info");
+            return;
+          }
+          window.location.href = "/api/auth/apple";
+        };
+      }
+      if (_facebookBtn) {
+        _setOauthButtonState(_facebookBtn, {
+          available: _facebookAvail,
+          badge: "facebook",
+          activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+          inactiveBadge: t("即将支持", "Coming soon", "近日対応", "곧 지원"),
+          inactiveTooltip: t("Facebook 登录即将支持。", "Facebook sign-in is coming soon.", "Facebook ログインは近日対応です。", "Facebook 로그인은 곧 지원됩니다."),
+        });
+        _facebookBtn.onclick = () => {
+          if (!_ensureLoginConsentReady()) return;
+          if (!_facebookAvail) {
+            _focusPhoneLogin(_inferDialPrefixFromContext() || "+1");
+            notify(t("Facebook 快捷登录即将支持，当前可先用手机号或邮箱登录。", "Facebook quick sign-in is coming soon. For now, use phone or email login.", "Facebook クイックログインは近日対応です。今は電話番号またはメールをご利用ください。", "Facebook 빠른 로그인은 곧 지원됩니다. 지금은 휴대폰 또는 이메일 로그인을 이용하세요."), "info");
+            return;
+          }
+          window.location.href = "/api/auth/facebook";
+        };
+      }
+      if (_xBtn) {
+        _setOauthButtonState(_xBtn, {
+          available: _xAvail,
+          badge: "x",
+          activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+          inactiveBadge: t("即将支持", "Coming soon", "近日対応", "곧 지원"),
+          inactiveTooltip: t("X 登录即将支持。", "X sign-in is coming soon.", "X ログインは近日対応です。", "X 로그인은 곧 지원됩니다."),
+        });
+        _xBtn.onclick = () => {
+          if (!_ensureLoginConsentReady()) return;
+          if (!_xAvail) {
+            _focusPhoneLogin(_inferDialPrefixFromContext() || "+1");
+            notify(t("X 快捷登录即将支持，当前可先用手机号或邮箱登录。", "X quick sign-in is coming soon. For now, use phone or email login.", "X クイックログインは近日対応です。今は電話番号またはメールをご利用ください。", "X 빠른 로그인은 곧 지원됩니다. 지금은 휴대폰 또는 이메일 로그인을 이용하세요."), "info");
+            return;
+          }
+          window.location.href = "/api/auth/x";
+        };
+      }
+      if (_wxBtn) {
+        _setOauthButtonState(_wxBtn, {
+          available: _wxAvail,
+          badge: "wechat",
+          activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+          inactiveBadge: t("暂不可用", "Unavailable", "一時利用不可", "일시 사용 불可"),
+          inactiveTooltip: t("微信登录暂不可用。", "WeChat sign-in is temporarily unavailable.", "WeChat ログインは一時的に利用できません。", "WeChat 로그인은 일시적으로 사용할 수 없습니다."),
+        });
+        _wxBtn.onclick = () => {
+          if (!_ensureLoginConsentReady()) return;
+          if (!_wxAvail) {
+            _focusPhoneLogin("+86");
+            notify(t("微信一键登录暂不可用，可先用中国手机号验证码登录。", "WeChat one-tap sign-in is temporarily unavailable. You can use a China phone number for OTP login.", "WeChat ワンタップログインは一時的に利用できません。中国の電話番号でOTPログインをご利用ください。", "WeChat 원탭 로그인은 일시적으로 사용할 수 없습니다. 중국 휴대폰 번호 OTP 로그인을 이용하세요."), "info");
+            return;
+          }
+          window.location.href = "/api/auth/wechat";
+        };
+      }
+      if (_alipayBtn) {
+        _setOauthButtonState(_alipayBtn, {
+          available: _alipayAvail,
+          badge: "alipay",
+          activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+          inactiveBadge: t("即将支持", "Coming soon", "近日対応", "곧 지원"),
+          inactiveTooltip: t("支付宝账号登录即将支持。", "Alipay account sign-in is coming soon.", "Alipay アカウントログインは近日対応です。", "Alipay 계정 로그인은 곧 지원됩니다."),
+        });
+        _alipayBtn.onclick = () => {
+          if (!_ensureLoginConsentReady()) return;
+          if (!_alipayAvail) {
+            _focusPhoneLogin("+86");
+            notify(t("支付宝账号一键登录即将支持，当前可先用手机号或邮箱登录。", "Alipay account sign-in is coming soon. For now, use phone or email login.", "Alipay アカウントログインは近日対応です。今は電話番号またはメールをご利用ください。", "Alipay 계정 로그인은 곧 지원됩니다. 지금은 휴대폰 또는 이메일 로그인을 이용하세요."), "info");
+            return;
+          }
+          window.location.href = "/api/auth/alipay";
+        };
+      }
+      if (_oauthHint) {
+        _oauthHint.textContent = _googleAvail || _appleAvail || _xAvail || _facebookAvail || _wxAvail || _alipayAvail
+          ? t("选择你常用的账号即可一键进入，手机和邮箱登录保留为备用方式。", "Choose your common account for one-tap access. Phone and email stay available as backup methods.", "よく使うアカウントでワンタップ入場でき、電話とメールは予備手段として使えます。", "자주 쓰는 계정으로 원탭 로그인하고, 휴대폰과 이메일은 보조 수단으로 이용할 수 있습니다.")
+          : t("Google / Apple / WeChat 已预留，X、Facebook、Alipay 将陆续开放；当前可使用手机或邮箱验证码登录。", "Google, Apple and WeChat are reserved, while X, Facebook and Alipay are rolling out next. Use phone or email OTP for now.", "Google / Apple / WeChat の枠は用意済みで、X・Facebook・Alipay は順次対応します。現在は電話またはメールの OTP をご利用ください。", "Google / Apple / WeChat 슬롯은 준비되어 있고, X·Facebook·Alipay는 순차 지원됩니다. 지금은 휴대폰 또는 이메일 OTP를 이용하세요.");
+      }
+    }).catch(() => {
+      _setOauthButtonState(_appleBtn, {
+        available: false,
+        badge: "apple",
+        activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+        inactiveBadge: t("即将支持", "Coming soon", "近日対応", "곧 지원"),
+        inactiveTooltip: t("Apple 登录即将支持。", "Apple sign-in is coming soon.", "Apple ログインは近日対応です。", "Apple 로그인은 곧 지원됩니다."),
+      });
+      _setOauthButtonState(_xBtn, {
+        available: false,
+        badge: "x",
+        activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+        inactiveBadge: t("即将支持", "Coming soon", "近日対応", "곧 지원"),
+        inactiveTooltip: t("X 登录即将支持。", "X sign-in is coming soon.", "X ログインは近日対応です。", "X 로그인은 곧 지원됩니다."),
+      });
+      _setOauthButtonState(_googleBtn, {
+        available: false,
+        badge: "google",
+        activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+        inactiveBadge: t("暂不可用", "Unavailable", "一時利用不可", "일시 사용 불가"),
+        inactiveTooltip: t("Google 登录暂不可用。", "Google sign-in is temporarily unavailable.", "Google サインインは一時的に利用できません。", "Google 로그인은 일시적으로 사용할 수 없습니다."),
+      });
+      _setOauthButtonState(_wxBtn, {
+        available: false,
+        badge: "wechat",
+        activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+        inactiveBadge: t("暂不可用", "Unavailable", "一時利用不可", "일시 사용 불가"),
+        inactiveTooltip: t("微信登录暂不可用。", "WeChat sign-in is temporarily unavailable.", "WeChat ログインは一時的に利用できません。", "WeChat 로그인은 일시적으로 사용할 수 없습니다."),
+      });
+      _setOauthButtonState(_alipayBtn, {
+        available: false,
+        badge: "alipay",
+        activeBadge: t("一键进入", "1-tap", "ワンタップ", "원탭"),
+        inactiveBadge: t("即将支持", "Coming soon", "近日対応", "곧 지원"),
+        inactiveTooltip: t("支付宝账号登录即将支持。", "Alipay account sign-in is coming soon.", "Alipay アカウントログインは近日対応です。", "Alipay 계정 로그인은 곧 지원됩니다."),
+      });
+      if (_oauthHint) {
+        _oauthHint.textContent = t("当前无法读取第三方登录状态，手机和邮箱登录仍可正常使用。", "We could not load third-party sign-in status. Phone and email login still work normally.", "サードパーティログイン状態を取得できませんでした。電話とメールは引き続き利用できます。", "서드파티 로그인 상태를 불러오지 못했습니다. 휴대폰과 이메일 로그인은 계속 사용할 수 있습니다.");
+      }
+    });
   }
 
   // Guest mode — dismiss modal and continue without auth
@@ -19009,6 +23590,14 @@ function _showLoginModal() {
 
   let _currentPhone = "";
   let _otpCooldownTimer = null;
+  const _setLoginStepVisibility = (firstStepEl, secondStepEl, current) => {
+    if (!firstStepEl || !secondStepEl) return;
+    const showSecond = current === 2;
+    firstStepEl.classList.toggle("hidden", showSecond);
+    secondStepEl.classList.toggle("hidden", !showSecond);
+    firstStepEl.toggleAttribute("hidden", showSecond);
+    secondStepEl.toggleAttribute("hidden", !showSecond);
+  };
 
   function _startOtpCooldown(btn) {
     let secs = 60;
@@ -19029,6 +23618,7 @@ function _showLoginModal() {
   }
 
   async function sendOtp() {
+    if (!_ensureLoginConsentReady()) return;
     const prefix = (document.getElementById("cxLoginCountry") || {}).value || "";
     const raw    = phoneInput.value.trim();
     if (!raw) { err1.textContent = pickText("请输入手机号", "Please enter your phone number", "電話番号を入力してください", "전화번호를 입력하세요"); err1.classList.remove("hidden"); return; }
@@ -19043,7 +23633,7 @@ function _showLoginModal() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone }),
       });
-      const data = await r.json();
+      const data = await _readJsonResponseSafe(r, {});
       if (!data.ok) {
         if (data.error === "too_soon" && data.retryAfterSec) {
           err1.textContent = pickText(`请等待 ${data.retryAfterSec} 秒后再重发`, `Please wait ${data.retryAfterSec}s before resending`, `${data.retryAfterSec}秒後に再送してください`, `${data.retryAfterSec}초 후에 재전송하세요`);
@@ -19062,14 +23652,13 @@ function _showLoginModal() {
       }
       _currentPhone = phone;
       _startOtpCooldown(btn);
-      step1.classList.add("hidden");
-      step2.classList.remove("hidden");
+      _setLoginStepVisibility(step1, step2, 2);
       if (data.dev_code) {
         codeInput.value = data.dev_code;
         const devHint = document.getElementById("cxLoginDevHint");
         if (devHint) { devHint.textContent = `[Dev] code: ${data.dev_code}`; devHint.classList.remove("hidden"); }
       }
-      codeInput.focus();
+      window.requestAnimationFrame(() => codeInput.focus());
     } catch {
       err1.textContent = pickText("网络错误，请重试", "Network error. Please retry.", "ネットワークエラー。再試行してください。", "네트워크 오류. 다시 시도하세요.");
       err1.classList.remove("hidden"); btn.disabled = false;
@@ -19078,10 +23667,11 @@ function _showLoginModal() {
   }
 
   async function verifyOtp() {
+    if (!_ensureLoginConsentReady()) return;
     const code = codeInput.value.trim();
     const name = document.getElementById("cxLoginName").value.trim();
-    if (!code || !/^\d{6}$/.test(code)) {
-      err2.textContent = pickText("请输入6位数字验证码", "Enter the 6-digit code", "6桁の数字コードを入力してください", "6자리 숫자 코드를 입력하세요");
+    if (!code || !/^\d{4,8}$/.test(code)) {
+      err2.textContent = pickText("请输入4到8位数字验证码", "Enter a 4 to 8 digit code", "4〜8桁の数字コードを入力してください", "4자리에서 8자리 숫자 코드를 입력하세요");
       err2.classList.remove("hidden"); return;
     }
     err2.classList.add("hidden");
@@ -19093,7 +23683,7 @@ function _showLoginModal() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone: _currentPhone, code, displayName: name }),
       });
-      const data = await r.json();
+      const data = await _readJsonResponseSafe(r, {});
       if (!data.ok) {
         const msg = data.error === "wrong_code"
           ? pickText(`验证码错误（剩余${data.attemptsLeft || 0}次）`, `Wrong code (${data.attemptsLeft || 0} attempts left)`, `コードが違います（残り${data.attemptsLeft || 0}回）`, `코드 오류 (${data.attemptsLeft || 0}회 남음)`)
@@ -19104,8 +23694,8 @@ function _showLoginModal() {
         btn.disabled = false; btn.textContent = pickText("确认登录", "Confirm", "確認", "확인");
         return;
       }
-      modal.remove();
-      _onLoginSuccess(data.token, data.userId, data.displayName);
+      close();
+      _onLoginSuccess(data.token || null, data.userId, data.displayName);
     } catch {
       err2.textContent = pickText("网络错误，请重试", "Network error. Please retry.", "ネットワークエラー。再試行してください。", "네트워크 오류. 다시 시도하세요.");
       err2.classList.remove("hidden"); btn.disabled = false;
@@ -19115,7 +23705,10 @@ function _showLoginModal() {
 
   document.getElementById("cxLoginSendOtp").onclick = sendOtp;
   document.getElementById("cxLoginVerify").onclick   = verifyOtp;
-  document.getElementById("cxLoginResend").onclick   = () => { step2.classList.add("hidden"); step1.classList.remove("hidden"); phoneInput.focus(); };
+  document.getElementById("cxLoginResend").onclick   = () => {
+    _setLoginStepVisibility(step1, step2, 1);
+    phoneInput.focus();
+  };
   phoneInput.onkeydown = (e) => { if (e.key === "Enter") sendOtp(); };
   codeInput.onkeydown  = (e) => { if (e.key === "Enter") verifyOtp(); };
 
@@ -19125,14 +23718,12 @@ function _showLoginModal() {
   const _phoneSection = document.getElementById("cxLoginPhoneSection");
   const _emailSection = document.getElementById("cxLoginEmailSection");
   function _switchTab(tab) {
+    if (_tabEmail) _tabEmail.classList.toggle("cx-modal-tab-active", tab === "email");
+    if (_tabPhone) _tabPhone.classList.toggle("cx-modal-tab-active", tab !== "email");
     if (tab === "email") {
-      _tabEmail.style.background = "#eff6ff"; _tabEmail.style.color = "#1a56db"; _tabEmail.style.fontWeight = "600";
-      _tabPhone.style.background = "#fff";    _tabPhone.style.color = "#6b7280"; _tabPhone.style.fontWeight = "500";
       _phoneSection.classList.add("hidden"); _emailSection.classList.remove("hidden");
       const emailInput = document.getElementById("cxLoginEmail"); if (emailInput) emailInput.focus();
     } else {
-      _tabPhone.style.background = "#eff6ff"; _tabPhone.style.color = "#1a56db"; _tabPhone.style.fontWeight = "600";
-      _tabEmail.style.background = "#fff";    _tabEmail.style.color = "#6b7280"; _tabEmail.style.fontWeight = "500";
       _emailSection.classList.add("hidden"); _phoneSection.classList.remove("hidden");
       phoneInput.focus();
     }
@@ -19168,6 +23759,7 @@ function _showLoginModal() {
   const emailErr2   = document.getElementById("cxLoginEmailErr2");
 
   async function sendEmailCode() {
+    if (!_ensureLoginConsentReady()) return;
     const email = (emailInput || {}).value.trim();
     if (!email || !email.includes("@")) {
       emailErr1.textContent = pickText("请输入有效邮箱", "Please enter a valid email", "有効なメールを入力してください", "유효한 이메일을 입력하세요");
@@ -19179,7 +23771,7 @@ function _showLoginModal() {
     btn.disabled = true; btn.textContent = pickText("发送中…", "Sending…", "送信中…", "전송 중…");
     try {
       const r = await fetch("/api/auth/send-email-code", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
-      const data = await r.json();
+      const data = await _readJsonResponseSafe(r, {});
       if (!data.ok) {
         btn.disabled = false; btn.textContent = pickText("发送验证码", "Send code", "コードを送信", "코드 전송");
         emailErr1.textContent = data.retryAfterSec
@@ -19189,13 +23781,13 @@ function _showLoginModal() {
       }
       _currentEmail = email;
       _startEmailCooldown(btn);
-      emailStep1.classList.add("hidden"); emailStep2.classList.remove("hidden");
+      _setLoginStepVisibility(emailStep1, emailStep2, 2);
       if (data.dev_code) {
         emailCode.value = data.dev_code;
         const hint = document.getElementById("cxLoginEmailDevHint");
         if (hint) { hint.textContent = `[Dev] code: ${data.dev_code}`; hint.classList.remove("hidden"); }
       }
-      emailCode.focus();
+      window.requestAnimationFrame(() => emailCode.focus());
     } catch {
       btn.disabled = false; btn.textContent = pickText("发送验证码", "Send code", "コードを送信", "코드 전송");
       emailErr1.textContent = pickText("网络错误，请重试", "Network error. Retry.", "ネットワークエラー", "네트워크 오류");
@@ -19204,10 +23796,11 @@ function _showLoginModal() {
   }
 
   async function verifyEmailCode() {
+    if (!_ensureLoginConsentReady()) return;
     const code = (emailCode || {}).value.trim();
     const name = (document.getElementById("cxLoginEmailName") || {}).value.trim();
-    if (!code || code.length !== 6) {
-      emailErr2.textContent = pickText("请输入6位验证码", "Enter the 6-digit code", "6桁のコードを入力してください", "6자리 코드를 입력하세요");
+    if (!code || !/^\d{4,8}$/.test(code)) {
+      emailErr2.textContent = pickText("请输入4到8位验证码", "Enter a 4 to 8 digit code", "4〜8桁のコードを入力してください", "4자리에서 8자리 코드를 입력하세요");
       emailErr2.classList.remove("hidden"); return;
     }
     emailErr2.classList.add("hidden");
@@ -19215,7 +23808,7 @@ function _showLoginModal() {
     btn.disabled = true; btn.textContent = pickText("验证中…", "Verifying…", "確認中…", "확인 중…");
     try {
       const r = await fetch("/api/auth/verify-email-code", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: _currentEmail, code, displayName: name }) });
-      const data = await r.json();
+      const data = await _readJsonResponseSafe(r, {});
       if (!data.ok) {
         const msg = data.error === "wrong_code"
           ? pickText(`验证码错误（剩余${data.attemptsLeft || 0}次）`, `Wrong code (${data.attemptsLeft || 0} left)`, `コードが違います（残り${data.attemptsLeft || 0}回）`, `코드 오류 (${data.attemptsLeft || 0}회 남음)`)
@@ -19226,8 +23819,8 @@ function _showLoginModal() {
         btn.disabled = false; btn.textContent = pickText("确认登录", "Confirm", "確認", "확인");
         return;
       }
-      modal.remove();
-      _onLoginSuccess(data.token, data.userId, data.displayName);
+      close();
+      _onLoginSuccess(data.token || null, data.userId, data.displayName);
     } catch {
       emailErr2.textContent = pickText("网络错误，请重试", "Network error. Retry.", "ネットワークエラー", "네트워크 오류");
       emailErr2.classList.remove("hidden"); btn.disabled = false;
@@ -19240,7 +23833,10 @@ function _showLoginModal() {
   const _resendEmailBtn = document.getElementById("cxLoginEmailResend");
   if (_sendEmailBtn)   _sendEmailBtn.onclick   = sendEmailCode;
   if (_verifyEmailBtn) _verifyEmailBtn.onclick  = verifyEmailCode;
-  if (_resendEmailBtn) _resendEmailBtn.onclick  = () => { emailStep2.classList.add("hidden"); emailStep1.classList.remove("hidden"); if (emailInput) emailInput.focus(); };
+  if (_resendEmailBtn) _resendEmailBtn.onclick  = () => {
+    _setLoginStepVisibility(emailStep1, emailStep2, 1);
+    if (emailInput) emailInput.focus();
+  };
   if (emailInput)  emailInput.onkeydown  = (e) => { if (e.key === "Enter") sendEmailCode(); };
   if (emailCode)   emailCode.onkeydown   = (e) => { if (e.key === "Enter") verifyEmailCode(); };
 
