@@ -1,14 +1,17 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cross X Ops | 人工干预后台</title>
+    <title>Cross X Ops | Operations Console</title>
+    <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png" />
+    <link rel="icon" type="image/svg+xml" href="/assets/logo-crossx.svg" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/assets/icon-192.png" />
     <link rel="stylesheet" href="/styles/tokens.css?v=20260224-23" />
-    <link rel="stylesheet" href="/styles.css?v=20260224-23" />
-    <link rel="stylesheet" href="/styles/components.css?v=20260224-23" />
+    <link rel="stylesheet" href="/styles.css?v=20260409-1816" />
+    <link rel="stylesheet" href="/styles/components.css?v=20260409-1318" />
     <link rel="stylesheet" href="/styles/motion.css?v=20260224-23" />
-    <link rel="stylesheet" href="/admin.css?v=20260224-23" />
+    <link rel="stylesheet" href="/admin.css?v=20260327-124" />
   </head>
   <body class="ops-body">
     <header class="topbar">
@@ -16,17 +19,18 @@
         <img src="/assets/logo-crossx.svg" alt="Cross X logo" class="logo" />
         <div class="brand">
           <h1 id="opsTitle">Cross X Ops Console</h1>
-          <p id="opsSubtitle">人工监督与工单执行中台</p>
+          <p id="opsSubtitle">Human supervision and execution control</p>
         </div>
       </div>
       <div class="top-actions">
-        <a class="pill ops-link" id="openUserAppLink" href="/index.html" target="_blank" rel="noopener">打开用户端</a>
-        <button class="pill locate-btn" id="opsRefreshBtn">刷新</button>
+        <a class="pill ops-link" id="openUserAppLink" href="/index.html" target="_blank" rel="noopener">Open user app</a>
+        <a class="pill ops-link" id="openMerchantConsoleLink" href="/merchant.html" target="_blank" rel="noopener">Merchant console</a>
+        <button class="pill locate-btn" id="opsRefreshBtn">Refresh</button>
         <span class="pill" id="opsBuildTag">build:-</span>
         <label class="pill lang-pill" for="opsLangSwitch">
-          <span id="opsLangLabel">语言</span>
+          <span id="opsLangLabel">Language</span>
           <select id="opsLangSwitch" name="opsLangSwitch">
-            <option value="ZH">中文</option>
+            <option value="ZH">ZH</option>
             <option value="EN">EN</option>
             <option value="JA">日本語</option>
             <option value="KO">한국어</option>
@@ -37,70 +41,114 @@
     </header>
 
     <main class="app-shell ops-shell">
-      <article class="card">
+      <article class="card ops-intro-card">
+        <div class="ops-intro-grid">
+          <div class="ops-intro-copy">
+            <p class="ops-section-minihead" id="opsIntroEyebrow">OPS CONTROL</p>
+            <h2 id="opsIntroTitle">Triage risk first, drive execution next, then close the governance loop</h2>
+            <p id="opsIntroCopy" class="ops-section-copy">
+              This console keeps only the core actions that affect platform stability: spot live risk, catch human escalations, and recalibrate governance strategy.
+            </p>
+          </div>
+          <nav class="ops-anchor-row" aria-label="Ops sections">
+            <a class="pill ops-link" id="opsNavOverview" href="#overviewCard">Overview</a>
+            <a class="pill ops-link" id="opsNavAnalytics" href="#analyticsCard">KPIs</a>
+            <a class="pill ops-link" id="opsNavSecurity" href="#securityCard">Security</a>
+            <a class="pill ops-link" id="opsNavPrivacy" href="#privacyQueueCard">Privacy</a>
+            <a class="pill ops-link" id="opsNavMerchant" href="#merchantGovernanceCard">Merchants</a>
+          </nav>
+        </div>
+      </article>
+
+      <article class="card" id="overviewCard">
         <div class="ops-section-head">
-          <h2 id="overviewHeading">人工干预总览</h2>
+          <h2 id="overviewHeading">Human intervention overview</h2>
           <span class="status" id="lastUpdatedText">-</span>
         </div>
+        <p id="overviewCopy" class="ops-section-copy">Confirm which sessions and tickets need human takeover today before deciding priority and handling order.</p>
         <div id="opsSummaryGrid" class="ops-summary-grid"></div>
       </article>
 
       <article class="card" id="analyticsCard">
         <div class="ops-section-head">
-          <h2 id="analyticsHeading">业务指标</h2>
+          <h2 id="analyticsHeading">Business metrics</h2>
           <span class="status" id="analyticsUpdatedText">-</span>
         </div>
+        <p id="analyticsCopy" class="ops-section-copy">Use funnel, revenue, and intent distribution to see whether issues sit in conversion, fulfillment, or supply quality.</p>
         <div id="analyticsKpiGrid" class="ops-summary-grid"></div>
-        <div id="analyticsFunnelRow" style="margin-top:12px"></div>
-        <div id="analyticsRevenueGrid" class="ops-summary-grid" style="margin-top:12px"></div>
+        <div id="analyticsFunnelRow" class="ops-mt-12"></div>
+        <div id="analyticsRevenueGrid" class="ops-summary-grid ops-mt-12"></div>
+        <div id="analyticsConvRow" class="ops-mt-16"></div>
+        <div id="analyticsIntentRow" class="ops-mt-14"></div>
+      </article>
+
+      <article class="card" id="securityCard">
+        <div class="ops-section-head">
+          <h2 id="securityHeading">Security health</h2>
+          <span class="status" id="securityUpdatedText">-</span>
+        </div>
+        <p id="securityCopy" class="ops-section-copy">Only the states that block operations, amplify compliance risk, or hurt live demos belong here.</p>
+        <div id="securityGrid" class="ops-summary-grid"></div>
+        <div id="securityDetail" class="ops-mt-12"></div>
+      </article>
+
+      <article class="card" id="privacyQueueCard">
+        <div class="ops-section-head">
+          <h2 id="privacyQueueHeading">Privacy request queue</h2>
+          <span class="status" id="privacyQueueUpdatedText">-</span>
+        </div>
+        <p id="privacyQueueCopy" class="ops-section-copy">Handle erasure, restriction, and legal hold requests here with deadline visibility so privacy SLA misses do not slip through.</p>
+        <div id="privacyQueueSummary" class="ops-summary-grid"></div>
+        <div id="privacyQueueList" class="cards-grid ops-mt-12"></div>
       </article>
 
       <article class="card" id="featureFlagsCard">
         <div class="ops-section-head">
           <h3 id="flagsHeading">Feature Flags</h3>
-          <div style="display:flex;gap:8px;align-items:center">
-            <input id="flagKeyInput" type="text" placeholder="flag_name" style="padding:4px 8px;border:1px solid var(--border,#e2e8f0);border-radius:6px;font-size:13px;width:140px;">
-            <select id="flagValInput" style="padding:4px 8px;border:1px solid var(--border,#e2e8f0);border-radius:6px;font-size:13px;">
+          <div class="ops-inline-row">
+            <input id="flagKeyInput" type="text" placeholder="flag_name" class="ops-control ops-control-sm">
+            <select id="flagValInput" class="ops-control">
               <option value="true">true</option>
               <option value="false">false</option>
             </select>
-            <button id="flagSetBtn" class="btn-primary" style="font-size:13px;padding:4px 10px">Set</button>
-            <a id="flagExportAuditBtn" style="font-size:12px;color:var(--primary,#6366f1);cursor:pointer;text-decoration:underline">Export Audit CSV</a>
+            <button id="flagSetBtn" class="btn-primary ops-btn-compact">Set</button>
+            <a id="flagExportAuditBtn" class="ops-link-action">Export Audit CSV</a>
           </div>
         </div>
-        <div id="flagsList" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px"></div>
+        <div id="flagsList" class="ops-chip-row"></div>
       </article>
 
       <article class="card">
         <div class="ops-section-head">
-          <h3 id="issuesHeading">待转人工问题</h3>
+          <h3 id="issuesHeading">Human escalation candidates</h3>
           <span id="issuesCountBadge" class="status-badge queued">0</span>
         </div>
+        <p id="issuesCopy" class="ops-section-copy">This area keeps only the problems worth human pickup before a formal ops ticket is created.</p>
         <div id="issuesList" class="cards-grid"></div>
       </article>
 
       <section class="ops-live-grid">
         <article class="card">
           <div class="ops-section-head">
-            <h3 id="liveSessionsHeading">实时会话队列</h3>
+            <h3 id="liveSessionsHeading">Live session queue</h3>
             <span id="liveSessionsCountBadge" class="status-badge running">0</span>
           </div>
           <div id="liveSessionsList" class="list"></div>
         </article>
         <article class="card">
           <div class="ops-section-head">
-            <h3 id="liveRoomHeading">人工通话空间</h3>
-            <span id="liveRoomStatusBadge" class="status-badge queued">未接入</span>
+            <h3 id="liveRoomHeading">Human support room</h3>
+            <span id="liveRoomStatusBadge" class="status-badge queued">Not connected</span>
           </div>
-          <div id="liveRoomMeta" class="status">请选择会话并接入。</div>
+          <div id="liveRoomMeta" class="status">Select a session and connect.</div>
           <div id="liveRoomMessages" class="ops-live-room"></div>
           <form id="liveRoomForm" class="form-col">
-            <textarea id="liveRoomInput" rows="3" placeholder="输入回复给前端用户..." required></textarea>
+            <textarea id="liveRoomInput" rows="3" placeholder="Type a reply for the user..." required></textarea>
             <div class="actions">
-              <button type="button" class="secondary" id="liveVoiceBtn" data-action="ops-live-voice">语音回复</button>
-              <button type="button" class="secondary" id="liveClaimBtn" data-action="ops-live-claim">接入会话</button>
-              <button type="button" class="secondary" id="liveCloseBtn" data-action="ops-live-close">关闭会话</button>
-              <button type="submit" id="liveSendBtn">发送</button>
+              <button type="button" class="secondary" id="liveVoiceBtn" data-action="ops-live-voice">Voice reply</button>
+              <button type="button" class="secondary" id="liveClaimBtn" data-action="ops-live-claim">Claim session</button>
+              <button type="button" class="secondary" id="liveCloseBtn" data-action="ops-live-close">Close session</button>
+              <button type="submit" id="liveSendBtn">Send</button>
             </div>
           </form>
         </article>
@@ -136,6 +184,368 @@
           <div id="resolvedList" class="list"></div>
         </article>
       </section>
+
+      <!-- ── 用户列表 ─────────────────────────────────────────────────── -->
+      <article class="card" id="usersCard">
+        <div class="ops-section-head">
+          <h3 id="usersHeading">User management</h3>
+          <div class="ops-inline-row">
+            <input id="usersSearchInput" type="text" placeholder="Search user / ID" class="ops-control ops-control-md">
+            <span id="usersTotalBadge" class="status-badge queued">0</span>
+          </div>
+        </div>
+        <p id="usersCopy" class="ops-section-copy">Use this area to inspect account, role, order volume, and recent city for support investigation.</p>
+        <div id="usersTableWrap" class="ops-table-wrap">
+          <table id="usersTable" class="ops-table">
+            <thead>
+              <tr>
+                <th>User ID</th>
+                <th>Name</th>
+                <th>Role</th>
+                <th>Plus</th>
+                <th>Orders</th>
+                <th>City</th>
+                <th>Last login</th>
+              </tr>
+            </thead>
+            <tbody id="usersTableBody"></tbody>
+          </table>
+        </div>
+        <div id="usersLoadMore" class="ops-load-more hidden">
+          <button class="secondary" id="usersLoadMoreBtn">Load more</button>
+        </div>
+      </article>
+
+      <!-- ── 数据源质量监控 ───────────────────────────────────────────── -->
+      <article class="card" id="dataQualityCard">
+        <div class="ops-section-head">
+          <h3 id="dataQualityHeading">Data source quality</h3>
+          <span id="dataQualityUpdatedText" class="status">-</span>
+        </div>
+        <p id="dataQualityCopy" class="ops-section-copy">Verify users, tasks, orders, audit trails, and revenue ledgers are complete before making business judgments.</p>
+        <div id="dataQualityGrid" class="ops-summary-grid"></div>
+        <div id="dataQualityDetail" class="ops-mt-12"></div>
+      </article>
+
+      <!-- ── 知识库管理 ───────────────────────────────────────────────── -->
+      <article class="card" id="kbCard">
+        <div class="ops-section-head">
+          <h3 id="kbHeading">Knowledge base</h3>
+          <div class="ops-inline-row ops-inline-wrap">
+            <input id="kbCityInput" type="text" placeholder="City (for example Beijing)" class="ops-control ops-control-xs">
+            <select id="kbCategoryInput" class="ops-control">
+              <option value="">All categories</option>
+              <option value="attraction">Attractions</option>
+              <option value="restaurant">Restaurants</option>
+              <option value="hotel">Hotels</option>
+            </select>
+            <button class="secondary ops-btn-compact" id="kbSearchBtn">Search</button>
+            <button class="secondary ops-btn-compact" id="kbRefreshBtn">Refresh</button>
+            <span id="kbVersionBadge" class="status-badge success">v-</span>
+          </div>
+        </div>
+        <p id="kbCopy" class="ops-section-copy">Sample cities and categories to see whether recommendation gaps come from weak supply or missing content ingestion.</p>
+        <div id="kbVersionInfo" class="ops-inline-note"></div>
+        <div id="kbAttractionsList" class="ops-mt-8"></div>
+      </article>
+
+      <article class="card" id="merchantGovernanceCard">
+        <div class="ops-section-head">
+          <h3>Merchant governance</h3>
+          <span id="merchantGovernanceBadge" class="status-badge queued">0 merchants</span>
+        </div>
+        <p id="merchantGovernanceCopy" class="ops-section-copy">这里处理“平台要不要管、账号能不能开、资料是否合规”这类治理动作，不承接商家日常运营细节。</p>
+        <p class="ops-inline-note ops-inline-note-spaced">
+          Internal admin handles merchant onboarding, status governance, password resets, and GEO binding. Profile upkeep and listing copy stay in merchant console.
+        </p>
+        <p class="ops-inline-note ops-inline-note-spaced">
+          For merchant-console testing, generate isolated demo data here for a specific merchant without touching real user data.
+        </p>
+
+        <div id="merchantSecretBox" class="ops-secret-box hidden"></div>
+
+        <div id="merchantGovernanceForm" class="geo-form">
+          <div class="geo-form-head">
+            <strong id="merchantFormTitle" class="geo-form-title">➕ 新建商家后台账号</strong>
+            <button class="secondary geo-cancel-btn hidden" id="merchantCancelEditBtn">取消编辑</button>
+          </div>
+          <input type="hidden" id="merchantEditId">
+          <div class="geo-form-grid">
+            <div>
+              <label class="geo-field-label">商家名称 *</label>
+              <input id="merchantName" type="text" placeholder="如：海底捞火锅（静安寺店）" class="geo-field-input">
+            </div>
+            <div>
+              <label class="geo-field-label">商家 Slug *</label>
+              <input id="merchantSlug" type="text" placeholder="如：haidilao-jingansi" class="geo-field-input">
+            </div>
+            <div>
+              <label class="geo-field-label">登录用户名 *</label>
+              <input id="merchantUsername" type="text" placeholder="如：haidilao_owner" class="geo-field-input">
+            </div>
+            <div>
+              <label class="geo-field-label">初始化密码</label>
+              <input id="merchantPassword" type="text" placeholder="留空则自动生成" class="geo-field-input">
+            </div>
+          </div>
+          <div class="geo-form-grid">
+            <div>
+              <label class="geo-field-label">账号类型</label>
+              <select id="merchantAccountType" class="geo-field-input">
+                <option value="local_merchant">本地商家</option>
+                <option value="enterprise_partner">企业合作方</option>
+              </select>
+            </div>
+            <div>
+              <label class="geo-field-label">城市</label>
+              <input id="merchantCity" type="text" placeholder="如：上海" class="geo-field-input">
+            </div>
+            <div>
+              <label class="geo-field-label">类别</label>
+              <select id="merchantCategory" class="geo-field-input">
+                <option value="restaurant">🍜 餐厅/美食</option>
+                <option value="hotel">🏨 酒店/住宿</option>
+                <option value="attraction">🏛️ 景点/娱乐</option>
+                <option value="transport">🚕 交通/出行</option>
+                <option value="shopping">🛍️ 购物/商场</option>
+                <option value="other">📌 其他</option>
+              </select>
+            </div>
+            <div>
+              <label class="geo-field-label">上级企业合作方</label>
+              <select id="merchantParentAccountId" class="geo-field-input">
+                <option value="">无</option>
+              </select>
+            </div>
+          </div>
+          <div class="geo-form-grid">
+            <div>
+              <label class="geo-field-label">绑定 GEO 商家</label>
+              <select id="merchantGeoPartnerId" class="geo-field-input">
+                <option value="">暂不绑定</option>
+              </select>
+            </div>
+            <div>
+              <label class="geo-field-label">账户状态</label>
+              <select id="merchantStatus" class="geo-field-input">
+                <option value="active">active</option>
+                <option value="suspended">suspended</option>
+              </select>
+            </div>
+          </div>
+          <div class="geo-form-actions">
+            <button id="merchantSaveBtn" class="btn-primary geo-save-btn">保存商家账户</button>
+            <button id="merchantRefreshBtn" class="secondary" type="button">刷新列表</button>
+          </div>
+        </div>
+
+        <div class="ops-table-scroll ops-mt-12">
+          <table class="ops-table ops-table-merchant">
+            <thead>
+              <tr>
+                <th>商家</th>
+                <th>类型/归属</th>
+                <th>Owner</th>
+                <th>绑定 GEO</th>
+                <th>状态</th>
+                <th>推荐</th>
+                <th>更新时间</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="merchantGovernanceTableBody">
+              <tr><td colspan="8" class="ops-table-empty-cell">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="card" id="merchantListingRequestsCard">
+        <div class="ops-section-head">
+          <h3>Merchant request review</h3>
+          <span id="merchantListingRequestsBadge" class="status-badge queued">0 pending</span>
+        </div>
+        <p class="ops-inline-note ops-inline-note-spaced">
+          Listing, material update, capability, and onboarding requests submitted from merchant console enter this queue. Review changes request status only and does not grant GEO control automatically.
+        </p>
+        <div class="ops-inline-row ops-inline-wrap ops-filter-row">
+          <select id="merchantListingRequestStatusFilter" class="ops-control">
+            <option value="">All statuses</option>
+            <option value="pending">Pending</option>
+            <option value="in_review">In review</option>
+            <option value="approved">Approved</option>
+            <option value="rejected">Rejected</option>
+          </select>
+          <select id="merchantListingRequestAccountTypeFilter" class="ops-control">
+            <option value="">All account types</option>
+            <option value="local_merchant">Local merchant</option>
+            <option value="enterprise_partner">Enterprise partner</option>
+          </select>
+          <select id="merchantListingRequestPriorityFilter" class="ops-control">
+            <option value="">All priorities</option>
+            <option value="critical">critical</option>
+            <option value="high">high</option>
+            <option value="normal">normal</option>
+          </select>
+          <input id="merchantListingRequestTagFilter" type="text" placeholder="Filter by tag" class="ops-control ops-control-sm">
+          <button id="merchantListingRequestRefreshBtn" class="secondary" type="button">Refresh requests</button>
+        </div>
+        <div id="merchantListingRequestsSlaSummary" class="ops-summary-grid ops-mt-12"></div>
+        <div class="ops-inline-row ops-inline-wrap ops-filter-row ops-mt-12">
+          <span id="merchantListingRequestSelectionMeta" class="ops-inline-note">No request selected</span>
+          <select id="merchantListingRequestBatchStatus" class="ops-control">
+            <option value="">Batch status update</option>
+            <option value="in_review">Mark in review</option>
+            <option value="approved">Batch approve</option>
+            <option value="rejected">Batch reject</option>
+          </select>
+          <input id="merchantListingRequestBatchOwner" type="text" placeholder="Owner" class="ops-control ops-control-sm">
+          <input id="merchantListingRequestBatchWindow" type="text" placeholder="Schedule window" class="ops-control ops-control-sm">
+          <button id="merchantListingRequestBatchApplyBtn" class="secondary" type="button">Apply to selected</button>
+        </div>
+        <div class="ops-mt-12">
+          <div class="ops-section-subhead">
+            <strong>Recent review actions</strong>
+            <span class="ops-inline-note">Use this to verify batch and single review operations quickly.</span>
+          </div>
+          <div id="merchantListingReviewAuditList" class="ops-review-feed">
+            <div class="ops-table-empty-cell">Loading...</div>
+          </div>
+        </div>
+        <div class="ops-table-scroll ops-mt-12">
+          <table class="ops-table ops-table-merchant">
+            <thead>
+              <tr>
+                <th><input id="merchantListingRequestSelectAll" type="checkbox" aria-label="Select all merchant listing requests"></th>
+                <th>Merchant</th>
+                <th>Request</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Content</th>
+                <th>Updated</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="merchantListingRequestsTableBody">
+              <tr><td colspan="8" class="ops-table-empty-cell">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <!-- ── GEO 合作商家排名 ─────────────────────────────────────────── -->
+      <article class="card" id="geoPartnersCard">
+        <div class="ops-section-head">
+          <h3 id="geoPartnersHeading">🏆 GEO 合作商家排名</h3>
+          <span id="geoPartnersBadge" class="status-badge success">0 活跃</span>
+        </div>
+        <p class="ops-inline-note ops-inline-note-spaced">
+          填入合作商家后，当用户提问时该商家信息将混合进 AI 回复，并以最高优先级（🏆 平台优选）展示。
+        </p>
+
+        <!-- 添加/编辑表单 -->
+        <div id="geoPartnerForm" class="geo-form">
+          <div class="geo-form-head">
+            <strong id="geoFormTitle" class="geo-form-title">➕ 新增合作商家</strong>
+            <button class="secondary geo-cancel-btn hidden" id="geoCancelEditBtn">取消编辑</button>
+          </div>
+          <input type="hidden" id="geoEditId">
+          <div class="geo-form-grid">
+            <div>
+              <label class="geo-field-label">商家名称 *</label>
+              <input id="geoName" type="text" placeholder="如：海底捞火锅（静安寺店）" class="geo-field-input">
+            </div>
+            <div>
+              <label class="geo-field-label">城市 *</label>
+              <input id="geoCity" type="text" placeholder="如：上海" class="geo-field-input">
+            </div>
+            <div>
+              <label class="geo-field-label">类别</label>
+              <select id="geoCategory" class="geo-field-input">
+                <option value="restaurant">🍜 餐厅/美食</option>
+                <option value="hotel">🏨 酒店/住宿</option>
+                <option value="attraction">🏛️ 景点/娱乐</option>
+                <option value="transport">🚕 交通/出行</option>
+                <option value="shopping">🛍️ 购物/商场</option>
+                <option value="other">📌 其他</option>
+              </select>
+            </div>
+            <div>
+              <label class="geo-field-label">优先级分数（越高越靠前）</label>
+              <input id="geoPriority" type="number" min="1" max="100" value="90" class="geo-field-input">
+            </div>
+          </div>
+          <div class="geo-form-grid">
+            <div>
+              <label class="geo-field-label">地址</label>
+              <input id="geoAddress" type="text" placeholder="如：静安区南京西路1515号" class="geo-field-input">
+            </div>
+            <div>
+              <label class="geo-field-label">联系方式</label>
+              <input id="geoContact" type="text" placeholder="电话 / 微信 / 公众号" class="geo-field-input">
+            </div>
+          </div>
+          <div class="geo-form-block">
+            <label class="geo-field-label">商家简介（AI 会直接引用此内容）</label>
+            <textarea id="geoDescription" rows="2" placeholder="人均150元，招牌菜：毛肚、鸭血；提供英文菜单；外国游客友好" class="geo-field-input geo-field-textarea"></textarea>
+          </div>
+          <div class="geo-form-inline">
+            <div class="geo-form-flex">
+              <label class="geo-field-label">标签（逗号分隔）</label>
+              <input id="geoTags" type="text" placeholder="火锅, 外国游客友好, 英文菜单, 24小时" class="geo-field-input">
+            </div>
+            <div class="geo-toggle-wrap">
+              <label class="geo-checkbox-label">
+                <input type="checkbox" id="geoActive" checked class="geo-checkbox"> 立即启用
+              </label>
+            </div>
+          </div>
+          <div class="geo-form-actions">
+            <button id="geoSaveBtn" class="btn-primary geo-save-btn">保存商家</button>
+          </div>
+        </div>
+
+        <!-- 筛选栏 -->
+        <div class="ops-inline-row ops-inline-wrap ops-filter-row">
+          <input id="geoFilterCity" type="text" placeholder="按城市筛选" class="ops-control ops-control-xxs">
+          <select id="geoFilterCategory" class="ops-control">
+            <option value="">全部类别</option>
+            <option value="restaurant">餐厅</option>
+            <option value="hotel">酒店</option>
+            <option value="attraction">景点</option>
+            <option value="transport">交通</option>
+            <option value="shopping">购物</option>
+            <option value="other">其他</option>
+          </select>
+          <select id="geoFilterActive" class="ops-control">
+            <option value="">全部状态</option>
+            <option value="1">仅活跃</option>
+            <option value="0">已停用</option>
+          </select>
+          <button class="secondary ops-btn-compact" id="geoFilterBtn">筛选</button>
+          <button class="secondary ops-btn-compact" id="geoRefreshBtn">刷新</button>
+        </div>
+
+        <!-- 商家列表 -->
+        <div id="geoPartnersList" class="ops-table-scroll">
+          <table class="ops-table ops-table-geo">
+            <thead>
+              <tr>
+                <th>商家名</th>
+                <th>城市</th>
+                <th>类别</th>
+                <th>优先级</th>
+                <th>状态</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody id="geoPartnersTableBody">
+              <tr><td colspan="6" class="ops-table-empty">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
     </main>
 
     <section id="opsDrawer" class="drawer hidden" aria-hidden="true">
@@ -154,8 +564,8 @@
     <script src="/ui/motion.js?v=20260224-23"></script>
     <script src="/ui/drawer.js?v=20260224-23"></script>
     <script src="/ui/modal.js?v=20260224-23"></script>
-    <script src="/ui/toast.js?v=20260224-23"></script>
+    <script src="/ui/toast.js?v=20260409-1318"></script>
     <script src="/ui/skeleton.js?v=20260224-23"></script>
-    <script src="/admin.js?v=20260224-23"></script>
+    <script src="/admin.js?v=20260409-1816"></script>
   </body>
 </html>
